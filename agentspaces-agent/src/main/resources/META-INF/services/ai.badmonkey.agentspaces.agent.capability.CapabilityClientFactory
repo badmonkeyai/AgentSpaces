@@ -1,0 +1,3 @@
+ai.badmonkey.agentspaces.agent.capability.VoteClient$Factory
+ai.badmonkey.agentspaces.agent.capability.AggregateClient$Factory
+ai.badmonkey.agentspaces.agent.capability.SemanticClient$Factory

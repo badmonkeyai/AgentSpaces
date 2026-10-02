@@ -1,0 +1,457 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Bad Monkey, Inc.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd"
+         child.project.url.inherit.append.path="false">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>ai.badmonkey.agentspaces</groupId>
+  <artifactId>agentspaces</artifactId>
+  <version>0.2.0</version>
+  <packaging>pom</packaging>
+
+  <name>AgentSpaces</name>
+  <description>
+    A peer-to-peer coordination suite for agents: JXTA-style peering (cryptographic peer
+    identity, self-certifying groups, signed advertisements) combined with JavaSpaces-style
+    coordination (a typed, leased tuple space with write, read, take, and notifications),
+    replicated with CRDTs over gossip, plus capability services and an annotation-based
+    programming model. The specification and conformance vectors are published separately
+    as agentspaces-spec.
+  </description>
+  <!-- Modules inherit these verbatim: without the attributes Maven appends each module's
+       artifactId to the URL and SCM paths, producing links that do not exist. -->
+  <url>https://github.com/badmonkeyai/agentspaces</url>
+  <inceptionYear>2026</inceptionYear>
+
+  <organization>
+    <name>Bad Monkey, Inc.</name>
+    <url>https://badmonkey.ai</url>
+  </organization>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>albaker</id>
+      <name>Al Baker</name>
+      <email>ajb732@gmail.com</email>
+      <organization>Bad Monkey, Inc.</organization>
+      <organizationUrl>https://badmonkey.ai</organizationUrl>
+      <roles>
+        <role>architect</role>
+        <role>developer</role>
+      </roles>
+    </developer>
+  </developers>
+
+  <scm child.scm.connection.inherit.append.path="false"
+       child.scm.developerConnection.inherit.append.path="false"
+       child.scm.url.inherit.append.path="false">
+    <url>https://github.com/badmonkeyai/agentspaces</url>
+    <connection>scm:git:https://github.com/badmonkeyai/agentspaces.git</connection>
+    <developerConnection>scm:git:git@github.com:badmonkeyai/agentspaces.git</developerConnection>
+    <tag>HEAD</tag>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/badmonkeyai/agentspaces/issues</url>
+  </issueManagement>
+
+  <modules>
+    <module>agentspaces-dependencies</module>
+    <module>agentspaces-common</module>
+    <module>agentspaces-api</module>
+    <module>agentspaces-test-support</module>
+    <module>agentspaces-identity</module>
+    <module>agentspaces-auth-oidc</module>
+    <module>agentspaces-space</module>
+    <module>agentspaces-peering</module>
+    <module>agentspaces-transport-quic</module>
+    <module>agentspaces-discovery</module>
+    <module>agentspaces-capabilities</module>
+    <module>agentspaces-agent</module>
+    <module>agentspaces-a2a</module>
+    <module>agentspaces-connect-core</module>
+    <module>agentspaces-console</module>
+    <module>agentspaces-spring-stubs</module>
+    <module>agentspaces-spring-boot-autoconfigure</module>
+    <module>agentspaces-spring-boot-starter</module>
+    <module>embabel-agentspaces</module>
+    <module>examples</module>
+  </modules>
+
+  <properties>
+    <java.version>21</java.version>
+    <maven.compiler.release>${java.version}</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+    <!-- Third-party versions, resolved from Maven Central.
+         Jackson 2 tracks the version Spring Boot 4.1 manages, so a Boot
+         application runs the canonical CBOR codec on the Jackson it was tested
+         with. Any Jackson bump must keep the golden-vector suites green
+         (they pin the canonical bytes); see docs/BUILD-ENVIRONMENTS.md. -->
+    <jackson.version>2.21.5</jackson.version>
+    <caffeine.version>3.2.0</caffeine.version>
+    <nimbus-jose-jwt.version>10.3</nimbus-jose-jwt.version>
+    <bouncycastle.version>1.81</bouncycastle.version>
+    <junit.version>5.13.4</junit.version>
+    <assertj.version>3.27.3</assertj.version>
+
+    <!-- Plugin versions -->
+    <maven-compiler-plugin.version>3.14.0</maven-compiler-plugin.version>
+    <maven-surefire-plugin.version>3.5.4</maven-surefire-plugin.version>
+    <maven-clean-plugin.version>3.2.0</maven-clean-plugin.version>
+    <maven-resources-plugin.version>3.3.0</maven-resources-plugin.version>
+    <maven-jar-plugin.version>3.3.0</maven-jar-plugin.version>
+    <maven-install-plugin.version>3.1.1</maven-install-plugin.version>
+    <maven-deploy-plugin.version>3.1.1</maven-deploy-plugin.version>
+    <jacoco-maven-plugin.version>0.8.12</jacoco-maven-plugin.version>
+    <exec-maven-plugin.version>3.1.0</exec-maven-plugin.version>
+
+    <!-- Publication plugin versions (used only by the central-publish profile;
+         resolved from Maven Central, so network-restricted builds that never
+         activate the profile are unaffected). -->
+    <maven-source-plugin.version>3.3.1</maven-source-plugin.version>
+    <maven-javadoc-plugin.version>3.11.2</maven-javadoc-plugin.version>
+    <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
+    <central-publishing-maven-plugin.version>0.9.0</central-publishing-maven-plugin.version>
+
+    <!-- Coverage gate, overridable per module. Examples set this to 0. -->
+    <jacoco.line.minimum>0.80</jacoco.line.minimum>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- Jackson 2 through its BOM: from 2.20 on, jackson-annotations carries a
+           major.minor version only, which the BOM aligns for us. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.github.ben-manes.caffeine</groupId>
+        <artifactId>caffeine</artifactId>
+        <version>${caffeine.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.nimbusds</groupId>
+        <artifactId>nimbus-jose-jwt</artifactId>
+        <version>${nimbus-jose-jwt.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcprov-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcpkix-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>${junit.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.assertj</groupId>
+        <artifactId>assertj-core</artifactId>
+        <version>${assertj.version}</version>
+      </dependency>
+      <!-- Internal modules -->
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-common</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-api</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-test-support</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-identity</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-space</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <!-- Test stack shared by every module. -->
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>${maven-compiler-plugin.version}</version>
+          <configuration>
+            <release>${java.version}</release>
+            <parameters>true</parameters>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${maven-surefire-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-clean-plugin</artifactId>
+          <version>${maven-clean-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-resources-plugin</artifactId>
+          <version>${maven-resources-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>${maven-jar-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-install-plugin</artifactId>
+          <version>${maven-install-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-deploy-plugin</artifactId>
+          <version>${maven-deploy-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <version>${exec-maven-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.jacoco</groupId>
+          <artifactId>jacoco-maven-plugin</artifactId>
+          <version>${jacoco-maven-plugin.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+
+  <profiles>
+    <!-- The Spring context integration test needs real Spring Boot artifacts
+         from Maven Central, so it lives behind this profile: activated
+         automatically in CI, or explicitly with -Pspring-it on a laptop.
+         Network-restricted environments never see it; the release rule in
+         docs/BUILD-ENVIRONMENTS.md requires it green before any release. -->
+    <profile>
+      <id>spring-it</id>
+      <activation>
+        <property>
+          <name>env.CI</name>
+        </property>
+      </activation>
+      <modules>
+        <module>integration-tests/spring-boot-it</module>
+        <module>integration-tests/embabel-it</module>
+      </modules>
+    </profile>
+    <!-- The flagship applications, the Party Bus, and the perf harnesses are
+         standalone projects at the workspace root, outside this repository and
+         its reactor: they consume the published libraries, so they are built and
+         tested after `mvn install` by the workspace runbook (BUILD.md,
+         verify-all.sh), which is how the lesson of QA4 A4-2 (leave them out of
+         every gate and they rot) is kept without pulling them into the core build. -->
+    <!-- Coverage runs wherever the JaCoCo Maven plugin can be resolved from
+         Maven Central: activated automatically in CI (the CI env var), or
+         explicitly with -Pcoverage. Network-restricted environments that build
+         from the system package repo skip it; see docs/BUILD-ENVIRONMENTS.md. -->
+    <profile>
+      <id>coverage</id>
+      <activation>
+        <property>
+          <name>env.CI</name>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>prepare-agent</id>
+                <goals>
+                  <goal>prepare-agent</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>report</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>report</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>coverage-check</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>check</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <rule>
+                      <element>BUNDLE</element>
+                      <limits>
+                        <limit>
+                          <counter>LINE</counter>
+                          <value>COVEREDRATIO</value>
+                          <minimum>${jacoco.line.minimum}</minimum>
+                        </limit>
+                      </limits>
+                    </rule>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- Maven Central publication: source, javadoc, test-source, and
+         test-javadoc jars for every deployed module, GPG signing, and upload
+         through the Sonatype Central Portal (the same shape as Embabel's
+         sonatype profile). Kept behind a profile so the default reactor builds
+         identically in network-restricted environments; CI activates it for
+         releases with -Pcentral-publish.
+
+         Modules that must never reach Central (spring-stubs, examples,
+         integration-tests, perf) set maven.deploy.skip + skipPublishing in
+         their own POMs, which also turns off signing and the extra jars there.
+
+         Credentials: the `central` server id in settings.xml carries the
+         Central Portal token; the GPG passphrase arrives via the
+         MAVEN_GPG_PASSPHRASE environment variable. -->
+    <profile>
+      <id>central-publish</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>${maven-source-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <attach>true</attach>
+              <excludeResources>false</excludeResources>
+              <includePom>false</includePom>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>${maven-javadoc-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <quiet>true</quiet>
+              <doclint>all,-missing</doclint>
+              <release>${java.version}</release>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>${maven-gpg-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <!-- Passphrase consumed from the MAVEN_GPG_PASSPHRASE environment
+                   variable; bestPractices fails the build on legacy insecure
+                   passphrase sources. -->
+              <bestPractices>true</bestPractices>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>${central-publishing-maven-plugin.version}</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

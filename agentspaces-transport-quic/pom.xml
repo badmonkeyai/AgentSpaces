@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Bad Monkey, Inc.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>ai.badmonkey.agentspaces</groupId>
+    <artifactId>agentspaces</artifactId>
+    <version>0.2.0</version>
+  </parent>
+
+  <artifactId>agentspaces-transport-quic</artifactId>
+  <name>AgentSpaces :: QUIC Transport</name>
+  <description>
+    The QUIC (RFC 9000) binding of the Transport SPI (spec §5.5): length-prefixed
+    frames over one bidirectional QUIC stream per peer connection, on Netty's
+    incubator QUIC codec (quiche). Peers gain transport-level encryption, loss
+    recovery, and connection migration; peer authentication remains the
+    AgentSpaces signed-envelope layer, exactly as over TCP.
+  </description>
+
+  <properties>
+    <!--
+      The quiche native library is platform-classified. The default suits the
+      Linux CI and container environments; the OS-activated profiles below
+      select the macOS classifiers (all are published on Maven Central), and
+      -Dquic.native.classifier=... overrides for anything else. Every test
+      class assumes Quic.isAvailable(), so an unsupported platform skips the
+      suite with the native library's own reason rather than failing it.
+    -->
+    <quic.native.classifier>linux-x86_64</quic.native.classifier>
+    <netty-quic.version>0.0.75.Final</netty-quic.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.netty.incubator</groupId>
+      <artifactId>netty-incubator-codec-classes-quic</artifactId>
+      <version>${netty-quic.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty.incubator</groupId>
+      <artifactId>netty-incubator-codec-native-quic</artifactId>
+      <version>${netty-quic.version}</version>
+      <classifier>${quic.native.classifier}</classifier>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-peering</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Attested mode (spec §5.6) presents the identity's channel certificate
+         at the QUIC handshake, so identity and common are compile scope. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-identity</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-common</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-space</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- TestCa for the CA-mode ports of the TLS tests (TODO item 11). -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-support</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <profiles>
+    <profile>
+      <id>quic-native-osx-aarch64</id>
+      <activation>
+        <os>
+          <family>mac</family>
+          <arch>aarch64</arch>
+        </os>
+      </activation>
+      <properties>
+        <quic.native.classifier>osx-aarch_64</quic.native.classifier>
+      </properties>
+    </profile>
+    <profile>
+      <id>quic-native-osx-x86_64</id>
+      <activation>
+        <os>
+          <family>mac</family>
+          <arch>x86_64</arch>
+        </os>
+      </activation>
+      <properties>
+        <quic.native.classifier>osx-x86_64</quic.native.classifier>
+      </properties>
+    </profile>
+  </profiles>
+</project>

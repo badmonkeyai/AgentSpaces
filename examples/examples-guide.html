@@ -1,0 +1,748 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentSpaces Examples Guide</title>
+<link rel="icon" href="assets/logo/agentspaces-mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --p1:#666699; --p2:#9999CC; --p3:#CCCCFF;
+    --control:#CCCCCC; --white:#FFFFFF;
+    --s1:#666666; --s2:#999999;
+    --black:#000000; --text:#111111; --muted:#444444;
+    --ui:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+    --metal-ui:"Helvetica Neue",Helvetica,Arial,"Liberation Sans",sans-serif;
+    --metal-mono:"Courier New",Courier,"Liberation Mono",monospace;
+    --bumps:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='4' height='4' fill='%239999CC'/%3E%3Crect width='1' height='1' fill='%23FFFFFF'/%3E%3Crect x='1' y='1' width='1' height='1' fill='%23666699'/%3E%3Crect x='2' y='2' width='1' height='1' fill='%23FFFFFF'/%3E%3Crect x='3' y='3' width='1' height='1' fill='%23666699'/%3E%3C/svg%3E");
+    --code-bg:#FFFFFF; --code-fg:#1F1F1F; --code-comment:#635D97; --code-purple:#644AC9; --code-pink:#A3144D; --code-green:#14710A; --code-cyan:#036A96; --code-yellow:#846E15; --code-orange:#A34D14;
+    --max:1180px; --gutter:clamp(18px,4vw,44px);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  body{margin:0;background:var(--white);color:var(--text);font-family:var(--ui);font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  a{color:var(--p1);text-decoration:underline;text-decoration-color:var(--p2);text-underline-offset:3px}
+  a:hover{color:var(--black);text-decoration-color:var(--p1)}
+  :focus-visible{outline:2px solid var(--p2);outline-offset:3px}
+  code,pre,kbd{font-family:var(--mono)}
+  code{font-size:.9em;background:#F0F0F4;border:1px solid var(--control);padding:.05em .3em}
+  pre code{background:none;border:0;padding:0;font-size:inherit}
+  p{margin:0 0 14px}
+  h1,h2,h3,h4{font-family:var(--ui);font-weight:700;margin:0;letter-spacing:-0.015em;line-height:1.15}
+  h1{font-size:clamp(34px,4.6vw,54px)}
+  h2{font-size:clamp(24px,3vw,32px);scroll-margin-top:84px}
+  h3{font-size:18px;letter-spacing:-0.005em;margin:28px 0 10px;scroll-margin-top:84px}
+  h4{font-size:15.5px;margin:22px 0 8px}
+  .wrap{max-width:var(--max);margin:0 auto;padding:0 var(--gutter)}
+  .lede{font-size:18.5px;color:var(--muted);max-width:60ch}
+  .eyebrow{font-family:var(--mono);font-size:13px;color:var(--p1);font-weight:500;margin-bottom:14px;display:inline-flex;align-items:center;gap:8px}
+  .eyebrow::before{content:"";width:10px;height:10px;background:var(--p2);border:1px solid var(--p1);display:inline-block}
+
+  header{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--control)}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:64px;gap:24px}
+  .brand{display:inline-flex;align-items:center;gap:10px;color:var(--black);font-weight:700;font-size:19px;text-decoration:none;letter-spacing:-0.01em}
+  .brand svg{width:26px;height:26px}
+  .links{display:flex;gap:24px;align-items:center;font-size:15px;font-weight:500}
+  .links a{color:var(--text);text-decoration:none;border-bottom:2px solid transparent;padding:2px 0}
+  .links a:hover{border-bottom-color:var(--p2);color:var(--black)}
+  .links a.on{border-bottom-color:var(--p1)}
+  .links a.cta{background:var(--p1);color:#fff;padding:8px 14px;border:0;border-radius:3px}
+  .links a.cta:hover{background:#55558A}
+  @media (max-width:760px){.links a:not(.cta){display:none}}
+
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:3px;font-weight:600;font-size:15px;text-decoration:none;border:1px solid var(--p1);color:var(--p1);background:var(--white)}
+  .btn:hover{background:var(--p3);color:var(--black)}
+  .btn.primary{background:var(--p1);color:#fff}
+  .btn.primary:hover{background:#55558A;color:#fff}
+
+  /* Metal window */
+  .mwin{background:var(--control);border:1px solid;border-color:#fff var(--s1) var(--s1) #fff;box-shadow:inset -1px -1px 0 var(--s2),inset 1px 1px 0 #fff,3px 3px 0 rgba(0,0,0,.12);font-family:var(--metal-ui);color:var(--black);margin:18px 0}
+  .mwin .mtitle{height:22px;background:var(--bumps);display:flex;align-items:center;padding:0 3px 0 4px;border-bottom:1px solid var(--p1)}
+  .mwin .mtitle .t{background:var(--p2);padding:0 8px 0 4px;font-weight:700;font-size:12px;height:22px;display:inline-flex;align-items:center;gap:5px;color:var(--black)}
+  .mwin .mtitle .sp{flex:1}
+  .mwin .mtitle .wb{width:15px;height:15px;background:var(--control);margin-left:2px;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;line-height:1;border:1px solid;border-color:#fff var(--s1) var(--s1) #fff;box-shadow:inset -1px -1px 0 var(--s2)}
+  .mwin .tabs{display:flex;gap:2px;padding:6px 6px 0;flex-wrap:wrap}
+  .mwin .tab{font-family:var(--metal-ui);font-weight:700;font-size:12px;padding:3px 10px;background:var(--control);border:1px solid;border-color:#fff var(--s1) transparent #fff;color:var(--s1);cursor:pointer;line-height:1.4}
+  .mwin .tab:focus-visible{outline:1px dashed var(--p2);outline-offset:-3px}
+  .mwin .tab.on{background:var(--white);color:var(--black);position:relative;top:1px}
+  .mwin .tabbody{margin:0 6px 6px;background:var(--white);border:1px solid;border-color:#fff var(--s1) var(--s1) #fff}
+  .mwin .mstatus{margin:0 6px 6px;font-size:12px;padding:3px 8px;background:var(--white);border:1px solid;border-color:var(--s1) #fff #fff var(--s1);box-shadow:inset 1px 1px 0 var(--s2);min-height:22px;font-family:var(--metal-ui)}
+  .mwin .ok{color:#006633;font-weight:700}
+
+  pre{margin:0;background:var(--code-bg);color:var(--code-fg);padding:14px 16px;font-size:13.5px;line-height:1.62;overflow:auto;tab-size:2}
+  pre .c{color:var(--code-comment);font-style:italic}
+  pre .k{color:var(--code-purple);font-weight:600}
+  pre .a{color:var(--code-pink)}
+  pre .s{color:var(--code-green)}
+  pre .t{color:var(--code-cyan)}
+  pre .n{color:var(--code-yellow)}
+  pre .f{color:var(--code-orange)}
+  .plainpre{border:1px solid var(--control);margin:14px 0}
+
+  /* guide layout */
+  .guide{display:grid;grid-template-columns:248px minmax(0,1fr);gap:clamp(24px,3.5vw,56px);padding:40px 0 90px}
+  @media (max-width:900px){.guide{grid-template-columns:1fr}}
+  .toc{position:sticky;top:84px;align-self:start;font-size:14px;max-height:calc(100vh - 110px);overflow:auto}
+  @media (max-width:900px){.toc{position:static;max-height:none;border:1px solid var(--control);padding:14px;background:#F7F7F9}}
+  .toc .group{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--s1);margin:18px 0 6px}
+  .toc a{display:block;color:var(--text);text-decoration:none;padding:4px 10px;border-left:2px solid var(--control)}
+  .toc a:hover{background:var(--p3);color:var(--black)}
+  .toc a.chap{font-weight:600}
+  .toc a small{color:var(--s1);font-family:var(--mono);font-size:11px;margin-right:6px}
+
+  .chapter{padding:34px 0 8px;border-top:1px solid var(--control);margin-top:34px}
+  .chapter:first-child{border-top:0;margin-top:0;padding-top:0}
+  .chapnum{font-family:var(--mono);font-size:12.5px;color:var(--p1);margin-bottom:10px}
+  .prose{max-width:72ch}
+  ul.tight{margin:0 0 14px;padding-left:22px}
+  ul.tight li{margin-bottom:6px}
+
+  table.attrs{border-collapse:collapse;width:100%;font-size:14px;margin:14px 0 22px}
+  table.attrs th{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--s1);text-align:left;font-weight:500;padding:7px 12px;border-bottom:2px solid var(--p2)}
+  table.attrs td{padding:8px 12px;border-bottom:1px solid var(--control);vertical-align:top}
+  table.attrs td:first-child{font-family:var(--mono);font-size:13px;white-space:nowrap}
+  table.attrs tr:hover td{background:var(--p3)}
+  .tablewrap{overflow-x:auto}
+
+  .note{border:1px solid var(--p2);border-left:4px solid var(--p1);background:#F4F4FA;padding:12px 16px;margin:16px 0;font-size:14.5px;max-width:72ch}
+  .note b{font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--p1);display:block;margin-bottom:4px;font-weight:500}
+
+  .hero{padding:52px 0 8px}
+  .facts{display:flex;flex-wrap:wrap;gap:6px 20px;margin-top:22px;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+  .facts span::before{content:"";display:inline-block;width:7px;height:7px;background:var(--p2);margin-right:8px;vertical-align:1px}
+  .ctas{display:flex;gap:10px;margin-top:26px;flex-wrap:wrap}
+
+  footer{border-top:1px solid var(--control);padding:34px 0 60px;color:var(--muted);font-size:14px}
+  footer .brand{font-size:16px;margin-bottom:10px}
+</style></head><body>
+<header><div class="wrap nav"><a class="brand" href="index.html" aria-label="AgentSpaces home"><svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="#666699" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" rx="3.5" fill="#9999CC"/></svg>AgentSpaces</a>
+<nav class="links" aria-label="Primary"><a href="getting-started.html">Getting started</a><a href="fleet-room.html">Fleet room</a><a href="developer-guide.html">Developer guide</a><a href="path.html">Spring &middot; Embabel &middot; fleet</a><a href="whats-new.html">What's new</a><a href="use-cases.html">Models</a><a href="docs.html">Docs</a><a href="brand.html">Brand</a><a class="cta" href="getting-started.html">Get started</a></nav></div></header>
+
+<div class="wrap hero">
+  <div class="eyebrow">aspace://examples</div>
+  <h1>Examples guide</h1>
+  <p class="lede" style="margin-top:16px">Eleven runnable programs, each one adding a single layer to the one before it: from a leased tuple space in one process, up through replicated fleets on real TCP, cost-aware auctions, quorum votes, WAN rendezvous, an A2A gateway, and three complete applied fleets. Each example runs with one Maven command, and each flow also runs as a deterministic JUnit test.</p>
+  <div class="facts"><span>11 examples</span><span>version 0.2.0</span><span>Java 21</span><span>Apache 2.0</span><span>one command each</span></div>
+  <div class="ctas"><a class="btn primary" href="#running">Run them</a><a class="btn" href="#ex-11">Start with Quickstart</a><a class="btn" href="#ex-08">The applied fleets</a></div>
+</div>
+
+<div class="wrap guide">
+<nav class="toc" aria-label="Guide contents">
+  <div class="group">Start</div>
+  <a class="chap" href="#running"><small>RUN</small>Running the examples</a>
+  <div class="group">First steps</div>
+  <a class="chap" href="#ex-11"><small>11</small>Quickstart</a>
+  <a class="chap" href="#ex-01"><small>01</small>Hello Space</a>
+  <div class="group">The fleet on the wire</div>
+  <a class="chap" href="#ex-02"><small>02</small>Research Fleet</a>
+  <a class="chap" href="#ex-03"><small>03</small>Discovery Cards</a>
+  <div class="group">Allocation &amp; decisions</div>
+  <a class="chap" href="#ex-04"><small>04</small>Auction</a>
+  <a class="chap" href="#ex-05"><small>05</small>Quorum</a>
+  <div class="group">Beyond the LAN</div>
+  <a class="chap" href="#ex-06"><small>06</small>WAN Rendezvous</a>
+  <a class="chap" href="#ex-07"><small>07</small>A2A Fleet</a>
+  <div class="group">Applied fleets</div>
+  <a class="chap" href="#ex-08"><small>08</small>Intake Fleet</a>
+  <a class="chap" href="#ex-09"><small>09</small>Fleet Console</a>
+  <a class="chap" href="#ex-10"><small>10</small>Data Fleet</a>
+</nav>
+
+<main>
+<!-- ======================= RUNNING ======================= -->
+<section class="chapter" id="running">
+  <div class="chapnum">aspace://examples/running</div>
+  <h2>Running the examples</h2>
+  <div class="prose">
+    <p>Every example runs from the repository root with one Maven command, and every example deploys nothing beyond its own JVMs: no broker, no registry, no scheduler. The peers in a multi-peer example listen on localhost TCP ports and form a real replicated fleet inside the demo.</p>
+  </div>
+<div class="plainpre"><pre>mvn -q -pl examples/example-01-hello-space exec:java     <span class="c"># any example, by module path</span></pre></div>
+  <div class="prose">
+    <p>Each example also ships its flow as a JUnit test in the same module, so the demonstrated behavior runs under <code>mvn test</code> and in CI. The single-process examples drive their tests with a <code>TestClock</code> and contain no sleeps; the fleet examples run their tests over real TCP peers.</p>
+    <p>The table below is the whole catalog. The sequence is deliberate: each example assumes the ideas of the one before it and adds one layer.</p>
+  </div>
+  <div class="tablewrap"><table class="attrs">
+    <tr><th>example</th><th>module</th><th>adds</th></tr>
+    <tr><td><a href="#ex-11">11 Quickstart</a></td><td>example-11-quickstart</td><td>the annotation surface: two plain classes become a two-peer fleet</td></tr>
+    <tr><td><a href="#ex-01">01 Hello Space</a></td><td>example-01-hello-space</td><td>the core space API in one process: write, take, crash, reappear, complete</td></tr>
+    <tr><td><a href="#ex-02">02 Research Fleet</a></td><td>example-02-research-fleet</td><td>the replicated space over real TCP, with kill tolerance across processes</td></tr>
+    <tr><td><a href="#ex-03">03 Discovery Cards</a></td><td>example-03-discovery-cards</td><td>automatic AgentCards as the routing table</td></tr>
+    <tr><td><a href="#ex-04">04 Auction</a></td><td>example-04-auction</td><td>the AUCTION strategy: bid functions price work, the space allocates it</td></tr>
+    <tr><td><a href="#ex-05">05 Quorum</a></td><td>example-05-quorum</td><td>capability choreography: push-sum sensing feeding a signed quorum vote</td></tr>
+    <tr><td><a href="#ex-06">06 WAN Rendezvous</a></td><td>example-06-wan-rendezvous</td><td>two sites joining through one rendezvous peer</td></tr>
+    <tr><td><a href="#ex-07">07 A2A Fleet</a></td><td>example-07-a2a-fleet</td><td>a standards-based A2A gateway in front of the whole fleet</td></tr>
+    <tr><td><a href="#ex-08">08 Intake Fleet</a></td><td>example-08-intake-fleet</td><td>an applied pipeline: extraction, quality vote, filing with signed provenance</td></tr>
+    <tr><td><a href="#ex-09">09 Fleet Console</a></td><td>example-09-fleet-console</td><td>a live observability console derived from the coordination state itself</td></tr>
+    <tr><td><a href="#ex-10">10 Data Fleet</a></td><td>example-10-data-fleet</td><td>a connector peer serving an asset catalog under leases and policy</td></tr>
+  </table></div>
+  <div class="note"><b>Choosing a first example</b>Read <a href="#ex-11">Quickstart</a> first if you want the surface you will actually write against; its whole fleet is one file of annotated POJOs. Read <a href="#ex-01">Hello Space</a> first if you want the coordination model itself; it shows every verb of the space API with nothing else in the frame. The <a href="developer-guide.html">developer guide</a> is the companion reference for both.</div>
+</section>
+
+<!-- ======================= EX 11 QUICKSTART ======================= -->
+<section class="chapter" id="ex-11">
+  <div class="chapnum">aspace://examples/quickstart &middot; example 11</div>
+  <h2>Quickstart</h2>
+  <div class="prose">
+    <p>The gentlest start. Two plain classes become a two-peer fleet: a worker that takes orders and ships them, and an auditor that reacts to every shipment with a receipt. The example names no space anywhere, because the binder infers the group's sole registered space; durations read like Spring properties (<code>"10m"</code>); and a <code>@SpaceRef</code> field hands the worker a space handle for a mid-work progress entry.</p>
+  </div>
+
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-11 &mdash; Quickstart.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="qs-a">Fulfiller</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="qs-b">Auditor</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="qs-c">records</button>
+    </div>
+    <div class="tabbody" id="qs-a" role="tabpanel"><pre><span class="a">@AgentSpec</span>(name = <span class="s">"fulfiller"</span>, description = <span class="s">"Ships orders from the shared space"</span>,
+        goals = {<span class="s">"fulfill orders"</span>})
+<span class="k">public static class</span> <span class="t">Fulfiller</span> {
+
+    <span class="a">@SpaceRef</span>                              <span class="c">// injected at bind time; sole space, no name</span>
+    <span class="k">private</span> <span class="t">Space</span> space;
+
+    <span class="a">@SpaceTake</span>(lease = <span class="s">"10m"</span>, pollTimeout = <span class="s">"300ms"</span>)
+    <span class="k">public</span> <span class="t">Shipment</span> <span class="f">ship</span>(<span class="t">Order</span> order) {
+        space.<span class="f">write</span>(<span class="k">new</span> <span class="t">Progress</span>(order.orderId(), <span class="s">"picking "</span> + order.item()),
+                <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(5)));
+        <span class="k">return new</span> <span class="t">Shipment</span>(order.orderId(), order.item(), <span class="s">"fulfiller"</span>);
+    }
+}</pre></div>
+    <div class="tabbody" id="qs-b" role="tabpanel" hidden><pre><span class="a">@AgentSpec</span>(name = <span class="s">"auditor"</span>, description = <span class="s">"Writes a receipt for every shipment"</span>,
+        goals = {<span class="s">"account for shipments"</span>})
+<span class="k">public static class</span> <span class="t">Auditor</span> {
+
+    <span class="a">@SpaceNotify</span>                           <span class="c">// react to X, produce Y</span>
+    <span class="k">public</span> <span class="t">Receipt</span> <span class="f">account</span>(<span class="t">Shipment</span> shipment) {
+        <span class="k">return new</span> <span class="t">Receipt</span>(shipment.orderId(),
+                shipment.item() + <span class="s">" shipped by "</span> + shipment.by());
+    }
+}</pre></div>
+    <div class="tabbody" id="qs-c" role="tabpanel" hidden><pre><span class="c">// entries are plain records; the space replicates them, signed and leased</span>
+<span class="k">public record</span> <span class="t">Order</span>(<span class="t">String</span> orderId, <span class="t">String</span> item) {}
+<span class="k">public record</span> <span class="t">Progress</span>(<span class="t">String</span> orderId, <span class="t">String</span> note) {}
+<span class="k">public record</span> <span class="t">Shipment</span>(<span class="t">String</span> orderId, <span class="t">String</span> item, <span class="t">String</span> by) {}
+<span class="k">public record</span> <span class="t">Receipt</span>(<span class="t">String</span> orderId, <span class="t">String</span> summary) {}</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> two peers on localhost TCP &middot; orders in, receipts out &middot; choreography in one returning method</div>
+  </div>
+
+  <div class="prose">
+    <p>The main method assembles two TCP peers, binds one POJO on each, writes two orders, and waits for two receipts. The worker's progress markers and the auditor's receipts print at the end, all read back from the space itself.</p>
+  </div>
+<div class="plainpre"><pre>mvn -q -pl examples/example-11-quickstart exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> The whole fleet is one file, and the choreography is one returning method: the auditor never subscribes, never dedupes, and never touches a listener API, because <code>@SpaceNotify</code> carries those disciplines. <code>QuickstartTest</code> runs the same flow as a JUnit test.</p></div>
+</section>
+
+<!-- ======================= EX 01 HELLO SPACE ======================= -->
+<section class="chapter" id="ex-01">
+  <div class="chapnum">aspace://examples/hello-space &middot; example 01</div>
+  <h2>Hello Space</h2>
+  <div class="prose">
+    <p>One process, one <code>LocalSpace</code>, and the whole coordination model in miniature. A coordinator writes leased <code>ResearchTask</code> entries; a worker takes the most urgent one and crashes; the take lease lapses and the task reappears; a healthy worker takes it again and completes it, writing a <code>Finding</code> result atomically with the completion. A notification subscription prints every lifecycle event as it happens, so the terminal shows the space thinking.</p>
+    <p>This is the example to read when you want the four verbs of the space API (<code>write</code>, <code>read</code>, <code>take</code>, <code>notify</code>) with no networking, no peers, and no annotations in the frame. Everything the fleet examples do over TCP, this example does against a single in-memory replica through the same interface.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-01 &mdash; HelloSpace.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e01-a">write &amp; watch</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e01-b">crash &amp; reappear</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e01-c">complete</button>
+    </div>
+    <div class="tabbody" id="e01-a" role="tabpanel"><pre><span class="c">// watch everything that happens to research tasks</span>
+space.<span class="f">notify</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">ResearchTask</span>.<span class="k">class</span>),
+        (<span class="t">SpaceEvent</span>&lt;<span class="t">ResearchTask</span>&gt; event) -&gt;
+                <span class="t">System</span>.out.<span class="f">println</span>(<span class="s">"event : "</span> + event.kind() + <span class="s">" "</span> + event.entry().topic()),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(5)));
+
+<span class="c">// a coordinator publishes work under a 30-minute lease</span>
+space.<span class="f">write</span>(<span class="k">new</span> <span class="t">ResearchTask</span>(<span class="s">"agentic memory"</span>, 3), <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(30)));
+space.<span class="f">write</span>(<span class="k">new</span> <span class="t">ResearchTask</span>(<span class="s">"tuple spaces"</span>, 7), <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(30)));</pre></div>
+    <div class="tabbody" id="e01-b" role="tabpanel" hidden><pre><span class="c">// a worker takes the most urgent task... and crashes (never completes)</span>
+<span class="t">TakenEntry</span>&lt;<span class="t">ResearchTask</span>&gt; doomed = space.<span class="f">take</span>(
+        <span class="t">Template</span>.<span class="f">of</span>(<span class="t">ResearchTask</span>.<span class="k">class</span>).<span class="f">where</span>(<span class="s">"priority"</span>, <span class="f">gte</span>(5)),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(300)), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(1)).<span class="f">orElseThrow</span>();
+
+<span class="c">// the take lease lapses; the task reappears for a healthy worker</span>
+<span class="t">Thread</span>.<span class="f">sleep</span>(600);
+<span class="t">TakenEntry</span>&lt;<span class="t">ResearchTask</span>&gt; retry = space.<span class="f">take</span>(
+        <span class="t">Template</span>.<span class="f">of</span>(<span class="t">ResearchTask</span>.<span class="k">class</span>).<span class="f">where</span>(<span class="s">"priority"</span>, <span class="f">gte</span>(5)),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(5)).<span class="f">orElseThrow</span>();</pre></div>
+    <div class="tabbody" id="e01-c" role="tabpanel" hidden><pre><span class="c">// worker B completes the take and atomically writes its result</span>
+space.<span class="f">complete</span>(retry,
+        <span class="k">new</span> <span class="t">Finding</span>(retry.entry().topic(), <span class="s">"write/take/complete with leases: it works"</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofHours</span>(1)));
+
+<span class="t">Finding</span> finding = space.<span class="f">read</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">Finding</span>.<span class="k">class</span>), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(1)).<span class="f">orElseThrow</span>();</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> one process &middot; LocalSpace &middot; every verb of the space API</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-01-hello-space exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> The crash costs the worker nothing beyond its lapsed lease: no cleanup handler runs, no janitor process exists, and the task's reappearance is the lease system doing its ordinary work. <code>HelloSpaceFlowTest</code> drives the identical flow with a <code>TestClock</code> and no sleeps, which is the pattern to copy for testing your own agents against <code>LocalSpace</code>.</p></div>
+  <div class="note"><b>Where the annotations fit</b>This example calls the core API directly. Example 11 shows the same worker shape as one <code>@SpaceTake</code> annotation on an ordinary method, and example 02 runs many such workers as separate processes draining one shared space.</div>
+</section>
+
+<!-- ======================= EX 02 RESEARCH FLEET ======================= -->
+<section class="chapter" id="ex-02">
+  <div class="chapnum">aspace://examples/research-fleet &middot; example 02</div>
+  <h2>Research Fleet</h2>
+  <div class="prose">
+    <p>The replicated-worker demo over the full stack, Layers 0 through 3 on real TCP. A coordinator peer publishes <code>ResearchTask</code> entries into a replicated space; worker peers drain them under the LEASE_RACE strategy; one worker dies mid-task; its take lease lapses; the task reappears; and the fleet finishes everything anyway. Every write, claim, and completion travels as a signed, verified, gossip-replicated delta.</p>
+    <p>The default invocation runs three peers in one process on localhost ports. The same binary also runs each peer as its own process, which turns the demo into the M1 LAN exercise: start a coordinator, then point workers at it.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-02 &mdash; ResearchFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e02-a">one peer, whole stack</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e02-b">worker loop</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e02-c">recovery</button>
+    </div>
+    <div class="tabbody" id="e02-a" role="tabpanel"><pre><span class="c">// startPeer: identity, transport, membership, and the replicated space</span>
+<span class="t">PeerIdentity</span> identity = <span class="t">PeerIdentity</span>.<span class="f">generate</span>();
+<span class="t">PeerNode</span> node = <span class="t">PeerNode</span>.<span class="f">builder</span>(identity).<span class="f">build</span>();
+node.<span class="f">listen</span>(<span class="k">new</span> <span class="t">TcpTransport</span>(), HOST + <span class="s">":"</span> + port);
+<span class="t">GroupRuntime</span> runtime = node.<span class="f">joinGroup</span>(<span class="f">fleetGroup</span>(),
+        <span class="k">new</span> <span class="t">GroupMembership.Config</span>(<span class="t">Duration</span>.<span class="f">ofSeconds</span>(30), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(2), 2),
+        seeds);
+<span class="t">ReplicatedSpace</span> space = <span class="t">ReplicatedSpace</span>.<span class="f">builder</span>(runtime, <span class="s">"tasks"</span>, identity, name)
+        .<span class="f">settleWindow</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(150))
+        .<span class="f">build</span>();
+node.<span class="f">startTicking</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(250));</pre></div>
+    <div class="tabbody" id="e02-b" role="tabpanel" hidden><pre><span class="t">Optional</span>&lt;<span class="t">TakenEntry</span>&lt;<span class="t">ResearchTask</span>&gt;&gt; taken = peer.space().<span class="f">take</span>(
+        <span class="t">Template</span>.<span class="f">of</span>(<span class="t">ResearchTask</span>.<span class="k">class</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofSeconds</span>(2)), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(2));
+
+<span class="k">if</span> (dieAfter &gt;= 0 &amp;&amp; completed &gt;= dieAfter) {
+    <span class="t">System</span>.out.<span class="f">println</span>(<span class="s">"  ["</span> + name + <span class="s">"] took '"</span> + task.topic()
+            + <span class="s">"' and DIED (no complete; the lease will lapse)"</span>);
+    peer.<span class="f">close</span>();
+    <span class="k">return</span> completed;
+}
+peer.space().<span class="f">complete</span>(taken.get(),
+        <span class="k">new</span> <span class="t">Finding</span>(task.topic(), <span class="s">"researched: "</span> + task.topic(), name),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofHours</span>(1)));</pre></div>
+    <div class="tabbody" id="e02-c" role="tabpanel" hidden><pre><span class="c">// the crashed worker's task reappears after its lease lapses; B sweeps it up</span>
+<span class="k">while</span> (coordinator.space().<span class="f">readAll</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">Finding</span>.<span class="k">class</span>), 10).size() &lt; 6) {
+    <span class="t">Optional</span>&lt;<span class="t">TakenEntry</span>&lt;<span class="t">ResearchTask</span>&gt;&gt; retry = workerB.space().<span class="f">take</span>(
+            <span class="t">Template</span>.<span class="f">of</span>(<span class="t">ResearchTask</span>.<span class="k">class</span>),
+            <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofSeconds</span>(2)), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(3));
+    <span class="k">if</span> (retry.isPresent()) {
+        workerB.space().<span class="f">complete</span>(retry.get(),
+                <span class="k">new</span> <span class="t">Finding</span>(retry.get().entry().topic(),
+                        <span class="s">"recovered: "</span> + retry.get().entry().topic(), <span class="s">"worker-b"</span>),
+                <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofHours</span>(1)));
+    }
+}</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> 3 peers on TCP &middot; LEASE_RACE &middot; one crash, six findings, each completed exactly once</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-02-research-fleet exec:java   <span class="c"># all three peers, one process</span>
+
+<span class="c"># or one process per peer:</span>
+mvn -q -pl examples/example-02-research-fleet exec:java -Dexec.args=<span class="s">"coordinator 7451"</span>
+mvn -q -pl examples/example-02-research-fleet exec:java -Dexec.args=<span class="s">"worker 7452 7451"</span>
+mvn -q -pl examples/example-02-research-fleet exec:java -Dexec.args=<span class="s">"worker 7453 7451"</span></pre></div>
+  <div class="prose"><p><b>What to watch for.</b> Kill a worker process mid-task and watch the task come back for another worker; the coordinator changes nothing about how it writes work. <code>ResearchFleetFlowTest</code> runs the kill-tolerance flow as a JUnit integration test over TCP, and that test is the executable form of the plan's M1 success criterion.</p></div>
+</section>
+
+<!-- ======================= EX 03 DISCOVERY CARDS ======================= -->
+<section class="chapter" id="ex-03">
+  <div class="chapnum">aspace://examples/discovery-cards &middot; example 03</div>
+  <h2>Discovery Cards</h2>
+  <div class="prose">
+    <p>Automatic AgentCards become the routing table. A summarizer and a translator live on different peers and publish their cards when they bind; a dispatcher peer asks the ad-cache which agent produces which entry type, then simply writes tasks and reads results. No peer carries configuration naming any other peer.</p>
+    <p>The cards come from the method signatures the agents already have: binding collects each agent's consumed and produced types and publishes them, TTL-leased and auto-refreshed. Routing by card query means the dispatcher keeps working as agents join, move between peers, or age out of the cache.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-03 &mdash; CardsFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e03-a">the specialists</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e03-b">route by card</button>
+    </div>
+    <div class="tabbody" id="e03-a" role="tabpanel"><pre><span class="a">@AgentSpec</span>(name = <span class="s">"summarizer"</span>, description = <span class="s">"Summarizes documents"</span>, goals = {<span class="s">"summarize"</span>})
+<span class="k">public static class</span> <span class="t">Summarizer</span> {
+    <span class="a">@SpaceTake</span>(space = <span class="s">"work"</span>, pollTimeout = <span class="s">"PT0.3S"</span>)
+    <span class="k">public</span> <span class="t">Summary</span> <span class="f">summarize</span>(<span class="t">SummaryTask</span> task) {
+        <span class="k">return new</span> <span class="t">Summary</span>(task.document(), <span class="s">"summary of "</span> + task.document());
+    }
+}
+
+<span class="a">@AgentSpec</span>(name = <span class="s">"translator"</span>, description = <span class="s">"Translates text"</span>, goals = {<span class="s">"translate"</span>})
+<span class="k">public static class</span> <span class="t">Translator</span> {
+    <span class="a">@SpaceTake</span>(space = <span class="s">"work"</span>, pollTimeout = <span class="s">"PT0.3S"</span>)
+    <span class="k">public</span> <span class="t">Translation</span> <span class="f">translate</span>(<span class="t">TranslateTask</span> task) {
+        <span class="k">return new</span> <span class="t">Translation</span>(task.text(), task.language(),
+                <span class="s">"["</span> + task.language() + <span class="s">"] "</span> + task.text());
+    }
+}</pre></div>
+    <div class="tabbody" id="e03-b" role="tabpanel" hidden><pre><span class="c">// who produces Summary? ask the ad-cache, then just write and read</span>
+<span class="t">String</span> summarySchema = <span class="t">Summary</span>.<span class="k">class</span>.getName() + <span class="s">"#v1"</span>;
+<span class="t">List</span>&lt;<span class="t">AgentCard</span>&gt; summarizers = dispatcher.discovery().<span class="f">find</span>(<span class="t">AgentCard</span>.<span class="k">class</span>,
+        card -&gt; card.produces().<span class="f">contains</span>(summarySchema));
+
+dispatcher.work().<span class="f">write</span>(<span class="k">new</span> <span class="t">SummaryTask</span>(<span class="s">"quarterly-report.pdf"</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));
+dispatcher.work().<span class="f">write</span>(<span class="k">new</span> <span class="t">TranslateTask</span>(<span class="s">"hello fleet"</span>, <span class="s">"fr"</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));
+
+<span class="t">Summary</span> summary = dispatcher.work()
+        .<span class="f">read</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">Summary</span>.<span class="k">class</span>), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(20)).<span class="f">orElseThrow</span>();</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> cards published on bind &middot; the ad-cache is the routing table &middot; no static wiring</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-03-discovery-cards exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> The dispatcher's only inputs are the entry types it wants produced. <code>CardsFleetFlowTest</code> runs the flow as a JUnit test. Chapter 5 of the <a href="developer-guide.html#discovery">developer guide</a> documents the discovery API the dispatcher uses.</p></div>
+</section>
+
+<!-- ======================= EX 04 AUCTION ======================= -->
+<section class="chapter" id="ex-04">
+  <div class="chapnum">aspace://examples/auction &middot; example 04</div>
+  <h2>Auction</h2>
+  <div class="prose">
+    <p>The AUCTION strategy end to end. Two model workers price the same tasks differently through <code>@BidFunction</code> cost models: the mini model bids low on routine work and high on hard work, the premium model's flat rate pays off on the hard work, and the space allocates each task to the lowest bidder. Cost-aware routing lives in the coordination layer itself, and the example runs no dispatcher of any kind.</p>
+    <p>A bid function is a plain method over the entry, so the cost model is ordinary code: denominate in dollars, tokens, or queue depth, and let FinOps tune it. The demo prints which worker won each task and why the prices differ.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-04 &mdash; AuctionFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e04-a">two cost models</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e04-b">win &amp; run</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e04-c">the space</button>
+    </div>
+    <div class="tabbody" id="e04-a" role="tabpanel"><pre><span class="c">// the small, cheap model: great value on routine tasks, poor on hard ones</span>
+<span class="a">@BidFunction</span>(space = <span class="s">"model-tasks"</span>)
+<span class="k">public double</span> <span class="f">bid</span>(<span class="t">ModelTask</span> task) {
+    <span class="k">return</span> 1.0 + task.difficulty() * 2.0;   <span class="c">// 3 .. 21</span>
+}
+
+<span class="c">// the premium model: flat pricing that only pays off on hard tasks</span>
+<span class="a">@BidFunction</span>(space = <span class="s">"model-tasks"</span>)
+<span class="k">public double</span> <span class="f">bid</span>(<span class="t">ModelTask</span> task) {
+    <span class="k">return</span> 12.0;
+}</pre></div>
+    <div class="tabbody" id="e04-b" role="tabpanel" hidden><pre><span class="c">// the worker only executes tasks its bid won; the space decides</span>
+<span class="a">@SpaceTake</span>(space = <span class="s">"model-tasks"</span>, pollTimeout = <span class="s">"PT0.3S"</span>)
+<span class="k">public</span> <span class="t">ModelResult</span> <span class="f">run</span>(<span class="t">ModelTask</span> task) {
+    <span class="k">return new</span> <span class="t">ModelResult</span>(task.prompt(), task.difficulty(), <span class="s">"mini-model"</span>, <span class="f">bid</span>(task));
+}</pre></div>
+    <div class="tabbody" id="e04-c" role="tabpanel" hidden><pre><span class="t">ReplicatedSpace</span> tasks = <span class="t">ReplicatedSpace</span>.<span class="f">builder</span>(runtime, <span class="s">"model-tasks"</span>, identity, agentName)
+        .<span class="f">settleWindow</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(200))
+        .<span class="f">strategy</span>(<span class="t">ConflictStrategyType</span>.AUCTION)
+        .<span class="f">build</span>();</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> 8 tasks, difficulty 1..8 &middot; mini bids 1+2d, premium bids flat 12 &middot; lowest bid takes each</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-04-auction exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> Routine tasks flow to the cheap capacity and hard tasks flow to the premium capacity with no routing rule written anywhere; the allocation emerges from the two bid functions. <code>AuctionFleetFlowTest</code> asserts the allocation. The strategy table in <a href="developer-guide.html#sp-strategies">developer guide chapter 4</a> places AUCTION next to LEASE_RACE and ORDERED.</p></div>
+</section>
+
+<!-- ======================= EX 05 QUORUM ======================= -->
+<section class="chapter" id="ex-05">
+  <div class="chapnum">aspace://examples/quorum &middot; example 05</div>
+  <h2>Quorum</h2>
+  <div class="prose">
+    <p>Capability choreography: two capability services compose into a fleet decision. Push-sum aggregation senses the fleet's average backlog with no collector process; the supervisor opens a scale-up proposal when the average crosses its threshold; every member casts a signed ballot into the vote space; and the quorum decision closes identically on every replica.</p>
+    <p>The tally stays recomputable by any member from the space itself, which makes this the auditable form of a fleet decision: the proposal, every ballot, and the closure all exist as signed entries, and a reviewer can replay them.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-05 &mdash; QuorumFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e05-a">sense</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e05-b">propose &amp; ballot</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e05-c">decision</button>
+    </div>
+    <div class="tabbody" id="e05-a" role="tabpanel"><pre><span class="c">// each member contributes its local backlog; push-sum converges on the average</span>
+<span class="k">double</span>[] backlogs = {4, 30, 41, 31};                 <span class="c">// average = 26.5 &gt; threshold 20</span>
+<span class="k">for</span> (<span class="k">int</span> i = 0; i &lt; fleet.size(); i++) {
+    fleet.get(i).aggregate().<span class="f">start</span>(<span class="s">"backlog"</span>, backlogs[i]);
+}
+
+<span class="k">double</span> sensed = supervisor.aggregate().<span class="f">estimate</span>(<span class="s">"backlog"</span>).<span class="f">orElseThrow</span>();</pre></div>
+    <div class="tabbody" id="e05-b" role="tabpanel" hidden><pre>supervisor.vote().<span class="f">propose</span>(<span class="s">"scale-up-1"</span>,
+        <span class="s">"Average backlog 26.5 exceeds threshold; add two workers?"</span>,
+        <span class="t">List</span>.<span class="f">of</span>(<span class="s">"approve"</span>, <span class="s">"reject"</span>), 4, <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));
+
+<span class="c">// members approve when their own backlog says they need help</span>
+<span class="t">String</span> ballot = backlogs[i] &gt; BACKLOG_THRESHOLD / 2 ? <span class="s">"approve"</span> : <span class="s">"reject"</span>;
+fleet.get(i).vote().<span class="f">castBallot</span>(<span class="s">"scale-up-1"</span>, ballot,
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));</pre></div>
+    <div class="tabbody" id="e05-c" role="tabpanel" hidden><pre><span class="t">Optional</span>&lt;<span class="t">VoteCapability.Decision</span>&gt; decision = supervisor.vote().<span class="f">decision</span>(<span class="s">"scale-up-1"</span>);
+
+<span class="t">System</span>.out.<span class="f">println</span>(<span class="s">"decision: "</span> + decision.<span class="f">orElseThrow</span>().winner()
+        + <span class="s">" "</span> + decision.<span class="f">orElseThrow</span>().tally()
+        + <span class="s">"  (signed ballots, recomputable by any member)"</span>);</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> push-sum sensing, no collector &middot; signed ballots &middot; quorum of 4 closes on every replica</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-05-quorum exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> The sensing runs with no collector and the vote closes with no counter: aggregation converges by pairwise gossip, and the decision derives from the ballots wherever it is computed. <code>QuorumFleetFlowTest</code> runs the flow as a JUnit test. The vote and aggregate services carry the capability ids <code>aspace:cap/vote</code> and <code>aspace:cap/aggregate</code>, documented in <a href="developer-guide.html#discovery">developer guide chapter 5</a>.</p></div>
+</section>
+
+<!-- ======================= EX 06 WAN RENDEZVOUS ======================= -->
+<section class="chapter" id="ex-06">
+  <div class="chapnum">aspace://examples/wan-rendezvous &middot; example 06</div>
+  <h2>WAN Rendezvous</h2>
+  <div class="prose">
+    <p>Two sites, one fleet. The rendezvous peer at headquarters is the only address anyone received in configuration; peers from both sites join through it, membership and discovery converge across the sites, and remote queries prefer rendezvous peers per SPEC &sect;5.4 and &sect;6.3. The shared task space spans everyone, so work written at one site completes at the other.</p>
+    <p>Rendezvous is a volunteered topology role, and correctness never depends on it: the role gives newcomers a larger discovery cache to ask first, and the fleet's guarantees come from the signed, replicated state underneath.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-06 &mdash; WanFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e06-a">the one address</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e06-b">work crosses sites</button>
+    </div>
+    <div class="tabbody" id="e06-a" role="tabpanel"><pre><span class="c">// hq volunteers the RENDEZVOUS role; every other peer knows only port 7491</span>
+<span class="t">Peer</span> hq = <span class="f">startPeer</span>(<span class="s">"hq-rendezvous"</span>, 7491, 0, <span class="k">true</span>);
+<span class="t">Peer</span> siteA1 = <span class="f">startPeer</span>(<span class="s">"siteA-analyst"</span>, 7492, 7491, <span class="k">false</span>);
+<span class="t">Peer</span> siteA2 = <span class="f">startPeer</span>(<span class="s">"siteA-worker"</span>, 7493, 7491, <span class="k">false</span>);
+<span class="t">Peer</span> siteB1 = <span class="f">startPeer</span>(<span class="s">"siteB-analyst"</span>, 7494, 7491, <span class="k">false</span>);
+<span class="t">Peer</span> siteB2 = <span class="f">startPeer</span>(<span class="s">"siteB-worker"</span>, 7495, 7491, <span class="k">false</span>);
+
+<span class="c">// the role is one builder call on the node</span>
+<span class="t">PeerNode</span> node = <span class="t">PeerNode</span>.<span class="f">builder</span>(identity)
+        .<span class="f">roles</span>(rendezvous ? <span class="t">Set</span>.<span class="f">of</span>(<span class="t">PeerAdvertisement.PeerRole</span>.RENDEZVOUS) : <span class="t">Set</span>.<span class="f">of</span>())
+        .<span class="f">build</span>();</pre></div>
+    <div class="tabbody" id="e06-b" role="tabpanel" hidden><pre><span class="c">// site B writes; site A takes and completes; site B reads the result</span>
+siteB1.tasks().<span class="f">write</span>(<span class="k">new</span> <span class="t">SiteTask</span>(<span class="s">"reconcile ledgers"</span>, <span class="s">"site-B"</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));
+
+<span class="k">var</span> taken = siteA2.tasks().<span class="f">take</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">SiteTask</span>.<span class="k">class</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(5)), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(15)).<span class="f">orElseThrow</span>();
+siteA2.tasks().<span class="f">complete</span>(taken, <span class="k">new</span> <span class="t">SiteResult</span>(taken.entry().description(),
+        taken.entry().origin(), <span class="s">"site-A"</span>), <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofHours</span>(1)));
+
+<span class="t">SiteResult</span> result = siteB1.tasks()
+        .<span class="f">read</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">SiteResult</span>.<span class="k">class</span>), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(15)).<span class="f">orElseThrow</span>();</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> 5 peers, 2 sites &middot; one configured address &middot; the space spans everyone</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-06-wan-rendezvous exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> Count the configured addresses: one. Everything else about the two-site topology assembles itself through the rendezvous peer. <code>WanFleetFlowTest</code> runs the flow as a JUnit test. Relay for NAT-restricted peers and group payload encryption over the WAN follow in later milestones (plan M3).</p></div>
+</section>
+
+<!-- ======================= EX 07 A2A FLEET ======================= -->
+<section class="chapter" id="ex-07">
+  <div class="chapnum">aspace://examples/a2a-fleet &middot; example 07</div>
+  <h2>A2A Fleet</h2>
+  <div class="prose">
+    <p>An A2A client drives a P2P fleet through one gateway. Worker agents join a replicated task space over TCP and publish AgentCards; the gateway serves those cards on the standard A2A discovery surface (<code>/.well-known/agent-card.json</code>) and speaks the A2A task surface as JSON-RPC over HTTP. <code>message/send</code> writes a leased task entry into the space; <code>tasks/get</code> reads the task's state out of space semantics, reporting <code>submitted</code> while unclaimed, <code>working</code> while an agent holds the take lease, and <code>completed</code> once a result entry exists; <code>tasks/cancel</code> withdraws the entry.</p>
+    <p>The demo sends "reconcile the ledgers" to the analyst agent with a plain HTTP client and polls the task to completion. The A2A client never sees the space, the fleet never sees HTTP, and the gateway is the entire boundary between the two. Crash tolerance carries straight through the standards-based interface: a worker that dies mid-task lets its take lease lapse, and the task honestly reports <code>submitted</code> again for another worker.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-07 &mdash; A2aFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e07-a">the gateway</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e07-b">message/send</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e07-c">the worker</button>
+    </div>
+    <div class="tabbody" id="e07-a" role="tabpanel"><pre><span class="c">// one gateway serves every discovered card and binds the A2A task surface</span>
+<span class="k">try</span> (<span class="t">A2aGateway</span> gateway = <span class="k">new</span> <span class="t">A2aGateway</span>(<span class="s">"a2a-fleet"</span>, <span class="s">"AgentSpaces demo"</span>,
+        () -&gt; gatewayPeer.discovery().<span class="f">find</span>(<span class="t">AgentCard</span>.<span class="k">class</span>, c -&gt; <span class="k">true</span>))
+        .<span class="f">taskBinding</span>(<span class="k">new</span> <span class="t">A2aTaskBinding</span>(gatewayPeer.tasks()))) {
+
+    <span class="k">int</span> port = gateway.<span class="f">start</span>(0);
+    <span class="c">// cards now serve at /.well-known/agent-card.json;</span>
+    <span class="c">// JSON-RPC serves at /agents/{name}</span>
+}</pre></div>
+    <div class="tabbody" id="e07-b" role="tabpanel" hidden><pre><span class="c">// a plain HTTP client speaks standard A2A JSON-RPC; no AgentSpaces types</span>
+POST /agents/analyst
+{<span class="s">"jsonrpc"</span>:<span class="s">"2.0"</span>,<span class="s">"id"</span>:1,<span class="s">"method"</span>:<span class="s">"message/send"</span>,<span class="s">"params"</span>:
+ {<span class="s">"message"</span>:{<span class="s">"role"</span>:<span class="s">"user"</span>,<span class="s">"parts"</span>:[{<span class="s">"kind"</span>:<span class="s">"text"</span>,
+  <span class="s">"text"</span>:<span class="s">"reconcile the ledgers"</span>}],<span class="s">"messageId"</span>:<span class="s">"m1"</span>}}}
+
+<span class="c">// then poll until the space's take lease semantics report completion</span>
+{<span class="s">"jsonrpc"</span>:<span class="s">"2.0"</span>,<span class="s">"id"</span>:2,<span class="s">"method"</span>:<span class="s">"tasks/get"</span>,<span class="s">"params"</span>:{<span class="s">"id"</span>:<span class="s">"..."</span>}}
+<span class="c">// submitted -&gt; working -&gt; completed (or submitted again after a crash)</span></pre></div>
+    <div class="tabbody" id="e07-c" role="tabpanel" hidden><pre><span class="c">// the analyst never sees HTTP: it takes and completes entries like any worker</span>
+<span class="k">var</span> taken = worker.tasks().<span class="f">take</span>(
+        <span class="t">Template</span>.<span class="f">of</span>(<span class="t">A2aTaskEntry</span>.<span class="k">class</span>).<span class="f">where</span>(<span class="s">"agent"</span>, <span class="f">eq</span>(worker.name())),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(1)), <span class="t">Duration</span>.<span class="f">ofSeconds</span>(2));
+taken.<span class="f">ifPresent</span>(t -&gt; worker.tasks().<span class="f">complete</span>(t,
+        <span class="k">new</span> <span class="t">A2aTaskResult</span>(t.entry().taskId(), worker.name(),
+                worker.name() + <span class="s">" says: worked '"</span> + t.entry().text() + <span class="s">"'"</span>),
+        <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofHours</span>(1))));</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> JSON-RPC over HTTP &middot; /.well-known/agent-card.json &middot; the gateway is the entire boundary</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-07-a2a-fleet exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> One gateway peer opens the door for the whole fleet, so individual agents never expose an inbound endpoint. <code>A2aFleetFlowTest</code> runs the flow as a JUnit test. <a href="developer-guide.html#gateways">Developer guide chapter 8</a> covers the gateway alongside the wire-compatible Python and TypeScript clients.</p></div>
+</section>
+
+<!-- ======================= EX 08 INTAKE FLEET ======================= -->
+<section class="chapter" id="ex-08">
+  <div class="chapnum">aspace://examples/intake-fleet &middot; example 08</div>
+  <h2>Intake Fleet</h2>
+  <div class="prose">
+    <p>The document intake fleet from USE-CASES.md, and the first of the applied examples. Hard-to-read scans enter the space; two extraction agents each produce a candidate reading with a confidence score; the fleet closes a signed quorum vote on which reading to trust; and an auditor files the winning candidate. The filing carries the whole provenance chain as signed entries: the scan, both candidates, every ballot, and the filing itself, all replayable by a compliance reviewer.</p>
+    <p>The pipeline is service choreography end to end. Each stage consumes the entries the previous stage produced, the vote capability supplies the quality gate, and no orchestrator process exists anywhere in the example. Adding a third extraction agent means binding a third agent; the vote absorbs it.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-08 &mdash; IntakeFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e08-a">extract</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e08-b">vote on quality</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e08-c">file with provenance</button>
+    </div>
+    <div class="tabbody" id="e08-a" role="tabpanel"><pre><span class="c">// each extractor reacts to every scan with a candidate reading + confidence</span>
+peer.intake().<span class="f">notify</span>(<span class="t">Template</span>.<span class="f">of</span>(<span class="t">ScanEntry</span>.<span class="k">class</span>), event -&gt; {
+    <span class="t">ScanEntry</span> scan = event.entry();
+    <span class="c">// a sloppy extractor misreads digits; a careful one does not</span>
+    peer.intake().<span class="f">write</span>(<span class="k">new</span> <span class="t">ExtractionCandidate</span>(scan.scanId(), peer.name(),
+                    taxpayerId, amount, skill),
+            <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));
+    <span class="f">castBallotWhenBothCandidatesVisible</span>(peer, scan.scanId());
+}, <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofHours</span>(1)));</pre></div>
+    <div class="tabbody" id="e08-b" role="tabpanel" hidden><pre><span class="c">// the auditor opens the vote; every agent backs the highest-confidence reading</span>
+auditor.vote().<span class="f">propose</span>(<span class="s">"scan-"</span> + scanId,
+        <span class="s">"Which reading of scan "</span> + scanId + <span class="s">" do we trust?"</span>,
+        candidates.stream().<span class="f">map</span>(<span class="t">ExtractionCandidate</span>::extractor).<span class="f">sorted</span>().<span class="f">toList</span>(),
+        quorum, <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));
+
+<span class="t">String</span> best = candidates.stream()
+        .<span class="f">max</span>(<span class="t">Comparator</span>.<span class="f">comparingDouble</span>(<span class="t">ExtractionCandidate</span>::confidence))
+        .<span class="f">orElseThrow</span>().extractor();
+peer.vote().<span class="f">castBallot</span>(<span class="s">"scan-"</span> + scanId, best, <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofMinutes</span>(10)));</pre></div>
+    <div class="tabbody" id="e08-c" role="tabpanel" hidden><pre><span class="c">// the winning candidate files, stamped with the quorum tally that approved it</span>
+<span class="t">FilingEntry</span> filing = <span class="k">new</span> <span class="t">FilingEntry</span>(scanId, chosen.extractor(),
+        chosen.taxpayerId(), chosen.amount(),
+        <span class="t">String</span>.<span class="f">format</span>(<span class="s">"%d-vote quorum %s"</span>, quorum, decision.get().tally()));
+
+auditor.intake().<span class="f">write</span>(filing, <span class="t">Lease</span>.<span class="f">of</span>(<span class="t">Duration</span>.<span class="f">ofDays</span>(1)),
+        <span class="t">Map</span>.<span class="f">of</span>(<span class="s">"stage"</span>, <span class="s">"filed"</span>));</pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> scan &rarr; candidates &rarr; ballots &rarr; filing &middot; every stage a signed entry &middot; no orchestrator</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-08-intake-fleet exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> The provenance chain assembles itself from entries the stages already write, because every entry is signed by its producer; the audit trail costs the pipeline no extra code. <code>IntakeFleetFlowTest</code> runs the flow as a JUnit test.</p></div>
+</section>
+
+<!-- ======================= EX 09 FLEET CONSOLE ======================= -->
+<section class="chapter" id="ex-09">
+  <div class="chapnum">aspace://examples/fleet-console &middot; example 09</div>
+  <h2>Fleet Console</h2>
+  <div class="prose">
+    <p>The fleet console from USE-CASES.md as a served surface. Everything shown derives from state the fabric already maintains: membership answers "who is alive", discovery answers "who can do what", and the replicated space answers "what is the fleet working on". The console runs no telemetry pipeline and no metrics database; it joins as one more read-only peer, and <code>agentspaces-console</code> serves its view three ways: a single-file web UI, a HAL+JSON API walkable from <code>/api/v1</code>, and a Server-Sent Events activity stream.</p>
+    <p>The demo starts a small working fleet, prints the console URL, and keeps the fleet busy while you watch. Agents carry zero instrumentation, which is the point: observability comes from the coordination state, so every fleet built on the fabric gets the console with two configuration properties.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-09 &mdash; FleetConsole.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e09-a">the view</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e09-b">directives</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e09-c">command &amp; control</button>
+    </div>
+    <div class="tabbody" id="e09-a" role="tabpanel"><pre><span class="c">// everything the console shows derives from state the fabric already holds</span>
+<span class="t">ConsoleView</span> view = <span class="t">ConsoleView</span>.<span class="f">builder</span>()
+        .<span class="f">space</span>(<span class="s">"tasks"</span>, peer.tasks(), <span class="t">TaskEntry</span>.<span class="k">class</span>)
+        .<span class="f">results</span>(<span class="s">"tasks"</span>, <span class="t">FindingEntry</span>.<span class="k">class</span>,
+                entry -&gt; ((<span class="t">FindingEntry</span>) entry).worker())
+        .<span class="f">members</span>(() -&gt; peer.runtime().membership().<span class="f">allMembers</span>())
+        .<span class="f">discovery</span>(peer.discovery())
+        .<span class="f">build</span>();
+
+<span class="t">FleetConsoleServer</span> server = <span class="t">FleetConsoleServer</span>.<span class="f">builder</span>(view)
+        .<span class="f">fleetName</span>(<span class="s">"console-fleet"</span>)
+        .<span class="f">panel</span>(<span class="f">storyPanel</span>(view))                       <span class="c">// ConsolePanel extension point</span>
+        .<span class="f">commandAndControl</span>(commander, token)
+        .<span class="f">build</span>();</pre></div>
+    <div class="tabbody" id="e09-b" role="tabpanel" hidden><pre><span class="c">// workers honor operator directives through a DirectiveGate in the work loop</span>
+<span class="k">try</span> (<span class="t">DirectiveGate</span> gate = <span class="t">DirectiveGate</span>.<span class="f">attach</span>(peer.control(), peer.name())) {
+    <span class="k">while</span> (!<span class="t">Thread</span>.<span class="f">currentThread</span>().isInterrupted()) {
+        <span class="k">if</span> (gate.<span class="f">draining</span>()) {
+            <span class="k">return</span>;              <span class="c">// commanded to drain: finish and stop for good</span>
+        }
+        <span class="k">if</span> (gate.<span class="f">paused</span>()) {
+            <span class="f">sleepQuietly</span>(200);   <span class="c">// commanded to pause: hold off taking</span>
+            <span class="k">continue</span>;
+        }
+        <span class="c">// ... take, work, complete ...</span>
+    }
+}</pre></div>
+    <div class="tabbody" id="e09-c" role="tabpanel" hidden><pre><span class="c">// the demo's scripted C2 pass, all through the control space, all audited</span>
+commander.<span class="f">broadcast</span>(<span class="s">"PAUSE"</span>, <span class="s">"worker-b"</span>, <span class="s">"operator"</span>);
+commander.<span class="f">execute</span>(<span class="s">"dispatch-task"</span>,
+        <span class="t">Map</span>.<span class="f">of</span>(<span class="s">"topic"</span>, <span class="s">"operator-dispatched"</span>, <span class="s">"priority"</span>, <span class="s">"9"</span>), <span class="s">"operator"</span>);
+<span class="c">// the task queues while worker-b holds...</span>
+commander.<span class="f">broadcast</span>(<span class="s">"RESUME"</span>, <span class="s">"worker-b"</span>, <span class="s">"operator"</span>);
+<span class="c">// ...and worker-b takes it on resume</span></pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> web UI &middot; HAL+JSON at /api/v1 &middot; SSE activity stream &middot; zero instrumentation in any agent</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-09-fleet-console exec:java    <span class="c"># then open the printed URL</span></pre></div>
+  <div class="prose"><p><b>What to watch for.</b> Pause a worker from the console mid-run and watch its queue hold; every command executes under the console peer's signed identity, attributed to the named operator, and lands in a durable audit space. <code>FleetConsoleFlowTest</code> runs the flow as a JUnit test, and the <a href="fleet-room.html#command">fleet room</a> gives the operator's tour of the same surface.</p></div>
+</section>
+
+<!-- ======================= EX 10 DATA FLEET ======================= -->
+<section class="chapter" id="ex-10">
+  <div class="chapnum">aspace://examples/data-fleet &middot; example 10</div>
+  <h2>Data Fleet</h2>
+  <div class="prose">
+    <p>The enterprise economics in one demo (ENTERPRISE &sect;3). A connector peer holds an orders table and advertises it as a leased AssetCard; analyst agents discover it by meaning through the semantic-discovery capability, then query it through the space. The first identical query per freshness window executes against the source; every later one reads the leased result at replica speed.</p>
+    <p>The counters print the money: executions against the source on one line, answers the space already held on the other. Freshness is a lease, so staleness has a bound you choose per asset, and the cached result ages out on its own with no invalidation logic anywhere.</p>
+  </div>
+  <div class="mwin">
+    <div class="mtitle"><span class="t"><svg viewBox="0 0 64 64" aria-hidden="true" width="13" height="13"><g fill="none" stroke="#666699" stroke-width="7"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" fill="#9999CC"/></svg>example-10 &mdash; DataFleet.java</span><span class="sp"></span><span class="wb" aria-hidden="true">_</span><span class="wb" aria-hidden="true">&#9633;</span><span class="wb" aria-hidden="true">&times;</span></div>
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" aria-selected="true" data-tab="e10-a">serve the asset</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e10-b">find by meaning</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="e10-c">query &amp; cache</button>
+    </div>
+    <div class="tabbody" id="e10-a" role="tabpanel"><pre><span class="c">// the connector wraps a table and advertises it as a leased AssetCard</span>
+<span class="t">TableAssetProvider</span> provider = <span class="k">new</span> <span class="t">TableAssetProvider</span>(<span class="s">"orders"</span>,
+        <span class="s">"postgres://ops/public.orders"</span>,
+        <span class="s">"Customer order history with line items and settlement status"</span>,
+        <span class="s">"com.example.OrderRow#v1"</span>, <span class="t">Duration</span>.<span class="f">ofMinutes</span>(5), rows);
+
+<span class="t">ConnectorRuntime</span> connector = <span class="k">new</span> <span class="t">ConnectorRuntime</span>(connectorPeer.data(),
+        connectorPeer.discovery(), connectorPeer.node().identity(),
+        <span class="s">"pg-connector"</span>, provider, connectorPeer.runtime().id(),
+        <span class="t">InstantSource</span>.<span class="f">system</span>(), <span class="t">Duration</span>.<span class="f">ofMinutes</span>(1));
+connector.<span class="f">start</span>();</pre></div>
+    <div class="tabbody" id="e10-b" role="tabpanel" hidden><pre><span class="c">// the analyst never learns an address; it asks for the data by meaning</span>
+<span class="k">var</span> matches = analystA.semantic()
+        .<span class="f">remoteQuery</span>(<span class="s">"who holds customer order history?"</span>, 3,
+                <span class="t">Duration</span>.<span class="f">ofSeconds</span>(2));
+<span class="t">AssetCard</span> card = (<span class="t">AssetCard</span>) matches.get(0).advertisement();
+<span class="c">// card.asset()="orders", card.uri(), card.freshness() -- all from the ad</span></pre></div>
+    <div class="tabbody" id="e10-c" role="tabpanel" hidden><pre><span class="t">DataQueryClient</span> clientA = <span class="k">new</span> <span class="t">DataQueryClient</span>(analystA.data(), <span class="s">"analyst-a"</span>);
+<span class="t">DataQueryClient</span> clientB = <span class="k">new</span> <span class="t">DataQueryClient</span>(analystB.data(), <span class="s">"analyst-b"</span>);
+
+<span class="k">var</span> first = clientA.<span class="f">fetch</span>(card.asset(), <span class="t">Map</span>.<span class="f">of</span>(<span class="s">"region"</span>, <span class="s">"eu"</span>),
+        <span class="t">Duration</span>.<span class="f">ofSeconds</span>(10)).<span class="f">orElseThrow</span>();   <span class="c">// fromCache=false: hits the source</span>
+<span class="k">var</span> second = clientB.<span class="f">fetch</span>(card.asset(), <span class="t">Map</span>.<span class="f">of</span>(<span class="s">"region"</span>, <span class="s">"eu"</span>),
+        <span class="t">Duration</span>.<span class="f">ofSeconds</span>(10)).<span class="f">orElseThrow</span>();   <span class="c">// fromCache=true: the space held it</span>
+<span class="k">var</span> third = clientB.<span class="f">fetch</span>(card.asset(), <span class="t">Map</span>.<span class="f">of</span>(<span class="s">"region"</span>, <span class="s">"us"</span>),
+        <span class="t">Duration</span>.<span class="f">ofSeconds</span>(10)).<span class="f">orElseThrow</span>();   <span class="c">// new query: hits the source</span>
+
+<span class="t">System</span>.out.<span class="f">println</span>(<span class="s">"source executions: "</span> + provider.<span class="f">executions</span>());  <span class="c">// 2 of 3</span></pre></div>
+    <div class="mstatus"><span class="ok">&#10003;</span> three fetches, two source executions &middot; freshness is a lease &middot; no invalidation logic</div>
+  </div>
+
+<div class="plainpre"><pre>mvn -q -pl examples/example-10-data-fleet exec:java</pre></div>
+  <div class="prose"><p><b>What to watch for.</b> The analysts never learn the connector's address; they discover the asset by meaning, and the reference embedder needs no model at all. <code>DataFleetFlowTest</code> runs the flow as a JUnit test. The <code>agentspaces-connect-core</code> module supplies the connector runtime, the asset provider surface, and the query client the example uses.</p></div>
+  <div class="note"><b>Where to go next</b>The four flagship fleets under <code>flagships/</code> are complete applications, standalone and movable to their own repositories. The <a href="developer-guide.html">developer guide</a> is the reference for every API these examples touch; <code>SPEC.md</code> and <code>TECH-SPEC.md</code> are the deep end.</div>
+</section>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <div class="brand"><svg viewBox="0 0 64 64" aria-hidden="true" width="22" height="22"><g fill="none" stroke="#666699" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 27 V13 Q9 9 13 9 H19"/><path d="M37 9 H51 Q55 9 55 13 V19"/><path d="M55 37 V51 Q55 55 51 55 H45"/><path d="M27 55 H13 Q9 55 9 51 V45"/></g><rect x="24" y="24" width="16" height="16" rx="3.5" fill="#9999CC"/></svg>AgentSpaces</div>
+  <p>Coordination without a coordinator. Shared memory that forgets on purpose.</p>
+  <p>&copy; 2026 Bad Monkey &middot; AgentSpaces is an open source project from Bad Monkey &middot; Apache License 2.0 &middot; <code>ai.badmonkey.agentspaces</code></p>
+</div></footer>
+
+<script>
+  document.querySelectorAll('.mwin .tabs').forEach(function (tabs) {
+    tabs.addEventListener('click', function (e) {
+      var tab = e.target.closest('.tab'); if (!tab) return;
+      var win = tabs.closest('.mwin');
+      tabs.querySelectorAll('.tab').forEach(function (t) {
+        t.classList.toggle('on', t === tab);
+        t.setAttribute('aria-selected', t === tab ? 'true' : 'false');
+      });
+      win.querySelectorAll('.tabbody').forEach(function (b) {
+        b.hidden = (b.id !== tab.dataset.tab);
+      });
+    });
+  });
+</script>
+</body></html>

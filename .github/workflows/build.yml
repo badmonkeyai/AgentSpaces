@@ -1,0 +1,49 @@
+# Copyright 2026 Bad Monkey, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Least privilege for the default GITHUB_TOKEN (ASF-039): the build only reads.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build and verify
+        # env.CI activates the coverage profile and the spring-it profile, so
+        # this run includes the real-Spring integration test (the release gate
+        # for the starter; see docs/BUILD-ENVIRONMENTS.md).
+        run: mvn -B -ntp verify
+
+  # The non-JVM clients (agentspaces-python, agentspaces-typescript) and the
+  # flagships are standalone projects beside this repository, not in it; the
+  # cross-language conformance gate runs here through the Java golden-vector
+  # tests against tools/golden/golden.json, and the workspace's verify-all.sh
+  # runs the client suites and the standalone projects against the installed
+  # libraries (remediation plan WS1/WS7, QA4 A4-2).

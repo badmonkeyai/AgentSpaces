@@ -1,0 +1,381 @@
+<!doctype html>
+<!--
+  Copyright 2026 Bad Monkey, Inc.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+  The AgentSpaces fleet console UI: one file, no build step, populated only
+  through the public /api/v1 surface. Theme it by overriding the CSS custom
+  properties below; replace it entirely by serving your own page against the
+  same API; extend it by registering ConsolePanel implementations, which
+  appear in the panels section automatically.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%%FLEET%% · fleet console</title>
+<style>
+:root {
+  --as-bg: #f6f4ef;
+  --as-surface: #ffffff;
+  --as-ink: #1f2430;
+  --as-muted: #6b7280;
+  --as-line: #e3ded4;
+  --as-accent: #7c5cff;
+  --as-ok: #1a936f;
+  --as-warn: #c2571a;
+  --as-c2: #0e7c86;
+  --as-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --as-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --as-radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --as-bg: #14161c;
+    --as-surface: #1d2029;
+    --as-ink: #e8e6e1;
+    --as-muted: #9aa0ab;
+    --as-line: #2c3040;
+    --as-accent: #9d85ff;
+    --as-ok: #37b58c;
+    --as-warn: #e07b3c;
+    --as-c2: #35b7c2;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--as-bg); color: var(--as-ink);
+  font: 15px/1.5 var(--as-sans);
+}
+header {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 18px 24px 6px;
+}
+header h1 { font-size: 20px; margin: 0; letter-spacing: 0.2px; }
+header .sub { color: var(--as-muted); font-size: 13px; }
+#live { color: var(--as-ok); font-size: 12px; }
+#live.down { color: var(--as-warn); }
+main { padding: 8px 24px 40px; max-width: 1100px; margin: 0 auto; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 12px; margin: 12px 0 20px; }
+.tile {
+  background: var(--as-surface); border: 1px solid var(--as-line);
+  border-radius: var(--as-radius); padding: 12px 14px;
+}
+.tile .n { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .l { color: var(--as-muted); font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.6px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px; align-items: start; }
+section {
+  background: var(--as-surface); border: 1px solid var(--as-line);
+  border-radius: var(--as-radius); padding: 14px 16px; overflow-x: auto;
+}
+section h2 { font-size: 13px; margin: 0 0 8px; color: var(--as-muted);
+  text-transform: uppercase; letter-spacing: 0.8px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th { text-align: left; color: var(--as-muted); font-weight: 500; font-size: 12px;
+  padding: 3px 10px 3px 0; border-bottom: 1px solid var(--as-line); }
+td { padding: 4px 10px 4px 0; border-bottom: 1px solid var(--as-line);
+  font-variant-numeric: tabular-nums; vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+.mono { font-family: var(--as-mono); font-size: 12.5px; }
+.empty { color: var(--as-muted); font-style: italic; }
+#feed { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+#feed li { padding: 3px 0; border-bottom: 1px solid var(--as-line); }
+#feed li:last-child { border-bottom: none; }
+#feed .k-written { color: var(--as-accent); }
+#feed .k-completed { color: var(--as-ok); }
+#feed .k-taken { color: var(--as-warn); }
+#feed .k-command { color: var(--as-c2); font-weight: 600; }
+#feed time { color: var(--as-muted); font-family: var(--as-mono); font-size: 11.5px;
+  margin-right: 6px; }
+.badge { display: inline-block; padding: 0 7px; border-radius: 999px;
+  font-size: 11.5px; border: 1px solid var(--as-line); color: var(--as-muted); }
+#c2 { grid-column: 1 / -1; border-color: var(--as-c2); }
+#c2 h2 { color: var(--as-c2); }
+.c2-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+  margin-bottom: 12px; }
+.c2-field { display: flex; flex-direction: column; gap: 3px; }
+.c2-field label { font-size: 11px; color: var(--as-muted);
+  text-transform: uppercase; letter-spacing: 0.5px; }
+.c2 input, .c2 select { font: inherit; font-size: 13px; padding: 5px 8px;
+  border: 1px solid var(--as-line); border-radius: 6px;
+  background: var(--as-bg); color: var(--as-ink); min-width: 120px; }
+.c2 button { font: inherit; font-size: 13px; font-weight: 600; padding: 6px 14px;
+  border: 1px solid var(--as-c2); border-radius: 6px; cursor: pointer;
+  background: var(--as-c2); color: #fff; }
+.c2 button.ghost { background: transparent; color: var(--as-c2); }
+.c2 button:hover { filter: brightness(1.08); }
+.c2 .cmd { border-top: 1px solid var(--as-line); padding-top: 10px; margin-top: 4px; }
+.c2 .cmd h3 { font-size: 13px; margin: 0 0 2px; }
+.c2 .cmd p { font-size: 12px; color: var(--as-muted); margin: 0 0 8px; }
+.c2-result { font-size: 12.5px; margin-left: 6px; }
+.c2-result.ok { color: var(--as-ok); }
+.c2-result.err { color: var(--as-warn); }
+.c2-locked { color: var(--as-muted); font-size: 12.5px; }
+footer { color: var(--as-muted); font-size: 12px; padding: 12px 24px;
+  text-align: center; }
+footer a { color: var(--as-accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>%%FLEET%%</h1>
+  <span class="sub">fleet console</span>
+  <span id="live">● live</span>
+</header>
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="n" id="t-members">–</div><div class="l">members</div></div>
+    <div class="tile"><div class="n" id="t-agents">–</div><div class="l">agents</div></div>
+    <div class="tile"><div class="n" id="t-queued">–</div><div class="l">queued</div></div>
+    <div class="tile"><div class="n" id="t-wip">–</div><div class="l">in progress</div></div>
+    <div class="tile"><div class="n" id="t-done">–</div><div class="l">completed</div></div>
+  </div>
+  <div class="grid">
+    <section id="c2" class="c2" style="display: none">
+      <h2>Command &amp; Control</h2>
+      <div id="c2-body"></div>
+    </section>
+    <section><h2>Spaces</h2><div id="spaces" class="empty">loading…</div></section>
+    <section><h2>Workers</h2><div id="workers" class="empty">no completions yet</div></section>
+    <section><h2>Peers</h2><div id="peers" class="empty">loading…</div></section>
+    <section><h2>Advertisements</h2><div id="ads" class="empty">loading…</div></section>
+    <section><h2>Activity</h2><ul id="feed"></ul></section>
+    <div id="panels" style="display: contents"></div>
+  </div>
+</main>
+<footer>served from coordination state alone ·
+  <a href="/api/v1">HAL API</a> · <a href="/api/v1/events">event stream</a></footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g,
+  (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+function table(headers, rows) {
+  if (!rows.length) return '<div class="empty">none</div>';
+  const head = headers.map((h) => "<th>" + esc(h) + "</th>").join("");
+  const body = rows.map((r) =>
+    "<tr>" + r.map((c) => "<td>" + c + "</td>").join("") + "</tr>").join("");
+  return "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
+}
+
+async function refresh() {
+  try {
+    const o = await (await fetch("/api/v1/overview")).json();
+    $("t-members").textContent = o.members;
+    $("t-agents").textContent = o.agents;
+    $("t-queued").textContent = o.queued;
+    $("t-wip").textContent = o.inProgress;
+    $("t-done").textContent = o.completed;
+    $("spaces").innerHTML = table(["space", "queued", "in progress", "done", "written"],
+      o.spaces.map((s) => [esc(s.name), s.queued, s.inProgress, s.completed, s.written]));
+    const workers = Object.entries(o.perWorker || {});
+    $("workers").innerHTML = workers.length
+      ? table(["worker", "completed"], workers.map(([w, n]) => [esc(w), n]))
+      : '<div class="empty">no completions yet</div>';
+    const peers = await (await fetch("/api/v1/peers")).json();
+    $("peers").innerHTML = table(["peer", "roles", "state", "channel"],
+      peers.peers.map((p) => ['<span class="mono">' + esc(p.peer.slice(0, 16)) + '…</span>',
+        p.roles.map((r) => '<span class="badge">' + esc(r.toLowerCase()) + "</span>").join(" "),
+        p.suspect ? '<span class="k-taken">suspect</span>' : "alive",
+        p.channel === "attested"
+          ? '<span class="badge">attested</span>' : esc(p.channel || "signed")]));
+    const ads = await (await fetch("/api/v1/ads")).json();
+    $("ads").innerHTML = table(["kind", "who / what", "detail"],
+      ads.ads.map((a) => ['<span class="badge">' + esc(a.kind) + "</span>",
+        esc(a.title), esc(a.detail)]));
+    $("live").textContent = "● live";
+    $("live").className = "";
+  } catch (e) {
+    $("live").textContent = "● reconnecting";
+    $("live").className = "down";
+  }
+}
+
+function follow() {
+  const source = new EventSource("/api/v1/events");
+  source.addEventListener("activity", (e) => {
+    const a = JSON.parse(e.data);
+    const li = document.createElement("li");
+    const at = a.at.replace(/^.*T/, "").replace(/\..*$/, "");
+    li.innerHTML = "<time>" + esc(at) + '</time><span class="k-' + esc(a.kind) + '">'
+      + esc(a.kind) + "</span> " + esc(a.entryType) + " in " + esc(a.space)
+      + (a.worker ? " · " + esc(a.worker) : "");
+    const feed = $("feed");
+    feed.prepend(li);
+    while (feed.children.length > 30) feed.removeChild(feed.lastChild);
+  });
+  source.onerror = () => { $("live").textContent = "● reconnecting"; $("live").className = "down"; };
+  source.onopen = () => { $("live").textContent = "● live"; $("live").className = ""; };
+}
+
+function renderData(el, data) {
+  if (Array.isArray(data) && data.length && typeof data[0] === "object") {
+    const cols = Object.keys(data[0]);
+    el.innerHTML = table(cols, data.map((row) => cols.map((c) => esc(row[c]))));
+  } else if (data !== null && typeof data === "object") {
+    el.innerHTML = table(["key", "value"], Object.entries(data)
+      .map(([k, v]) => [esc(k), esc(typeof v === "object" ? JSON.stringify(v) : v)]));
+  } else {
+    el.innerHTML = '<pre class="mono">' + esc(JSON.stringify(data, null, 2)) + "</pre>";
+  }
+}
+
+async function panels() {
+  const index = await (await fetch("/api/v1/panels")).json();
+  for (const p of index.panels) {
+    const section = document.createElement("section");
+    section.innerHTML = "<h2>" + esc(p.title) + "</h2>";
+    const body = document.createElement("div");
+    section.appendChild(body);
+    $("panels").appendChild(section);
+    if (p.hasFragment) {
+      const html = await (await fetch(p._links.fragment.href)).text();
+      body.innerHTML = html;
+      // Scripts injected via innerHTML are inert; recreate them so they run.
+      body.querySelectorAll("script").forEach((old) => {
+        const s = document.createElement("script");
+        [...old.attributes].forEach((attr) => s.setAttribute(attr.name, attr.value));
+        s.textContent = old.textContent;
+        old.replaceWith(s);
+      });
+    } else {
+      const poll = async () => {
+        try { renderData(body, await (await fetch(p._links.data.href)).json()); }
+        catch (e) { /* next poll retries */ }
+      };
+      poll();
+      setInterval(poll, 2500);
+    }
+  }
+}
+
+// ------------------------------------------------------------ command & control
+
+function store(key, value) {
+  try { if (value === undefined) return sessionStorage.getItem(key);
+    sessionStorage.setItem(key, value); } catch (e) { /* private mode: skip */ }
+  return null;
+}
+
+function c2Post(path, payload, resultEl) {
+  const token = $("c2-token") ? $("c2-token").value.trim() : "";
+  const operator = $("c2-operator") ? ($("c2-operator").value.trim() || "operator") : "operator";
+  store("as-c2-token", token);
+  store("as-c2-operator", operator);
+  resultEl.textContent = "…";
+  resultEl.className = "c2-result";
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Console-Token": token },
+    body: JSON.stringify(Object.assign({ operator }, payload)),
+  }).then(async (r) => {
+    const doc = await r.json().catch(() => ({}));
+    if (r.status === 401) { resultEl.textContent = "unauthorized — check the operator token";
+      resultEl.className = "c2-result err"; return; }
+    resultEl.textContent = doc.message || (doc.ok ? "ok" : "failed")
+      + (doc.entryId ? " (" + doc.entryId.slice(0, 8) + "…)" : "");
+    resultEl.className = "c2-result " + (doc.ok ? "ok" : "err");
+  }).catch(() => { resultEl.textContent = "request failed";
+    resultEl.className = "c2-result err"; });
+}
+
+async function commandConsole() {
+  let cat;
+  try { cat = await (await fetch("/api/v1/commands")).json(); }
+  catch (e) { return; }
+  if (!cat.enabled) return; // read-only console: no C2 surface
+
+  const parts = [];
+  parts.push('<div class="c2-row">'
+    + '<div class="c2-field"><label>operator</label>'
+    + '<input id="c2-operator" type="text" placeholder="your name"></div>'
+    + '<div class="c2-field"><label>operator token</label>'
+    + '<input id="c2-token" type="password" placeholder="required to command"></div>'
+    + '<span class="c2-locked">commands run under the console peer on your behalf</span>'
+    + '</div>');
+
+  // Directive broadcaster.
+  const actions = (cat.directive && cat.directive.actions) || ["PAUSE", "RESUME", "DRAIN"];
+  parts.push('<div class="cmd"><h3>Broadcast directive</h3>'
+    + '<p>Pause, resume, or drain a worker (or <span class="mono">*</span> for all).</p>'
+    + '<div class="c2-row">'
+    + '<div class="c2-field"><label>action</label><select id="d-action">'
+    + actions.map((a) => '<option>' + esc(a) + '</option>').join("") + '</select></div>'
+    + '<div class="c2-field"><label>target</label>'
+    + '<input id="d-target" type="text" value="*"></div>'
+    + '<button id="d-send">Send</button>'
+    + '<span id="d-result" class="c2-result"></span></div></div>');
+
+  // Cancel a dispatched entry.
+  parts.push('<div class="cmd"><h3>Cancel dispatched task</h3>'
+    + '<p>Withdraw a task this console dispatched, by entry id.</p>'
+    + '<div class="c2-row">'
+    + '<div class="c2-field"><label>entry id</label>'
+    + '<input id="x-entry" type="text" placeholder="entry id"></div>'
+    + '<button id="x-send" class="ghost">Cancel</button>'
+    + '<span id="x-result" class="c2-result"></span></div></div>');
+
+  // Application-registered commands.
+  for (const cmd of cat.commands || []) {
+    const fields = (cmd.fields || []).map((f) => {
+      const label = '<label>' + esc(f.label) + '</label>';
+      if (f.kind === "select") {
+        return '<div class="c2-field">' + label + '<select data-f="' + esc(f.name) + '">'
+          + (f.options || []).map((o) => '<option>' + esc(o) + '</option>').join("")
+          + '</select></div>';
+      }
+      const type = f.kind === "number" ? "number" : "text";
+      return '<div class="c2-field">' + label + '<input data-f="' + esc(f.name)
+        + '" type="' + type + '" placeholder="' + esc(f.name) + '"></div>';
+    }).join("");
+    parts.push('<div class="cmd" data-cmd="' + esc(cmd.id) + '"><h3>' + esc(cmd.title)
+      + '</h3><p>' + esc(cmd.description || "") + '</p>'
+      + '<div class="c2-row">' + fields
+      + '<button data-run="' + esc(cmd.id) + '">Run</button>'
+      + '<span class="c2-result" data-res="' + esc(cmd.id) + '"></span></div></div>');
+  }
+
+  $("c2-body").innerHTML = parts.join("");
+  $("c2").style.display = "";
+  if (store("as-c2-token")) $("c2-token").value = store("as-c2-token");
+  if (store("as-c2-operator")) $("c2-operator").value = store("as-c2-operator");
+
+  $("d-send").addEventListener("click", () => c2Post("/api/v1/commands/directive",
+    { action: $("d-action").value, target: $("d-target").value.trim() || "*" }, $("d-result")));
+  $("x-send").addEventListener("click", () => c2Post("/api/v1/commands/cancel",
+    { entryId: $("x-entry").value.trim() }, $("x-result")));
+  $("c2-body").querySelectorAll("[data-run]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-run");
+      const holder = btn.closest("[data-cmd]");
+      const args = {};
+      holder.querySelectorAll("[data-f]").forEach((el) => { args[el.getAttribute("data-f")] = el.value; });
+      c2Post("/api/v1/commands/" + id, { args },
+        $("c2-body").querySelector('[data-res="' + id + '"]'));
+    });
+  });
+}
+
+refresh();
+setInterval(refresh, 2000);
+follow();
+panels();
+commandConsole();
+</script>
+</body>
+</html>

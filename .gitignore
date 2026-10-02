@@ -1,0 +1,55 @@
+# AgentSpaces core repository.
+#
+# What must be COMMITTED and therefore is deliberately NOT listed here:
+#   .github/          the CI workflow and Dependabot config
+#   tools/golden/     the golden-vector generator and the vendored golden.json
+#   .mvn/wrapper/maven-wrapper.properties (the jar itself is ignored below)
+
+# Maven build output, in every module (examples/**, integration-tests/** included)
+target/
+dependency-reduced-pom.xml
+release.properties
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+.flattened-pom.xml
+.mvn/wrapper/maven-wrapper.jar
+
+# Compiled classes outside target (IDE builds)
+*.class
+hs_err_pid*
+replay_pid*
+
+# IDEs and editors
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated/
+.sts4-cache/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and scratch
+*.log
+/tmp/
+
+# Peer key material a running node persists (FileKeystore); never commit a private key
+peer.key
+peer.keys/
+*.pem
+*.p12
+*.jks
+
+# Local environment
+.env
+.env.local

@@ -115,7 +115,7 @@
          with. Any Jackson bump must keep the golden-vector suites green
          (they pin the canonical bytes); see docs/BUILD-ENVIRONMENTS.md. -->
     <jackson.version>2.21.7</jackson.version>
-    <caffeine.version>3.2.0</caffeine.version>
+    <caffeine.version>3.3.0</caffeine.version>
     <nimbus-jose-jwt.version>10.3</nimbus-jose-jwt.version>
     <bouncycastle.version>1.86</bouncycastle.version>
     <junit.version>5.13.4</junit.version>

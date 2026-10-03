@@ -38,6 +38,9 @@
 
   <properties>
     <spring-boot.version>4.1.1</spring-boot.version>
+    <!-- Jackson 3 above the version Boot 4.1.1 manages (3.1.5), for the
+         advisories fixed in 3.1.7; drop once Boot manages 3.1.7 or later. -->
+    <jackson3.version>3.1.7</jackson3.version>
     <!-- An integration-test module carries no coverage gate of its own. -->
     <jacoco.line.minimum>0.0</jacoco.line.minimum>
 
@@ -51,6 +54,22 @@
 
   <dependencyManagement>
     <dependencies>
+      <!-- Imported ahead of the Boot BOM so these win: Boot 4.1.1 manages
+           Jackson 2.21.5 and 3.1.5, both with open advisories. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>tools.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson3.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
       <dependency>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-dependencies</artifactId>

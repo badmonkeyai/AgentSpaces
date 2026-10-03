@@ -19,7 +19,10 @@ import ai.badmonkey.agentspaces.common.codec.Multibase;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.test.TestCa;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.X500NameBuilder;
+import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.cert.X509v3CertificateBuilder;
@@ -144,7 +147,11 @@ class ChannelCertificateTest {
         generator.initialize(new ECGenParameterSpec("secp256r1"));
         KeyPair tls = generator.generateKeyPair();
         Instant now = Instant.now().minus(1, ChronoUnit.HOURS);
-        X500Name name = new X500Name("CN=" + cn);
+        // The CN goes in as an ASN.1 value, not parsed from a DN string: from
+        // 1.86 Bouncy Castle's string parser refuses a CN over ub-common-name
+        // (64), but a hostile peer's certificate need not come from that parser,
+        // so the over-long case must still reach identityKeyFromCn's guard.
+        X500Name name = new X500NameBuilder().addRDN(BCStyle.CN, new DERUTF8String(cn)).build();
         X509v3CertificateBuilder builder = new X509v3CertificateBuilder(
                 name, BigInteger.valueOf(7),
                 Date.from(now), Date.from(now.plus(1, ChronoUnit.DAYS)),

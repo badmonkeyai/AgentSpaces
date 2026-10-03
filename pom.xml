@@ -114,12 +114,16 @@
          application runs the canonical CBOR codec on the Jackson it was tested
          with. Any Jackson bump must keep the golden-vector suites green
          (they pin the canonical bytes); see docs/BUILD-ENVIRONMENTS.md. -->
-    <jackson.version>2.21.5</jackson.version>
+    <jackson.version>2.21.7</jackson.version>
     <caffeine.version>3.2.0</caffeine.version>
     <nimbus-jose-jwt.version>10.3</nimbus-jose-jwt.version>
-    <bouncycastle.version>1.81</bouncycastle.version>
+    <bouncycastle.version>1.86</bouncycastle.version>
     <junit.version>5.13.4</junit.version>
-    <assertj.version>3.27.3</assertj.version>
+    <assertj.version>3.27.7</assertj.version>
+    <!-- Netty arrives through the QUIC codec, whose last incubator release
+         (0.0.75) pins Netty 4.1.131; managed up to the 4.1 line's current
+         patch for the advisories fixed since (handler, codec). -->
+    <netty.version>4.1.138.Final</netty.version>
 
     <!-- Plugin versions -->
     <maven-compiler-plugin.version>3.14.0</maven-compiler-plugin.version>
@@ -129,8 +133,9 @@
     <maven-jar-plugin.version>3.3.0</maven-jar-plugin.version>
     <maven-install-plugin.version>3.1.1</maven-install-plugin.version>
     <maven-deploy-plugin.version>3.1.1</maven-deploy-plugin.version>
-    <jacoco-maven-plugin.version>0.8.12</jacoco-maven-plugin.version>
+    <jacoco-maven-plugin.version>0.8.15</jacoco-maven-plugin.version>
     <exec-maven-plugin.version>3.1.0</exec-maven-plugin.version>
+    <cyclonedx-maven-plugin.version>2.9.3</cyclonedx-maven-plugin.version>
 
     <!-- Publication plugin versions (used only by the central-publish profile;
          resolved from Maven Central, so network-restricted builds that never
@@ -152,6 +157,13 @@
         <groupId>com.fasterxml.jackson</groupId>
         <artifactId>jackson-bom</artifactId>
         <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-bom</artifactId>
+        <version>${netty.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -280,6 +292,23 @@
           <artifactId>jacoco-maven-plugin</artifactId>
           <version>${jacoco-maven-plugin.version}</version>
         </plugin>
+        <!-- The resolved dependency tree as a CycloneDX SBOM, for the OSV scan
+             (.github/workflows/osv-scan.yml). The scanner cannot resolve this
+             reactor's pom.xml files itself (its sibling modules are not on
+             Maven Central), so it reads Maven's own resolution instead, test
+             scope and the unpublished modules (examples, ITs) included:
+             mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -->
+        <plugin>
+          <groupId>org.cyclonedx</groupId>
+          <artifactId>cyclonedx-maven-plugin</artifactId>
+          <version>${cyclonedx-maven-plugin.version}</version>
+          <configuration>
+            <outputFormat>json</outputFormat>
+            <outputName>bom.cdx</outputName>
+            <includeTestScope>true</includeTestScope>
+            <skipNotDeployed>false</skipNotDeployed>
+          </configuration>
+        </plugin>
       </plugins>
     </pluginManagement>
   </build>
@@ -364,8 +393,8 @@
         </plugins>
       </build>
     </profile>
-    <!-- Maven Central publication: source, javadoc, test-source, and
-         test-javadoc jars for every deployed module, GPG signing, and upload
+    <!-- Maven Central publication: source and javadoc jars for every
+         deployed module, GPG signing, and upload
          through the Sonatype Central Portal (the same shape as Embabel's
          sonatype profile). Kept behind a profile so the default reactor builds
          identically in network-restricted environments; CI activates it for

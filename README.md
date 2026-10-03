@@ -3,7 +3,38 @@
 AgentSpaces is a peer-to-peer coordination suite for agents. It combines JXTA-style
 peering (cryptographic peer identity, peer groups, signed advertisements) with
 JavaSpaces-style coordination (a typed, leased tuple space with `write`, `read`,
-`take`, and notifications), replicated with CRDTs over gossip. 
+`take`, and notifications), replicated with CRDTs over gossip.
+
+Back when the Bad Monkey founders were at Bell Labs, we always wanted to build with Jini or JXTA, though neither was ever quite the right fit. Given how agents get built with these frameworks, the needs of those developers, we finally thought it was time to re-visit this tech, modernize it a bit, and introduce developers to P2P architecture.. this time for agents.
+
+Looking at Spring AI, and Embabel, it was clear that having a method for agents to coordinate, and do that in an extensible way was important. AgentSpaces, combined with Embabel, enables all AgentCards across teh Peer group to be visible to the Embabel GOAP planner - even ones seen in the A2A Gateway! This is promising for building a lot of fun new applications. 
+
+While many applications will be fine with leasing TupleSpace like in JavaSpaces, others may want stronger coordination with task-auctions, voting, and even ordered-log. Because these are all additional message flows on top of the peer group, we find them with capability advertisements, and then can signal on them. Layer 4 is meant to be extensible, such that other services could be built, advertised over time, and peer networks leverage them. This is why we picked up relay and rendezvous support, inspired in JXTA, so that peer networks can grow as necessary.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 4  CAPABILITY SERVICES (advertised, pluggable)            │
+│   task-auction (CBBA)  ·  vote  ·  aggregate (push-sum)         │
+│   gossip-learn  ·  ordered-log (Raft quorum)  ·  custom…        │
+├─────────────────────────────────────────────────────────────────┤
+│ Layer 3  AGENTSPACE (distributed tuple space)                   │
+│   write/read/take/notify · templates · leases · CRDT replication│
+│   conflict-resolution strategies · content-addressed payloads   │
+├─────────────────────────────────────────────────────────────────┤
+│ Layer 2  ADVERTISEMENT & DISCOVERY                              │
+│   typed signed documents · TTL · local ad-cache · queries       │
+├─────────────────────────────────────────────────────────────────┤
+│ Layer 1  PEERING                                                │
+│   peer groups · SWIM membership · gossip dissemination          │
+│   rendezvous & relay roles · transport SPI                      │
+├─────────────────────────────────────────────────────────────────┤
+│ Layer 0  IDENTITY                                               │
+│   keypair PeerID · signatures · (optional) DID interop          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Each layer depends only on the layers below it. A conforming minimal implementation comprises Layers 0 through 3 on a single LAN with the default conflict strategy; capability services and WAN topology are additive.
+
 
 The full design
 lives in `SPEC.md` (v0.1.13) with implementation detail in `TECH-SPEC.md`, both in

@@ -114,11 +114,11 @@ mvn -q -pl examples/example-12-exactly-once-desk test
   fails fast and asks for a `@ProvidesCapability` bean that wraps a `RaftLog`,
   because only the application knows the member set. Restrict who may vote and
   lead with `agentspaces.security.grants.raft-voter`.
-- **See it in an application.** The [Party Bus](../../../agentspaces-partybus/README.md)
+- **See it in an application.** The [Party Bus](https://github.com/badmonkeyai/agentspaces-partybus)
   confirms every booking exactly once through `@OrderedTake` clerks, alongside
   auctions and votes in the same fleet.
 - **Prove which agent confirmed.** Combine this example with subordinate keys
   ([example 13](../example-13-signed-agents/README.md)): the committed claim then
   carries the clerk agent's own attestation.
-- **Read the design.** SPEC §8 in [agentspaces-spec](../../../agentspaces-spec/README.md)
+- **Read the design.** SPEC §8 in [agentspaces-spec](https://github.com/badmonkeyai/agentspaces-spec)
   specifies the ordered log and its leader lease.

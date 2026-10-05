@@ -141,9 +141,9 @@ mvn -q -pl examples/example-05-quorum test
   `.entity(...)`. With Embabel, the ballot can call an agent that gathers evidence
   first. Either way, the space records one signed ballot per voter, which gives
   a panel of LLM agents an auditable decision process.
-- **See panels at scale.** The [release-audit flagship](../../../flagships/agentspaces-audit-fleet/README.md)
+- **See panels at scale.** The [release-audit example app](https://github.com/badmonkeyai/agentspaces-example-apps/blob/main/agentspaces-audit-fleet/README.md)
   adjudicates every finding by a QUORUM vote of discipline specialists, and the
-  [Party Bus](../../../agentspaces-partybus/README.md) runs a safety panel and a
+  [Party Bus](https://github.com/badmonkeyai/agentspaces-partybus) runs a safety panel and a
   travelers' vote with `@Ballot` and `@OnDecision`.
 - **Apply it to a pipeline.** [Example 08](../example-08-intake-fleet/README.md)
   uses the same annotations to choose between two extraction candidates and file

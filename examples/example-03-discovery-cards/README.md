@@ -98,7 +98,7 @@ mvn -q -pl examples/example-03-discovery-cards test
   directions. `EmbabelBinder` publishes each Embabel `@Agent` as an AgentCard,
   and `EmbabelRemoteActions` turns the fleet's foreign cards into typed planner
   actions, so an Embabel GOAP planner in one JVM can plan over agents that run on
-  other machines. The [Party Bus](../../../agentspaces-partybus/README.md)
+  other machines. The [Party Bus](https://github.com/badmonkeyai/agentspaces-partybus)
   planner finds its scouts this way.
 - **Discover by meaning.** [Example 10](../example-10-data-fleet/README.md)
   queries cards by natural-language description through the semantic-discovery

@@ -29,7 +29,7 @@ at the workspace root, beside the Spring AI patterns (`springai-patterns`).
 
 - Each module's own `README.md` covers what the example demonstrates, the API it
   uses, how to run and test it, and next steps into the Spring Boot starter,
-  Embabel, Spring AI, the flagships, and the non-JVM clients.
+  Embabel, Spring AI, the example apps, and the non-JVM clients.
 - Every example module depends on `agentspaces-agent` with an explicit `${project.version}`;
   the examples parent manages the space and identity versions but not the agent's.
 - `examples-guide.html` beside the modules is the narrative walk-through.

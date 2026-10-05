@@ -2,7 +2,7 @@
 # The whole gate for the AgentSpaces workspace: the core reactor (with the
 # real-Spring integration tests and the golden vectors required), then both
 # non-JVM client suites, then every standalone project that consumes the
-# published libraries — the four flagships, the Party Bus (with its Embabel
+# published libraries — the four example apps, the Party Bus (with its Embabel
 # profile), the Clojure bindings, agentspaces-springai, and a compile of the perf
 # harnesses — against the libraries the reactor just installed. Leaving
 # the consumers out of the gate is how they rotted once (QA4 A4-2); keeping
@@ -34,7 +34,7 @@ step "typescript client"
 step "clojure bindings"
 ( cd agentspaces-clj && clojure -M:test ) || { echo "FAILED: agentspaces-clj"; status=1; }
 
-for d in flagships/*/; do
+for d in agentspaces-example-apps/*/; do
   step "standalone: $d"
   ( cd "$d" && $MVN -q clean test ) || { echo "FAILED: $d"; status=1; }
 done
@@ -45,7 +45,7 @@ step "standalone: agentspaces-partybus (with -Pembabel)"
 ( cd agentspaces-partybus && $MVN -q -Pembabel clean test ) || { echo "FAILED: agentspaces-partybus"; status=1; }
 
 step "standalone: agentspaces-springai (library, example 15, patterns)"
-( cd agentspaces-springai && $MVN -q clean install ) || { echo "FAILED: agentspaces-springai"; status=1; }
+( cd agentspaces-springai && $MVN -q clean install -Pexamples ) || { echo "FAILED: agentspaces-springai"; status=1; }
 
 step "standalone: agentspaces-perf (compile)"
 ( cd agentspaces-perf && $MVN -q clean compile ) || { echo "FAILED: agentspaces-perf"; status=1; }

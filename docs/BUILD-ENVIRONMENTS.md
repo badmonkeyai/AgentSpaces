@@ -85,9 +85,12 @@ and that is precisely the integration test's job.
 
 ## The perf module (JMH)
 
-`agentspaces-perf` (benchmarks and stress harnesses) is a standalone project at the
-workspace root whose parent is this reactor's POM, so the default reactor stays fast: `mvn -f ../agentspaces-perf/pom.xml clean verify` builds
-and smoke-tests it, and the module README documents the run commands.
+`agentspaces-perf` (benchmarks and stress harnesses) is a standalone project in
+its own repository, [badmonkeyai/agentspaces-perf](https://github.com/badmonkeyai/agentspaces-perf),
+so the default reactor stays fast. It has no parent: it consumes the published
+libraries through the `agentspaces-dependencies` BOM, so after a `mvn install`
+here, `mvn -f ../agentspaces-perf/pom.xml clean package` builds and smoke-tests
+it and writes `target/benchmarks.jar`. Its README documents the run commands.
 
 ## The QUIC module
 

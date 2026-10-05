@@ -139,6 +139,6 @@ mvn -q -pl examples/example-09-fleet-console test
   profile, the command routes validate the operator's JWT against your identity
   provider and require the `aspace:console:operate` scope, and
   `agentspaces.security.grants.directive-issuer` limits which peers workers obey.
-- **See a busy console.** The [Party Bus](../../../agentspaces-partybus/README.md)
+- **See a busy console.** The [Party Bus](https://github.com/badmonkeyai/agentspaces-partybus)
   runs thirty-four agents under one console through a simulated week; its
   `fleet/Turret.java` registers domain `ConsolePanel`s over the same server.

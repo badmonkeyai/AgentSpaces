@@ -29,6 +29,51 @@
     Bill of materials for AgentSpaces. Applications import this BOM to align the
     versions of every AgentSpaces artifact and its key third-party dependencies.
   </description>
+  <!-- Deliberately parentless so importers take only dependencyManagement, which
+       means the Maven Central metadata the parent carries for every other module
+       (url, licenses, developers, scm) has to be repeated here. Keep in step
+       with ../pom.xml. -->
+  <url>https://github.com/badmonkeyai/agentspaces</url>
+  <inceptionYear>2026</inceptionYear>
+
+  <organization>
+    <name>Bad Monkey, Inc.</name>
+    <url>https://badmonkey.ai</url>
+  </organization>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>albaker</id>
+      <name>Al Baker</name>
+      <email>al@badmonkey.ai</email>
+      <organization>Bad Monkey, Inc.</organization>
+      <organizationUrl>https://badmonkey.ai</organizationUrl>
+      <roles>
+        <role>architect</role>
+        <role>developer</role>
+      </roles>
+    </developer>
+  </developers>
+
+  <scm>
+    <url>https://github.com/badmonkeyai/agentspaces</url>
+    <connection>scm:git:https://github.com/badmonkeyai/agentspaces.git</connection>
+    <developerConnection>scm:git:git@github.com:badmonkeyai/agentspaces.git</developerConnection>
+    <tag>HEAD</tag>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/badmonkeyai/agentspaces/issues</url>
+  </issueManagement>
 
   <properties>
     <jackson.version>2.21.7</jackson.version>

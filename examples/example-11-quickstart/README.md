@@ -127,9 +127,9 @@ with no network at all.
   subordinate agent keys (example 13) all follow the same shape: the parameter is
   the cue and the return value is the next entry.
 - **Study a complete teaching application.** The
-  [PetClinic Fleet](../../../flagships/agentspaces-petclinic-fleet/README.md)
+  [PetClinic Fleet](https://github.com/badmonkeyai/agentspaces-example-apps/blob/main/agentspaces-petclinic-fleet/README.md)
   runs a veterinary clinic purely by `@SpaceNotify` choreography over one space,
-  and is the gentlest of the flagships.
-- **Prefer Clojure?** [agentspaces-clj](../../../agentspaces-clj/README.md) binds
+  and is the gentlest of the example apps.
+- **Prefer Clojure?** [agentspaces-clj](https://github.com/badmonkeyai/agentspaces-clj) binds
   the same fleet with maps, keywords, and a `fleet/start` config map that mirrors
   the Spring starter.

@@ -134,10 +134,11 @@ class AgentBinderLayer4ClusterTest {
         }
     }
 
-    /** A clerk that confirms every order it is handed, exactly once. */
+    /** A clerk that confirms every order it is handed, exactly once, and records the take it ran under. */
     @AgentSpec(name = "clerk", description = "Confirms orders", goals = {"confirm"})
     public static class Clerk {
         final List<String> confirmed = new CopyOnWriteArrayList<>();
+        final List<TakeContext> contexts = new CopyOnWriteArrayList<>();
         final String label;
 
         Clerk(String label) {
@@ -146,6 +147,7 @@ class AgentBinderLayer4ClusterTest {
 
         @OrderedTake(space = "orders", lease = "30s", pollTimeout = "200ms")
         public Receipt confirm(Order order) {
+            TakeContext.current().ifPresent(contexts::add);
             confirmed.add(order.id());
             return new Receipt(order.id(), label);
         }
@@ -155,6 +157,8 @@ class AgentBinderLayer4ClusterTest {
      * {@code @OrderedTake} (written before the annotation existed): three clerks
      * on a three-member log each bind one method; every order is confirmed by
      * exactly one clerk and drains from every replica, the desk's included.
+     * Each confirmation runs inside its own {@link TakeContext}, as a
+     * {@code @SpaceTake} method does.
      */
     @Test
     void anOrderedTakeMethodCompletesEachEntryExactlyOnceThroughTheLog() throws Exception {
@@ -193,6 +197,16 @@ class AgentBinderLayer4ClusterTest {
         assertThat(receipts).extracting(Receipt::id).containsExactlyInAnyOrder("ord-1", "ord-2", "ord-3", "ord-4");
         assertThat(clerks.stream().mapToInt(cl -> cl.confirmed.size()).sum())
                 .as("every order confirmed by exactly one clerk").isEqualTo(4);
+        List<TakeContext> contexts = clerks.stream().flatMap(cl -> cl.contexts.stream()).toList();
+        assertThat(contexts).as("every confirmation ran inside its take").hasSize(4);
+        assertThat(contexts).allSatisfy(context -> {
+            assertThat(context.spaceName()).isEqualTo("orders");
+            assertThat(context.lease()).isEqualTo(Duration.ofSeconds(30));
+            assertThat(context.agent().localName()).isEqualTo("clerk");
+            assertThat(context.entryId()).isEqualTo(context.taken().entryId());
+        });
+        assertThat(contexts).extracting(TakeContext::entryId).doesNotHaveDuplicates();
+        assertThat(TakeContext.current()).as("the test thread holds no take").isEmpty();
         tickAll(6);
         for (Member m : members) {
             assertThat(m.space().readAll(Template.of(Order.class), 10)).as("drained at " + m.identity().peerId().display()).isEmpty();

@@ -96,10 +96,10 @@ mvn -q -pl examples/example-04-auction test
   price and an estimate of the prompt's size. The space then routes each task to
   the cheapest model that is willing to take it, and adding a provider means
   starting one more peer.
-- **See it at scale.** The [code-migration flagship](../../../flagships/agentspaces-code-fleet/README.md)
+- **See it at scale.** The [code-migration example app](https://github.com/badmonkeyai/agentspaces-example-apps/blob/main/agentspaces-code-fleet/README.md)
   allocates repository issues by AUCTION across specialist and generalist coding
   agents, then reviews the changes under LEASE_RACE in a second space. The
-  [Party Bus](../../../agentspaces-partybus/README.md) auctions each day of a trip
+  [Party Bus](https://github.com/badmonkeyai/agentspaces-partybus) auctions each day of a trip
   among activity planners.
 - **Spring Boot.** Set `strategy: AUCTION` on the space under
   `agentspaces.groups[].spaces[]`; any bean with a `@BidFunction` method enrolls

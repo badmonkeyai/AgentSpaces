@@ -176,7 +176,7 @@ mvn -pl agentspaces-space,agentspaces-peering,agentspaces-capabilities,agentspac
   -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
-The full workspace gate (about 15 minutes) is `tools/verify-all.sh`, run from the workspace root where all repos have been checked out. It covers the reactor, a check that the golden-vector copies match, the Python, TypeScript and Clojure clients, the flagships, Party Bus, agentspaces-springai, and a compile of the perf harnesses. 
+The full workspace gate (about 15 minutes) is `tools/verify-all.sh`, run from the workspace root where all repos have been checked out. It covers the reactor, a check that the golden-vector copies match, the Python, TypeScript and Clojure clients, the example apps, Party Bus, agentspaces-springai, and a compile of the perf harnesses. 
 
 Build success should look like:
 ```
@@ -252,9 +252,9 @@ architecture.
 | `agentspaces-spring-stubs` | Provided-scope copies of the Spring API names the autoconfigure module compiles against, for builds that cannot reach Maven Central. DoD/enclave builds only, not included otherwise. |
 | `embabel-agentspaces` | The Embabel extension. `EmbabelBinder` publishes `@Agent` metadata as AgentCards into every group, `EmbabelRemoteActions` generates a typed `@Agent` whose actions invoke the fleet's advertised capabilities, and a deployer redeploys it onto the platform as cards arrive and lapse. It reads Embabel reflectively and needs no Embabel artifact to build. |
 | `agentspaces-partybus/` (separate repo) | The largest demo application, a standalone project outside this repository that consumes the published libraries: the Embabel travel planner rebuilt as a fleet of agents that uses every coordination type at once — panelists and travelers vote with `@Ballot`, leads publish with `@OnDecision`, clerks confirm bookings with `@OrderedTake` — with a vacation simulator that drives it through a week that goes wrong on purpose. Its guide is `site/partybus-guide.html`. |
-| `agentspaces-perf/` (separate repo) | Standalone, parented on this reactor's POM: JMH microbenchmarks (codec, crypto, HLC, templates, CRDT merges, frames, space verbs) and multi-peer TCP stress harnesses for throughput, propagation, and churn recovery. Built with `mvn -f ../agentspaces-perf/pom.xml verify`; see its README. |
+| `agentspaces-perf/` (separate repo) | Standalone, on the published libraries through the `agentspaces-dependencies` BOM: JMH microbenchmarks (codec, crypto, HLC, templates, CRDT merges, frames, space verbs) and multi-peer TCP stress harnesses for throughput, propagation, and churn recovery. Built with `mvn -f ../agentspaces-perf/pom.xml package` after a `mvn install` here; see its README. |
 | `examples/` | Graduated examples 01 through 14: hello space, research fleet, discovery cards, auction, quorum (with a council of `@Ballot` seats on one peer), WAN rendezvous, A2A fleet, intake fleet, fleet console, data fleet, the one-file quickstart, the exactly-once desk (`@OrderedTake`), signed agents (subordinate keys and attestation), and gossip learning. Each has a test that drives it end to end. |
-| `flagships/` (separate repo) | Larger applications, standalone projects outside this repository, every agent an annotated plain object bound through the facade: a compliance intake fleet (evidence counted per authenticated member), a code-migration fleet allocating work by AUCTION, a release-audit fleet of discipline specialists voting with `@Ballot` and adjudicating with `@OnDecision`, and a veterinary clinic that coordinates purely by `@SpaceNotify` choreography over one space. |
+| `agentspaces-example-apps/` (separate repo) | Larger example applications, standalone projects outside this repository, every agent an annotated plain object bound through the facade: a compliance intake fleet (evidence counted per authenticated member), a code-migration fleet allocating work by AUCTION, a release-audit fleet of discipline specialists voting with `@Ballot` and adjudicating with `@OnDecision`, and a veterinary clinic that coordinates purely by `@SpaceNotify` choreography over one space. |
 | `agentspaces-python/`, `agentspaces-typescript/` (separate repo) | Wire-compatible non-JVM peers. They join Java fleets by seed or by GroupID with the founding document verified, write signed entries, take under the claim lattice, and read through anti-entropy, and both reproduce every shared golden vector byte for byte from their vendored copies of `agentspaces-spec/golden.json`. |
 | `agentspaces-springai/` (separate repo) | AgentSpaces for Spring AI applications, standalone on the published libraries (Spring Boot 4.1, Spring AI 2.0): the fleet's AgentCards as Spring AI tools, discovery and data tools, crash-safe LLM workers (a take lease renewed per model round-trip, chat memory in a space), model access as a fleet service (`FleetChatModel` and `ModelServer`, with streaming), a Spring AI embedder for semantic discovery, fleet-wide token usage, and MCP export. No Embabel dependency; see its README and `agentspaces-springai.md`. |
 | `agentspaces-clj/` (separate repo) | Idiomatic Clojure bindings outside the reactor, consuming the published artifacts: maps in and out over record entry types, a keyword `:where` DSL, and `fleet/start` from a config map mirroring the Spring starter. |
@@ -276,7 +276,7 @@ layers below it, with the programming model, gateways, and tooling around them.
 | Programming model and hosting | `agentspaces-agent`, `agentspaces-spring-boot-autoconfigure`, `agentspaces-spring-boot-starter`, `agentspaces-spring-stubs`, `embabel-agentspaces`, `agentspaces-clj/` |
 | Gateways and served interfaces | `agentspaces-a2a`, `agentspaces-console`, `agentspaces-connect-core` |
 | Non-JVM implementations of Layers 0 through 3 | `agentspaces-python/`, `agentspaces-typescript/` |
-| Applications and verification | `examples/`, `integration-tests/` in this repository; `flagships/`, `agentspaces-partybus/`, `agentspaces-perf/` as standalone projects beside it |
+| Applications and verification | `examples/`, `integration-tests/` in this repository; `agentspaces-example-apps/`, `agentspaces-partybus/`, `agentspaces-perf/` as standalone projects beside it |
 | Framework integrations | `agentspaces-springai/` (Spring AI, model-call granularity), `embabel-agentspaces` for Embabel support |
 
 A conforming minimal implementation is Layers 0 through 3 on one LAN with the
@@ -469,7 +469,7 @@ integration tests and requires the shared golden vectors:
 mvn clean verify -Pspring-it -Dgolden.required=true
 ```
 
-The flagships, the Party Bus, the perf harnesses, and the two non-JVM clients are
+The example apps, the Party Bus, the perf harnesses, and the two non-JVM clients are
 standalone projects beside this repository that consume the published libraries;
 `verify-all.sh` at the workspace root runs this gate and then every one of them
 against the freshly installed libraries, which is how they are kept from drifting
@@ -568,7 +568,7 @@ public class Clerk {
 With `agentspaces.identity.agent-keys=subordinate` every bound agent signs with a
 certified key of its own, so the ballot above is the panelist's attested record
 and several agents on one peer are several voters wherever the authorizer counts
-per agent. The four flagships under `flagships/` and the Party Bus are written
+per agent. The four example apps in `agentspaces-example-apps/` and the Party Bus are written
 entirely this way.
 
 ## License

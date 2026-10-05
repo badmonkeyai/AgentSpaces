@@ -105,6 +105,6 @@ mvn -q -pl examples/example-14-gossip-learning test
 - **Spring Boot.** `agentspaces.capabilities.gossip-learn=true` wires the default
   weight-averaging learner into every group; it defaults off because a learner
   needs a model.
-- **Read the design.** SPEC §8 in [agentspaces-spec](../../../agentspaces-spec/README.md)
+- **Read the design.** SPEC §8 in [agentspaces-spec](https://github.com/badmonkeyai/agentspaces-spec)
   specifies the offer/accept exchange, content addressing, and epoch
   evaluations.

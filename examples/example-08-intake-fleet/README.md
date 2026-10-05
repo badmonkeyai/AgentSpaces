@@ -114,7 +114,7 @@ mvn -q -pl examples/example-08-intake-fleet test
   becomes an ensemble decision, and a disagreement can route to a human.
 - **Carry the real image.** Entries larger than 64 KiB travel content-addressed
   (by CID) over the block exchange, and the space replicates only the record. The
-  [document intake flagship](../../../flagships/agentspaces-intake-fleet/README.md)
+  [document intake example app](https://github.com/badmonkeyai/agentspaces-example-apps/blob/main/agentspaces-intake-fleet/README.md)
   builds this pipeline at full size, with page images by CID, per-field
   adjudication, a human review queue, and evidence counted per authenticated member.
 - **Make the chain provable per agent.** With subordinate keys

@@ -67,7 +67,7 @@ The core provides leases, gossip, and CRDT replication. The stronger semantics a
 
 The ideas behind AgentSpaces are old. Tuple spaces were described in 1985. Peer-to-peer groups were tried in the late 1990s. Two of our founders worked through that era at Bell Labs, Lucent, and Avaya and wanted to build with those systems. Neither Jini nor JXTA was ever quite right: Java-only, centralized spaces, security as an afterthought.
 
-Agents are what changed the math. They're ephemeral, failure-prone, and built by many teams. They need the coordination model that the earlier systems imagined, implemented with tools that didn't exist then: CRDTs, Ed25519, QUIC, and signed CBOR over gossip. The layered approach also enables us to swap in different implementations (e.g. transport tier, security providers, etc), rather than mandate one. Tweny years ago, there was a lot of compute not being used that a P2P protocol would have enabled compelling architectures. There's even more today. So we're excited to bring this back.
+Agents are what changed the math. They're ephemeral, failure-prone, and built by many teams. They need the coordination model that the earlier systems imagined, implemented with tools that didn't exist then: CRDTs, Ed25519, QUIC, and signed CBOR over gossip. The layered approach also enables us to swap in different implementations (e.g. transport tier, security providers, etc), rather than mandate one. Twenty years ago, there was a lot of compute not being used that a P2P protocol would have enabled compelling architectures. There's even more today. So we're excited to bring this back.
 
 You don't need to know any of that history to use AgentSpaces. But if you're curious, it's a good story.
 

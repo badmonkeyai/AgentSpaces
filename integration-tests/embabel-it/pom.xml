@@ -42,7 +42,7 @@
     <!-- Jackson 3 above the version Boot 4.1.1 manages (3.1.5), for the
          advisories fixed in 3.1.7; drop once Boot manages 3.1.7 or later. -->
     <jackson3.version>3.1.7</jackson3.version>
-    <embabel-agent.version>1.5.2</embabel-agent.version>
+    <embabel-agent.version>1.5.3</embabel-agent.version>
     <!-- An integration-test module carries no coverage gate of its own. -->
     <jacoco.line.minimum>0.0</jacoco.line.minimum>
 

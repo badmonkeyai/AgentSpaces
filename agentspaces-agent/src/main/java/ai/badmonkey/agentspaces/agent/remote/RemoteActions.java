@@ -19,6 +19,7 @@ import ai.badmonkey.agentspaces.agent.AgentSpaces;
 import ai.badmonkey.agentspaces.api.ad.AgentCard;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Space;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 
@@ -59,6 +60,8 @@ public final class RemoteActions {
     private final DiscoveryService discovery;
     private final PeerId self;
     private final Map<String, Space> spaces;
+    /** The group's registry, consulted before the class-name rule; null for the rule alone. */
+    private final SchemaRegistry schemas;
     private final Map<Class<?>, String> taskRoutes = new ConcurrentHashMap<>();
     private final Map<Class<?>, String> resultRoutes = new ConcurrentHashMap<>();
     private volatile Correlation correlation = Correlation.sharedFields();
@@ -72,9 +75,28 @@ public final class RemoteActions {
      * @param spaces    the group's spaces by name
      */
     public RemoteActions(DiscoveryService discovery, PeerId self, Map<String, Space> spaces) {
+        this(discovery, self, spaces, null);
+    }
+
+    /**
+     * Creates a registry over explicit pieces that resolves card schema names
+     * through a schema registry first (ISSUE-WorkflowShape §9.1): the registry
+     * the group's spaces and binder share, so a card naming an IRI such as
+     * {@code https://example.org/claims#Claim} resolves to the local class.
+     * Names the registry does not know fall back to the class-name rule when
+     * they look like class names.
+     *
+     * @param discovery the group's discovery service (the card source)
+     * @param self      the local peer id; its own cards are never actions
+     * @param spaces    the group's spaces by name
+     * @param schemas   the schema registry, or null for the class-name rule alone
+     */
+    public RemoteActions(DiscoveryService discovery, PeerId self, Map<String, Space> spaces,
+                         SchemaRegistry schemas) {
         this.discovery = Objects.requireNonNull(discovery, "discovery");
         this.self = Objects.requireNonNull(self, "self");
         this.spaces = Map.copyOf(Objects.requireNonNull(spaces, "spaces"));
+        this.schemas = schemas;
         if (this.spaces.isEmpty()) {
             throw new IllegalArgumentException("a RemoteActions registry needs at least one space");
         }
@@ -86,7 +108,7 @@ public final class RemoteActions {
      *
      * @param group the group context
      * @param self  the local peer id
-     * @return the registry over the group's discovery and spaces
+     * @return the registry over the group's discovery, spaces, and schema registry
      */
     public static RemoteActions over(AgentSpaces.GroupContext group, PeerId self) {
         Objects.requireNonNull(group, "group");
@@ -94,7 +116,7 @@ public final class RemoteActions {
         for (String name : group.spaceNames()) {
             byName.put(name, group.space(name));
         }
-        return new RemoteActions(group.discovery(), self, byName);
+        return new RemoteActions(group.discovery(), self, byName, group.schemaRegistry());
     }
 
     /**
@@ -251,17 +273,32 @@ public final class RemoteActions {
 
     // ---------------------------------------------------------------- internals
 
-    /** Resolves a card schema name ({@code <fqn>#v1}) to a local class. */
-    private static Optional<Class<?>> resolve(String schemaName) {
+    /**
+     * Resolves a card schema name to a local class: through the group's schema
+     * registry first (an IRI or any name the registry knows), then by the
+     * class-name rule ({@code <fqn>#v1}) for names that look like class names.
+     * A name containing {@code :} or {@code /} is an IRI, which never resolves
+     * as a class.
+     */
+    private Optional<Class<?>> resolve(String schemaName) {
+        if (schemas != null) {
+            Optional<Class<?>> known = schemas.classFor(schemaName);
+            if (known.isPresent()) {
+                // ASF-029 holds for the registry's answer too: a platform class
+                // is never an entry schema, whatever named it.
+                return isPlatform(known.get().getName()) ? Optional.empty() : known;
+            }
+        }
+        if (schemaName.indexOf(':') >= 0 || schemaName.indexOf('/') >= 0) {
+            return Optional.empty();
+        }
         int versionAt = schemaName.lastIndexOf('#');
         String className = versionAt < 0 ? schemaName : schemaName.substring(0, versionAt);
         // ASF-029: schema names come from foreign cards any admitted peer can
         // publish. The class is looked up WITHOUT initialization, so a hostile
         // name cannot run static initializers, and platform packages are never
         // entry schemas, so they are refused outright.
-        if (className.startsWith("java.") || className.startsWith("javax.")
-                || className.startsWith("jdk.") || className.startsWith("sun.")
-                || className.startsWith("com.sun.")) {
+        if (isPlatform(className)) {
             return Optional.empty();
         }
         try {
@@ -270,6 +307,13 @@ public final class RemoteActions {
         } catch (ClassNotFoundException | LinkageError e) {
             return Optional.empty();
         }
+    }
+
+    /** ASF-029: the platform packages that are never entry schemas. */
+    private static boolean isPlatform(String className) {
+        return className.startsWith("java.") || className.startsWith("javax.")
+                || className.startsWith("jdk.") || className.startsWith("sun.")
+                || className.startsWith("com.sun.");
     }
 
     /** Explicit route, then the action's space, then the card's binding, then the sole space. */

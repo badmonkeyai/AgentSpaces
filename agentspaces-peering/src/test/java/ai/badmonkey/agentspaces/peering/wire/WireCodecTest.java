@@ -32,7 +32,7 @@ class WireCodecTest {
     private final PeerIdentity sender = PeerIdentity.generate();
 
     private Envelope envelope(PeerIdentity from) {
-        return new Envelope(2, GroupId.of("zG"), Envelope.Kind.RUMOR, from.peerId(),
+        return new Envelope(WireCodec.WIRE_VERSION, GroupId.of("zG"), Envelope.Kind.RUMOR, from.peerId(),
                 from.peerId(), new HlcTimestamp(42L, 0, "n"), new byte[]{1, 2, 3});
     }
 
@@ -149,24 +149,24 @@ class WireCodecTest {
         assertThat(wire.decode(emptyBoth)).isEmpty();
     }
 
-    /** SPEC §9: receivers accept only wire version 2; a validly signed frame at any other version is dropped as malformed, signed or bare. */
+    /** SPEC §9: receivers accept only wire version 3; a validly signed frame at any other version is dropped as malformed, signed or bare. */
     @Test
     void unknownWireVersionsAreDropped() {
         Envelope future = new Envelope(99, GroupId.of("zG"), Envelope.Kind.RUMOR,
                 sender.peerId(), sender.peerId(), new HlcTimestamp(42L, 0, "n"),
                 new byte[]{1, 2, 3});
-        Envelope past = new Envelope(1, GroupId.of("zG"), Envelope.Kind.RUMOR,
+        Envelope past = new Envelope(2, GroupId.of("zG"), Envelope.Kind.RUMOR,
                 sender.peerId(), sender.peerId(), new HlcTimestamp(42L, 0, "n"),
                 new byte[]{1, 2, 3});
 
-        assertThat(WireCodec.WIRE_VERSION).isEqualTo(2);
+        assertThat(WireCodec.WIRE_VERSION).isEqualTo(3);
         assertThat(wire.decode(wire.encode(future, sender))).isEmpty();
         assertThat(wire.decode(wire.encode(past, sender))).isEmpty();
         assertThat(wire.decode(wire.encodeBare(future), Optional.of(sender.peerId()))).isEmpty();
         // The current version, identically signed, decodes.
         assertThat(wire.decode(wire.encode(envelope(sender), sender))).isPresent();
         // ver is inside the signed canonical bytes, so it cannot be changed in
-        // flight: re-labelling a v99 frame as v2 breaks the signature.
+        // flight: re-labelling a v99 frame as v3 breaks the signature.
         assertThatThrownBy(() -> new Envelope(0, GroupId.of("zG"), Envelope.Kind.RUMOR,
                 sender.peerId(), sender.peerId(), new HlcTimestamp(42L, 0, "n"), new byte[0]))
                 .isInstanceOf(IllegalArgumentException.class);

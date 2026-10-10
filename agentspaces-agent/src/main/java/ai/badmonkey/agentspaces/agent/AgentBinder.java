@@ -22,9 +22,18 @@ import ai.badmonkey.agentspaces.agent.annotation.SpaceNotify;
 import ai.badmonkey.agentspaces.agent.annotation.Ballot;
 import ai.badmonkey.agentspaces.agent.annotation.CapabilityRef;
 import ai.badmonkey.agentspaces.agent.annotation.OnDecision;
+import ai.badmonkey.agentspaces.agent.annotation.OnEstimate;
 import ai.badmonkey.agentspaces.agent.annotation.OrderedTake;
+import ai.badmonkey.agentspaces.agent.annotation.Part;
+import ai.badmonkey.agentspaces.agent.annotation.Propose;
+import ai.badmonkey.agentspaces.agent.annotation.SpaceJoin;
+import ai.badmonkey.agentspaces.agent.annotation.SpaceReduce;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceRef;
 import ai.badmonkey.agentspaces.agent.capability.Contribution;
+import ai.badmonkey.agentspaces.agent.capability.Motion;
+import ai.badmonkey.agentspaces.agent.join.JoinBinding;
+import ai.badmonkey.agentspaces.agent.join.Joined;
+import ai.badmonkey.agentspaces.agent.reduce.ReduceBinding;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.capabilities.orderedlog.OrderedTakes;
 import ai.badmonkey.agentspaces.capabilities.vote.VoteCapability;
@@ -32,6 +41,7 @@ import ai.badmonkey.agentspaces.agent.annotation.SpaceTake;
 import ai.badmonkey.agentspaces.api.ad.AgentCard;
 import ai.badmonkey.agentspaces.api.ad.CardAction;
 import ai.badmonkey.agentspaces.api.space.Lease;
+import ai.badmonkey.agentspaces.api.space.Matchers;
 import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.space.SpaceEvent;
 import ai.badmonkey.agentspaces.api.space.Subscription;
@@ -48,6 +58,8 @@ import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.time.Duration;
 import java.time.InstantSource;
 import java.util.ArrayList;
@@ -85,7 +97,14 @@ public final class AgentBinder implements AutoCloseable {
     private final String groupName;
     private final InstantSource clock;
     private final DiscoveryService discovery;
-    private final SchemaRegistry schemas;
+    /**
+     * The registry every card name comes from (ISSUE-WorkflowShape §9.1). Share
+     * the spaces' registry so the card advertises what the space writes; the
+     * default names {@code <fqcn>#v1}, as the spaces do by default.
+     */
+    private volatile SchemaRegistry schemas = new SimpleSchemaRegistry();
+    /** Set by the first bind; the registry is fixed from then on. */
+    private volatile boolean everBound;
     private final AdvertisementSigner signer = new AdvertisementSigner();
     private final Map<String, Space> spaces = new ConcurrentHashMap<>();
     /** Space name to the agent whose @BidFunction prices it (QA4 A4-8): one per space per peer. */
@@ -162,8 +181,33 @@ public final class AgentBinder implements AutoCloseable {
         this.discovery = discovery;
         this.clock = Objects.requireNonNull(clock, "clock");
         this.groupName = groupName;
-        this.schemas = new SimpleSchemaRegistry();
         this.identities = identities != null ? identities : identity::agentIdentity;
+    }
+
+    /**
+     * Replaces the schema registry card names come from (ISSUE-WorkflowShape
+     * §9.1): give the binder the registry its spaces were built with, and the
+     * {@code consumes}, {@code produces}, {@code spaceBindings}, and action
+     * schemas of every card name exactly what the spaces write. Refused once an
+     * agent has been bound, since that card already carries the earlier names.
+     *
+     * @param schemas the registry
+     * @return this binder
+     * @throws IllegalStateException after the first bind
+     */
+    public AgentBinder schemas(SchemaRegistry schemas) {
+        Objects.requireNonNull(schemas, "schemas");
+        if (everBound) {
+            throw new IllegalStateException(
+                    "the schema registry must be set before the first bind");
+        }
+        this.schemas = schemas;
+        return this;
+    }
+
+    /** Returns the schema registry card names come from. */
+    public SchemaRegistry schemas() {
+        return schemas;
     }
 
     /**
@@ -333,6 +377,7 @@ public final class AgentBinder implements AutoCloseable {
      */
     public Bound bind(Object agent, String name) {
         Objects.requireNonNull(agent, "agent");
+        everBound = true;
         Class<?> type = agent.getClass();
         Spec spec = findSpec(type);
         if (name == null || name.isEmpty()) {
@@ -358,7 +403,7 @@ public final class AgentBinder implements AutoCloseable {
 
         // Bid functions first, so AUCTION spaces are priced before any take runs.
         for (Method method : type.getMethods()) {
-            BidFunction bid = method.getAnnotation(BidFunction.class);
+            BidFunction bid = annotationOf(method, BidFunction.class);
             if (bid == null || !owns(bid.group())) {
                 continue;
             }
@@ -386,35 +431,35 @@ public final class AgentBinder implements AutoCloseable {
         }
 
         for (Method method : type.getMethods()) {
-            SpaceTake take = method.getAnnotation(SpaceTake.class);
+            SpaceTake take = annotationOf(method, SpaceTake.class);
             if (take != null && owns(take.group())) {
                 requireSignature(method, 1, "a @SpaceTake method takes the entry parameter");
                 Class<?> entryType = method.getParameterTypes()[0];
                 String schema = schemas.register(entryType);
                 consumes.add(schema);
                 spaceBindings.put(schema, resolveSpaceName(take.space(), method));
-                if (method.getReturnType() != void.class) {
-                    produces.add(schemas.register(method.getReturnType()));
+                for (Class<?> produced : producedTypes(method, take.produces())) {
+                    produces.add(schemas.register(produced));
                 }
-                actions.add(action(method, take.description(), List.of(schema),
+                actions.add(action(method, take.produces(), take.description(), List.of(schema),
                         resolveSpaceName(take.space(), method), CardAction.TAKE));
                 handle.threads.add(startTakeLoop(agent, method, take, handle));
             }
-            SpaceNotify notify = method.getAnnotation(SpaceNotify.class);
+            SpaceNotify notify = annotationOf(method, SpaceNotify.class);
             if (notify != null && owns(notify.group())) {
                 requireSignature(method, 1, "a @SpaceNotify method takes the entry parameter");
                 Class<?> entryType = method.getParameterTypes()[0];
                 String schema = schemas.register(entryType);
                 consumes.add(schema);
                 spaceBindings.putIfAbsent(schema, resolveSpaceName(notify.space(), method));
-                if (method.getReturnType() != void.class) {
-                    produces.add(schemas.register(method.getReturnType()));
+                for (Class<?> produced : producedTypes(method, notify.produces())) {
+                    produces.add(schemas.register(produced));
                 }
-                actions.add(action(method, notify.description(), List.of(schema),
+                actions.add(action(method, notify.produces(), notify.description(), List.of(schema),
                         resolveSpaceName(notify.space(), method), CardAction.NOTIFY));
                 handle.subscriptions.add(subscribe(agent, method, notify, entryType, handle));
             }
-            Ballot ballot = method.getAnnotation(Ballot.class);
+            Ballot ballot = annotationOf(method, Ballot.class);
             if (ballot != null && owns(ballot.group())) {
                 requireSignature(method, 1, "a @Ballot method takes the VoteCapability.Proposal parameter");
                 if (method.getParameterTypes()[0] != VoteCapability.Proposal.class
@@ -433,35 +478,133 @@ public final class AgentBinder implements AutoCloseable {
                         resolveVoteSpaceName(ballot.space(), method), CardAction.BALLOT));
                 handle.subscriptions.add(castBallots(agent, method, ballot, handle));
             }
-            OnDecision onDecision = method.getAnnotation(OnDecision.class);
+            OnDecision onDecision = annotationOf(method, OnDecision.class);
             if (onDecision != null && owns(onDecision.group())) {
                 requireSignature(method, 1, "an @OnDecision method takes the VoteCapability.Decision parameter");
                 if (method.getParameterTypes()[0] != VoteCapability.Decision.class) {
                     throw new IllegalArgumentException(
                             "an @OnDecision method takes a VoteCapability.Decision: " + method);
                 }
-                if (method.getReturnType() != void.class) {
-                    produces.add(schemas.register(method.getReturnType()));
+                for (Class<?> produced : producedTypes(method, new Class<?>[0])) {
+                    produces.add(schemas.register(produced));
                 }
-                actions.add(action(method, "",
+                actions.add(action(method, new Class<?>[0], "",
                         List.of(schemas.register(VoteCapability.Decision.class)),
                         resolveVoteSpaceName(onDecision.space(), method), CardAction.ON_DECISION));
                 handle.subscriptions.add(watchDecisions(agent, method, onDecision, handle));
             }
-            OrderedTake orderedTake = method.getAnnotation(OrderedTake.class);
+            OrderedTake orderedTake = annotationOf(method, OrderedTake.class);
             if (orderedTake != null && owns(orderedTake.group())) {
                 requireSignature(method, 1, "an @OrderedTake method takes the entry parameter");
                 Class<?> entryType = method.getParameterTypes()[0];
                 String schema = schemas.register(entryType);
                 consumes.add(schema);
                 spaceBindings.put(schema, resolveCoordinatedSpaceName(orderedTake.space(), method));
-                if (method.getReturnType() != void.class) {
-                    produces.add(schemas.register(method.getReturnType()));
+                for (Class<?> produced : producedTypes(method, orderedTake.produces())) {
+                    produces.add(schemas.register(produced));
                 }
-                actions.add(action(method, orderedTake.description(), List.of(schema),
+                actions.add(action(method, orderedTake.produces(), orderedTake.description(), List.of(schema),
                         resolveCoordinatedSpaceName(orderedTake.space(), method),
                         CardAction.ORDERED_TAKE));
                 handle.threads.add(startOrderedTakeLoop(agent, method, orderedTake, handle));
+            }
+            SpaceJoin join = annotationOf(method, SpaceJoin.class);
+            if (join != null && owns(join.group())) {
+                requireSignature(method, 1, "a @SpaceJoin method takes the Joined parameter");
+                if (method.getParameterTypes()[0] != Joined.class) {
+                    throw new IllegalArgumentException("a @SpaceJoin method takes a Joined: " + method);
+                }
+                String spaceName = resolveSpaceName(join.space(), method);
+                List<String> consumed = new ArrayList<>();
+                for (Part part : join.parts()) {
+                    String schema = schemas.register(part.value());
+                    consumed.add(schema);
+                    consumes.add(schema);
+                    spaceBindings.putIfAbsent(schema, part.space().isEmpty()
+                            ? spaceName : resolveSpaceName(part.space(), method));
+                }
+                for (Class<?> produced : producedTypes(method, join.produces())) {
+                    produces.add(schemas.register(produced));
+                }
+                actions.add(action(method, join.produces(), join.description(), consumed, spaceName,
+                        CardAction.JOIN));
+                handle.closeables.add(startJoin(agent, method, join, handle, spaceName));
+            }
+            SpaceReduce reduce = annotationOf(method, SpaceReduce.class);
+            if (reduce != null && owns(reduce.group())) {
+                requireSignature(method, 2, "a @SpaceReduce method takes the accumulator and the element");
+                Class<?> accumulatorType = method.getParameterTypes()[0];
+                Class<?> elementType = method.getParameterTypes()[1];
+                if (accumulatorType.isPrimitive() || method.getReturnType() == void.class
+                        || !(method.getReturnType() == accumulatorType || method.getReturnType() == Tagged.class
+                                || method.getReturnType() == Entries.class)) {
+                    throw new IllegalArgumentException("a @SpaceReduce method takes (A accumulator, E element) and"
+                            + " returns A, Tagged<A>, or Entries: " + method);
+                }
+                String spaceName = resolveSpaceName(reduce.space(), method);
+                String schema = schemas.register(elementType);
+                consumes.add(schema);
+                spaceBindings.putIfAbsent(schema, spaceName);
+                produces.add(schemas.register(accumulatorType));
+                for (Class<?> produced : producedTypes(method, reduce.produces())) {
+                    produces.add(schemas.register(produced));
+                }
+                CardAction base = action(method, reduce.produces(), reduce.description(), List.of(schema),
+                        spaceName, CardAction.REDUCE);
+                List<String> produced = new ArrayList<>(base.produces());
+                if (!produced.contains(schemas.register(accumulatorType))) {
+                    produced.add(0, schemas.register(accumulatorType));
+                }
+                actions.add(new CardAction(base.name(), base.description(), base.consumes(), produced,
+                        base.space(), base.kind()));
+                handle.closeables.add(startReduce(agent, method, reduce, handle, spaceName, accumulatorType,
+                        elementType));
+            }
+            OnEstimate onEstimate = annotationOf(method, OnEstimate.class);
+            if (onEstimate != null && owns(onEstimate.group())) {
+                requireSignature(method, 1, "an @OnEstimate method takes the PushSumAggregate.Estimate parameter");
+                if (method.getParameterTypes()[0] != PushSumAggregate.Estimate.class) {
+                    throw new IllegalArgumentException(
+                            "an @OnEstimate method takes a PushSumAggregate.Estimate: " + method);
+                }
+                if (aggregate == null) {
+                    throw new IllegalArgumentException("@OnEstimate at " + method + " but no aggregate is"
+                            + " registered; register it with binder.aggregate(aggregate) or"
+                            + " group.provide(aggregate)");
+                }
+                for (Class<?> produced : producedTypes(method, new Class<?>[0])) {
+                    produces.add(schemas.register(produced));
+                }
+                String estimateResultSpace = writesAnEntry(method)
+                        ? resolveSpaceName(onEstimate.resultSpace(), method) : null;
+                actions.add(action(method, new Class<?>[0], onEstimate.description(), List.of(),
+                        estimateResultSpace, CardAction.ON_ESTIMATE));
+                handle.closeables.add(startEstimateWatch(agent, method, onEstimate, handle, estimateResultSpace));
+            }
+            Propose propose = annotationOf(method, Propose.class);
+            if (propose != null && owns(propose.group())) {
+                requireSignature(method, 1, "a @Propose method takes the cue parameter");
+                Class<?> cueType = method.getParameterTypes()[0];
+                String cueSchema = schemas.register(cueType);
+                String proposalSchema = schemas.register(VoteCapability.Proposal.class);
+                String cueSpaceName = resolveSpaceName(propose.space(), method);
+                consumes.add(cueSchema);
+                produces.add(proposalSchema);
+                spaceBindings.putIfAbsent(cueSchema, cueSpaceName);
+                spaceBindings.putIfAbsent(proposalSchema, resolveVoteSpaceName(propose.vote(), method));
+                actions.add(new CardAction(method.getName(), propose.description(), List.of(cueSchema),
+                        List.of(proposalSchema), cueSpaceName, CardAction.PROPOSE));
+                handle.subscriptions.add(startPropose(agent, method, propose, handle, cueSpaceName));
+            }
+        }
+        // ISSUE-Motion FR-7: a declared Motion return produces a Proposal into the
+        // vote space, which bind time knows only when there is exactly one.
+        if (votes.size() == 1) {
+            for (Method method : type.getMethods()) {
+                if (method.getReturnType() == Motion.class && hasBindingAnnotation(method)) {
+                    spaceBindings.putIfAbsent(schemas.register(VoteCapability.Proposal.class),
+                            votes.keySet().iterator().next());
+                }
             }
         }
 
@@ -546,6 +689,8 @@ public final class AgentBinder implements AutoCloseable {
         private final ai.badmonkey.agentspaces.api.spi.AgentIdentity identity;
         private final List<Thread> threads = new ArrayList<>();
         private final List<Subscription> subscriptions = new ArrayList<>();
+        /** Bindings that own their own threads and subscriptions (joins). */
+        private final List<AutoCloseable> closeables = new ArrayList<>();
         private volatile boolean running = true;
         private volatile AgentCard card;
 
@@ -579,6 +724,13 @@ public final class AgentBinder implements AutoCloseable {
             running = false;
             threads.forEach(Thread::interrupt);
             subscriptions.forEach(Subscription::close);
+            for (AutoCloseable closeable : closeables) {
+                try {
+                    closeable.close();
+                } catch (Exception e) {
+                    LOG.log(System.Logger.Level.DEBUG, agentId.localName() + ": close failed", e);
+                }
+            }
         }
     }
 
@@ -602,11 +754,10 @@ public final class AgentBinder implements AutoCloseable {
         Lease takeLease = Lease.of(Durations.parse(take.lease()));
         Duration pollTimeout = Durations.parse(take.pollTimeout());
         Lease resultLease = Lease.of(Durations.parse(take.resultLease()));
-        boolean hasResult = method.getReturnType() != void.class;
         String label = handle.agentId.localName() + "." + method.getName();
+        Template<?> template = templateFor(entryType, take.tags(), take.where(), method);
 
         return Thread.ofVirtual().name("space-take-" + label).start(() -> {
-            Template<?> template = Template.of(entryType);
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
@@ -625,17 +776,7 @@ public final class AgentBinder implements AutoCloseable {
                     Object result = invokeWithin(new TakeContext(taken.get(),
                             takeLease.duration(), handle.agentId, space.name()),
                             agent, method, taken.get().entry());
-                    if (result instanceof Contribution contribution) {
-                        space.complete(taken.get());
-                        contribute(contribution, label);
-                    } else if (hasResult && result != null && resultSpace == space) {
-                        space.complete(taken.get(), result, resultLease);
-                    } else {
-                        space.complete(taken.get());
-                        if (hasResult && result != null) {
-                            resultSpace.write(result, resultLease);
-                        }
-                    }
+                    dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
                 } catch (RuntimeException | Error e) {
                     // The crash idiom: no complete, the TAKE lease lapses, and the
                     // entry reappears for another worker (spec §7.2). Errors are
@@ -656,12 +797,47 @@ public final class AgentBinder implements AutoCloseable {
                 : spaceFor(handle.identity, notify.resultSpace(), method);
         Lease lease = Lease.of(Durations.parse(notify.lease()));
         Lease resultLease = Lease.of(Durations.parse(notify.resultLease()));
-        boolean hasResult = method.getReturnType() != void.class;
         // Delivery is at-least-once; the binder carries the choreography
-        // discipline so the method body never has to: dedupe per entry id,
+        // discipline so the method body never has to: dedupe per entry id (watch),
         // then run the reaction on its own virtual thread so slow work never
         // holds the fabric's delivery thread, and write a non-null result back
         // as the next entry in the flow.
+        String label = agent.getClass().getSimpleName() + "." + method.getName();
+        Template<?> template = templateFor(entryType, notify.tags(), notify.where(), method);
+        if (notify.on().length == 0) {
+            throw new IllegalArgumentException("@SpaceNotify at " + method + " reacts to no event kind");
+        }
+        return watch(space, template, lease, handle, "space-notify", label, Set.of(notify.on()), spaceEvent ->
+                Thread.ofVirtual().name("space-notify-" + label).start(() -> {
+                    try {
+                        Object result = invoke(agent, method, spaceEvent.entry());
+                        dispatch(result, null, resultSpace, resultLease, null, handle, method, label);
+                    } catch (RuntimeException e) {
+                        LOG.log(System.Logger.Level.WARNING, label + ": notify failed", e);
+                    }
+                }));
+    }
+
+    /**
+     * The leased, deduplicated subscription every reacting binding shares
+     * ({@code @SpaceNotify}, {@code @Propose}): WRITTEN events only, each entry
+     * id delivered once per binding against a bounded set, and the subscription
+     * renewed at half-lease on a virtual thread while the agent stays bound, so
+     * a long-lived reactor never goes deaf when its lease would otherwise lapse
+     * (spec §7.2). The reaction runs on the delivery thread; callers hand off to
+     * their own virtual thread.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private Subscription watch(Space space, Template<?> template, Lease lease, Bound handle,
+                               String threadPrefix, String label,
+                               java.util.function.Consumer<SpaceEvent<?>> onWritten) {
+        return watch(space, template, lease, handle, threadPrefix, label,
+                Set.of(SpaceEvent.Kind.WRITTEN), onWritten);
+    }
+
+    private Subscription watch(Space space, Template<?> template, Lease lease, Bound handle,
+                               String threadPrefix, String label, Set<SpaceEvent.Kind> kinds,
+                               java.util.function.Consumer<SpaceEvent<?>> onEvent) {
         Set<Object> seen = java.util.Collections.newSetFromMap(
                 new java.util.LinkedHashMap<>() {
                     @Override
@@ -669,35 +845,24 @@ public final class AgentBinder implements AutoCloseable {
                         return size() > NOTIFY_DEDUP_CAPACITY;
                     }
                 });
-        String label = agent.getClass().getSimpleName() + "." + method.getName();
-        Subscription subscription = space.notify((Template) Template.of(entryType), event -> {
+        Subscription subscription = space.notify((Template) template, event -> {
             SpaceEvent<?> spaceEvent = (SpaceEvent<?>) event;
-            if (spaceEvent.kind() != SpaceEvent.Kind.WRITTEN) {
+            if (!kinds.contains(spaceEvent.kind())) {
                 return;
             }
+            // Once per entry per kind: a WRITTEN and a later EXPIRED of one entry are
+            // two deliveries; a redelivered WRITTEN is not.
+            Object key = kinds.size() == 1 ? spaceEvent.entryId()
+                    : spaceEvent.entryId().value() + ":" + spaceEvent.kind();
             synchronized (seen) {
-                if (!seen.add(spaceEvent.entryId())) {
-                    return; // redelivery of an entry this agent already handled
+                if (!seen.add(key)) {
+                    return; // redelivery of an event this agent already handled
                 }
             }
-            Thread.ofVirtual().name("space-notify-" + label).start(() -> {
-                try {
-                    Object result = invoke(agent, method, spaceEvent.entry());
-                    if (result instanceof Contribution contribution) {
-                        contribute(contribution, label);
-                    } else if (hasResult && result != null) {
-                        resultSpace.write(result, resultLease);
-                    }
-                } catch (RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, label + ": notify failed", e);
-                }
-            });
+            onEvent.accept(spaceEvent);
         }, lease);
-        // The subscription is leased (spec §7.2): renew it at half-lease while the
-        // agent stays bound, so a long-lived reactor never goes deaf when its
-        // lease would otherwise lapse. Closing the handle interrupts this thread.
         long halfLeaseMillis = Math.max(1L, lease.duration().toMillis() / 2);
-        handle.threads.add(Thread.ofVirtual().name("space-notify-renew-" + label).start(() -> {
+        handle.threads.add(Thread.ofVirtual().name(threadPrefix + "-renew-" + label).start(() -> {
             while (handle.running) {
                 try {
                     Thread.sleep(halfLeaseMillis);
@@ -720,13 +885,147 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     /**
+     * The {@code @Propose} runtime (ISSUE-Propose §9.3): the cue watched as a
+     * notify is, the proposal id derived from the cue's key, the method invoked
+     * once per proposal id per bound agent, the vote opened once per replica,
+     * as the bound agent.
+     */
+    private Subscription startPropose(Object agent, Method method, Propose propose, Bound handle,
+                                      String cueSpaceName) {
+        Class<?> returnType = method.getReturnType();
+        if (returnType != String.class && returnType != Motion.class && returnType != void.class) {
+            throw new IllegalArgumentException("a @Propose method returns the question as a String,"
+                    + " a Motion, or void: " + method);
+        }
+        if (propose.options().length < 2) {
+            throw new IllegalArgumentException("@Propose needs at least two options at " + method);
+        }
+        if (propose.quorum() <= 0) {
+            throw new IllegalArgumentException("@Propose quorum must be positive at " + method
+                    + ": " + propose.quorum());
+        }
+        boolean byTag = !propose.keyTag().isEmpty();
+        if (byTag && propose.key().length > 0) {
+            throw new IllegalArgumentException("@Propose at " + method
+                    + " names both key and keyTag; choose one");
+        }
+        boolean keyed = byTag || propose.key().length > 0;
+        if (!keyed && returnType != Motion.class) {
+            throw new IllegalArgumentException("@Propose at " + method + " names no key or keyTag;"
+                    + " the proposal id needs one, or the method returns a Motion carrying its own");
+        }
+        Class<?> cueType = method.getParameterTypes()[0];
+        List<Method> accessors = byTag ? List.of() : Keys.accessors(cueType, propose.key());
+        String voteSpaceName = resolveVoteSpaceName(propose.vote(), method);
+        VoteCapability vote = voteFor(handle.identity, voteSpaceName);
+        Space cueSpace = spaceFor(handle.identity, cueSpaceName, method);
+        Template<?> template = templateFor(cueType, propose.tags(), propose.where(), method);
+        Lease proposalLease = Lease.of(Durations.parse(propose.lease()));
+        Lease subscriptionLease = Lease.of(Durations.parse(propose.subscriptionLease()));
+        List<String> options = List.of(propose.options());
+        String label = handle.agentId.localName() + "." + method.getName();
+        Set<String> opened = java.util.Collections.newSetFromMap(
+                new java.util.LinkedHashMap<>() {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+                        return size() > NOTIFY_DEDUP_CAPACITY;
+                    }
+                });
+        return watch(cueSpace, template, subscriptionLease, handle, "space-propose", label, event -> {
+            String key = !keyed ? null
+                    : byTag ? event.tags().get(propose.keyTag()) : Keys.keyOf(event.entry(), accessors);
+            if (keyed && key == null) {
+                LOG.log(System.Logger.Level.DEBUG, label + ": the cue carries no key; no proposal");
+                return;
+            }
+            String proposalId = keyed ? propose.prefix() + key : null;
+            if (proposalId != null) {
+                synchronized (opened) {
+                    if (!opened.add(proposalId)) {
+                        return; // another cue of the same proposal: the lead has already asked
+                    }
+                }
+            }
+            Thread.ofVirtual().name("space-propose-" + label).start(() -> {
+                try {
+                    if (proposalId != null && vote.proposal(proposalId).isPresent()) {
+                        LOG.log(System.Logger.Level.DEBUG, label + ": proposal '" + proposalId
+                                + "' already open; nothing proposed");
+                        return;
+                    }
+                    Object result = invoke(agent, method, event.entry());
+                    if (result == null) {
+                        if (proposalId != null) {
+                            synchronized (opened) {
+                                opened.remove(proposalId); // asked nothing: the next cue may ask
+                            }
+                        }
+                        return;
+                    }
+                    if (result instanceof Motion motion) {
+                        move(motion, handle, method, label, voteSpaceName);
+                        return;
+                    }
+                    vote.propose(proposalId, (String) result, options, propose.quorum(), proposalLease);
+                } catch (RuntimeException e) {
+                    if (proposalId != null) {
+                        synchronized (opened) {
+                            opened.remove(proposalId); // a refused open may be retried by the next cue
+                        }
+                    }
+                    LOG.log(System.Logger.Level.WARNING, label + ": propose failed", e);
+                }
+            });
+        });
+    }
+
+    /** Whether a method carries any binding annotation whose return goes through {@link #dispatch}. */
+    private static boolean hasBindingAnnotation(Method method) {
+        return annotationOf(method, SpaceTake.class) != null || annotationOf(method, SpaceNotify.class) != null
+                || annotationOf(method, OrderedTake.class) != null || annotationOf(method, OnDecision.class) != null
+                || annotationOf(method, SpaceJoin.class) != null || annotationOf(method, Propose.class) != null
+                || annotationOf(method, OnEstimate.class) != null || annotationOf(method, SpaceReduce.class) != null;
+    }
+
+    /** Whether a method's declared return is something the binder writes as an entry. */
+    private static boolean writesAnEntry(Method method) {
+        Class<?> returned = method.getReturnType();
+        return returned != void.class && returned != Contribution.class && returned != Motion.class;
+    }
+
+    /**
+     * The {@code @OnEstimate} runtime (ISSUE-OnEstimate §9.4): the aggregate
+     * evaluates the settle rule on its own tick and calls back once per epoch
+     * on a virtual thread; the binder dispatches the return as for any binding.
+     */
+    private AutoCloseable startEstimateWatch(Object agent, Method method, OnEstimate on, Bound handle,
+                                             String resultSpaceName) {
+        Space resultSpace = resultSpaceName == null ? null
+                : spaceFor(handle.identity, resultSpaceName, method);
+        Lease resultLease = Lease.of(Durations.parse(on.resultLease()));
+        String label = handle.agentId.localName() + "." + method.getName();
+        return aggregate.onEstimate(id -> id.startsWith(on.prefix()),
+                PushSumAggregate.Settle.after(on.settleTicks(), on.tolerance()), estimate -> {
+                    try {
+                        Object result = invoke(agent, method, estimate);
+                        dispatch(result, null, resultSpace, resultLease, null, handle, method, label);
+                    } catch (RuntimeException e) {
+                        LOG.log(System.Logger.Level.WARNING, label + ": estimate reaction failed", e);
+                    }
+                });
+    }
+
+    /**
      * One declared action for a bound method (SPEC §6.1, v0.1.13): what it
      * consumes, what its return type produces, where it is bound.
      */
-    private CardAction action(Method method, String description, List<String> consumed,
-                              String space, String kind) {
-        List<String> produced = method.getReturnType() == void.class
-                ? List.of() : List.of(schemas.register(method.getReturnType()));
+    private CardAction action(Method method, Class<?>[] declaredProduces, String description,
+                              List<String> consumed, String space, String kind) {
+        requireCapabilityForDeclaredReturn(method);
+        List<String> produced = new ArrayList<>();
+        for (Class<?> type : producedTypes(method, declaredProduces)) {
+            produced.add(schemas.register(type));
+        }
         return new CardAction(method.getName(), description, consumed, produced, space, kind);
     }
 
@@ -809,6 +1108,16 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     private static Spec findSpec(Class<?> type) {
+        for (Class<?> candidate : supertypes(type)) {
+            Spec spec = declaredSpec(candidate);
+            if (spec != null) {
+                return spec;
+            }
+        }
+        return null;
+    }
+
+    private static Spec declaredSpec(Class<?> type) {
         AgentSpec direct = type.getAnnotation(AgentSpec.class);
         if (direct != null) {
             return new Spec(direct.name(), direct.description(), List.of(direct.goals()));
@@ -823,6 +1132,62 @@ public final class AgentBinder implements AutoCloseable {
                     goalsAttribute(composed));
         }
         return null;
+    }
+
+    /**
+     * A binding annotation on a method, or on the same-signature method of a
+     * supertype (SPEC §10.3): the class itself first, then its superclasses,
+     * then its interfaces, so an object that implements an annotated
+     * interface binds as if it carried the annotations itself. That is how a
+     * {@code java.lang.reflect.Proxy}, a LangChain4j {@code AiServices}
+     * proxy, a Clojure {@code reify}, or a Kotlin object joins the fleet:
+     * Java inherits no method annotation on its own, and the interface is the
+     * natural place to declare what the fleet sees. The first declaration in
+     * that order wins.
+     *
+     * @param method     the method on the bound object's class
+     * @param annotation the annotation type
+     * @param <A>        the annotation type
+     * @return the annotation, or null
+     */
+    static <A extends java.lang.annotation.Annotation> A annotationOf(Method method, Class<A> annotation) {
+        A own = method.getAnnotation(annotation);
+        if (own != null) {
+            return own;
+        }
+        for (Class<?> candidate : supertypes(method.getDeclaringClass())) {
+            if (candidate == method.getDeclaringClass()) {
+                continue;
+            }
+            try {
+                A inherited = candidate.getMethod(method.getName(), method.getParameterTypes())
+                        .getAnnotation(annotation);
+                if (inherited != null) {
+                    return inherited;
+                }
+            } catch (NoSuchMethodException e) {
+                // the supertype declares no such method; keep looking
+            }
+        }
+        return null;
+    }
+
+    /** The class, its superclasses (nearest first), then every interface, each once. */
+    static List<Class<?>> supertypes(Class<?> type) {
+        List<Class<?>> ordered = new ArrayList<>();
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            ordered.add(c);
+        }
+        java.util.ArrayDeque<Class<?>> queue = new java.util.ArrayDeque<>(ordered);
+        while (!queue.isEmpty()) {
+            for (Class<?> iface : queue.poll().getInterfaces()) {
+                if (!ordered.contains(iface)) {
+                    ordered.add(iface);
+                    queue.add(iface);
+                }
+            }
+        }
+        return ordered;
     }
 
     private static String stringAttribute(java.lang.annotation.Annotation composed,
@@ -996,17 +1361,12 @@ public final class AgentBinder implements AutoCloseable {
                 : spaceFor(handle.identity, onDecision.resultSpace(), method);
         Lease lease = Lease.of(Durations.parse(onDecision.lease()));
         Lease resultLease = Lease.of(Durations.parse(onDecision.resultLease()));
-        boolean hasResult = method.getReturnType() != void.class;
         String label = handle.agentId.localName() + "." + method.getName();
         Subscription subscription = vote.onDecision(id -> id.startsWith(onDecision.prefix()), decision ->
                 Thread.ofVirtual().name("space-decision-" + label).start(() -> {
                     try {
                         Object result = invoke(agent, method, decision);
-                        if (result instanceof Contribution contribution) {
-                            contribute(contribution, label);
-                        } else if (hasResult && result != null) {
-                            resultSpace.write(result, resultLease);
-                        }
+                        dispatch(result, null, resultSpace, resultLease, null, handle, method, label);
                     } catch (RuntimeException e) {
                         LOG.log(System.Logger.Level.WARNING, label + ": decision reaction failed", e);
                     }
@@ -1049,10 +1409,9 @@ public final class AgentBinder implements AutoCloseable {
         Lease takeLease = Lease.of(Durations.parse(take.lease()));
         Duration pollTimeout = Durations.parse(take.pollTimeout());
         Lease resultLease = Lease.of(Durations.parse(take.resultLease()));
-        boolean hasResult = method.getReturnType() != void.class;
         String label = handle.agentId.localName() + "." + method.getName();
+        Template<?> template = templateFor(entryType, take.tags(), take.where(), method);
         return Thread.ofVirtual().name("space-ordered-take-" + label).start(() -> {
-            Template<?> template = Template.of(entryType);
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
@@ -1070,17 +1429,7 @@ public final class AgentBinder implements AutoCloseable {
                     Object result = invokeWithin(new TakeContext(taken.get(),
                             takeLease.duration(), handle.agentId, spaceName),
                             agent, method, taken.get().entry());
-                    if (result instanceof Contribution contribution) {
-                        space.complete(taken.get());
-                        contribute(contribution, label);
-                    } else if (hasResult && result != null && resultSpace == space) {
-                        space.complete(taken.get(), result, resultLease);
-                    } else {
-                        space.complete(taken.get());
-                        if (hasResult && result != null) {
-                            resultSpace.write(result, resultLease);
-                        }
-                    }
+                    dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
                 } catch (RuntimeException | Error e) {
                     // The crash idiom, exactly once: no complete, the TAKE lease
                     // lapses, and the log's next committed claim reassigns the entry.
@@ -1165,34 +1514,64 @@ public final class AgentBinder implements AutoCloseable {
         for (Method method : type.getMethods()) {
             // An empty resultSpace means "the take space", never an inferred
             // name, so only a named result space is a requirement of its own.
-            SpaceTake take = method.getAnnotation(SpaceTake.class);
+            SpaceTake take = annotationOf(method, SpaceTake.class);
             if (take != null) {
                 declared.add(new Declared(take.group(), take.resultSpace().isEmpty()
                         ? List.of(take.space()) : List.of(take.space(), take.resultSpace())));
             }
-            SpaceNotify notify = method.getAnnotation(SpaceNotify.class);
+            SpaceNotify notify = annotationOf(method, SpaceNotify.class);
             if (notify != null) {
                 declared.add(new Declared(notify.group(), notify.resultSpace().isEmpty()
                         ? List.of(notify.space())
                         : List.of(notify.space(), notify.resultSpace())));
             }
-            BidFunction bid = method.getAnnotation(BidFunction.class);
+            BidFunction bid = annotationOf(method, BidFunction.class);
             if (bid != null) {
                 declared.add(new Declared(bid.group(), List.of(bid.space())));
             }
-            Ballot ballot = method.getAnnotation(Ballot.class);
+            Ballot ballot = annotationOf(method, Ballot.class);
             if (ballot != null) {
                 declared.add(new Declared(ballot.group(), List.of(ballot.space())));
             }
-            OnDecision decision = method.getAnnotation(OnDecision.class);
+            OnDecision decision = annotationOf(method, OnDecision.class);
             if (decision != null) {
                 declared.add(new Declared(decision.group(), decision.resultSpace().isEmpty()
                         ? List.of(decision.space()) : List.of(decision.space(), decision.resultSpace())));
             }
-            OrderedTake ordered = method.getAnnotation(OrderedTake.class);
+            OrderedTake ordered = annotationOf(method, OrderedTake.class);
             if (ordered != null) {
                 declared.add(new Declared(ordered.group(), ordered.resultSpace().isEmpty()
                         ? List.of(ordered.space()) : List.of(ordered.space(), ordered.resultSpace())));
+            }
+            SpaceJoin join = annotationOf(method, SpaceJoin.class);
+            if (join != null) {
+                List<String> names = new ArrayList<>();
+                names.add(join.space());
+                if (!join.resultSpace().isEmpty()) {
+                    names.add(join.resultSpace());
+                }
+                for (Part part : join.parts()) {
+                    if (!part.space().isEmpty()) {
+                        names.add(part.space());
+                    }
+                }
+                declared.add(new Declared(join.group(), names));
+            }
+            Propose propose = annotationOf(method, Propose.class);
+            if (propose != null) {
+                declared.add(new Declared(propose.group(), propose.vote().isEmpty()
+                        ? List.of(propose.space()) : List.of(propose.space(), propose.vote())));
+            }
+            OnEstimate onEstimate = annotationOf(method, OnEstimate.class);
+            if (onEstimate != null) {
+                declared.add(new Declared(onEstimate.group(),
+                        writesAnEntry(method) ? List.of(onEstimate.resultSpace()) : List.of()));
+            }
+            SpaceReduce reduce = annotationOf(method, SpaceReduce.class);
+            if (reduce != null) {
+                // The accumulator lives in the reduce's own space; a class whose only
+                // binding is a reduce has bindings too (found by the Micronaut enroller).
+                declared.add(new Declared(reduce.group(), List.of(reduce.space())));
             }
         }
         for (Class<?> at = type; at != null && at != Object.class; at = at.getSuperclass()) {
@@ -1206,9 +1585,339 @@ public final class AgentBinder implements AutoCloseable {
         return declared;
     }
 
-    private static Object invoke(Object agent, Method method, Object argument) {
+    // ------------------------------------------------ tags, Tagged returns, joins (issue #16)
+
+    /**
+     * The method's template: its parameter type plus the tag filters the
+     * annotation declares, each {@code "key=value"} or {@code "key"}, judged by
+     * the space before the payload is decoded (SPEC §7.2).
+     */
+    private static Template<?> templateFor(Class<?> type, String[] tags, String[] where, Object site) {
+        Template<?> template = Template.of(type);
+        for (String filter : tags) {
+            int at = filter.indexOf('=');
+            String key = at < 0 ? filter : filter.substring(0, at);
+            if (key.isBlank()) {
+                throw new IllegalArgumentException("malformed tag filter '" + filter + "' at " + site
+                        + "; use \"key=value\" or \"key\"");
+            }
+            template = at < 0 ? template.hasTag(key)
+                    : template.whereTag(key, Matchers.eq(filter.substring(at + 1)));
+        }
+        // Field filters (ISSUE-WorkflowVerbs): the field's string form against the
+        // literal, the rule a join key uses, so numbers and enums read as written.
+        for (String filter : where) {
+            int at = filter.indexOf("!=");
+            boolean negated = at >= 0;
+            if (!negated) {
+                at = filter.indexOf('=');
+            }
+            String field = at < 0 ? "" : filter.substring(0, at);
+            if (at < 0 || field.isBlank()) {
+                throw new IllegalArgumentException("malformed field filter '" + filter + "' at " + site
+                        + "; use \"field=value\" or \"field!=value\"");
+            }
+            String value = filter.substring(at + (negated ? 2 : 1));
+            template = template.where(field, Matchers.predicate(v ->
+                    negated != value.equals(String.valueOf(v))));
+        }
+        return template;
+    }
+
+    /**
+     * What a method's return produces, for the card: the {@code Proposal} a
+     * {@link Motion} becomes; the entry type inside a {@link Tagged}; the
+     * permitted subclasses of a sealed return; the {@code produces} attribute's
+     * types for an {@link Entries} fork or an {@code Object} return (nothing when
+     * it is not given); else the return type itself.
+     */
+    private static List<Class<?>> producedTypes(Method method, Class<?>[] declaredProduces) {
+        Class<?> returned = method.getReturnType();
+        if (returned == void.class || returned == Contribution.class) {
+            return List.of();
+        }
+        if (returned == Motion.class) {
+            return List.of(VoteCapability.Proposal.class);  // a motion becomes a Proposal entry
+        }
+        if (returned == Entries.class || returned == Object.class) {
+            return List.of(declaredProduces);
+        }
+        if (returned == Tagged.class) {
+            Type generic = method.getGenericReturnType();
+            if (generic instanceof ParameterizedType parameterized
+                    && parameterized.getActualTypeArguments()[0] instanceof Class<?> wrapped) {
+                return List.of(wrapped);
+            }
+            throw new IllegalArgumentException("a method returning Tagged must declare the entry type,"
+                    + " e.g. Tagged<Finding>: " + method);
+        }
+        if (returned.isSealed()) {
+            return List.of(returned.getPermittedSubclasses());
+        }
+        return List.of(returned);
+    }
+
+    /** The one produced type a card-level binding needs, for the bindings that produce exactly one. */
+    private static Class<?> producedType(Method method) {
+        List<Class<?>> produced = producedTypes(method, new Class<?>[0]);
+        return produced.size() == 1 ? produced.get(0) : method.getReturnType();
+    }
+
+    /**
+     * The return handling every binding shares (ISSUE-Motion §10.3, issue #16).
+     * Null, and a void method, complete a take and write nothing; a
+     * {@link Contribution} goes to the aggregate; a {@link Tagged} entry is
+     * unwrapped and written with its tags; any other value is written as the
+     * next entry, atomically with the completion when the result space is the
+     * take space.
+     *
+     * @param space the take space, or null when nothing was taken
+     * @param taken the take to complete, or null for a reaction
+     */
+    private void dispatch(Object result, Space space, Space resultSpace, Lease resultLease,
+                          TakenEntry<?> taken, Bound handle, Method site, String label) {
+        if (result == null) {
+            if (taken != null) {
+                space.complete(taken);
+            }
+            return;
+        }
+        if (result instanceof Entries entries) {
+            // The fork (ISSUE-WorkflowVerbs): the take is completed once, then each
+            // element is dispatched as if returned alone. Not atomic across the
+            // elements; forked entries carry the input's id for the stage downstream.
+            if (taken != null) {
+                space.complete(taken);
+            }
+            for (Object element : entries.elements()) {
+                if (element instanceof Entries) {
+                    throw new IllegalArgumentException(label + " returned a fork inside a fork");
+                }
+                dispatch(element, null, resultSpace, resultLease, null, handle, site, label);
+            }
+            return;
+        }
+        if (result instanceof Contribution contribution) {
+            if (taken != null) {
+                space.complete(taken);
+            }
+            contribute(contribution, label);
+            return;
+        }
+        if (result instanceof Motion motion) {
+            // ISSUE-Motion FR-4: the take is finished before the vote is opened, so
+            // a failed open cannot make a completed task reappear.
+            if (taken != null) {
+                space.complete(taken);
+            }
+            move(motion, handle, site, label, null);
+            return;
+        }
+        Object entry = result;
+        Map<String, String> tags = Map.of();
+        if (result instanceof Tagged<?> tagged) {
+            entry = tagged.entry();
+            tags = tagged.tags();
+            if (entry instanceof Contribution || entry instanceof Motion || entry instanceof Entries) {
+                throw new IllegalArgumentException(label + " returned a Tagged "
+                        + entry.getClass().getSimpleName() + "; it is not an entry and carries no tags");
+            }
+        }
+        if (taken != null && resultSpace == space) {
+            if (tags.isEmpty()) {
+                space.complete(taken, entry, resultLease);
+            } else {
+                space.complete(taken, entry, resultLease, tags);
+            }
+            return;
+        }
+        if (taken != null) {
+            space.complete(taken);
+        }
+        if (tags.isEmpty()) {
+            resultSpace.write(entry, resultLease);
+        } else {
+            resultSpace.write(entry, resultLease, tags);
+        }
+    }
+
+    /**
+     * Opens the vote a {@link Motion} names, as the bound agent, once per
+     * proposal id per replica (ISSUE-Motion §9.2).
+     *
+     * @param defaultVoteSpace the vote space to use when the motion names none,
+     *                         or null to infer the sole registered one
+     */
+    private void move(Motion motion, Bound handle, Method site, String label, String defaultVoteSpace) {
+        String spaceName = !motion.space().isEmpty() ? resolveVoteSpaceName(motion.space(), site)
+                : defaultVoteSpace != null ? defaultVoteSpace : resolveVoteSpaceName("", site);
+        VoteCapability vote = voteFor(handle.identity, spaceName);
+        if (vote.proposal(motion.proposalId()).isPresent()) {
+            LOG.log(System.Logger.Level.DEBUG, label + ": proposal '" + motion.proposalId()
+                    + "' already open; motion skipped");
+            return;
+        }
+        vote.propose(motion.proposalId(), motion.question(), motion.options(), motion.quorum(),
+                motion.lease());
+    }
+
+    /**
+     * A declared {@link Motion} or {@link Contribution} return buys the fail-fast
+     * (ISSUE-Motion FR-5, FR-6): the capability it needs must be registered when
+     * the method is bound, not when its first value comes back.
+     */
+    private void requireCapabilityForDeclaredReturn(Method method) {
+        if (method.getReturnType() == Motion.class && votes.isEmpty()) {
+            throw new IllegalArgumentException(method + " declares a Motion return but no vote"
+                    + " capability is registered; register it with binder.vote(\"votes\", vote) or"
+                    + " group.provide(vote)");
+        }
+        if (method.getReturnType() == Contribution.class && aggregate == null) {
+            throw new IllegalArgumentException(method + " declares a Contribution return but no"
+                    + " aggregate is registered; register it with binder.aggregate(aggregate) or"
+                    + " group.provide(aggregate)");
+        }
+    }
+
+    private JoinBinding startJoin(Object agent, Method method, SpaceJoin join, Bound handle,
+                                  String spaceName) {
+        boolean gathers = !join.settle().isEmpty() || java.util.Arrays.stream(join.parts())
+                .anyMatch(p -> p.atLeast() > 1 || !p.countedBy().isEmpty());
+        if (join.parts().length < 2 && !gathers) {
+            throw new IllegalArgumentException("a @SpaceJoin needs at least two parts, or one part that"
+                    + " gathers (atLeast, countedBy, or settle): " + method);
+        }
+        Space space = spaceFor(handle.identity, spaceName, method);
+        Space resultSpace = join.resultSpace().isEmpty() ? space
+                : spaceFor(handle.identity, join.resultSpace(), method);
+        List<JoinBinding.PartSpec> parts = new ArrayList<>();
+        for (Part part : join.parts()) {
+            if (!part.key().isEmpty() && !part.keyTag().isEmpty()) {
+                throw new IllegalArgumentException("part " + part.value().getSimpleName() + " of "
+                        + method + " names both key and keyTag; choose one");
+            }
+            boolean byField = part.keyTag().isEmpty();
+            String keyField = byField ? (part.key().isEmpty() ? join.key() : part.key()) : null;
+            if (byField) {
+                JoinBinding.PartSpec.accessor(part.value(), keyField); // fails fast, naming the field
+            }
+            Space partSpace = part.space().isEmpty() ? space
+                    : spaceFor(handle.identity, part.space(), method);
+            String countedByType = null;
+            String countedByField = null;
+            if (!part.countedBy().isEmpty()) {
+                int dot = part.countedBy().lastIndexOf('.');
+                if (dot <= 0 || dot == part.countedBy().length() - 1) {
+                    throw new IllegalArgumentException("part " + part.value().getSimpleName() + " of "
+                            + method + " has countedBy '" + part.countedBy()
+                            + "'; use \"SimpleTypeName.field\"");
+                }
+                countedByType = part.countedBy().substring(0, dot);
+                countedByField = part.countedBy().substring(dot + 1);
+            }
+            parts.add(new JoinBinding.PartSpec(part.value(),
+                    templateFor(part.value(), part.tags(), part.where(), method), partSpace, keyField,
+                    byField ? null : part.keyTag(), part.optional(), part.atLeast(), countedByType,
+                    countedByField));
+        }
+        OrderedTakes coordinator = null;
+        if (join.mode() == SpaceJoin.Mode.ORDERED) {
+            coordinator = coordinators.get(spaceName);
+            if (coordinator == null) {
+                throw new IllegalArgumentException("@SpaceJoin at " + method + " is ORDERED but space '"
+                        + spaceName + "' has no ordered-log coordinator; register it with"
+                        + " binder.ordered(\"" + spaceName + "\", OrderedTakes.over(...)) or"
+                        + " group.ordered(...); coordinated spaces: " + coordinators.keySet());
+            }
+            requireCoordinatorAgrees(coordinator, space, spaceName, handle, "@SpaceJoin");
+        }
+        String name = join.name().isEmpty()
+                ? handle.agentId.localName() + "." + method.getName() : join.name();
+        String label = handle.agentId.localName() + "." + method.getName();
+        Lease resultLease = Lease.of(Durations.parse(join.resultLease()));
+        JoinBinding.Config config = new JoinBinding.Config(name, join.mode(), space, parts,
+                Durations.parse(join.within()), join.maxOpen(),
+                Lease.of(Durations.parse(join.lease())), Lease.of(Durations.parse(join.ticketLease())),
+                Lease.of(Durations.parse(join.takeLease())), Durations.parse(join.pollTimeout()),
+                coordinator, join.settle().isEmpty() ? Duration.ZERO : Durations.parse(join.settle()));
+        JoinBinding binding = new JoinBinding(config, joined -> invoke(agent, method, joined),
+                result -> dispatch(result, null, resultSpace, resultLease, null, handle, method, label), clock);
+        binding.start();
+        return binding;
+    }
+
+    /** Resolves a {@code @SpaceReduce} and starts its binding (ISSUE-SpaceReduce §9.3). */
+    private ReduceBinding startReduce(Object agent, Method method, SpaceReduce reduce, Bound handle,
+                                      String spaceName, Class<?> accumulatorType, Class<?> elementType) {
+        if (!reduce.key().isEmpty() && !reduce.keyTag().isEmpty()) {
+            throw new IllegalArgumentException("@SpaceReduce at " + method + " names both key and keyTag; choose one");
+        }
+        if (!reduce.key().isEmpty()) {
+            try {
+                Keys.accessor(elementType, reduce.key());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(e.getMessage() + " as the reduce key at " + method, e);
+            }
+        }
+        Space space = spaceFor(handle.identity, spaceName, method);
+        String name = reduce.name().isEmpty()
+                ? handle.agentId.localName() + "." + method.getName() : reduce.name();
+        for (AutoCloseable other : handle.closeables) {
+            if (other instanceof JoinBinding join && join.name().equals(name)) {
+                throw new IllegalArgumentException("@SpaceReduce at " + method + " is named '" + name
+                        + "' like a @SpaceJoin on this agent; tickets would collide, name one of them");
+            }
+        }
+        OrderedTakes coordinator = null;
+        if (reduce.mode() == SpaceReduce.Mode.ORDERED) {
+            coordinator = coordinators.get(spaceName);
+            if (coordinator == null) {
+                throw new IllegalArgumentException("@SpaceReduce at " + method + " is ORDERED but space '"
+                        + spaceName + "' has no ordered-log coordinator; register it with"
+                        + " binder.ordered(\"" + spaceName + "\", OrderedTakes.over(...)) or"
+                        + " group.ordered(...); coordinated spaces: " + coordinators.keySet());
+            }
+            requireCoordinatorAgrees(coordinator, space, spaceName, handle, "@SpaceReduce");
+        }
+        String label = handle.agentId.localName() + "." + method.getName();
+        Lease accumulatorLease = Lease.of(Durations.parse(reduce.accumulatorLease()));
+        ReduceBinding.Config config = new ReduceBinding.Config(name, reduce.mode(), space, elementType,
+                templateFor(elementType, reduce.tags(), reduce.where(), method), accumulatorType,
+                reduce.key().isEmpty() ? null : reduce.key(), reduce.keyTag().isEmpty() ? null : reduce.keyTag(),
+                Lease.of(Durations.parse(reduce.lease())), Durations.parse(reduce.pollTimeout()), accumulatorLease,
+                Lease.of(Durations.parse(reduce.subscriptionLease())), reduce.maxOpen(), coordinator);
+        ReduceBinding binding = new ReduceBinding(config,
+                (accumulator, element) -> invoke(agent, method, accumulator, element),
+                other -> dispatch(other, null, space, accumulatorLease, null, handle, method, label), clock);
+        binding.start();
+        return binding;
+    }
+
+    /**
+     * The coordinator's claims name its holder and only a handle writing as that
+     * holder can complete them; an attested agent must take as itself (rule A6).
+     */
+    private void requireCoordinatorAgrees(OrderedTakes coordinator, Space space, String spaceName,
+                                          Bound handle, String what) {
+        if (handle.identity.isSubordinate()
+                && (!coordinator.holder().equals(handle.agentId) || !coordinator.signsAsHolder())) {
+            throw new IllegalArgumentException(what + " on attested agent "
+                    + handle.agentId.encoded() + " but the ordered coordinator for '" + spaceName
+                    + "' takes as " + coordinator.holder().encoded()
+                    + (coordinator.signsAsHolder() ? "" : " under the peer key") + "; build the coordinator"
+                    + " with OrderedTakes.over(..., agentIdentity, ...) for this agent");
+        }
+        if (space.writer().isPresent() && !space.writer().get().equals(coordinator.holder())) {
+            throw new IllegalArgumentException("the ordered coordinator for '" + spaceName
+                    + "' takes as " + coordinator.holder().encoded() + " but the registered space"
+                    + " writes as " + space.writer().get().encoded() + "; build both with the same"
+                    + " identity and agent name, or register the coordinator's own space");
+        }
+    }
+
+    private static Object invoke(Object agent, Method method, Object... arguments) {
         try {
-            return method.invoke(agent, argument);
+            return method.invoke(agent, arguments);
         } catch (IllegalAccessException e) {
             throw new IllegalStateException("inaccessible agent method: " + method, e);
         } catch (InvocationTargetException e) {

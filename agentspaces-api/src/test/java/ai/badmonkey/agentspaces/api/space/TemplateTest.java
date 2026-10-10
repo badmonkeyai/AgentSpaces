@@ -17,6 +17,8 @@ package ai.badmonkey.agentspaces.api.space;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
+
 import static ai.badmonkey.agentspaces.api.space.Matchers.contains;
 import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
 import static ai.badmonkey.agentspaces.api.space.Matchers.gt;
@@ -125,5 +127,78 @@ class TemplateTest {
         assertThat(base.matches(new Task("k", 1, null))).isTrue();
         assertThat(narrowed.matches(new Task("k", 1, null))).isFalse();
         assertThat(base).isNotSameAs(narrowed);
+    }
+
+    /** Issue #16 §9.2: tag predicates are evaluated against the record's tags. */
+    @Test
+    void tagConditionsMatchTheRecordsTags() {
+        assertThat(Template.of(Task.class).whereTag("region", eq("eu"))
+                .matchesTags(Map.of("region", "eu"))).isTrue();
+        assertThat(Template.of(Task.class).whereTag("region", eq("eu"))
+                .matchesTags(Map.of("region", "us"))).isFalse();
+        assertThat(Template.of(Task.class).whereTag("region", in("eu", "uk"))
+                .matchesTags(Map.of("region", "uk", "tier", "gold"))).isTrue();
+        assertThat(Template.of(Task.class).whereTag("rdf:type", contains("#Claim"))
+                .matchesTags(Map.of("rdf:type", "https://example.org/ns#Claim"))).isTrue();
+        assertThat(Template.of(Task.class)
+                .whereTag("region", eq("eu")).whereTag("tier", eq("gold"))
+                .matchesTags(Map.of("region", "eu"))).isFalse();
+    }
+
+    @Test
+    void hasTagRequiresTheKeyWhateverItsValue() {
+        Template<Task> template = Template.of(Task.class).hasTag("rdf:type");
+
+        assertThat(template.matchesTags(Map.of("rdf:type", "x"))).isTrue();
+        assertThat(template.matchesTags(Map.of("rdf:type", ""))).isTrue();
+        assertThat(template.matchesTags(Map.of("other", "x"))).isFalse();
+        assertThat(template.matchesTags(Map.of())).isFalse();
+    }
+
+    /** A missing key is presented to the matcher as null, so ordinary matchers fail on it. */
+    @Test
+    void aTagConditionOnAMissingKeyFails() {
+        assertThat(Template.of(Task.class).whereTag("region", eq("eu")).matchesTags(Map.of()))
+                .isFalse();
+        assertThat(Template.of(Task.class).whereTag("region", in("eu", "us"))
+                .matchesTags(Map.of("tier", "gold"))).isFalse();
+        assertThat(Template.of(Task.class).whereTag("region", contains("e")).matchesTags(Map.of()))
+                .isFalse();
+        // The one matcher that accepts an absent key, by design: isNull selects untagged entries.
+        assertThat(Template.of(Task.class).whereTag("region", isNull()).matchesTags(Map.of()))
+                .isTrue();
+    }
+
+    @Test
+    void matchesTagsWithNoTagConditionsIsTrue() {
+        assertThat(Template.of(Task.class).matchesTags(Map.of())).isTrue();
+        assertThat(Template.of(Task.class).where("priority", gte(5))
+                .matchesTags(Map.of("region", "eu"))).isTrue();
+    }
+
+    /** matches(Object) stays field-and-type only; the space applies the tag conditions. */
+    @Test
+    void tagConditionsAreExposedAndDoNotAffectFieldMatching() {
+        Template<Task> base = Template.of(Task.class).where("priority", gte(3));
+        Template<Task> tagged = base.whereTag("region", eq("eu")).hasTag("rdf:type");
+
+        assertThat(tagged.matches(new Task("k", 3, null))).isTrue();
+        assertThat(tagged.matches(new Task("k", 1, null))).isFalse();
+        assertThat(base.tagConditions()).isEmpty();
+        assertThat(tagged.tagConditions()).extracting(Template.TagCondition::key)
+                .containsExactly("region", "rdf:type");
+        assertThat(tagged.type()).isEqualTo(Task.class);
+        assertThat(base).isNotSameAs(tagged);
+        assertThatThrownBy(() -> Template.of(Task.class).whereTag(null, eq("x")))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> Template.of(Task.class).whereTag("k", null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void anUnknownFieldStillFailsFastOnATaggedTemplate() {
+        assertThatThrownBy(() -> Template.of(Task.class).hasTag("x").where("priorty", eq(1)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("priorty");
     }
 }

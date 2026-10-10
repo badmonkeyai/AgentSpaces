@@ -162,7 +162,7 @@ class GoldenVectorsConformanceTest {
         byte[] body = codec.toBytes(new Bodies.Ping(42));
         assertBytes(body, "ping_body_cbor");
 
-        Envelope ping = new Envelope(2, group, Envelope.Kind.PING, self, self, stamp, body);
+        Envelope ping = new Envelope(WireCodec.WIRE_VERSION, group, Envelope.Kind.PING, self, self, stamp, body);
         byte[] envelopeCbor = codec.toBytes(ping);
         assertBytes(envelopeCbor, "ping_envelope_cbor");
         assertBytes(identity.sign(envelopeCbor), "ping_envelope_signature");
@@ -173,7 +173,7 @@ class GoldenVectorsConformanceTest {
         assertThat(decoded.get().kind()).isEqualTo(Envelope.Kind.PING);
         assertThat(decoded.get().from()).isEqualTo(self);
         assertThat(decoded.get().to()).isEqualTo(self);
-        assertThat(decoded.get().ver()).isEqualTo(2);
+        assertThat(decoded.get().ver()).isEqualTo(WireCodec.WIRE_VERSION);
     }
 
     /** SPEC §4.1/§5: the membership introduction (PeerAdvertisement, SignedPeerAd, peers-stream rumor body) is byte-identical. */

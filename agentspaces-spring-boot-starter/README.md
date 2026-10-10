@@ -4,6 +4,7 @@ Add this starter and Spring Boot to an application, configure the
 `agentspaces` properties, and the fabric boots with the application:
 
 ```xml
+<!-- pom.xml, with the agentspaces-dependencies BOM imported (or add <version>0.2.0</version>) -->
 <dependency>
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces-spring-boot-starter</artifactId>
@@ -13,6 +14,26 @@ Add this starter and Spring Boot to an application, configure the
   <artifactId>spring-boot-starter</artifactId>
 </dependency>
 ```
+
+```kotlin
+// build.gradle.kts
+dependencies {
+    implementation(platform("ai.badmonkey.agentspaces:agentspaces-dependencies:0.2.0"))
+    implementation("ai.badmonkey.agentspaces:agentspaces-spring-boot-starter")
+    implementation("org.springframework.boot:spring-boot-starter")
+}
+```
+
+```groovy
+// build.gradle
+dependencies {
+    implementation platform('ai.badmonkey.agentspaces:agentspaces-dependencies:0.2.0')
+    implementation 'ai.badmonkey.agentspaces:agentspaces-spring-boot-starter'
+    implementation 'org.springframework.boot:spring-boot-starter'
+}
+```
+
+The artifacts are on Maven Central under `ai.badmonkey.agentspaces`; the root README's "Add it to your build" section covers the bill of materials and the other entry points.
 
 ```yaml
 agentspaces:

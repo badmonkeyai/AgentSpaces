@@ -129,6 +129,10 @@ class GoldenVectorsV0110ConformanceTest {
     record StoredAd(String adType, byte[] adBytes, byte[] publicKey, byte[] signature) {
     }
 
+    /** Mirrors ai.badmonkey.agentspaces.agent.join.JoinTicket (agentspaces-agent, not on this module's classpath; issue #16). */
+    record JoinTicket(String join, String key) {
+    }
+
     @BeforeAll
     @SuppressWarnings("unchecked")
     static void loadVectors() throws Exception {
@@ -228,7 +232,7 @@ class GoldenVectorsV0110ConformanceTest {
     /** SPEC §9: the GROUP_AD_WANT envelope and frame are byte-identical, decode, and carry the wanted group with an empty body. */
     @Test
     void groupAdWantFrameMatchesAndDecodes() {
-        Envelope want = new Envelope(2, foundingGroup, Envelope.Kind.GROUP_AD_WANT, self, self,
+        Envelope want = new Envelope(WireCodec.WIRE_VERSION, foundingGroup, Envelope.Kind.GROUP_AD_WANT, self, self,
                 stamp, new byte[0]);
         assertBytes(codec.toBytes(want), "group_ad_want_envelope_cbor");
         assertBytes(wire.encode(want, identity), "group_ad_want_frame_cbor");
@@ -249,7 +253,7 @@ class GoldenVectorsV0110ConformanceTest {
     /** SPEC §9: the GROUP_AD envelope and frame are byte-identical; the body is the signed founding advertisement and verifies. */
     @Test
     void groupAdFrameMatchesAndCarriesTheVerifiableFounding() {
-        Envelope answer = new Envelope(2, foundingGroup, Envelope.Kind.GROUP_AD, self, self,
+        Envelope answer = new Envelope(WireCodec.WIRE_VERSION, foundingGroup, Envelope.Kind.GROUP_AD, self, self,
                 stamp, hex("signed_group_ad_cbor"));
         assertBytes(codec.toBytes(answer), "group_ad_envelope_cbor");
         assertBytes(wire.encode(answer, identity), "group_ad_frame_cbor");
@@ -349,6 +353,67 @@ class GoldenVectorsV0110ConformanceTest {
                 .isEqualTo(record.sig());
     }
 
+    /**
+     * SPEC §7.1 reserved types / §10.3 (issue #16): a JoinTicket entry record decodes, names the
+     * reserved type, carries the join and key tags, its payload is the two-field ticket, and its
+     * record signature verifies over the SignView with the tags in wire order (join, key).
+     * The whole record is not re-encoded byte-exact here on purpose: EntryRecord copies its tags
+     * through Map.copyOf, whose iteration order is salted per JVM, so a two-tag record re-encodes
+     * in either order; the vector pins the (join, key) order a client sees on the wire.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void joinTicketRecordRoundTripsAndNamesTheReservedType() {
+        assumeTrue(golden.containsKey("join_ticket_record_cbor"),
+                "golden.json predates the issue #16 join ticket vector");
+        byte[] bytes = hex("join_ticket_record_cbor");
+        EntryRecord record = codec.fromBytes(bytes, EntryRecord.class);
+
+        assertThat(record.type()).isEqualTo("ai.badmonkey.agentspaces.agent.join.JoinTicket#v1");
+        assertThat(record.entryId()).isEqualTo(EntryId.of("33333333-4444-5555-6666-777777777777"));
+        assertThat(record.spaceId().value()).isEqualTo(text("space_id"));
+        assertThat(record.issuer()).isEqualTo(issuer);
+        assertThat(record.issued()).isEqualTo(stamp);
+        assertThat(record.payloadRef()).isNull();
+        assertThat(record.keyEpoch()).isNull();
+        assertThat(record.tags()).containsOnly(
+                Map.entry("join", "golden.join"), Map.entry("key", "golden-key"));
+        assertThat(record.lease().kind()).isEqualTo(LeaseKind.WRITE);
+        assertThat(record.lease().holder()).isEqualTo(issuer);
+        assertThat(record.lease().expiresAtMillis())
+                .as("the ticket's lease: PT10M after issue")
+                .isEqualTo(stamp.physical() + Duration.ofMinutes(10).toMillis());
+
+        Map<String, Object> payload = codec.fromBytes(record.payload(), Map.class);
+        assertThat(payload).as("payload is the two-field ticket map, join then key")
+                .containsExactly(Map.entry("join", "golden.join"), Map.entry("key", "golden-key"));
+        JoinTicket ticket = codec.fromBytes(record.payload(), JoinTicket.class);
+        assertThat(ticket).isEqualTo(new JoinTicket("golden.join", "golden-key"));
+        assertThat(codec.toBytes(ticket)).as("payload re-encodes byte-exact").isEqualTo(record.payload());
+
+        // Structural round trip of the whole record (tag order aside, see above).
+        EntryRecord again = codec.fromBytes(codec.toBytes(record), EntryRecord.class);
+        assertThat(again.entryId()).isEqualTo(record.entryId());
+        assertThat(again.type()).isEqualTo(record.type());
+        assertThat(again.payload()).isEqualTo(record.payload());
+        assertThat(again.lease()).isEqualTo(record.lease());
+        assertThat(again.tags()).isEqualTo(record.tags());
+        assertThat(again.sig()).isEqualTo(record.sig());
+
+        // The signature covers the tags as they travel, in canonical order (wire v3,
+        // ISSUE-CanonicalMaps: shorter key first, then bytewise): key, then join.
+        Map<String, Object> wireForm = codec.fromBytes(bytes, Map.class);
+        Map<String, String> wireTags = (Map<String, String>) wireForm.get("tags");
+        assertThat(List.copyOf(wireTags.keySet())).containsExactly("key", "join");
+        byte[] view = codec.toBytes(new SignView(record.entryId(), record.spaceId(), record.type(),
+                record.payload(), record.payloadRef(), record.issuer(), record.issued(), wireTags,
+                record.keyEpoch()));
+        assertThat(Ed25519.verify(Ed25519.publicKeyFromRaw(hex("public_key_raw")), view, record.sig()))
+                .as("the joiner's record signature verifies").isTrue();
+        assertThat(identity.sign(view)).as("deterministic Ed25519: re-signing reproduces it")
+                .isEqualTo(record.sig());
+    }
+
     /** SPEC §8 / TECH §8.2: each aggregate Frame variant is byte-identical and decodes with exactly that variant set. */
     @Test
     void aggregateFrameVariantsMatch() {
@@ -428,7 +493,7 @@ class GoldenVectorsV0110ConformanceTest {
     @Test
     void wireVersionIsPinned() {
         assertThat(((Number) golden.get("wire_version")).intValue())
-                .isEqualTo(WireCodec.WIRE_VERSION).isEqualTo(2);
+                .isEqualTo(WireCodec.WIRE_VERSION).isEqualTo(3);
     }
 
     /** Every v0.1.10 {@code *_cbor} vector, adversarial ones included, is well-formed CBOR to this codec. */
@@ -442,7 +507,8 @@ class GoldenVectorsV0110ConformanceTest {
                 "aggregate_share_frame_cbor", "aggregate_extremum_frame_cbor",
                 "aggregate_histogram_frame_cbor", "aggregate_roster_frame_cbor",
                 "learn_exchange_offer_cbor", "learn_exchange_accept_cbor",
-                "learn_exchange_busy_cbor", "space_credential_record_cbor");
+                "learn_exchange_busy_cbor", "space_credential_record_cbor",
+                "join_ticket_record_cbor");
         for (String name : expected) {
             assertThat(codec.fromBytes(hex(name), Object.class)).as(name).isNotNull();
         }

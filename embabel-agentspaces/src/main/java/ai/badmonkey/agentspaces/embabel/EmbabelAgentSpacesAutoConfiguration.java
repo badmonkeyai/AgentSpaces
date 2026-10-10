@@ -81,7 +81,10 @@ public class EmbabelAgentSpacesAutoConfiguration {
                                         PeerIdentity identity) {
         List<String> order = new ArrayList<>();
         properties.getGroups().forEach(group -> order.add(group.getName()));
-        return new EmbabelBinder(spaces, identity, InstantSource.system(), order);
+        // ISSUE-WorkflowShape §9.1: the facade's registry (the SchemaRegistry bean,
+        // when the application declares one) names the Embabel cards too.
+        return new EmbabelBinder(spaces, identity, InstantSource.system(), order,
+                spaces.schemaRegistry().orElse(null));
     }
 
     /**

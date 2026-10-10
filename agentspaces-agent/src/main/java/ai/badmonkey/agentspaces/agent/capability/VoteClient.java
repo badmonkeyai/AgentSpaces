@@ -71,6 +71,21 @@ public final class VoteClient {
     }
 
     /**
+     * Opens a {@link Motion} on this client's capability, once per proposal id
+     * per replica: a motion whose proposal is already visible is skipped
+     * (ISSUE-Motion FR-8). {@code motion.space()} is not consulted; a client is
+     * already bound to one vote space.
+     */
+    public VoteClient propose(Motion motion) {
+        java.util.Objects.requireNonNull(motion, "motion");
+        if (vote.proposal(motion.proposalId()).isEmpty()) {
+            vote.propose(motion.proposalId(), motion.question(), motion.options(), motion.quorum(),
+                    motion.lease());
+        }
+        return this;
+    }
+
+    /**
      * Casts this peer's ballot.
      *
      * @param proposalId the proposal

@@ -25,7 +25,6 @@ import ai.badmonkey.agentspaces.api.ad.CardAction;
 import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
-import ai.badmonkey.agentspaces.space.local.SimpleSchemaRegistry;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
@@ -62,7 +61,8 @@ public final class EmbabelBinder {
     private final PeerIdentity identity;
     private final InstantSource clock;
     private final List<String> groupOrder;
-    private final SchemaRegistry schemas = new SimpleSchemaRegistry();
+    /** An explicit registry card names come from; null to use each group's (ISSUE-WorkflowShape §9.1). */
+    private final SchemaRegistry schemas;
 
     /**
      * Creates the binder.
@@ -75,10 +75,30 @@ public final class EmbabelBinder {
      */
     public EmbabelBinder(AgentSpaces spaces, PeerIdentity identity,
                          InstantSource clock, List<String> groupOrder) {
+        this(spaces, identity, clock, groupOrder, null);
+    }
+
+    /**
+     * Creates the binder with the schema registry its cards are named from
+     * (ISSUE-WorkflowShape §9.1). Without one, each card is named from its
+     * group's registry ({@link AgentSpaces.GroupContext#schemaRegistry()}), which
+     * is the facade's when one was set there, so the card advertises what the
+     * group's spaces write.
+     *
+     * @param spaces     the facade whose groups cards publish into
+     * @param identity   the local peer identity
+     * @param clock      the time source for card freshness
+     * @param groupOrder the configured group names, in configuration order
+     * @param schemas    the registry card names come from, or null for each
+     *                   group's own
+     */
+    public EmbabelBinder(AgentSpaces spaces, PeerIdentity identity,
+                         InstantSource clock, List<String> groupOrder, SchemaRegistry schemas) {
         this.spaces = Objects.requireNonNull(spaces, "spaces");
         this.identity = Objects.requireNonNull(identity, "identity");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.groupOrder = List.copyOf(Objects.requireNonNull(groupOrder, "groupOrder"));
+        this.schemas = schemas;
     }
 
     /**
@@ -131,6 +151,7 @@ public final class EmbabelBinder {
 
     private AgentCard cardFor(EmbabelIntrospector.EmbabelAgent agent,
                               AgentSpaces.GroupContext group) {
+        SchemaRegistry schemas = this.schemas != null ? this.schemas : group.schemaRegistry();
         Set<String> consumes = new LinkedHashSet<>();
         Set<String> produces = new LinkedHashSet<>();
         Map<String, String> spaceBindings = new LinkedHashMap<>();

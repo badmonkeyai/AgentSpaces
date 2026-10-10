@@ -18,8 +18,12 @@ package ai.badmonkey.agentspaces.agent;
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceTake;
 import ai.badmonkey.agentspaces.api.ad.AgentCard;
+import ai.badmonkey.agentspaces.api.ad.CardAction;
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
+import ai.badmonkey.agentspaces.api.space.Lease;
+import ai.badmonkey.agentspaces.api.space.Template;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.discovery.AdCache;
@@ -29,6 +33,7 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.local.LocalSpace;
+import ai.badmonkey.agentspaces.space.local.NamespaceSchemaRegistry;
 import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
 import ai.badmonkey.agentspaces.test.SimNetwork;
@@ -41,8 +46,10 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Card lifecycle under a deterministic clock (spec §10.4): bound agents' cards
@@ -173,5 +180,77 @@ class AgentBinderCardsTest {
         binder.refreshCards();
         assertThat(bound.card().actions()).isEqualTo(actions);
         assertThat(discovery.find(AgentCard.class, c -> true).get(0).actions()).isEqualTo(actions);
+    }
+
+    /** ISSUE-WorkflowShape §7.1 item 1 / §14 item 1: a binder given the namespace registry publishes IRI names on consumes, produces, spaceBindings, and each CardAction. */
+    @Test
+    void aNamespaceRegistryPublishesIriNamesOnEveryCardField() {
+        String ns = "https://example.org/test#";
+        SchemaRegistry schemas =
+                NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
+        try (AgentBinder named = new AgentBinder(identity, groupId, discovery, clock)) {
+            assertThat(named.schemas(schemas)).isSameAs(named);
+            assertThat(named.schemas()).isSameAs(schemas);
+            named.space("tasks", tasks);
+            AgentCard card = named.bind(new Desk()).card();
+
+            assertThat(card.consumes())
+                    .containsExactlyInAnyOrder(ns + "TaskEntry", ns + "FindingEntry");
+            assertThat(card.produces()).containsExactly(ns + "FindingEntry");
+            assertThat(card.spaceBindings()).containsEntry(ns + "TaskEntry", "tasks")
+                    .containsEntry(ns + "FindingEntry", "tasks");
+            assertThat(card.actions()).extracting(CardAction::name)
+                    .containsExactly("audit", "research");
+            CardAction research = card.actions().get(1);
+            assertThat(research.consumes()).containsExactly(ns + "TaskEntry");
+            assertThat(research.produces()).containsExactly(ns + "FindingEntry");
+            assertThat(card.actions().get(0).consumes()).containsExactly(ns + "FindingEntry");
+            assertThat(discovery.find(AgentCard.class, c -> c.agent().equals(card.agent())))
+                    .singleElement().satisfies(published ->
+                            assertThat(published.consumes()).isEqualTo(card.consumes()));
+        }
+    }
+
+    /** ISSUE-WorkflowShape §9.1: the registry is fixed by the first bind, as the identity factory is meant to be. */
+    @Test
+    void theRegistryCannotChangeAfterTheFirstBind() {
+        SchemaRegistry schemas = NamespaceSchemaRegistry.of(
+                Map.of("ai.badmonkey.agentspaces.test", "https://example.org/test#"));
+        binder.bind(new Researcher());
+        assertThatThrownBy(() -> binder.schemas(schemas))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("bind");
+        assertThat(binder.schemas()).as("the default registry stays").isNotSameAs(schemas);
+    }
+
+    /**
+     * ISSUE-WorkflowShape §8.1: a space and a binder sharing one registry agree
+     * on names by construction. The space names what it writes through the
+     * registry, the card names what it consumes through the same registry, and
+     * the worker still takes and completes under the IRI names.
+     */
+    @Test
+    void aSpaceAndABinderSharingTheRegistryAgreeOnNames() {
+        String ns = "https://example.org/test#";
+        SchemaRegistry shared =
+                NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
+        try (LocalSpace work = LocalSpace.builder("tasks", identity.agent("host"))
+                     .schemaRegistry(shared).build();
+             AgentBinder named = new AgentBinder(identity, groupId, discovery, clock)
+                     .schemas(shared)) {
+            named.space("tasks", work);
+            AgentCard card = named.bind(new Researcher()).card();
+
+            work.write(new TaskEntry("agreement", 1), Lease.of(Duration.ofMinutes(5)));
+            assertThat(work.read(Template.of(FindingEntry.class), Duration.ofSeconds(10)))
+                    .hasValueSatisfying(f -> assertThat(f.topic()).isEqualTo("agreement"));
+
+            // The space registered both types as it wrote them; the card's names
+            // are those registrations, not a parallel guess.
+            assertThat(card.consumes()).containsExactly(shared.schemaNameOf(TaskEntry.class));
+            assertThat(card.produces()).containsExactly(shared.schemaNameOf(FindingEntry.class));
+            assertThat(shared.schemaNameOf(TaskEntry.class)).isEqualTo(ns + "TaskEntry");
+            assertThat(work.readAll(Template.of(FindingEntry.class), 10)).hasSize(1);
+        }
     }
 }

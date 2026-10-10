@@ -240,6 +240,35 @@ class GossipBusTest {
                 .isEqualTo("fact-2");
     }
 
+    /**
+     * ISSUE-CanonicalMaps: a PULL_RESP's deltas apply in the order their
+     * streams were registered, not the order the wire (now sorted, shorter
+     * stream ids first) carries them, so a revocation registry registered
+     * before a space judges first.
+     */
+    @Test
+    void pullRespDeltasApplyInRegistrationOrderNotWireOrder() {
+        List<String> applied = new ArrayList<>();
+        ReconcilableState first = recording("credential-revocations", applied);
+        ReconcilableState second = recording("space:tasks", applied);
+        bus.reconcile("credential-revocations", first);
+        bus.reconcile("space:tasks", second);
+        bus.antiEntropyTick();
+        Map<String, byte[]> wireOrder = new java.util.LinkedHashMap<>();
+        wireOrder.put("space:tasks", "x".getBytes(StandardCharsets.UTF_8));          // shorter id: first on the wire
+        wireOrder.put("credential-revocations", "y".getBytes(StandardCharsets.UTF_8));
+        bus.onPullResp(neighbor, new Bodies.PullResp(wireOrder));
+        assertThat(applied).containsExactly("credential-revocations", "space:tasks");
+    }
+
+    private static ReconcilableState recording(String name, List<String> applied) {
+        return new ReconcilableState() {
+            @Override public byte[] digest() { return new byte[0]; }
+            @Override public byte[] deltaFor(byte[] remoteDigest) { return new byte[0]; }
+            @Override public void applyDelta(byte[] delta) { applied.add(name); }
+        };
+    }
+
     /** Spec §5.3 dedup: the seen-cache is bounded (insertion-order eviction) yet recent items still dedup. */
     @Test
     void theSeenCacheIsBoundedButRecentItemsStillDedup() {

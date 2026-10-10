@@ -58,6 +58,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
+import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
 import static ai.badmonkey.agentspaces.api.space.Matchers.gte;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -829,6 +830,54 @@ class ReplicatedSpaceClusterTest {
                 .contains(new TaskEntry("replicate me", 5));
         assertThat(c.space().read(Template.of(TaskEntry.class).where("priority", gte(5))))
                 .isPresent();
+    }
+
+    /** Issue #16 §9.2: tags travel on the record, so a tag condition selects the same entries at every replica, before decode, on reads and on subscriptions. */
+    @Test
+    void tagConditionsSelectReplicatedEntriesAtEveryPeer() throws Exception {
+        Peer a = newPeer("a", 1);
+        Peer b = newPeer("b", 2, "a");
+        tickAll(4);
+        List<SpaceEvent<TaskEntry>> euAtB = new CopyOnWriteArrayList<>();
+        List<SpaceEvent<TaskEntry>> allAtB = new CopyOnWriteArrayList<>();
+        b.space().notify(Template.of(TaskEntry.class).whereTag("region", eq("eu")), euAtB::add,
+                MINUTES_30);
+        b.space().notify(Template.of(TaskEntry.class), allAtB::add, MINUTES_30);
+
+        a.space().write(new TaskEntry("eu-task", 5), MINUTES_30, Map.of("region", "eu"));
+        a.space().write(new TaskEntry("us-task", 5), MINUTES_30, Map.of("region", "us"));
+        tickAll(4);
+
+        assertThat(b.space().read(Template.of(TaskEntry.class).whereTag("region", eq("eu"))))
+                .contains(new TaskEntry("eu-task", 5));
+        assertThat(b.space().read(Template.of(TaskEntry.class).whereTag("region", eq("apac"))))
+                .isEmpty();
+        assertThat(b.space().readAll(Template.of(TaskEntry.class).hasTag("region"), 10)).hasSize(2);
+        assertThat(b.space().readAllEntries(Template.of(TaskEntry.class)
+                .whereTag("region", eq("us")), 10)).singleElement().satisfies(entry -> {
+                    assertThat(entry.value()).isEqualTo(new TaskEntry("us-task", 5));
+                    assertThat(entry.tags()).containsExactly(Map.entry("region", "us"));
+                    assertThat(entry.issuer()).isEqualTo(a.node().identity().agent("worker"));
+                });
+        assertThat(allAtB).hasSize(2);
+        assertThat(euAtB).singleElement().satisfies(event -> {
+            assertThat(event.entry()).isEqualTo(new TaskEntry("eu-task", 5));
+            assertThat(event.tags()).containsExactly(Map.entry("region", "eu"));
+        });
+
+        TakenEntry<TaskEntry> taken = b.space().take(
+                Template.of(TaskEntry.class).whereTag("region", eq("us")), MINUTES_10,
+                Duration.ZERO).orElseThrow();
+        assertThat(taken.entry().topic()).isEqualTo("us-task");
+        assertThat(b.space().take(Template.of(TaskEntry.class).whereTag("region", eq("apac")),
+                MINUTES_10, Duration.ZERO)).isEmpty();
+        b.space().complete(taken, new FindingEntry("us-task", "done"), MINUTES_30,
+                Map.of("region", "us"));
+        tickAll(4);
+        assertThat(a.space().read(Template.of(FindingEntry.class).whereTag("region", eq("us"))))
+                .contains(new FindingEntry("us-task", "done"));
+        assertThat(a.space().read(Template.of(FindingEntry.class).whereTag("region", eq("eu"))))
+                .isEmpty();
     }
 
     /** A result that overruns the inline limit on a space with no block store. */

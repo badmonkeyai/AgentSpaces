@@ -118,6 +118,12 @@ public final class GossipBus {
      * injected into replicated state by any other member. */
     private volatile PeerId expectedPullPartner;
     private final Map<String, ReconcilableState> states = new ConcurrentHashMap<>();
+    /** The streams in registration order: the order a PULL_RESP's deltas are
+     * applied in, whatever order the wire put them in (ISSUE-CanonicalMaps).
+     * A node registers its revocation registries before any space attaches,
+     * so a late joiner judges the records a pull brings with the revocations
+     * the same pull brings, never before them. */
+    private final List<String> registrationOrder = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final Map<String, Boolean> seen = Collections.synchronizedMap(
             new LinkedHashMap<>(256, 0.75f, false) {
                 @Override
@@ -226,7 +232,12 @@ public final class GossipBus {
                     + " state on this node; close the earlier registration before registering"
                     + " another (a second space handle for one name is the usual cause)");
         }
-        return () -> states.remove(streamId, state);
+        registrationOrder.add(streamId);
+        return () -> {
+            if (states.remove(streamId, state)) {
+                registrationOrder.remove(streamId);
+            }
+        };
     }
 
     /**
@@ -321,8 +332,8 @@ public final class GossipBus {
     }
 
     /**
-     * Handles an inbound PULL_RESP: apply the deltas, but only from the partner
-     * this bus sent its last digest to. Anti-entropy is strictly
+     * Handles an inbound PULL_RESP: apply the deltas, in the order the streams
+     * were registered, but only from the partner this bus sent its last digest to. Anti-entropy is strictly
      * request-response; an unsolicited PULL_RESP is a delta-injection attempt
      * and is dropped (ASF-003).
      *
@@ -333,10 +344,14 @@ public final class GossipBus {
         if (!from.equals(expectedPullPartner)) {
             return;
         }
-        for (Map.Entry<String, byte[]> e : resp.deltas().entrySet()) {
-            ReconcilableState state = states.get(e.getKey());
+        // In registration order, not wire order: the canonical map order of wire
+        // v3 sorts shorter stream ids first, which would apply "space:x" before
+        // "credential-revocations"; the revocation registries registered first.
+        for (String streamId : registrationOrder) {
+            byte[] delta = resp.deltas().get(streamId);
+            ReconcilableState state = delta == null ? null : states.get(streamId);
             if (state != null) {
-                state.applyDelta(e.getValue());
+                state.applyDelta(delta);
             }
         }
     }

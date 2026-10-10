@@ -18,6 +18,7 @@ package ai.badmonkey.agentspaces.api.space;
 import ai.badmonkey.agentspaces.api.entry.EntryId;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -29,21 +30,45 @@ import java.util.Objects;
  * gate honoring its console, an audit reader) checks it here rather than
  * trusting self-declared payload fields.
  *
+ * <p>The {@code details} view (issue #16 §9.2, appended with the older
+ * constructors kept) carries the record's metadata: tags, lease, issue stamp,
+ * issuer and attestation. The library's spaces fill it for {@code WRITTEN} and
+ * {@code REAPPEARED}, and for any other kind when they still hold the record at
+ * the moment the event fires; an event built without the record carries
+ * {@code null}, and {@link #tags()} is then empty.
+ *
  * @param kind    what happened to the entry
  * @param entryId the entry's identifier
  * @param entry   the entry value at the time of the event
  * @param issuer  the entry's authenticated writer
+ * @param actor   who caused the event: the issuer, or the holder for a completion
+ * @param details the entry's metadata view, or {@code null} when unavailable
  * @param <T>     the entry type
  */
-public record SpaceEvent<T>(Kind kind, EntryId entryId, T entry, AgentId issuer, AgentId actor) {
+public record SpaceEvent<T>(Kind kind, EntryId entryId, T entry, AgentId issuer, AgentId actor,
+                            Space.Entry<T> details) {
 
     /**
      * An event whose actor is the entry's issuer: every kind but a completion,
      * which names the claim holder that completed the entry as its actor
-     * (SPEC §11a.4, v0.1.13).
+     * (SPEC §11a.4, v0.1.13). No metadata view.
      */
     public SpaceEvent(Kind kind, EntryId entryId, T entry, AgentId issuer) {
-        this(kind, entryId, entry, issuer, issuer);
+        this(kind, entryId, entry, issuer, issuer, null);
+    }
+
+    /** An event with an explicit actor ({@code null} meaning the issuer) and no metadata view. */
+    public SpaceEvent(Kind kind, EntryId entryId, T entry, AgentId issuer, AgentId actor) {
+        this(kind, entryId, entry, issuer, actor, null);
+    }
+
+    /**
+     * The entry record's tags, read through {@link #details()}.
+     *
+     * @return the tags, or an empty map when the event carries no view
+     */
+    public Map<String, String> tags() {
+        return details == null ? Map.of() : details.tags();
     }
 
     /** The kinds of entry event a space emits. */

@@ -24,6 +24,7 @@ import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.space.Template;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.discovery.AdCache;
@@ -35,6 +36,7 @@ import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.peering.transport.TcpTransport;
 import ai.badmonkey.agentspaces.space.local.LocalSpace;
+import ai.badmonkey.agentspaces.space.local.NamespaceSchemaRegistry;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import ai.badmonkey.agentspaces.test.SimNetwork;
 import ai.badmonkey.agentspaces.test.TestClock;
@@ -560,6 +562,12 @@ class RemoteActionsTest {
     // ------------------------------------------------------- in-memory fixture
 
     private SimPeer simPeer(String address, String... seedAddresses) throws IOException {
+        return simPeer(null, address, seedAddresses);
+    }
+
+    /** A sim peer whose space and binder share the given registry (null for the default). */
+    private SimPeer simPeer(SchemaRegistry schemas, String address, String... seedAddresses)
+            throws IOException {
         PeerIdentity identity = PeerIdentity.generate();
         PeerNode node = PeerNode.builder(identity).clock(clock)
                 .randomSeed(simPeers.size() + 1).build();
@@ -577,12 +585,130 @@ class RemoteActionsTest {
         CborCodec codec = CborCodec.defaultCodec();
         DiscoveryService discovery = new DiscoveryService(runtime,
                 new AdCache(codec, clock), codec, identity.peerId());
-        LocalSpace work = LocalSpace.builder("work", identity.agent("host")).build();
+        LocalSpace.Builder workBuilder = LocalSpace.builder("work", identity.agent("host"));
         AgentBinder binder = new AgentBinder(identity, groupId, discovery, clock);
+        if (schemas != null) {
+            workBuilder.schemaRegistry(schemas);
+            binder.schemas(schemas);
+        }
+        LocalSpace work = workBuilder.build();
         binder.space("work", work);
         SimPeer peer = new SimPeer(node, identity, discovery, work, binder);
         simPeers.add(peer);
         return peer;
+    }
+
+
+    // ------------------------------------------- ISSUE-WorkflowShape §9.1 registry
+
+    private static final String NS = "https://example.org/remote#";
+
+    private static NamespaceSchemaRegistry namespaced() {
+        return NamespaceSchemaRegistry.of(
+                Map.of("ai.badmonkey.agentspaces.agent.remote", NS));
+    }
+
+    /** A foreign card over the sim fixture's group with the given flat schema lists. */
+    private AgentCard foreignCard(PeerIdentity foreign, String name, List<String> consumes,
+                                  List<String> produces) {
+        GroupId groupId = GroupId.of("zRemote");
+        return new AgentCard("aspace://" + groupId.value() + "/agent/" + name,
+                foreign.peerId(), groupId, clock.instant(), Duration.ofMinutes(15),
+                foreign.agent(name), "Card " + name, List.of(), consumes, produces, Map.of());
+    }
+
+    /** §7.1 item 2 / §14 item 2: an IRI-named card's action resolves through the registry and invokes. */
+    @Test
+    @Timeout(60)
+    void anIriNamedCardResolvesThroughTheRegistryAndInvokes() throws Exception {
+        SchemaRegistry schemas = namespaced();
+        SimPeer local = simPeer(schemas, "iri");
+        PeerIdentity foreign = PeerIdentity.generate();
+        AgentCard card = foreignCard(foreign, "iri",
+                List.of(NS + "Task"), List.of(NS + "Finding"));
+        local.discovery().publish(new AdvertisementSigner().sign(card, foreign));
+        // The local worker's bind registers Task and Finding on the shared
+        // registry (nested test records are not reverse-resolvable by name);
+        // its own card is never an action.
+        local.binder().bind(new Researcher());
+
+        // Without the registry an IRI is not a class name: no action.
+        assertThat(new RemoteActions(local.discovery(), local.identity().peerId(),
+                Map.of("work", local.work())).available()).isEmpty();
+
+        RemoteActions remote = new RemoteActions(local.discovery(), local.identity().peerId(),
+                Map.of("work", local.work()), schemas);
+        List<RemoteAction> actions = remote.available();
+        assertThat(actions).hasSize(1);
+        assertThat(actions.get(0).inputType()).isEqualTo(Task.class);
+        assertThat(actions.get(0).outputType()).isEqualTo(Finding.class);
+
+        // The worker on the same registry takes under the same IRI and completes.
+        Optional<Finding> finding = actions.get(0).invoke(new Task("by iri", 1),
+                Finding.class, Duration.ofSeconds(20));
+        assertThat(finding).isPresent();
+        assertThat(finding.get().summary()).isEqualTo("researched: by iri");
+    }
+
+    /** §7.1 item 2: a class-named card still resolves when a registry is present. */
+    @Test
+    void aClassNamedCardStillResolvesUnderARegistry() throws Exception {
+        SchemaRegistry schemas = namespaced();
+        SimPeer local = simPeer(schemas, "classy");
+        PeerIdentity foreign = PeerIdentity.generate();
+        AgentCard card = foreignCard(foreign, "classy",
+                List.of(Question.class.getName() + "#v1"), List.of(Answer.class.getName() + "#v1"));
+        local.discovery().publish(new AdvertisementSigner().sign(card, foreign));
+
+        List<RemoteAction> actions = new RemoteActions(local.discovery(),
+                local.identity().peerId(), Map.of("work", local.work()), schemas).available();
+        assertThat(actions).hasSize(1);
+        assertThat(actions.get(0).inputType()).isEqualTo(Question.class);
+        assertThat(actions.get(0).outputType()).isEqualTo(Answer.class);
+    }
+
+    /** ASF-029 kept: a platform-package name is refused with or without a registry, even from a registry that would resolve it. */
+    @Test
+    void aPlatformPackageNameIsStillRefusedUnderARegistry() throws Exception {
+        SchemaRegistry schemas = namespaced();
+        schemas.register(Task.class);
+        schemas.register(Finding.class);
+        SimPeer local = simPeer(schemas, "platform");
+        PeerIdentity foreign = PeerIdentity.generate();
+        AgentCard card = foreignCard(foreign, "platform",
+                List.of(NS + "Task", "java.lang.Runtime#v1", "jdk.internal.misc.Unsafe#v1"),
+                List.of(NS + "Finding", "javax.naming.InitialContext#v1"));
+        local.discovery().publish(new AdvertisementSigner().sign(card, foreign));
+
+        List<RemoteAction> actions = new RemoteActions(local.discovery(),
+                local.identity().peerId(), Map.of("work", local.work()), schemas).available();
+        assertThat(actions).hasSize(1);
+        assertThat(actions.get(0).inputType()).isEqualTo(Task.class);
+        assertThat(actions.get(0).outputType()).isEqualTo(Finding.class);
+
+        // A registry that hands back a platform class is not trusted either.
+        SchemaRegistry hostile = new SchemaRegistry() {
+            @Override public String register(Class<?> entryType) {
+                return entryType.getName();
+            }
+            @Override public String schemaNameOf(Class<?> entryType) {
+                return entryType.getName();
+            }
+            @Override public Optional<Class<?>> classFor(String schemaName) {
+                return Optional.of(Runtime.class);
+            }
+        };
+        assertThat(new RemoteActions(local.discovery(), local.identity().peerId(),
+                Map.of("work", local.work()), hostile).available()).isEmpty();
+    }
+
+    /** §9.1: {@code schemas(...)} after a bind is refused, so a card never names types under a registry its space does not share. */
+    @Test
+    void schemasAfterABindIsRefused() throws Exception {
+        SimPeer local = simPeer("late");
+        local.binder().bind(new Researcher());
+        assertThatThrownBy(() -> local.binder().schemas(namespaced()))
+                .isInstanceOf(IllegalStateException.class);
     }
 
     private void tick(int rounds) {

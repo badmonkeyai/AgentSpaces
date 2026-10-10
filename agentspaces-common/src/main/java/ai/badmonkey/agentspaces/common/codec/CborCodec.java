@@ -52,6 +52,9 @@ public final class CborCodec {
 
     private CborCodec() {
         this.cbor = configure(new ObjectMapper(constrained(new CBORFactory())));
+        // ISSUE-CanonicalMaps (wire v3): map entries in RFC 8949 order in every
+        // CBOR structure. The JSON rendering is for logs and keeps its order.
+        this.cbor.registerModule(CanonicalMaps.module());
         this.json = configure(new ObjectMapper());
     }
 

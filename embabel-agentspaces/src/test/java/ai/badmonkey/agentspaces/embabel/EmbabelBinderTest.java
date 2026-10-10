@@ -19,6 +19,8 @@ import com.embabel.agent.api.annotation.AchievesGoal;
 import com.embabel.agent.api.annotation.Action;
 import com.embabel.agent.api.annotation.Agent;
 import ai.badmonkey.agentspaces.agent.AgentSpaces;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
+import ai.badmonkey.agentspaces.space.local.NamespaceSchemaRegistry;
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
 import ai.badmonkey.agentspaces.api.ad.AgentCard;
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
@@ -46,6 +48,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -286,5 +289,30 @@ class EmbabelBinderTest {
         assertThat(research.consumes()).containsExactly(TaskEntry.class.getName() + "#v1");
         assertThat(research.produces()).containsExactly(FindingEntry.class.getName() + "#v1");
         assertThat(card.actions().get(0).consumes()).containsExactly(FindingEntry.class.getName() + "#v1");
+    }
+
+    /** ISSUE-WorkflowShape §7.1 item 1: the Embabel binder names cards from the group's registry, or from one it is given. */
+    @Test
+    void embabelCardsNameThroughTheGroupsRegistryOrAnExplicitOne() {
+        String ns = "https://example.org/test#";
+        SchemaRegistry shared =
+                NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
+        spaces.group("fleet").schemaRegistry(shared);
+
+        AgentCard card = binder.bind(new TwoActionDesk()).orElseThrow();
+        assertThat(card.consumes())
+                .containsExactlyInAnyOrder(ns + "TaskEntry", ns + "FindingEntry");
+        assertThat(card.produces())
+                .containsExactlyInAnyOrder(ns + "FindingEntry", ns + "TaskEntry");
+        assertThat(card.actions()).allSatisfy(action -> {
+            assertThat(action.consumes()).allMatch(name -> name.startsWith(ns));
+            assertThat(action.produces()).allMatch(name -> name.startsWith(ns));
+        });
+
+        SchemaRegistry own = NamespaceSchemaRegistry.of(
+                Map.of("ai.badmonkey.agentspaces.test", "https://example.org/own#"));
+        EmbabelBinder explicit = new EmbabelBinder(spaces, identity, clock, List.of("fleet"), own);
+        assertThat(explicit.bind(new EmbabelResearcher()).orElseThrow().consumes())
+                .containsExactly("https://example.org/own#TaskEntry");
     }
 }

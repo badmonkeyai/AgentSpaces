@@ -74,7 +74,9 @@ public record AssetCard(
         Objects.requireNonNull(description, "description");
         Objects.requireNonNull(shape, "shape");
         Objects.requireNonNull(freshness, "freshness");
-        costHints = Map.copyOf(Objects.requireNonNull(costHints, "costHints"));
-        access = Map.copyOf(Objects.requireNonNull(access, "access"));
+        costHints = java.util.Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(Objects.requireNonNull(costHints, "costHints"))); // signed in iteration order
+        access = java.util.Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(Objects.requireNonNull(access, "access"))); // signed in iteration order
     }
 }

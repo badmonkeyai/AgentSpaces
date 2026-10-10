@@ -34,6 +34,8 @@ import java.util.List;
 import ai.badmonkey.agentspaces.capabilities.runtime.CapabilityPipes;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.BiConsumer;
 
 /**
  * The {@code ORDERED} strategy (spec §7.4) as a coordinator over the
@@ -67,6 +69,9 @@ public final class OrderedTakes {
     private final HybridLogicalClock hlc;
     private final CborCodec codec;
     private final InstantSource clock;
+    /** Listeners told of every claim this member commits from the log (issue #16, the ordered join). */
+    private final CopyOnWriteArrayList<BiConsumer<EntryId, TakeClaim>> committedListeners =
+            new CopyOnWriteArrayList<>();
 
     /**
      * Creates the coordinator. Register the returned instance's
@@ -242,7 +247,15 @@ public final class OrderedTakes {
         long committedEpoch = space.currentClaim(parsed.entryId())
                 .map(TakeClaim::epoch).orElse(0L);
         if (parsed.claim().epoch() != committedEpoch + 1) {
-            return; // duplicate, stale, or conflicting generation: the log already decided
+            // Duplicate, stale, or conflicting generation: the log already decided,
+            // or gossip delivered this very claim before the log applied it here.
+            // Nothing to install, but listeners on the committed order (issue #16)
+            // must still hear of every authentic claim, in the log's order.
+            if (space.verifiesAuthorizedClaim(parsed.entryId(), parsed.claim(), parsed.holderKey(),
+                    parsed.signature(), parsed.holderCertificate())) {
+                notifyCommitted(parsed.entryId(), parsed.claim());
+            }
+            return;
         }
         // Install the claim exactly as the holder signed it, attestation and all
         // (QA4 A4-5). Re-stamping it with the log index used to buy arbitration
@@ -259,8 +272,36 @@ public final class OrderedTakes {
             space.applyAuthorizedClaim(parsed.entryId(), parsed.claim(),
                     parsed.holderKey(), parsed.signature(), parsed.holderCertificate());
         } catch (IllegalArgumentException inauthentic) {
-            // dropped: not authentic, or bound to another entry
+            return; // dropped: not authentic, or bound to another entry
         }
+        notifyCommitted(parsed.entryId(), parsed.claim());
+    }
+
+    private void notifyCommitted(EntryId entryId, TakeClaim claim) {
+        for (BiConsumer<EntryId, TakeClaim> listener : committedListeners) {
+            try {
+                listener.accept(entryId, claim);
+            } catch (RuntimeException e) {
+                // a listener's failure is its own; the log's apply must not stall
+            }
+        }
+    }
+
+    /**
+     * Registers a listener told, in commit order, of every claim this member
+     * applies from the log, whoever its holder is (issue #16). Because every
+     * member applies the same committed sequence, a rule a listener derives
+     * from that sequence ("the first committed claim for key K") is the same
+     * at every member, which is what lets the ordered {@code @SpaceJoin} fire
+     * once fleet-wide. Called on the log's apply path: keep it quick.
+     *
+     * @param listener receives the entry id and the claim as committed
+     * @return a handle that removes the listener
+     */
+    public AutoCloseable onCommitted(BiConsumer<EntryId, TakeClaim> listener) {
+        Objects.requireNonNull(listener, "listener");
+        committedListeners.add(listener);
+        return () -> committedListeners.remove(listener);
     }
 
     /**

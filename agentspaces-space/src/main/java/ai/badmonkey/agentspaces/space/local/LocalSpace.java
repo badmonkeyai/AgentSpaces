@@ -36,6 +36,7 @@ import ai.badmonkey.agentspaces.common.crypto.Digests;
 import ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.common.id.SpaceId;
+import ai.badmonkey.agentspaces.space.EntryView;
 
 import java.time.Duration;
 import java.time.InstantSource;
@@ -252,7 +253,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             stored.record = buildRecord(entryId, entry, stored.writeExpiryMillis, tags, writer);
             stored.attested = attested;
             indexPut(entryId, stored);
-            events.add(eventsFor(SpaceEvent.Kind.WRITTEN, entryId, entry));
+            events.add(eventsFor(SpaceEvent.Kind.WRITTEN, entryId, stored));
             lock.notifyAll();
         }
         deliver(events);
@@ -293,7 +294,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             outer:
             for (LinkedHashMap<EntryId, Stored> bucket : bucketsFor(template.type())) {
                 for (Stored stored : bucket.values()) {
-                    if (stored.state == State.AVAILABLE && template.matches(stored.entry)) {
+                    if (stored.state == State.AVAILABLE && matchesLocked(template, stored)) {
                         results.add(template.type().cast(stored.entry));
                         if (results.size() == limit) {
                             break outer;
@@ -320,7 +321,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             outer:
             for (LinkedHashMap<EntryId, Stored> bucket : bucketsFor(template.type())) {
                 for (Stored stored : bucket.values()) {
-                    if (stored.state == State.AVAILABLE && template.matches(stored.entry)) {
+                    if (stored.state == State.AVAILABLE && matchesLocked(template, stored)) {
                         results.add(new Issued<>(template.type().cast(stored.entry),
                                 stored.record.issuer(), stored.attested
                                         ? Attestation.AGENT_ATTESTED : Attestation.PEER_ASSERTED));
@@ -345,14 +346,61 @@ public final class LocalSpace implements Space, AutoCloseable {
 
     @Override
     public void complete(TakenEntry<?> taken) {
-        completeInternal(taken, null, null);
+        completeInternal(taken, null, null, Map.of());
     }
 
     @Override
     public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease) {
+        return complete(taken, result, resultLease, Map.of());
+    }
+
+    @Override
+    public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease,
+                                    Map<String, String> tags) {
         Objects.requireNonNull(result, "result");
         Objects.requireNonNull(resultLease, "resultLease");
-        return completeInternal(taken, result, resultLease);
+        Objects.requireNonNull(tags, "tags");
+        return completeInternal(taken, result, resultLease, tags);
+    }
+
+    @Override
+    public <T> List<Entry<T>> readAllEntries(Template<T> template, int limit) {
+        Objects.requireNonNull(template, "template");
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive: " + limit);
+        }
+        ensureOpen();
+        List<Runnable> events;
+        List<Entry<T>> results = new ArrayList<>();
+        synchronized (lock) {
+            events = sweepLocked();
+            outer:
+            for (LinkedHashMap<EntryId, Stored> bucket : bucketsFor(template.type())) {
+                for (Stored stored : bucket.values()) {
+                    if (stored.state == State.AVAILABLE && matchesLocked(template, stored)) {
+                        results.add(viewOf(stored, template.type().cast(stored.entry)));
+                        if (results.size() == limit) {
+                            break outer;
+                        }
+                    }
+                }
+            }
+        }
+        deliver(events);
+        return results;
+    }
+
+    /**
+     * The schema name this space registers {@code type} under (issue #16 §10.2),
+     * registering it first when it is new. A binder compares this with the name
+     * it advertises so a card and the space agree on a type's name.
+     *
+     * @param type the entry type
+     * @return the schema name
+     */
+    public String schemaNameOf(Class<?> type) {
+        Objects.requireNonNull(type, "type");
+        return schemas.register(type);
     }
 
     @Override
@@ -399,7 +447,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             for (LinkedHashMap<EntryId, Stored> bucket : bucketsFor(template.type())) {
                 for (Map.Entry<EntryId, Stored> candidate : bucket.entrySet()) {
                     Stored stored = candidate.getValue();
-                    if (stored.state != State.AVAILABLE || !template.matches(stored.entry)) {
+                    if (stored.state != State.AVAILABLE || !matchesLocked(template, stored)) {
                         continue;
                     }
                     long now = nowMillis();
@@ -409,7 +457,7 @@ public final class LocalSpace implements Space, AutoCloseable {
                     stored.record = stored.record.withLease(
                             new LeaseInfo(issuer, stored.takeExpiryMillis, LeaseKind.TAKE));
                     T value = template.type().cast(stored.entry);
-                    events.add(eventsFor(SpaceEvent.Kind.TAKEN, candidate.getKey(), stored.entry));
+                    events.add(eventsFor(SpaceEvent.Kind.TAKEN, candidate.getKey(), stored));
                     result = Optional.of(new Taken<>(candidate.getKey(), value, stored.takeToken));
                     break outer;
                 }
@@ -419,12 +467,14 @@ public final class LocalSpace implements Space, AutoCloseable {
         return result;
     }
 
-    private EntryHandle completeInternal(TakenEntry<?> taken, Object result, Lease resultLease) {
-        return completeInternal(taken, result, resultLease, null, false);
+    private EntryHandle completeInternal(TakenEntry<?> taken, Object result, Lease resultLease,
+                                         Map<String, String> tags) {
+        return completeInternal(taken, result, resultLease, tags, null, false);
     }
 
     private EntryHandle completeInternal(TakenEntry<?> taken, Object result, Lease resultLease,
-                                         AgentId resultWriter, boolean resultAttested) {
+                                         Map<String, String> tags, AgentId resultWriter,
+                                         boolean resultAttested) {
         Objects.requireNonNull(taken, "taken");
         ensureOpen();
         if (!(taken instanceof Taken<?> t)) {
@@ -450,14 +500,14 @@ public final class LocalSpace implements Space, AutoCloseable {
                 written.entry = result;
                 written.writeExpiryMillis = now + resultLease.duration().toMillis();
                 written.record = buildRecord(resultId, result, written.writeExpiryMillis,
-                        Map.of(), resultWriter == null ? issuer : resultWriter);
+                        tags, resultWriter == null ? issuer : resultWriter);
                 written.attested = resultAttested;
             }
             indexRemove(t.entryId(), stored);
-            events.add(eventsFor(SpaceEvent.Kind.COMPLETED, t.entryId(), stored.entry));
+            events.add(eventsFor(SpaceEvent.Kind.COMPLETED, t.entryId(), stored));
             if (written != null) {
                 indexPut(resultId, written);
-                events.add(eventsFor(SpaceEvent.Kind.WRITTEN, resultId, result));
+                events.add(eventsFor(SpaceEvent.Kind.WRITTEN, resultId, written));
                 resultHandle = new Handle(resultId);
             }
             lock.notifyAll();
@@ -497,7 +547,7 @@ public final class LocalSpace implements Space, AutoCloseable {
     private <T> Optional<T> firstMatchLocked(Template<T> template) {
         for (LinkedHashMap<EntryId, Stored> bucket : bucketsFor(template.type())) {
             for (Stored stored : bucket.values()) {
-                if (stored.state == State.AVAILABLE && template.matches(stored.entry)) {
+                if (stored.state == State.AVAILABLE && matchesLocked(template, stored)) {
                     return Optional.of(template.type().cast(stored.entry));
                 }
             }
@@ -563,7 +613,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             if (stored.writeExpiryMillis <= now) {
                 iterator.remove();
                 bucketRemove(e.getKey(), stored);
-                events.add(eventsFor(SpaceEvent.Kind.EXPIRED, e.getKey(), stored.entry));
+                events.add(eventsFor(SpaceEvent.Kind.EXPIRED, e.getKey(), stored));
                 continue;
             }
             if (stored.state == State.TAKEN && stored.takeExpiryMillis <= now) {
@@ -571,7 +621,7 @@ public final class LocalSpace implements Space, AutoCloseable {
                 stored.takeToken++;
                 stored.record = stored.record.withLease(
                         new LeaseInfo(issuer, stored.writeExpiryMillis, LeaseKind.WRITE));
-                events.add(eventsFor(SpaceEvent.Kind.REAPPEARED, e.getKey(), stored.entry));
+                events.add(eventsFor(SpaceEvent.Kind.REAPPEARED, e.getKey(), stored));
             }
         }
         subscriptions.removeIf(sub -> sub.expiryMillis <= now || sub.closedFlag);
@@ -599,14 +649,40 @@ public final class LocalSpace implements Space, AutoCloseable {
                 hlc.now(), new LeaseInfo(writer, writeExpiry, LeaseKind.WRITE), tags, null);
     }
 
+    /**
+     * Issue #16 §9.2 matching order: type (the bucket), then the record's tags,
+     * then the fields. A local space holds the value undecoded, so "before
+     * decode" costs nothing here, but the order is the replicated space's.
+     * Callers hold the lock.
+     */
+    private static boolean matchesLocked(Template<?> template, Stored stored) {
+        return template.matchesTags(stored.record.tags()) && template.matches(stored.entry);
+    }
+
+    /** The metadata view over a stored entry (issue #16 §9.2). Callers hold the lock. */
+    private static <T> EntryView<T> viewOf(Stored stored, T value) {
+        return EntryView.of(stored.record, value, stored.attested
+                ? Attestation.AGENT_ATTESTED : Attestation.PEER_ASSERTED);
+    }
+
+    /**
+     * Queues an event for the subscriptions whose template accepts the entry's
+     * type, tags and fields. The record and value are captured now, under the
+     * lock, so the view a listener sees is the one in force when the event
+     * happened; the event's issuer is the record's writer, which is the view's
+     * agent for a write made through {@link #as}.
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private Runnable eventsFor(SpaceEvent.Kind kind, EntryId entryId, Object entry) {
-        // Every local write is attributed to this space's issuer (buildRecord),
-        // so the event's writer identity is the space issuer by construction.
+    private Runnable eventsFor(SpaceEvent.Kind kind, EntryId entryId, Stored stored) {
+        Object entry = stored.entry;
+        EntryRecord record = stored.record;
+        EntryView<Object> details = viewOf(stored, entry);
         return () -> {
             for (Sub sub : subscriptions) {
-                if (!sub.closedFlag && sub.template.matches(entry)) {
-                    sub.listener.onEvent(new SpaceEvent(kind, entryId, entry, issuer));
+                if (!sub.closedFlag && sub.template.matchesTags(record.tags())
+                        && sub.template.matches(entry)) {
+                    sub.listener.onEvent(new SpaceEvent(kind, entryId, entry, record.issuer(),
+                            record.issuer(), details));
                 }
             }
         };
@@ -664,7 +740,7 @@ public final class LocalSpace implements Space, AutoCloseable {
                 Stored stored = entries.get(entryId);
                 if (stored != null) {
                     indexRemove(entryId, stored);
-                    events.add(eventsFor(SpaceEvent.Kind.EXPIRED, entryId, stored.entry));
+                    events.add(eventsFor(SpaceEvent.Kind.EXPIRED, entryId, stored));
                     lock.notifyAll();
                 }
             }
@@ -772,11 +848,19 @@ public final class LocalSpace implements Space, AutoCloseable {
                                                           Duration timeout) {
             return LocalSpace.this.take(template, takeLease, timeout);
         }
+        @Override public <T> List<Entry<T>> readAllEntries(Template<T> template, int limit) {
+            return LocalSpace.this.readAllEntries(template, limit);
+        }
         @Override public void complete(TakenEntry<?> taken) { LocalSpace.this.complete(taken); }
         @Override public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease) {
+            return complete(taken, result, resultLease, Map.of());
+        }
+        @Override public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease,
+                                                  Map<String, String> tags) {
             Objects.requireNonNull(result, "result");
             Objects.requireNonNull(resultLease, "resultLease");
-            return completeInternal(taken, result, resultLease, actor, attested);
+            Objects.requireNonNull(tags, "tags");
+            return completeInternal(taken, result, resultLease, tags, actor, attested);
         }
         @Override public <T> Subscription notify(Template<T> template, SpaceListener<T> listener,
                                                  Lease lease) {

@@ -25,13 +25,15 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A typed template for associative matching against space entries (spec §7.2): an
- * entry type plus zero or more field conditions. Templates are immutable; each
- * {@link #where} call returns a new template.
+ * entry type plus zero or more field conditions and zero or more tag conditions.
+ * Templates are immutable; each {@link #where} or {@link #whereTag} call returns
+ * a new template.
  *
  * <pre>{@code
  * Template.of(TaskEntry.class)
  *         .where("kind", eq("summarize"))
  *         .where("priority", gte(3))
+ *         .whereTag("region", eq("eu"))
  * }</pre>
  *
  * <p>Fields resolve against record components first, then against conventional
@@ -39,6 +41,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * Unknown fields fail fast at template construction, so a typo surfaces where the
  * template is written and never as a silently empty match. Accessors are cached
  * per entry type.
+ *
+ * <p>Tag conditions (issue #16 §9.2) are evaluated by the space against the entry
+ * record's tags, after the type comparison and before the payload is decoded, so
+ * a tagged template never pays for decoding an entry it would not select. A
+ * template with only tag conditions still selects by type. {@link #matches}
+ * covers type and fields only; {@link #matchesTags} covers the tags.
  *
  * @param <T> the entry type this template matches
  */
@@ -48,13 +56,29 @@ public final class Template<T> {
 
     private final Class<T> type;
     private final List<Condition> conditions;
+    private final List<TagCondition> tagConditions;
 
     private record Condition(String field, Matcher matcher, Method accessor) {
     }
 
-    private Template(Class<T> type, List<Condition> conditions) {
+    /**
+     * One condition on an entry record's tags: the value under {@code key} (or
+     * {@code null} when the record has no such tag) must satisfy the matcher.
+     *
+     * @param key     the tag key
+     * @param matcher the condition the tag value must satisfy
+     */
+    public record TagCondition(String key, Matcher matcher) {
+        public TagCondition {
+            Objects.requireNonNull(key, "key");
+            Objects.requireNonNull(matcher, "matcher");
+        }
+    }
+
+    private Template(Class<T> type, List<Condition> conditions, List<TagCondition> tagConditions) {
         this.type = type;
         this.conditions = conditions;
+        this.tagConditions = tagConditions;
     }
 
     /**
@@ -66,7 +90,7 @@ public final class Template<T> {
      */
     public static <T> Template<T> of(Class<T> type) {
         Objects.requireNonNull(type, "type");
-        return new Template<>(type, List.of());
+        return new Template<>(type, List.of(), List.of());
     }
 
     /**
@@ -83,7 +107,36 @@ public final class Template<T> {
         Method accessor = accessorFor(type, field);
         List<Condition> extended = new ArrayList<>(conditions);
         extended.add(new Condition(field, matcher, accessor));
-        return new Template<>(type, List.copyOf(extended));
+        return new Template<>(type, List.copyOf(extended), tagConditions);
+    }
+
+    /**
+     * Returns a new template with an additional condition on the entry record's
+     * tags (issue #16 §9.2). The matcher is given the value stored under
+     * {@code key}, or {@code null} when the record carries no such tag, so the
+     * ordinary matchers ({@code eq}, {@code in}, {@code contains}) fail on an
+     * absent key and {@code isNull()} selects untagged entries.
+     *
+     * @param key     the tag key
+     * @param matcher the condition the tag value must satisfy
+     * @return the extended template
+     */
+    public Template<T> whereTag(String key, Matcher matcher) {
+        TagCondition condition = new TagCondition(key, matcher);
+        List<TagCondition> extended = new ArrayList<>(tagConditions);
+        extended.add(condition);
+        return new Template<>(type, conditions, List.copyOf(extended));
+    }
+
+    /**
+     * Returns a new template requiring the entry record to carry a tag under
+     * {@code key}, whatever its value: {@code whereTag(key, notNull())}.
+     *
+     * @param key the tag key
+     * @return the extended template
+     */
+    public Template<T> hasTag(String key) {
+        return whereTag(key, Matchers.notNull());
     }
 
     /** Returns the entry type this template matches. */
@@ -92,11 +145,40 @@ public final class Template<T> {
     }
 
     /**
-     * Tests a candidate object against this template.
+     * Returns the tag conditions, in the order they were added; empty for a
+     * template that selects by type and fields alone.
+     */
+    public List<TagCondition> tagConditions() {
+        return tagConditions;
+    }
+
+    /**
+     * Tests an entry record's tags against this template's tag conditions. A
+     * template with no tag conditions accepts every tag map, including the
+     * empty one.
+     *
+     * @param tags the record's tags
+     * @return {@code true} when every tag condition accepts the tags
+     */
+    public boolean matchesTags(Map<String, String> tags) {
+        Objects.requireNonNull(tags, "tags");
+        for (TagCondition condition : tagConditions) {
+            if (!condition.matcher().matches(tags.get(condition.key()))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Tests a candidate object against this template's type and field conditions.
+     * Tag conditions are not consulted here: they apply to the entry record, not
+     * the value, and the space evaluates them with {@link #matchesTags} before it
+     * decodes the value.
      *
      * @param candidate the candidate entry; may be {@code null}
      * @return {@code true} when the candidate is of the template type and every
-     *         condition accepts its field value
+     *         field condition accepts its field value
      */
     public boolean matches(Object candidate) {
         if (!type.isInstance(candidate)) {
@@ -119,7 +201,8 @@ public final class Template<T> {
 
     @Override
     public String toString() {
-        return "Template[" + type.getSimpleName() + ", conditions=" + conditions.size() + "]";
+        return "Template[" + type.getSimpleName() + ", conditions=" + conditions.size()
+                + ", tagConditions=" + tagConditions.size() + "]";
     }
 
     private static Method accessorFor(Class<?> type, String field) {

@@ -55,7 +55,11 @@ key (and the adversarial forger's key and the subordinate agent key) from it, so
 only vectors whose inputs changed differ; it generates a fresh key only when no
 file exists. The generator also checks its mirrors of the private wire records
 (`ReplicatedSpace.SignView`, `PushSumAggregate.Frame`, `GossipLearner.Exchange`,
-...) against the real records by reflection and refuses to run on drift. Then
+...) against the real records by reflection and refuses to run on drift. One
+mirror, `JoinTicket` (the issue #16 reserved type, real class in
+`agentspaces-agent`), stands in for a module outside this classpath: the
+generator checks it only when the class loads and prints a note otherwise, so
+appending `agentspaces-agent/target/classes` to `CP` turns that check on. Then
 run `mvn -q -pl agentspaces-space test -Dgolden.required=true` and the Python
 and TypeScript suites.
 

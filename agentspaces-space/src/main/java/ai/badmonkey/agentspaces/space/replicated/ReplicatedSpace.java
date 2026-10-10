@@ -53,6 +53,7 @@ import ai.badmonkey.agentspaces.space.crdt.Dot;
 import ai.badmonkey.agentspaces.space.crdt.EntryState;
 import ai.badmonkey.agentspaces.space.crdt.LwwRegister;
 import ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt;
+import ai.badmonkey.agentspaces.space.EntryView;
 import ai.badmonkey.agentspaces.space.local.SimpleSchemaRegistry;
 
 import java.nio.charset.StandardCharsets;
@@ -730,15 +731,27 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
 
         @Override
+        public <T> List<Entry<T>> readAllEntries(Template<T> template, int limit) {
+            return ReplicatedSpace.this.readAllEntries(template, limit);
+        }
+
+        @Override
         public void complete(TakenEntry<?> taken) {
-            completeInternal(actor, taken, null, null);
+            completeInternal(actor, taken, null, null, Map.of());
         }
 
         @Override
         public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease) {
+            return complete(taken, result, resultLease, Map.of());
+        }
+
+        @Override
+        public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease,
+                                        Map<String, String> tags) {
             Objects.requireNonNull(result, "result");
             Objects.requireNonNull(resultLease, "resultLease");
-            return completeInternal(actor, taken, result, resultLease);
+            Objects.requireNonNull(tags, "tags");
+            return completeInternal(actor, taken, result, resultLease, tags);
         }
 
         @Override
@@ -1118,7 +1131,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             dto = signedDto(prepared.entryId(), identity.rawPublicKey(), prepared.actor());
         }
         publishDelta(new SpaceWire.Delta(dto, null, null), "w:" + prepared.entryId());
-        fire(SpaceEvent.Kind.WRITTEN, prepared.entryId(), prepared.value(), prepared.actor().id());
+        fire(SpaceEvent.Kind.WRITTEN, prepared.entryId(), prepared.value(), prepared.actor().id(),
+                prepared.actor().id(), prepared.signed());
         return new Handle(prepared.entryId(), prepared.actor());
     }
 
@@ -1224,15 +1238,104 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     @Override
+    public <T> List<Entry<T>> readAllEntries(Template<T> template, int limit) {
+        Objects.requireNonNull(template, "template");
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive: " + limit);
+        }
+        registerSchema(template.type());
+        // Issue #16 §9.2: the readAll visibility rule (live, unclaimed, decodable
+        // now) over the records this replica holds; the attestation is read
+        // under the lock beside the candidates, as the certificate table is.
+        List<EntryRecord> candidates;
+        Set<EntryId> attested = new HashSet<>();
+        synchronized (lock) {
+            candidates = availableRecords(schemas.schemaNameOf(template.type()));
+            for (EntryRecord record : candidates) {
+                if (issuerCertificates.containsKey(record.entryId())) {
+                    attested.add(record.entryId());
+                }
+            }
+        }
+        List<Entry<T>> results = new ArrayList<>();
+        for (EntryRecord record : candidates) {
+            decodeIfMatches(template, record).ifPresent(value ->
+                    results.add(EntryView.of(record, value, attested.contains(record.entryId())
+                            ? Attestation.AGENT_ATTESTED : Attestation.PEER_ASSERTED)));
+            if (results.size() == limit) {
+                break;
+            }
+        }
+        return results;
+    }
+
+    /**
+     * The record this replica currently holds for an entry (issue #16 §9.3):
+     * present while the CRDT reports the entry present, whether it is available
+     * or claimed, and empty once it is completed, withdrawn, or unknown here.
+     * The ordered join uses it to read a ticket's tags for an entry id it learned
+     * from a committed claim, which a template read cannot see while claimed.
+     * The lease on the returned record is the one in force.
+     *
+     * @param entryId the entry
+     * @return the record, when the entry is present here
+     */
+    public Optional<EntryRecord> recordOf(EntryId entryId) {
+        return recordOf(entryId, false);
+    }
+
+    /**
+     * {@link #recordOf(EntryId)}, optionally answering for a completed entry
+     * too, from the tombstone the CRDT keeps until the collection horizon
+     * (SPEC §7.3). The ordered join needs this: a member may learn of the first
+     * committed ticket claim for a key after that ticket's taker has already
+     * completed it, and must still read the ticket's key to know that a later
+     * ticket for the same key does not fire.
+     *
+     * @param entryId      the entry
+     * @param completedToo whether a completed entry's record is returned as well
+     * @return the record, when the replica holds one
+     */
+    public Optional<EntryRecord> recordOf(EntryId entryId, boolean completedToo) {
+        Objects.requireNonNull(entryId, "entryId");
+        synchronized (lock) {
+            return crdt.state(entryId)
+                    .filter(state -> state.present() || (completedToo && state.completed()))
+                    .map(state -> state.record().withLease(state.lease().value()));
+        }
+    }
+
+    /**
+     * The schema name this replica registers {@code type} under (issue #16
+     * §10.2), registering it first when it is new, as a read or subscription
+     * would. A binder compares this with the name it advertises so a card and
+     * the space agree on a type's name.
+     *
+     * @param type the entry type
+     * @return the schema name
+     */
+    public String schemaNameOf(Class<?> type) {
+        Objects.requireNonNull(type, "type");
+        return registerSchema(type);
+    }
+
+    @Override
     public void complete(TakenEntry<?> taken) {
-        completeInternal(writer, taken, null, null);
+        completeInternal(writer, taken, null, null, Map.of());
     }
 
     @Override
     public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease) {
+        return complete(taken, result, resultLease, Map.of());
+    }
+
+    @Override
+    public <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease,
+                                    Map<String, String> tags) {
         Objects.requireNonNull(result, "result");
         Objects.requireNonNull(resultLease, "resultLease");
-        return completeInternal(writer, taken, result, resultLease);
+        Objects.requireNonNull(tags, "tags");
+        return completeInternal(writer, taken, result, resultLease, tags);
     }
 
     @Override
@@ -1318,27 +1421,58 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Objects.requireNonNull(signature, "signature");
         SpaceWire.SignedClaim attested = new SpaceWire.SignedClaim(claim, holderKey, signature,
                 certificate);
-        if (!attested.holderAttested()) {
-            throw new IllegalArgumentException("claim on " + entryId.value() + " is held by agent '"
-                    + claim.holder().localName() + "' of " + claim.holder().peer().display()
-                    + " but the key offered as its attestation belongs to "
-                    + (holderKey.length == Ed25519.RAW_PUBLIC_KEY_LENGTH
-                            ? PeerId.fromPublicKey(holderKey).display() : "no valid peer")
-                    + "; a completion could never be authenticated against it");
-        }
-        if (!verifyClaim(entryId, attested)) {
-            throw new IllegalArgumentException("claim on " + entryId.value()
-                    + " does not verify under its holder's key, or is bound to another entry");
-        }
-        if (runtime.revocationView().refuses(claim.holder(), claimKey(attested), null)) {
-            // v0.1.13: the log path refuses a revoked holder exactly as gossip does.
-            throw new IllegalArgumentException("claim on " + entryId.value() + " is held by "
-                    + claim.holder().encoded() + ", which is revoked in this group");
+        String refusal = claimRefusal(entryId, attested);
+        if (refusal != null) {
+            throw new IllegalArgumentException(refusal);
         }
         synchronized (lock) {
             claims.merge(entryId, attested, SpaceWire.SignedClaim::merge);
             logDecidedEpochs.merge(entryId, claim.epoch(), Math::max);
         }
+    }
+
+    /**
+     * Whether a log-committed claim would be accepted by
+     * {@link #applyAuthorizedClaim(EntryId, TakeClaim, byte[], byte[], AgentCertificate)},
+     * without installing it (issue #16): the ordered-log coordinator asks this
+     * for a committed claim whose generation this replica already holds through
+     * gossip, so that listeners on the committed order still hear of every
+     * authentic claim.
+     */
+    public boolean verifiesAuthorizedClaim(EntryId entryId, TakeClaim claim, byte[] holderKey,
+                                           byte[] signature,
+                                           ai.badmonkey.agentspaces.api.security.AgentCertificate certificate) {
+        Objects.requireNonNull(entryId, "entryId");
+        Objects.requireNonNull(claim, "claim");
+        if (holderKey == null || signature == null) {
+            return false;
+        }
+        return claimRefusal(entryId, new SpaceWire.SignedClaim(claim, holderKey, signature,
+                certificate)) == null;
+    }
+
+    /** The reason a log-committed claim is refused, or null when it is accepted. */
+    private String claimRefusal(EntryId entryId, SpaceWire.SignedClaim attested) {
+        TakeClaim claim = attested.claim();
+        byte[] holderKey = attested.holderKey();
+        if (!attested.holderAttested()) {
+            return "claim on " + entryId.value() + " is held by agent '"
+                    + claim.holder().localName() + "' of " + claim.holder().peer().display()
+                    + " but the key offered as its attestation belongs to "
+                    + (holderKey.length == Ed25519.RAW_PUBLIC_KEY_LENGTH
+                            ? PeerId.fromPublicKey(holderKey).display() : "no valid peer")
+                    + "; a completion could never be authenticated against it";
+        }
+        if (!verifyClaim(entryId, attested)) {
+            return "claim on " + entryId.value()
+                    + " does not verify under its holder's key, or is bound to another entry";
+        }
+        if (runtime.revocationView().refuses(claim.holder(), claimKey(attested), null)) {
+            // v0.1.13: the log path refuses a revoked holder exactly as gossip does.
+            return "claim on " + entryId.value() + " is held by "
+                    + claim.holder().encoded() + ", which is revoked in this group";
+        }
+        return null;
     }
 
     /**
@@ -1449,7 +1583,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         EntryId claimedId = null;
         TakeClaim myClaim = null;
         T claimedValue = null;
-        AgentId claimedIssuer = null;
+        EntryRecord claimedRecord = null;
         synchronized (lock) {
             long now = nowMillis();
             // Gather matching candidates; under AUCTION, bid on the candidate this
@@ -1500,7 +1634,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                         SpaceWire.SignedClaim::merge);
                 claimedId = candidate.entry().entryId();
                 claimedValue = candidate.value();
-                claimedIssuer = candidate.entry().issuer();
+                claimedRecord = candidate.entry();
                 break;
             }
         }
@@ -1518,12 +1652,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 return Optional.empty(); // lost the race; retry elsewhere
             }
         }
-        fire(SpaceEvent.Kind.TAKEN, claimedId, claimedValue, claimedIssuer);
+        fire(SpaceEvent.Kind.TAKEN, claimedId, claimedValue, claimedRecord.issuer(),
+                claimedRecord.issuer(), claimedRecord);
         return Optional.of(new Taken<>(claimedId, claimedValue, myClaim.epoch(), actor));
     }
 
     private EntryHandle completeInternal(AgentIdentity actor, TakenEntry<?> taken, Object result,
-                                         Lease resultLease) {
+                                         Lease resultLease, Map<String, String> tags) {
         Objects.requireNonNull(taken, "taken");
         if (!(taken instanceof Taken<?> t)) {
             throw new IllegalArgumentException("foreign TakenEntry implementation: " + taken.getClass());
@@ -1541,7 +1676,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // blocks-less space, unserializable, block-store failure) never leaves
         // the task completed-but-resultless and fleet-wide unrecoverable.
         PreparedWrite preparedResult = result == null
-                ? null : prepareWrite(actor, result, resultLease, Map.of());
+                ? null : prepareWrite(actor, result, resultLease, tags);
         SpaceWire.EntryStateDto dto;
         SpaceWire.SignedClaim proof;
         Object completedValue;
@@ -1567,7 +1702,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         publishDelta(new SpaceWire.Delta(dto, t.entryId(), proof), "d:" + t.entryId());
         fire(SpaceEvent.Kind.COMPLETED, t.entryId(),
                 completedValue == null ? t.entry() : completedValue,
-                dto.record().issuer(), actor.id());
+                dto.record().issuer(), actor.id(), dto.record());
         return preparedResult == null ? null : commitWrite(preparedResult);
     }
 
@@ -1672,7 +1807,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (isNew && visible) {
             Optional<Object> value = decodeValue(dto.record());
             if (value.isPresent()) {
-                fire(SpaceEvent.Kind.WRITTEN, entryId, value.get(), dto.record().issuer());
+                fire(SpaceEvent.Kind.WRITTEN, entryId, value.get(), dto.record().issuer(),
+                        dto.record().issuer(), dto.record());
             } else if (dto.record().payload() == null && dto.record().payloadRef() != null
                     && blocks != null) {
                 // A content-addressed entry whose block has not landed: fetch it now
@@ -1681,7 +1817,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 // the only way before; the flagships all polled for this reason).
                 EntryRecord record = dto.record();
                 fetchInBackground(record, () -> decodeValue(record).ifPresent(v ->
-                        fire(SpaceEvent.Kind.WRITTEN, entryId, v, record.issuer())));
+                        fire(SpaceEvent.Kind.WRITTEN, entryId, v, record.issuer(),
+                                record.issuer(), record)));
             }
         }
         if (nowCompleted) {
@@ -1691,7 +1828,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 completer = claim == null ? dto.record().issuer() : claim.claim().holder();
             }
             decodeValue(dto.record()).ifPresent(value ->
-                    fire(SpaceEvent.Kind.COMPLETED, entryId, value, dto.record().issuer(), completer));
+                    fire(SpaceEvent.Kind.COMPLETED, entryId, value, dto.record().issuer(), completer,
+                            dto.record()));
             valueCache.remove(entryId); // #11: stop pinning a completed entry's decoded value
         }
     }
@@ -2196,6 +2334,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (!record.type().equals(schemas.schemaNameOf(template.type()))) {
             return Optional.empty();
         }
+        // Issue #16 §9.2 matching order: type, tags, then decode and fields. The
+        // tags sit on the record, so a tagged template never decodes an entry it
+        // would not select.
+        if (!template.matchesTags(record.tags())) {
+            return Optional.empty();
+        }
         Object value = valueCache.get(record.entryId());
         if (value == null) {
             byte[] payload = record.payload();
@@ -2386,7 +2530,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** Queues an event for delivery outside the lock; silent when the value cannot be decoded here. */
     private void deferredEvent(List<Runnable> events, SpaceEvent.Kind kind, EntryRecord record) {
         events.add(() -> decodeValue(record).ifPresent(value ->
-                fire(kind, record.entryId(), value, record.issuer())));
+                fire(kind, record.entryId(), value, record.issuer(), record.issuer(), record)));
     }
 
     /** Binds a ciphertext to its entry within this space (and so this group). */
@@ -2682,18 +2826,34 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         runtime.gossip().publish(streamId, itemId, codec.toBytes(delta));
     }
 
+    /**
+     * Delivers an event to the subscriptions whose template accepts the entry's
+     * type, tags and fields (issue #16 §9.2). Every caller holds the record the
+     * event is about, so the event carries the {@link EntryView} over it; the
+     * attestation is read under the lock, as {@code readAllEntries} reads it.
+     * Callers do not hold the lock.
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private void fire(SpaceEvent.Kind kind, EntryId entryId, Object value, AgentId writer) {
-        fire(kind, entryId, value, writer, writer);
-    }
-
     private void fire(SpaceEvent.Kind kind, EntryId entryId, Object value, AgentId writer,
-                      AgentId actor) {
+                      AgentId actor, EntryRecord record) {
         long now = nowMillis();
         subscriptions.removeIf(sub -> sub.expiryMillis <= now || sub.closed);
+        if (value == null) {
+            return;
+        }
+        EntryView<Object> details = null;
         for (Sub sub : subscriptions) {
-            if (!sub.closed && value != null && sub.template.matches(value)) {
-                sub.listener.onEvent(new SpaceEvent(kind, entryId, value, writer, actor));
+            if (!sub.closed && sub.template.matchesTags(record.tags())
+                    && sub.template.matches(value)) {
+                if (details == null) {
+                    boolean attested;
+                    synchronized (lock) {
+                        attested = issuerCertificates.containsKey(entryId);
+                    }
+                    details = EntryView.of(record, value, attested
+                            ? Attestation.AGENT_ATTESTED : Attestation.PEER_ASSERTED);
+                }
+                sub.listener.onEvent(new SpaceEvent(kind, entryId, value, writer, actor, details));
             }
         }
     }

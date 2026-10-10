@@ -57,5 +57,6 @@
     <module>example-12-exactly-once-desk</module>
     <module>example-13-signed-agents</module>
     <module>example-14-gossip-learning</module>
+    <module>example-18-agentic-workflow</module>
   </modules>
 </project>

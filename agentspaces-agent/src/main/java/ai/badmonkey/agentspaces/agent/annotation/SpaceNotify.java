@@ -83,4 +83,37 @@ public @interface SpaceNotify {
      * A2A skills; empty means the card's agent description stands in.
      */
     String description() default "";
+
+    /**
+     * Tag filters an entry must satisfy to be seen by this method, each
+     * {@code "key=value"} (the tag equals the value) or {@code "key"} (the tag
+     * is present), compiled onto the method's template so they are judged
+     * before the payload is decoded (SPEC §7.2, issue #16).
+     */
+    String[] tags() default {};
+
+    /**
+     * Field filters an entry must satisfy to be seen by this method, each
+     * {@code "field=value"} or {@code "field!=value"} compared on the field's
+     * string form, compiled onto the method's template (ISSUE-WorkflowVerbs);
+     * an unknown field is refused at bind time.
+     */
+    String[] where() default {};
+
+    /**
+     * What this method produces when its return type does not say: the entry
+     * types inside an {@code Entries} fork or an {@code Object} return, declared
+     * on the card (ISSUE-WorkflowVerbs). A sealed return type declares its
+     * permitted subclasses without this.
+     */
+    Class<?>[] produces() default {};
+
+    /**
+     * The event kinds this method reacts to; {@code WRITTEN} by default.
+     * {@code EXPIRED} turns a leased entry into a timer, {@code REAPPEARED}
+     * into a dead-worker signal, {@code COMPLETED} into "done elsewhere"
+     * (ISSUE-WorkflowVerbs). Each entry is delivered once per kind.
+     */
+    ai.badmonkey.agentspaces.api.space.SpaceEvent.Kind[] on() default {
+            ai.badmonkey.agentspaces.api.space.SpaceEvent.Kind.WRITTEN};
 }

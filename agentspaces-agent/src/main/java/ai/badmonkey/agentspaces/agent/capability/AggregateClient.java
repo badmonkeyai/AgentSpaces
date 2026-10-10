@@ -96,6 +96,33 @@ public final class AggregateClient {
         return aggregate.estimate(epochId);
     }
 
+    /** {@link PushSumAggregate#onEstimate}: a listener fired once per matching epoch when it settles. */
+    public AutoCloseable onEstimate(java.util.function.Predicate<String> epochs,
+                                    PushSumAggregate.Settle settle,
+                                    java.util.function.Consumer<PushSumAggregate.Estimate> listener) {
+        return aggregate.onEstimate(epochs, settle, listener);
+    }
+
+    /**
+     * Blocks until the epoch's estimate has settled under the rule, or the
+     * timeout elapses; the procedural form of {@link #onEstimate} (ISSUE-OnEstimate).
+     */
+    public OptionalDouble awaitSettled(String epochId, PushSumAggregate.Settle settle,
+                                       java.time.Duration timeout) {
+        java.util.concurrent.CompletableFuture<Double> settled = new java.util.concurrent.CompletableFuture<>();
+        try (AutoCloseable watch = aggregate.onEstimate(epochId::equals, settle,
+                estimate -> settled.complete(estimate.value()))) {
+            return OptionalDouble.of(settled.get(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS));
+        } catch (java.util.concurrent.TimeoutException e) {
+            return OptionalDouble.empty();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return OptionalDouble.empty();
+        } catch (Exception e) {
+            throw new IllegalStateException("awaiting the settled estimate of " + epochId, e);
+        }
+    }
+
     /**
      * Returns the current, unexpired advertisements of the aggregate
      * capability in this group.

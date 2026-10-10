@@ -1,6 +1,6 @@
 # examples
 
-Fourteen graduated examples, each adding one layer or one coordination idea to the one before,
+Fifteen graduated examples, each adding one layer or one coordination idea to the one before,
 each with a flow test that drives it end to end over real TCP (`mvn -q -pl examples/<name> exec:java`
 runs the live demo). The developer guide cuts its snippets from these sources.
 
@@ -20,10 +20,12 @@ runs the live demo). The developer guide cuts its snippets from these sources.
 | 12 | `exactly-once-desk` | ORDERED takes: `OrderedTakes.over(...)` and an `@OrderedTake` clerk |
 | 13 | `signed-agents` | Subordinate agent keys, attestation, two annotated agents on one peer |
 | 14 | `gossip-learning` | Three local models converge on the fleet mean on the peer tick alone |
+| 18 | `agentic-workflow` | A nine-stage claims flow: fan-out, a duplicate-safe join, an auction, a vote gate, an exactly-once payment, fleet sensing, and entries that mirror an ontology |
 
 Example 15, a Spring AI orchestrator whose model calls fleet agents as tools,
 lives with the Spring AI integration in `agentspaces-springai/examples/springai-fleet`
 at the workspace root, beside the Spring AI patterns (`springai-patterns`).
+Examples 16 and 17 are the Micronaut fleets under `agentspaces-micronaut/examples`.
 
 ## Notes
 

@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.capabilities.runtime;
 
 import ai.badmonkey.agentspaces.api.ad.CapabilityAdvertisement;
 import ai.badmonkey.agentspaces.api.spi.CapabilityProvider;
+import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.AdvertisementSigner;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
@@ -247,6 +248,11 @@ public final class CapabilityRuntime implements AutoCloseable {
         CapabilityAdvertisement ad = provider.describe(runtime.id());
         publish(provider, ad);
         providers.put(ad.id(), provider);
+        if (provider instanceof PushSumAggregate aggregate && !aggregate.hasParticipantRule()) {
+            // Shares go only to members that advertise the aggregate: a bystander
+            // without one would swallow them (2026-10-09, the council and Spring runs).
+            aggregate.participants(PushSumAggregate.advertisedIn(discovery));
+        }
         provider.start();
     }
 

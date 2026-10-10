@@ -15,11 +15,15 @@
  */
 package ai.badmonkey.agentspaces.api.space;
 
+import ai.badmonkey.agentspaces.api.entry.EntryId;
+import ai.badmonkey.agentspaces.api.entry.LeaseInfo;
+import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.common.id.SpaceId;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -157,6 +161,58 @@ public interface Space {
     <T> List<Issued<T>> readAllIssued(Template<T> template, int limit);
 
     /**
+     * One matched entry with the metadata its record carries (issue #16 §9.2):
+     * the decoded value, the entry id, the authenticated issuer and how far it
+     * is attested, the tags, the lease in force, and the issue stamp. An
+     * interface rather than a record, so a later accessor (the key epoch, the
+     * writer's certificate) can be added without touching any constructor or
+     * breaking a record pattern. {@link Issued} is unchanged beside it.
+     *
+     * @param <T> the entry type
+     */
+    interface Entry<T> {
+
+        /** The decoded entry value. */
+        T value();
+
+        /** The entry's identifier. */
+        EntryId entryId();
+
+        /** The entry's authenticated writer. */
+        AgentId issuer();
+
+        /** How far the issuer is proven. */
+        Attestation attestation();
+
+        /** The record's tags; empty when the writer gave none. */
+        Map<String, String> tags();
+
+        /** The lease in force on the record at the time of the read or event. */
+        LeaseInfo lease();
+
+        /** The record's issue stamp. */
+        HlcTimestamp issued();
+    }
+
+    /**
+     * Non-destructive match returning up to {@code limit} entries present now,
+     * each as an {@link Entry} view over its record. Visibility is that of
+     * {@link #readAll}: live, unclaimed, and decodable now.
+     *
+     * <p>The default throws; both library spaces implement it.
+     *
+     * @param template the template to match
+     * @param limit    the maximum number of entries to return
+     * @param <T>      the entry type
+     * @return the matching entries with their metadata, possibly empty
+     * @throws UnsupportedOperationException when the implementation predates this method
+     */
+    default <T> List<Entry<T>> readAllEntries(Template<T> template, int limit) {
+        throw new UnsupportedOperationException(
+                "readAllEntries is not supported by " + getClass().getName());
+    }
+
+    /**
      * Destructive, exclusive match under the space's conflict strategy (spec §7.4),
      * waiting up to the timeout for a matching entry. The returned take holds a
      * TAKE lease: if the taker dies or lets the lease lapse without
@@ -191,6 +247,30 @@ public interface Space {
      * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the TAKE lease lapsed
      */
     <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease);
+
+    /**
+     * Consumes a taken entry permanently and atomically writes a tagged result
+     * entry (issue #16 §9.2): as {@link #complete(TakenEntry, Object, Lease)},
+     * with {@code tags} carried on the result's record exactly as
+     * {@link #write(Object, Lease, Map)} would carry them.
+     *
+     * <p>The default throws; both library spaces and their per-agent views
+     * implement it.
+     *
+     * @param taken       the take to complete
+     * @param result      the result entry to write
+     * @param resultLease the write lease for the result entry
+     * @param tags        free-form tags for the result record
+     * @param <R>         the result entry type
+     * @return a handle for the written result entry
+     * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the TAKE lease lapsed
+     * @throws UnsupportedOperationException when the implementation predates this method
+     */
+    default <R> EntryHandle complete(TakenEntry<?> taken, R result, Lease resultLease,
+                                     Map<String, String> tags) {
+        throw new UnsupportedOperationException(
+                "complete(taken, result, lease, tags) is not supported by " + getClass().getName());
+    }
 
     /**
      * Registers a leased subscription for events on entries matching the template.

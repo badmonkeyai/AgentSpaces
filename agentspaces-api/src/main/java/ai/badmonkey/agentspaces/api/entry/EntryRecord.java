@@ -86,7 +86,12 @@ public record EntryRecord(
                     "inline payload exceeds " + INLINE_PAYLOAD_LIMIT + " bytes ("
                             + payload.length + "); use a content-addressed payloadRef");
         }
-        tags = Map.copyOf(tags);
+        // The record signature covers the tags in iteration order (SignView, TECH-SPEC
+        // §7.2), so the copy must keep the order the map arrived in: Map.copyOf
+        // iterates in an order salted per JVM start, and a receiver that rebuilt
+        // the view from such a copy would refuse every honest record with two or
+        // more tags about half the time (issue #16, found by the ticket vector).
+        tags = java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(tags));
         if (keyEpoch != null && keyEpoch < 1) {
             throw new IllegalArgumentException("a record names key epoch 1 or later, or none: "
                     + keyEpoch);

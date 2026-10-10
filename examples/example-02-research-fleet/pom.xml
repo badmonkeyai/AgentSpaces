@@ -52,6 +52,17 @@
       <artifactId>agentspaces-discovery</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- The council act (CouncilFleet): votes, push-sum, semantic discovery, remote actions. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-capabilities</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-agent</artifactId>
+      <version>${project.version}</version>
+    </dependency>
   </dependencies>
 
   <build>

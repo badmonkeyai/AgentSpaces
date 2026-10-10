@@ -62,7 +62,9 @@ public record CapabilityAdvertisement(
         Objects.requireNonNull(capabilityType, "capabilityType");
         Objects.requireNonNull(version, "version");
         Objects.requireNonNull(binding, "binding");
-        parameters = Map.copyOf(Objects.requireNonNull(parameters, "parameters"));
-        costHints = Map.copyOf(Objects.requireNonNull(costHints, "costHints"));
+        parameters = java.util.Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(Objects.requireNonNull(parameters, "parameters"))); // signed in iteration order
+        costHints = java.util.Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(Objects.requireNonNull(costHints, "costHints"))); // signed in iteration order
     }
 }

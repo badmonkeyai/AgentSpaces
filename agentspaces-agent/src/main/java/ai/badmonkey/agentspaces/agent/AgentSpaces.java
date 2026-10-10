@@ -17,12 +17,16 @@ package ai.badmonkey.agentspaces.agent;
 
 import ai.badmonkey.agentspaces.agent.annotation.BidFunction;
 import ai.badmonkey.agentspaces.agent.annotation.ProvidesCapability;
+import ai.badmonkey.agentspaces.agent.annotation.OnEstimate;
+import ai.badmonkey.agentspaces.agent.annotation.Propose;
+import ai.badmonkey.agentspaces.agent.annotation.SpaceJoin;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceNotify;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceRef;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceTake;
 import ai.badmonkey.agentspaces.agent.capability.CapabilityClientFactory;
 import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.spi.CapabilityProvider;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.capabilities.runtime.CapabilityPipes;
 import ai.badmonkey.agentspaces.capabilities.runtime.CapabilityRuntime;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
@@ -81,6 +85,8 @@ public final class AgentSpaces implements AutoCloseable {
     private final Map<String, GroupContext> groups = new ConcurrentHashMap<>();
     private final Map<Class<?>, CapabilityClientFactory<?>> clientFactories =
             new ConcurrentHashMap<>();
+    /** The registry groups registered from now on hand their binders; null for each binder's default. */
+    private volatile SchemaRegistry schemaRegistry;
 
     /**
      * Creates the facade. Typed-client factories on the classpath are picked
@@ -157,6 +163,30 @@ public final class AgentSpaces implements AutoCloseable {
         Objects.requireNonNull(factory, "factory");
         clientFactories.put(Objects.requireNonNull(factory.clientType(), "clientType"), factory);
         return this;
+    }
+
+    /**
+     * Sets the schema registry every group registered from now on hands its
+     * binder (ISSUE-WorkflowShape §9.1), so cards name what the spaces built
+     * with the same registry write. Groups already registered keep theirs;
+     * spaces are built by the caller, who passes the same instance to their
+     * builders.
+     *
+     * @param schemaRegistry the registry
+     * @return this facade
+     */
+    public AgentSpaces schemaRegistry(SchemaRegistry schemaRegistry) {
+        this.schemaRegistry = Objects.requireNonNull(schemaRegistry, "schemaRegistry");
+        return this;
+    }
+
+    /**
+     * Returns the facade-wide schema registry, when one was set.
+     *
+     * @return the registry, or empty when each group's binder uses its default
+     */
+    public Optional<SchemaRegistry> schemaRegistry() {
+        return Optional.ofNullable(schemaRegistry);
     }
 
     /** Returns the client types a {@link GroupContext#capability(Class)} can resolve. */
@@ -313,6 +343,18 @@ public final class AgentSpaces implements AutoCloseable {
             if (bid != null) {
                 named.add(bid.group());
             }
+            SpaceJoin join = method.getAnnotation(SpaceJoin.class);
+            if (join != null) {
+                named.add(join.group());
+            }
+            Propose propose = method.getAnnotation(Propose.class);
+            if (propose != null) {
+                named.add(propose.group());
+            }
+            OnEstimate onEstimate = method.getAnnotation(OnEstimate.class);
+            if (onEstimate != null) {
+                named.add(onEstimate.group());
+            }
         }
         for (Class<?> at = type; at != null && at != Object.class; at = at.getSuperclass()) {
             for (java.lang.reflect.Field field : at.getDeclaredFields()) {
@@ -349,6 +391,10 @@ public final class AgentSpaces implements AutoCloseable {
             this.runtime = runtime;
             this.discoveryService = discovery;
             this.binder = new AgentBinder(identity, groupId, discovery, clock, name, identities);
+            SchemaRegistry shared = schemaRegistry;
+            if (shared != null) {
+                this.binder.schemas(shared);
+            }
             // @CapabilityRef fields resolve through this group's typed clients.
             this.binder.clients(type -> clientFactories.containsKey(type) ? capability(type) : null);
             if (runtime != null) {
@@ -476,6 +522,30 @@ public final class AgentSpaces implements AutoCloseable {
         /** Returns the group's agent binder. */
         public AgentBinder binder() {
             return binder;
+        }
+
+        /**
+         * Sets the schema registry this group's binder names cards from
+         * (ISSUE-WorkflowShape §9.1); pass the registry the group's spaces were
+         * built with. Refused after the group's first bind.
+         *
+         * @param schemaRegistry the registry
+         * @return this context
+         * @throws IllegalStateException after the first bind
+         */
+        public GroupContext schemaRegistry(SchemaRegistry schemaRegistry) {
+            binder.schemas(schemaRegistry);
+            return this;
+        }
+
+        /**
+         * Returns the schema registry this group's cards are named from: the
+         * one set here or on the facade, else the binder's default.
+         *
+         * @return the registry
+         */
+        public SchemaRegistry schemaRegistry() {
+            return binder.schemas();
         }
 
         /**

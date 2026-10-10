@@ -28,6 +28,7 @@ import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.CapabilityProvider;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.capabilities.runtime.CapabilityRuntime;
 import ai.badmonkey.agentspaces.capabilities.vote.VoteCapability;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
@@ -39,6 +40,7 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.local.LocalSpace;
+import ai.badmonkey.agentspaces.space.local.NamespaceSchemaRegistry;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
@@ -54,6 +56,7 @@ import java.time.Instant;
 import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -459,5 +462,41 @@ class AgentSpacesTest {
         for (int i = 0; i < rounds; i++) {
             nodes.forEach(PeerNode::tick);
         }
+    }
+
+    /** ISSUE-WorkflowShape §9.1: the facade's registry reaches every group registered after it; a group may still choose its own. */
+    @Test
+    void theFacadeRegistryReachesEveryGroupRegisteredAfterIt() {
+        String ns = "https://example.org/test#";
+        SchemaRegistry shared =
+                NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
+        AgentSpaces.GroupContext before = spaces.register("before", GroupId.of("zBefore"), null, null)
+                .space("tasks", tasks).space("findings", findings);
+        assertThat(spaces.schemaRegistry()).isEmpty();
+        assertThat(before.schemaRegistry()).as("defaults to the binder's")
+                .isSameAs(before.binder().schemas());
+
+        assertThat(spaces.schemaRegistry(shared)).isSameAs(spaces);
+        assertThat(spaces.schemaRegistry()).contains(shared);
+        AgentSpaces.GroupContext after = spaces.register("after", GroupId.of("zAfter"), null, null)
+                .space("tasks", tasks).space("findings", findings);
+        assertThat(after.schemaRegistry()).isSameAs(shared);
+        assertThat(after.binder().schemas()).isSameAs(shared);
+        assertThat(before.schemaRegistry()).as("already registered groups keep theirs")
+                .isNotSameAs(shared);
+
+        assertThat(after.bind(new Researcher()).card().consumes())
+                .containsExactly(ns + "TaskEntry");
+        assertThat(before.bind(new Researcher()).card().consumes())
+                .containsExactly(TaskEntry.class.getName() + "#v1");
+
+        // A group's own setter wins over the facade default, until its first bind.
+        SchemaRegistry own = NamespaceSchemaRegistry.of(
+                Map.of("ai.badmonkey.agentspaces.test", "https://example.org/own#"));
+        AgentSpaces.GroupContext chosen = spaces.register("chosen", GroupId.of("zChosen"), null, null)
+                .schemaRegistry(own);
+        assertThat(chosen.schemaRegistry()).isSameAs(own);
+        assertThatThrownBy(() -> after.schemaRegistry(own))
+                .isInstanceOf(IllegalStateException.class);
     }
 }

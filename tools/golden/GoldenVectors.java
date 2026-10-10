@@ -144,6 +144,16 @@ public final class GoldenVectors {
     record ResearchTask(String topic, int priority) {
     }
 
+    /**
+     * Mirrors {@code ai.badmonkey.agentspaces.agent.join.JoinTicket} (issue #16,
+     * SPEC §7.1 reserved types): the same two components in the same order. The
+     * real record lives in agentspaces-agent, which is not on this program's
+     * documented classpath, so {@link #assertMirrorsIfLoadable} checks the shape
+     * whenever the agent classes happen to be present and reports a skip otherwise.
+     */
+    record JoinTicket(String join, String key) {
+    }
+
     // Mirrors of PushSumAggregate's private wire records (SPEC §8 aggregate,
     // TECH-SPEC §8.2): one Frame carries exactly one of the four variants.
     record Share(String epochId, double value, double weight) {
@@ -187,6 +197,7 @@ public final class GoldenVectors {
                 "EpochCommitment", EpochCommitment.class);
         assertMirrors(ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor.class,
                 "WrapBinding", WrapBinding.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.agent.join.JoinTicket", JoinTicket.class);
 
         // The golden identity: reloaded from the existing file so signatures
         // stay stable; generated fresh only on the very first run.
@@ -251,7 +262,7 @@ public final class GoldenVectors {
 
         // A PING envelope: canonical bytes and the signed frame. Addressed to
         // self here so the golden vector exercises the non-null `to` binding.
-        Envelope ping = new Envelope(2, group, Envelope.Kind.PING, self, self, stamp,
+        Envelope ping = new Envelope(WireCodec.WIRE_VERSION, group, Envelope.Kind.PING, self, self, stamp,
                 codec.toBytes(new Bodies.Ping(42)));
         byte[] envelopeCbor = codec.toBytes(ping);
         json.append(field("ping_body_cbor", hex.formatHex(codec.toBytes(new Bodies.Ping(42)))));
@@ -354,7 +365,7 @@ public final class GoldenVectors {
         // bid would win every lattice comparison by making the total order lie
         // (ASF-033), and a non-positive epoch is outside the lattice. Encoded
         // as raw maps because the typed constructors refuse to build them.
-        java.util.LinkedHashMap<String, Object> nanClaim = new java.util.LinkedHashMap<>();
+        java.util.LinkedHashMap<String, Object> nanClaim = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
         nanClaim.put("entryId", entryId.value());
         nanClaim.put("spaceId", spaceId.value());
         nanClaim.put("epoch", 1L);
@@ -364,7 +375,7 @@ public final class GoldenVectors {
         nanClaim.put("expiresAtMillis", 1735693200000L);
         json.append(field("adv_claim_nan_bid_delta",
                 hex.formatHex(codec.toBytes(rawDelta(entryId, nanClaim, identity, codec)))));
-        java.util.LinkedHashMap<String, Object> zeroEpoch = new java.util.LinkedHashMap<>(nanClaim);
+        java.util.LinkedHashMap<String, Object> zeroEpoch = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim(nanClaim);
         zeroEpoch.put("epoch", 0L);
         zeroEpoch.put("bid", 0.0);
         json.append(field("adv_claim_epoch_zero_delta",
@@ -402,7 +413,7 @@ public final class GoldenVectors {
         // A correctly signed frame addressed to a different peer: signature
         // verification succeeds, and the receiver must still drop it (ASF-010).
         PeerId other = PeerId.fromPublicKey(new byte[32]);
-        Envelope misaddressed = new Envelope(2, group, Envelope.Kind.PING, self, other,
+        Envelope misaddressed = new Envelope(WireCodec.WIRE_VERSION, group, Envelope.Kind.PING, self, other,
                 stamp, codec.toBytes(new Bodies.Ping(43)));
         json.append(field("adv_frame_wrong_destination",
                 hex.formatHex(wire.encode(misaddressed, identity))));
@@ -462,11 +473,11 @@ public final class GoldenVectors {
         //   group_ad_want_frame_cbor     the signed frame around it
         //   group_ad_envelope_cbor       Envelope {..., kind GROUP_AD, body signed_group_ad_cbor}
         //   group_ad_frame_cbor          the signed frame around it
-        Envelope want = new Envelope(2, foundingGroup, Envelope.Kind.GROUP_AD_WANT, self, self,
+        Envelope want = new Envelope(WireCodec.WIRE_VERSION, foundingGroup, Envelope.Kind.GROUP_AD_WANT, self, self,
                 stamp, new byte[0]);
         json.append(field("group_ad_want_envelope_cbor", hex.formatHex(codec.toBytes(want))));
         json.append(field("group_ad_want_frame_cbor", hex.formatHex(wire.encode(want, identity))));
-        Envelope answer = new Envelope(2, foundingGroup, Envelope.Kind.GROUP_AD, self, self,
+        Envelope answer = new Envelope(WireCodec.WIRE_VERSION, foundingGroup, Envelope.Kind.GROUP_AD, self, self,
                 stamp, signedGroupAd);
         json.append(field("group_ad_envelope_cbor", hex.formatHex(codec.toBytes(answer))));
         json.append(field("group_ad_frame_cbor", hex.formatHex(wire.encode(answer, identity))));
@@ -560,6 +571,85 @@ public final class GoldenVectors {
                 Map.of(), identity.sign(credentialView));
         json.append(field("space_credential_record_cbor",
                 hex.formatHex(codec.toBytes(credentialRecord))));
+
+        // A join ticket entry record (SPEC §7.1 reserved types, §10.3; issue #16):
+        // the ordinary EntryRecord a @SpaceJoin in LEASED or ORDERED mode writes
+        // when a key completes and takes before it fires. Signed by the joiner
+        // that wrote it over the same SignView as any record (tags included),
+        // leased WRITE for the ticket's validity, tagged with the join name and
+        // the key so a joiner's take template selects its own tickets without
+        // decoding the payload. Clients only need to recognise the type name;
+        // a peer or client that knows no joins stores and replicates it as any
+        // foreign type.
+        //   join_ticket_record_cbor  EntryRecord {entryId, spaceId (= space_id),
+        //       type "ai.badmonkey.agentspaces.agent.join.JoinTicket#v1",
+        //       payload = CBOR of JoinTicket {join "golden.join", key "golden-key"},
+        //       payloadRef null, issuer peer_id/python, issued hlc_encoded,
+        //       lease {holder, expiresAtMillis issued + PT10M, WRITE},
+        //       tags {join "golden.join", key "golden-key"} (in that order),
+        //       sig = Ed25519 over the SignView bytes, tags in that same order}
+        // EntryRecord copies its tags through Map.copyOf, whose iteration order is
+        // salted per JVM start, so codec.toBytes(record) would encode a two-tag
+        // map in either order from one run to the next (and a Java peer
+        // re-verifying a multi-tag record rebuilds the view in its own order).
+        // The vector is therefore assembled below as EntryRecord's ten wire
+        // fields in component order with the tags in the signed (join, key)
+        // order, which is what a client that verifies over the tags as received
+        // needs; the self-checks prove the bytes decode to the record built here
+        // and differ from the record's own encoding in nothing but tag order.
+        String joinTicketType = "ai.badmonkey.agentspaces.agent.join.JoinTicket#v1";
+        JoinTicket joinTicket = new JoinTicket("golden.join", "golden-key");
+        byte[] joinTicketPayload = codec.toBytes(joinTicket);
+        Map<String, String> joinTicketTags = new java.util.LinkedHashMap<>();
+        joinTicketTags.put("join", joinTicket.join());
+        joinTicketTags.put("key", joinTicket.key());
+        EntryId joinTicketEntry = EntryId.of("33333333-4444-5555-6666-777777777777");
+        byte[] joinTicketView = codec.toBytes(new SignView(joinTicketEntry, spaceId, joinTicketType,
+                joinTicketPayload, null, issuer, stamp, joinTicketTags));
+        EntryRecord joinTicketRecord = new EntryRecord(joinTicketEntry, spaceId, joinTicketType,
+                joinTicketPayload, null, issuer, stamp,
+                new LeaseInfo(issuer, stamp.physical() + Duration.ofMinutes(10).toMillis(),
+                        LeaseKind.WRITE),
+                joinTicketTags, identity.sign(joinTicketView));
+        java.util.LinkedHashMap<String, Object> joinTicketWire = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        joinTicketWire.put("entryId", joinTicketRecord.entryId());
+        joinTicketWire.put("spaceId", joinTicketRecord.spaceId());
+        joinTicketWire.put("type", joinTicketRecord.type());
+        joinTicketWire.put("payload", joinTicketRecord.payload());
+        joinTicketWire.put("payloadRef", null);
+        joinTicketWire.put("issuer", joinTicketRecord.issuer());
+        joinTicketWire.put("issued", joinTicketRecord.issued());
+        joinTicketWire.put("lease", joinTicketRecord.lease());
+        joinTicketWire.put("tags", joinTicketTags);
+        joinTicketWire.put("sig", joinTicketRecord.sig());
+        byte[] joinTicketBytes = codec.toBytes(joinTicketWire);
+        EntryRecord joinTicketDecoded = codec.fromBytes(joinTicketBytes, EntryRecord.class);
+        require(joinTicketDecoded.entryId().equals(joinTicketEntry)
+                && joinTicketDecoded.spaceId().equals(spaceId)
+                && joinTicketDecoded.type().equals(joinTicketType)
+                && Arrays.equals(joinTicketDecoded.payload(), joinTicketPayload)
+                && joinTicketDecoded.payloadRef() == null
+                && joinTicketDecoded.issuer().equals(issuer)
+                && joinTicketDecoded.issued().equals(stamp)
+                && joinTicketDecoded.lease().equals(joinTicketRecord.lease())
+                && joinTicketDecoded.tags().equals(joinTicketTags)
+                && Arrays.equals(joinTicketDecoded.sig(), joinTicketRecord.sig())
+                && joinTicketDecoded.keyEpoch() == null,
+                "join ticket wire form decodes to the record it was built from");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> joinTicketWireKeys = codec.fromBytes(joinTicketBytes, Map.class);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> joinTicketRecordKeys =
+                codec.fromBytes(codec.toBytes(joinTicketRecord), Map.class);
+        require(List.copyOf(joinTicketWireKeys.keySet()).equals(List.copyOf(joinTicketRecordKeys.keySet())),
+                "join ticket wire form carries EntryRecord's fields in component order");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> joinTicketWireTags = (Map<String, Object>) joinTicketWireKeys.get("tags");
+        // ISSUE-CanonicalMaps (wire v3): map entries sort shorter key first, then
+        // bytewise, so "key" precedes "join" whatever order the map was built in.
+        require(List.copyOf(joinTicketWireTags.keySet()).equals(List.of("key", "join")),
+                "join ticket tags encode key then join (canonical order)");
+        json.append(field("join_ticket_record_cbor", hex.formatHex(joinTicketBytes)));
 
         // Aggregate pipe frames (SPEC §8, TECH-SPEC §8.2): the PIPE_DATA payload
         // for capability aspace:cap/aggregate is CBOR of the Frame union with
@@ -1237,11 +1327,11 @@ public final class GoldenVectors {
     private static Map<String, Object> rawDelta(EntryId claimEntry,
                                                 Map<String, Object> claim,
                                                 PeerIdentity identity, CborCodec codec) {
-        java.util.LinkedHashMap<String, Object> signed = new java.util.LinkedHashMap<>();
+        java.util.LinkedHashMap<String, Object> signed = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
         signed.put("claim", claim);
         signed.put("holderKey", identity.rawPublicKey());
         signed.put("signature", identity.sign(codec.toBytes(claim)));
-        java.util.LinkedHashMap<String, Object> delta = new java.util.LinkedHashMap<>();
+        java.util.LinkedHashMap<String, Object> delta = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
         delta.put("state", null);
         delta.put("claimEntry", claimEntry.value());
         delta.put("claim", signed);
@@ -1267,12 +1357,34 @@ public final class GoldenVectors {
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         owner.getSimpleName() + " has no nested class " + realName));
-        require(real.isRecord(), realName + " is a record");
+        assertSameShape(owner.getSimpleName() + "." + realName, real, mirror);
+    }
+
+    /**
+     * Like {@link #assertMirrors} for a top-level record in a module outside this
+     * program's documented classpath (agentspaces-agent's {@code JoinTicket}):
+     * checks the shape when the class loads and says so when it does not, so a
+     * run with the agent classes added to the classpath still catches drift.
+     */
+    private static void assertMirrorsIfLoadable(String realClassName, Class<?> mirror) {
+        Class<?> real;
+        try {
+            real = Class.forName(realClassName);
+        } catch (ClassNotFoundException absent) {
+            System.err.println("note: " + realClassName + " is not on the classpath; the "
+                    + mirror.getSimpleName() + " mirror is unchecked this run");
+            return;
+        }
+        assertSameShape(realClassName, real, mirror);
+    }
+
+    private static void assertSameShape(String label, Class<?> real, Class<?> mirror) {
+        require(real.isRecord(), label + " is a record");
         List<String> realShape = shape(real.getRecordComponents());
         List<String> mirrorShape = shape(mirror.getRecordComponents());
         if (!realShape.equals(mirrorShape)) {
-            throw new IllegalStateException("mirror drift for " + owner.getSimpleName() + "."
-                    + realName + ": real " + realShape + " vs mirror " + mirrorShape);
+            throw new IllegalStateException("mirror drift for " + label
+                    + ": real " + realShape + " vs mirror " + mirrorShape);
         }
     }
 

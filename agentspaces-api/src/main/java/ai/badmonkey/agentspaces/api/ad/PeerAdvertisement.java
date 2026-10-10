@@ -78,6 +78,7 @@ public record PeerAdvertisement(
         Objects.requireNonNull(ttl, "ttl");
         endpoints = List.copyOf(Objects.requireNonNull(endpoints, "endpoints"));
         roles = Set.copyOf(Objects.requireNonNull(roles, "roles"));
-        resourceHints = Map.copyOf(Objects.requireNonNull(resourceHints, "resourceHints"));
+        resourceHints = java.util.Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(Objects.requireNonNull(resourceHints, "resourceHints"))); // signed in iteration order
     }
 }

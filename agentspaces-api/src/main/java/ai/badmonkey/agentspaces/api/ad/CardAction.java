@@ -57,6 +57,17 @@ public record CardAction(
     public static final String ON_DECISION = "on-decision";
     /** An Embabel {@code @Action}. */
     public static final String EMBABEL_ACTION = "embabel-action";
+    /**
+     * A {@code @SpaceJoin} fan-in (issue #16): consumes every part's schema, is
+     * never invocable by writing one entry.
+     */
+    public static final String JOIN = "join";
+    /** A {@code @Propose} lead (ISSUE-Propose): consumes the cue, produces the proposal, never invocable. */
+    public static final String PROPOSE = "propose";
+    /** An {@code @OnEstimate} reaction (ISSUE-OnEstimate): consumes no entry, never invocable. */
+    public static final String ON_ESTIMATE = "on-estimate";
+    /** A {@code @SpaceReduce} fold (ISSUE-SpaceReduce): consumes the element, produces the accumulator, never invocable. */
+    public static final String REDUCE = "reduce";
 
     /** The recognized kinds. */
     public static final Set<String> KINDS =

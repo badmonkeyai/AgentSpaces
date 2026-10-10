@@ -131,8 +131,10 @@ public record AgentCard(
         goals = List.copyOf(Objects.requireNonNull(goals, "goals"));
         consumes = List.copyOf(Objects.requireNonNull(consumes, "consumes"));
         produces = List.copyOf(Objects.requireNonNull(produces, "produces"));
-        costHints = Map.copyOf(Objects.requireNonNull(costHints, "costHints"));
-        spaceBindings = spaceBindings == null ? Map.of() : Map.copyOf(spaceBindings);
+        costHints = java.util.Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(Objects.requireNonNull(costHints, "costHints"))); // signed in iteration order
+        spaceBindings = spaceBindings == null ? Map.of()
+                : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(spaceBindings));
         agentPublicKey = agentPublicKey == null ? null : agentPublicKey.clone();
         if (agentCertificate != null && (agentPublicKey == null
                 || !java.util.Arrays.equals(agentPublicKey, agentCertificate.agentPublicKey())

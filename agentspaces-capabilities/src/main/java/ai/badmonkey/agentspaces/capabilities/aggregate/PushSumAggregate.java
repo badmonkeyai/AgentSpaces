@@ -25,6 +25,7 @@ import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.crypto.Digests;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -37,7 +38,10 @@ import java.util.Objects;
 import java.util.OptionalDouble;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * The {@code aspace:cap/aggregate} capability (spec §8): gossip aggregation over
@@ -300,6 +304,64 @@ public final class PushSumAggregate implements CapabilityProvider {
     }
 
     /** What this node declared when it joined an epoch (absent for epochs only heard about). */
+    /**
+     * A settled estimate handed to an {@link #onEstimate} listener (ISSUE-OnEstimate).
+     *
+     * @param epochId the epoch
+     * @param mode    the operator the epoch runs
+     * @param value   the estimate when it settled
+     * @param ticks   protocol ticks this node has run since the epoch was known here
+     */
+    public record Estimate(String epochId, Mode mode, double value, int ticks) {
+    }
+
+    /**
+     * When an estimate counts as settled: unchanged, within a relative
+     * tolerance of the larger of one and the last value, for a number of
+     * consecutive ticks. {@link #FIRST} fires on the first estimate present.
+     */
+    public record Settle(int ticks, double tolerance) {
+        public static final Settle FIRST = new Settle(0, 0);
+
+        public Settle {
+            if (ticks < 0 || tolerance < 0) {
+                throw new IllegalArgumentException("ticks and tolerance are not negative");
+            }
+        }
+
+        public static Settle after(int ticks, double tolerance) {
+            return new Settle(ticks, tolerance);
+        }
+
+        boolean unchanged(double now, double last) {
+            return !Double.isNaN(last) && Math.abs(now - last) <= tolerance * Math.max(1.0, Math.abs(last));
+        }
+    }
+
+    private static final class Track {
+        double last = Double.NaN;
+        int stable;
+        boolean fired;
+        /** The epoch's receipt count when this track last judged the estimate. */
+        long seenReceipts;
+    }
+
+    private static final class Watch {
+        final Predicate<String> epochs;
+        final Settle settle;
+        final Consumer<Estimate> listener;
+        final Map<String, Track> tracks = new ConcurrentHashMap<>();
+
+        Watch(Predicate<String> epochs, Settle settle, Consumer<Estimate> listener) {
+            this.epochs = epochs;
+            this.settle = settle;
+            this.listener = listener;
+        }
+    }
+
+    private final List<Watch> watches = new CopyOnWriteArrayList<>();
+    private final Map<String, Integer> epochTicks = new ConcurrentHashMap<>();
+
     private record Declared(Mode mode, Quantile quantile, boolean template) {
     }
 
@@ -314,6 +376,10 @@ public final class PushSumAggregate implements CapabilityProvider {
     private final Map<String, HistogramState> histograms = new ConcurrentHashMap<>();
     private final Map<String, RosterState> rosters = new ConcurrentHashMap<>();
     private final Map<String, Declared> declared = new ConcurrentHashMap<>();
+    /** Frames received per epoch: the evidence a settle rule needs (see {@link #evaluateWatches}). */
+    private final Map<String, Long> received = new ConcurrentHashMap<>();
+    /** Which sampled members may receive a share; everyone until a rule is set. */
+    private volatile Predicate<PeerId> participants;
 
     /**
      * Creates the aggregator.
@@ -516,6 +582,42 @@ public final class PushSumAggregate implements CapabilityProvider {
      * mass and push the other half; extrema and rosters push their whole state;
      * histograms halve and push their vector. Each item goes to one sampled member.
      */
+    /**
+     * Restricts the members this node pushes shares to. A share sent to a
+     * member that runs no aggregate is mass lost: the receiver never mixes it
+     * back, and every estimate in the fleet drifts by it (a bystander peer, a
+     * console, a client that has not started the capability). With a rule,
+     * {@link #tick()} samples members and pushes only to one the rule admits,
+     * holding the mass otherwise.
+     *
+     * @param rule which members take part; {@link #advertisedIn} is the usual one
+     * @return this aggregate
+     */
+    public PushSumAggregate participants(Predicate<PeerId> rule) {
+        this.participants = Objects.requireNonNull(rule, "rule");
+        return this;
+    }
+
+    /** Whether a participant rule is set. */
+    public boolean hasParticipantRule() {
+        return participants != null;
+    }
+
+    /**
+     * The participant rule discovery supports: a member takes part when it
+     * has advertised this capability ({@link #describe}) and the advertisement
+     * is still live in the cache. {@code CapabilityRuntime.register} applies it
+     * to every aggregate it registers.
+     *
+     * @param discovery the group's discovery service
+     * @return the rule
+     */
+    public static Predicate<PeerId> advertisedIn(DiscoveryService discovery) {
+        Objects.requireNonNull(discovery, "discovery");
+        return peer -> !discovery.find(CapabilityAdvertisement.class,
+                ad -> TYPE.equals(ad.capabilityType()) && peer.equals(ad.issuer())).isEmpty();
+    }
+
     @Override
     public boolean requiresTick() {
         return true;
@@ -534,8 +636,11 @@ public final class PushSumAggregate implements CapabilityProvider {
     public void tick() {
         exchanged = true;
         for (Map.Entry<String, Epoch> e : epochs.entrySet()) {
+            // Halve only when a participant takes the other half: mass held is
+            // mass kept, mass sent to nobody is mass lost.
             sampled().ifPresent(to -> send(to, Frame.of(e.getValue().halve(e.getKey()))));
         }
+        evaluateWatches();
         for (Map.Entry<String, ExtremumState> e : extrema.entrySet()) {
             ExtremumState state = e.getValue();
             if (Double.isNaN(state.value)) {
@@ -553,9 +658,102 @@ public final class PushSumAggregate implements CapabilityProvider {
         }
     }
 
+    /**
+     * Registers a listener told once per matching epoch when this node's
+     * estimate has settled under the rule, evaluated on the protocol tick so
+     * no caller polls (ISSUE-OnEstimate). A watch registered after an epoch
+     * settled starts counting afresh and fires once the rule holds again; with
+     * {@link Settle#FIRST} that is the next tick with an estimate present.
+     *
+     * @return a handle that removes the listener
+     */
+    public AutoCloseable onEstimate(Predicate<String> epochs, Settle settle, Consumer<Estimate> listener) {
+        Watch watch = new Watch(Objects.requireNonNull(epochs, "epochs"),
+                Objects.requireNonNull(settle, "settle"), Objects.requireNonNull(listener, "listener"));
+        watches.add(watch);
+        return () -> watches.remove(watch);
+    }
+
+    /** Every epoch this node knows, whatever its operator. */
+    private java.util.Set<String> knownEpochs() {
+        java.util.Set<String> known = new java.util.LinkedHashSet<>(epochs.keySet());
+        known.addAll(extrema.keySet());
+        known.addAll(histograms.keySet());
+        known.addAll(rosters.keySet());
+        return known;
+    }
+
+    /**
+     * Judges every watch on this tick. A tick counts toward a settle rule only
+     * when this node heard a frame for the epoch since the track last judged it:
+     * halving leaves the local value/weight ratio untouched, so an estimate
+     * that nobody has pushed to is stable by construction and says nothing
+     * about the fleet (the hazard was a node settling at its own value while
+     * its peers were still mixing). A node with no participant to exchange
+     * with judges every tick, since its own value is then the only estimate
+     * there is.
+     */
+    private void evaluateWatches() {
+        if (watches.isEmpty()) {
+            for (String epochId : knownEpochs()) {
+                epochTicks.merge(epochId, 1, Integer::sum);
+            }
+            return;
+        }
+        boolean alone = !anyParticipant();
+        for (String epochId : knownEpochs()) {
+            int ticks = epochTicks.merge(epochId, 1, Integer::sum);
+            OptionalDouble now = estimate(epochId);
+            long receipts = received.getOrDefault(epochId, 0L);
+            for (Watch watch : watches) {
+                if (!watch.epochs.test(epochId)) {
+                    continue;
+                }
+                Track track = watch.tracks.computeIfAbsent(epochId, k -> new Track());
+                if (track.fired || now.isEmpty()) {
+                    continue;
+                }
+                boolean heard = receipts > track.seenReceipts;
+                if (!heard && !alone) {
+                    continue; // no new evidence: the streak neither grows nor resets
+                }
+                track.seenReceipts = receipts;
+                double value = now.getAsDouble();
+                track.stable = watch.settle.unchanged(value, track.last) ? track.stable + 1 : 0;
+                track.last = value;
+                if (track.stable >= watch.settle.ticks()) {
+                    track.fired = true;
+                    Declared d = declared.get(epochId);
+                    Estimate estimate = new Estimate(epochId, d == null ? Mode.AVG : d.mode(), value, ticks);
+                    Thread.ofVirtual().name("aggregate-estimate-" + epochId)
+                            .start(() -> watch.listener.accept(estimate));
+                }
+            }
+        }
+    }
+
+    /** How many members one sample draws when a participant rule filters them. */
+    private static final int SAMPLE_WIDTH = 8;
+
     private java.util.Optional<PeerId> sampled() {
-        List<PeerId> target = sampler.randomMembers(1);
-        return target.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(target.get(0));
+        Predicate<PeerId> rule = participants;
+        if (rule == null) {
+            List<PeerId> target = sampler.randomMembers(1);
+            return target.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(target.get(0));
+        }
+        for (PeerId candidate : sampler.randomMembers(SAMPLE_WIDTH)) {
+            if (rule.test(candidate)) {
+                return java.util.Optional.of(candidate);
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    /** Whether any sampled member may take a share now. */
+    private boolean anyParticipant() {
+        Predicate<PeerId> rule = participants;
+        List<PeerId> members = sampler.randomMembers(SAMPLE_WIDTH);
+        return rule == null ? !members.isEmpty() : members.stream().anyMatch(rule);
     }
 
     private void send(PeerId to, Frame frame) {
@@ -690,6 +888,13 @@ public final class PushSumAggregate implements CapabilityProvider {
         // A peer's contribution is participation just as much as our own tick:
         // this node now holds more than its own seed.
         exchanged = true;
+        String heard = frame.share() != null ? frame.share().epochId()
+                : frame.extremum() != null ? frame.extremum().epochId()
+                : frame.histogram() != null ? frame.histogram().epochId()
+                : frame.roster() != null ? frame.roster().epochId() : null;
+        if (heard != null) {
+            received.merge(heard, 1L, Long::sum);
+        }
         if (frame.share() != null && frame.share().epochId() != null) {
             Share share = frame.share();
             if (Double.isFinite(share.value()) && Double.isFinite(share.weight())

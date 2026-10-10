@@ -21,6 +21,7 @@ import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.SpaceAdvertisement;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.api.spi.Authorizer;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.api.spi.Transport;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor;
@@ -526,7 +527,9 @@ public class AgentSpacesAutoConfiguration {
     }
 
     /**
-     * The fluent facade as the bean, with the agent identity factory.
+     * The fluent facade with the agent identity factory and no application
+     * schema registry: cards and spaces use the default
+     * {@code <fqcn>#v1} names.
      *
      * @param properties  the starter configuration
      * @param node        the peer node
@@ -537,13 +540,65 @@ public class AgentSpacesAutoConfiguration {
      * @param agents      the agent identity factory
      * @return the facade, groups joined and spaces attached
      */
+    public AgentSpaces agentSpaces(AgentSpacesProperties properties, PeerNode node,
+                                   PeerIdentity identity, Authorizers authorizers, Embedder embedder,
+                                   InstantSource clock,
+                                   ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents) {
+        return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
+                agents, null);
+    }
+
+    /**
+     * The fluent facade as the bean: when the application declares a
+     * {@link SchemaRegistry} bean (ISSUE-WorkflowShape §9.1), every space the
+     * starter builds and every group's binder share it, so cards name exactly
+     * what the spaces write; absent, the default names.
+     *
+     * @param properties     the starter configuration
+     * @param node           the peer node
+     * @param identity       the peer identity
+     * @param authorizers    the profile's authorizer selection
+     * @param embedder       the embedder semantic discovery ranks with
+     * @param clock          the fabric's clock
+     * @param agents         the agent identity factory
+     * @param schemaRegistry the application's schema registry bean, if any
+     * @return the facade, groups joined and spaces attached
+     */
     @Bean
     @ConditionalOnMissingBean
     public AgentSpaces agentSpaces(AgentSpacesProperties properties, PeerNode node,
                                    PeerIdentity identity, Authorizers authorizers, Embedder embedder,
                                    InstantSource clock,
-                                   ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents) {
+                                   ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
+                                   ObjectProvider<SchemaRegistry> schemaRegistry) {
+        return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
+                agents, schemaRegistry.getIfAvailable());
+    }
+
+    /**
+     * The fluent facade over an explicit schema registry, for programmatic use.
+     *
+     * @param properties     the starter configuration
+     * @param node           the peer node
+     * @param identity       the peer identity
+     * @param authorizers    the profile's authorizer selection
+     * @param embedder       the embedder semantic discovery ranks with
+     * @param clock          the fabric's clock
+     * @param agents         the agent identity factory
+     * @param schemaRegistry the registry spaces and binders share, or null for
+     *                       the default names
+     * @return the facade, groups joined and spaces attached
+     */
+    public AgentSpaces agentSpacesWithRegistry(AgentSpacesProperties properties, PeerNode node,
+                                   PeerIdentity identity, Authorizers authorizers, Embedder embedder,
+                                   InstantSource clock,
+                                   ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
+                                   SchemaRegistry schemaRegistry) {
         AgentSpaces spaces = new AgentSpaces(identity, clock, agents);
+        if (schemaRegistry != null) {
+            // Before any group registers, so every group's binder gets it.
+            spaces.schemaRegistry(schemaRegistry);
+        }
         CborCodec codec = CborCodec.defaultCodec();
         Set<PeerAdvertisement.PeerRole> roles = rolesOf(properties);
         AgentId writer = identity.agent("app");
@@ -568,13 +623,13 @@ public class AgentSpacesAutoConfiguration {
             for (AgentSpacesProperties.SpaceDef spaceDef : groupConfig.getSpaces()) {
                 context.space(spaceDef.getName(),
                         buildSpace(runtime, identity, spaceDef, blocks, discovery, ring,
-                                authorizer, clock),
+                                authorizer, clock, schemaRegistry),
                         writer);
             }
             if (properties.getCapabilities().isEnabled()) {
                 registerCapabilities(properties.getCapabilities(), context, runtime,
                         discovery, identity, codec, clock, blocks, ring, groupConfig,
-                        authorizer, embedder, peerEncryptionKeys(properties));
+                        authorizer, embedder, peerEncryptionKeys(properties), schemaRegistry);
             }
         }
         return spaces;
@@ -629,7 +684,8 @@ public class AgentSpacesAutoConfiguration {
                                              AgentSpacesProperties.Group groupConfig,
                                              Authorizer authorizer,
                                              Embedder embedder,
-                                             java.security.KeyPair encryptionKeys) {
+                                             java.security.KeyPair encryptionKeys,
+                                             SchemaRegistry schemas) {
         if (config.isOrderedLog()) {
             throw new IllegalStateException("agentspaces.capabilities.ordered-log=true: the"
                     + " ordered log runs over a fixed member set the starter cannot infer;"
@@ -655,7 +711,7 @@ public class AgentSpacesAutoConfiguration {
                 AgentSpacesProperties.SpaceDef def = new AgentSpacesProperties.SpaceDef();
                 def.setName(votesName);
                 votes = buildSpace(runtime, identity, def, blocks, discovery, contentKey,
-                        authorizer, clock);
+                        authorizer, clock, schemas);
             }
             // gate2-review G2-3: the profile's authorizer narrows the electorate,
             // so an identity provider names QUORUM voters as it names Raft voters.
@@ -948,13 +1004,15 @@ public class AgentSpacesAutoConfiguration {
      * Builds one replicated space over the group's block exchange (spec
      * §6.1a), advertising itself through discovery and enforcing the
      * configured admission rule (§7.5), encrypted with the group's content
-     * key when one is configured (§11a).
+     * key when one is configured (§11a), naming entries through the
+     * application's schema registry when one is declared (ISSUE-WorkflowShape
+     * §9.1).
      */
     private static ReplicatedSpace buildSpace(GroupRuntime runtime, PeerIdentity identity,
                                               AgentSpacesProperties.SpaceDef spaceDef,
                                               BlockExchange blocks, DiscoveryService discovery,
                                               GroupKeyRing contentKey, Authorizer authorizer,
-                                              InstantSource clock) {
+                                              InstantSource clock, SchemaRegistry schemas) {
         ConflictStrategyType strategy =
                 ConflictStrategyType.valueOf(spaceDef.getStrategy().trim().toUpperCase());
         ReplicatedSpace.Builder builder =
@@ -964,6 +1022,9 @@ public class AgentSpacesAutoConfiguration {
                         .clock(clock) // the fabric's clock (review M-8)
                         .blocks(blocks)
                         .advertise(discovery::publish);
+        if (schemas != null) {
+            builder.schemaRegistry(schemas);
+        }
         SpaceAdvertisement.Admission admission = SpaceAdvertisement.Admission.valueOf(
                 spaceDef.getAdmission().trim().toUpperCase());
         if (admission == SpaceAdvertisement.Admission.ALLOWLIST) {

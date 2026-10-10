@@ -31,6 +31,7 @@ import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.Authorizer;
 import ai.badmonkey.agentspaces.api.spi.CapabilityProvider;
+import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor;
 import ai.badmonkey.agentspaces.capabilities.semantic.SemanticDiscovery;
@@ -46,6 +47,7 @@ import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.peering.node.SignedGroupAdvertisement;
 import ai.badmonkey.agentspaces.peering.transport.TlsTcpTransport;
 import ai.badmonkey.agentspaces.space.SpaceAdmissionException;
+import ai.badmonkey.agentspaces.space.local.NamespaceSchemaRegistry;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import ai.badmonkey.agentspaces.space.replicated.SpaceAdmission;
 import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
@@ -887,6 +889,55 @@ class AgentSpacesAutoConfigurationTest {
 
         app.lifecycle().stop();
         assertThat(app.lifecycle().isRunning()).isFalse();
+    }
+
+    /**
+     * ISSUE-WorkflowShape §9.1 / §10.4: a {@code SchemaRegistry} bean reaches the
+     * facade before the groups register, so the spaces the starter builds and the
+     * binder's cards name entries through it, and a bound worker still runs.
+     */
+    @Test
+    @Timeout(60)
+    void aSchemaRegistryBeanNamesTheSpacesAndTheCards() throws Exception {
+        String ns = "https://example.org/test#";
+        SchemaRegistry registry =
+                NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
+        AgentSpacesProperties properties = fleetProperties(freePort(), 0);
+        PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
+        PeerNode node = autoConfig.agentSpacesNode(properties, identity);
+        Authorizers authorizers = autoConfig.agentSpacesAuthorizers(properties, identity);
+        java.time.InstantSource clock = java.time.InstantSource.system();
+        AgentSpaces spaces = autoConfig.agentSpacesWithRegistry(properties, node, identity, authorizers,
+                autoConfig.agentSpacesEmbedder(), clock,
+                autoConfig.agentSpacesAgentIdentities(properties, identity, clock), registry);
+        AgentSpacesBeanPostProcessor postProcessor =
+                autoConfig.agentSpacesBeanPostProcessor(properties, spaces);
+        AgentSpacesLifecycle lifecycle =
+                autoConfig.agentSpacesLifecycle(properties, node, spaces, authorizers);
+        closeables.add(lifecycle::stop);
+        lifecycle.start();
+
+        assertThat(spaces.schemaRegistry()).contains(registry);
+        assertThat(spaces.group("fleet").schemaRegistry()).isSameAs(registry);
+
+        // The space names what it writes through the bean: before any bind, only
+        // the space could have registered TaskEntry.
+        assertThatThrownBy(() -> registry.schemaNameOf(TaskEntry.class))
+                .isInstanceOf(IllegalArgumentException.class);
+        spaces.group("fleet").space("tasks")
+                .write(new TaskEntry("named", 1), Lease.of(Duration.ofMinutes(10)));
+        assertThat(registry.schemaNameOf(TaskEntry.class)).isEqualTo(ns + "TaskEntry");
+
+        // The binder's card names through the same bean, and the worker runs.
+        postProcessor.postProcessAfterInitialization(new Researcher(), "researcher");
+        AgentCard card = spaces.group("fleet").discovery()
+                .find(AgentCard.class, c -> c.description().contains("Researches")).get(0);
+        assertThat(card.consumes()).containsExactly(ns + "TaskEntry");
+        assertThat(card.produces()).containsExactly(ns + "FindingEntry");
+        assertThat(card.spaceBindings()).containsEntry(ns + "TaskEntry", "tasks");
+        assertThat(spaces.group("fleet").space("findings")
+                .read(Template.of(FindingEntry.class), Duration.ofSeconds(10)))
+                .hasValueSatisfying(f -> assertThat(f.summary()).isEqualTo("done: named"));
     }
 
     @Test

@@ -43,13 +43,14 @@ public final class WireCodec {
 
     /**
      * The wire protocol version this codec speaks (spec §9): 2 since the
-     * ASF-010 destination binding. A frame whose {@code ver} differs is
+     * ASF-010 destination binding, 3 since the canonical map order of
+     * ISSUE-CanonicalMaps (every map's entries sorted by key in the signed bytes). A frame whose {@code ver} differs is
      * malformed to this codec and is dropped before verification, so a peer
      * cannot smuggle a differently-shaped envelope past a receiver by
      * relabelling it; version negotiation is a future protocol change, not a
      * decode-time tolerance.
      */
-    public static final int WIRE_VERSION = 2;
+    public static final int WIRE_VERSION = 3;
 
     /**
      * An envelope as it travels: signed, or bare on an attested channel.

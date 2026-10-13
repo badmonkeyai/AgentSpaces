@@ -98,7 +98,7 @@ class GroupMembershipTest {
     @Test
     void indirectProbesAreAskedOfKRelaysAndAnAskedRelayMayVouch() {
         GroupMembership membership = membership(
-                new GroupMembership.Config(Duration.ofMinutes(5), Duration.ofSeconds(1), 2));
+                new GroupMembership.Config(Duration.ofMinutes(5), Duration.ofSeconds(1), 2, Duration.ZERO)); // probe every tick: the clock stands still between ticks here
         PeerId target = admit(membership);
         for (int i = 0; i < 3; i++) {
             admit(membership);
@@ -138,7 +138,7 @@ class GroupMembershipTest {
     @Test
     void aTargetUnansweredThroughTheIndirectStageIsDropped() {
         GroupMembership membership = membership(
-                new GroupMembership.Config(Duration.ofMinutes(5), Duration.ofSeconds(1), 2));
+                new GroupMembership.Config(Duration.ofMinutes(5), Duration.ofSeconds(1), 2, Duration.ZERO)); // probe every tick: the clock stands still between ticks here
         PeerId target = admit(membership);
         for (int i = 0; i < 3; i++) {
             admit(membership);
@@ -233,5 +233,37 @@ class GroupMembershipTest {
         membership.evict(peer);
         assertThat(membership.member(peer)).isEmpty();
         assertThat(membership.allMembers()).isEmpty();
+    }
+
+    /**
+     * v0.1.17: on a quiet fleet the probe interval doubles at each probe up to four times the
+     * base, and the first active tick snaps it back. Every ping is answered here, so nothing
+     * is ever suspected; only the cadence is under test.
+     */
+    @Test
+    void theProbeIntervalStretchesWhileQuietAndSnapsBackOnActivity() {
+        GroupMembership membership = membership(
+                new GroupMembership.Config(Duration.ofMinutes(5), Duration.ofSeconds(1), 2, Duration.ofSeconds(1)));
+        admit(membership);
+        admit(membership);
+        RecordingProber prober = new RecordingProber(membership, PeerIdentity.generate().peerId());
+        List<Integer> probeSeconds = new ArrayList<>();
+        for (int second = 0; second < 20; second++) {
+            int before = prober.otherPings.size();
+            membership.tick(prober, true);
+            if (prober.otherPings.size() > before) {
+                probeSeconds.add(second);
+            }
+            clock.advance(Duration.ofSeconds(1));
+        }
+        assertThat(probeSeconds).as("base, base, then doubling to a cap of four seconds")
+                .containsExactly(0, 1, 3, 7, 11, 15, 19);
+        int before = prober.otherPings.size();
+        membership.tick(prober, false); // something moved: back to the base interval at once
+        assertThat(prober.otherPings.size()).isEqualTo(before + 1);
+        clock.advance(Duration.ofSeconds(1));
+        membership.tick(prober, false);
+        assertThat(prober.otherPings.size()).as("active ticks probe every second").isEqualTo(before + 2);
+        assertThat(membership.allMembers()).hasSize(2);
     }
 }

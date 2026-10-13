@@ -687,27 +687,27 @@ class ReplicatedSpaceClusterTest {
     }
 
     /**
-     * QA4 A4-5, the negative that keeps the check honest: a claim installed
-     * without the holder's attestation is signed by the installing node, so the
-     * holder's completion cannot be authenticated against it anywhere else. This
-     * is the old failure, pinned: no completion is seen, and once the TAKE lease
-     * lapses the finished work comes back as takeable.
+     * QA4 A4-5, revisited for v0.1.17. Each replica installs the ordered claim bare, signed by
+     * itself; at b that signer is the holder, so the proof b carries with its completion is
+     * holder-attested and verifies anywhere. The old version of this test pinned "no completion
+     * is seen" because the partition lost b's rumor and anti-entropy carries states without
+     * proofs; gossip repair now re-delivers the rumor (b's probe announces it, a grafts), so a
+     * and c authenticate the completion and the finished work does not come back as takeable.
+     * The negatives for a forged or unattested completion live in {@code verifyState}'s own tests.
      */
     @Test
-    void aBareLogClaimCannotAuthenticateACompletionAtOtherReplicas() throws Exception {
+    void aHolderAttestedProofReachesTheOtherReplicasOnceThePartitionHeals() throws Exception {
         Peer a = newPeer("a", 1);
         Peer b = newPeer("b", 2, "a");
         Peer c = newPeer("c", 3, "a");
         tickAll(4);
         a.space().write(new TaskEntry("stuck", 1), MINUTES_30);
         tickAll(2);
-        // A non-writer resolves an entry id from a value it has decoded, so read first,
-        // exactly as OrderedTakes.take does before it asks entryIdOf.
         TaskEntry seenAtB = b.space().read(Template.of(TaskEntry.class)).orElseThrow();
         EntryId entryId = b.space().entryIdOf(seenAtB).orElseThrow();
         TakeClaim claim = claimBy(b, entryId, 1);
         for (Peer p : List.of(a, b, c)) {
-            p.space().applyAuthorizedClaim(entryId, claim);              // bare: no attestation
+            p.space().applyAuthorizedClaim(entryId, claim);              // bare: signed by the installer
         }
         List<SpaceEvent.Kind> atA = eventsAt(a);
 
@@ -716,15 +716,16 @@ class ReplicatedSpaceClusterTest {
         network.partition("b", "a");
         network.partition("b", "c");
         b.space().complete(taken);
+        assertThat(atA).as("partitioned: nothing reached a").doesNotContain(SpaceEvent.Kind.COMPLETED);
         network.heal();
         tickAll(40);
 
-        assertThat(atA).as("a cannot authenticate a completion against a claim it signed itself")
-                .doesNotContain(SpaceEvent.Kind.COMPLETED);
+        assertThat(atA).as("b's proof, re-delivered by gossip repair, authenticates its completion at a")
+                .contains(SpaceEvent.Kind.COMPLETED);
         clock.advance(Duration.ofMinutes(11));
-        tickAll(3);
+        tickAll(2);
         assertThat(a.space().read(Template.of(TaskEntry.class)))
-                .as("the finished order reappears at a — the Party Bus symptom").isPresent();
+                .as("completed work does not come back as takeable").isEmpty();
     }
 
     /** QA4 A4-5: proof that does not prove what it claims is refused, naming both parties. */
@@ -998,6 +999,10 @@ class ReplicatedSpaceClusterTest {
         c.space().complete(retry.get(),
                 new FindingEntry("survivable", "finished elsewhere"), MINUTES_30);
 
+        // Under lazy push (v0.1.17) the result may travel a tree edge that went through the dead
+        // worker; the next ticks drop it from the view, which forgets every prune, and the
+        // announcement and graft deliver the result. Delivery is a few ticks, never a lease.
+        tickAll(4);
         assertThat(a.space().read(Template.of(FindingEntry.class)))
                 .contains(new FindingEntry("survivable", "finished elsewhere"));
     }
@@ -1190,7 +1195,9 @@ class ReplicatedSpaceClusterTest {
         ReconcilableState counter = new ReconcilableState() {
             @Override
             public byte[] digest() {
-                return new byte[0];
+                // Never equal between two members: since v0.1.17 a round opens with digest hashes
+                // and asks for no delta on a stream whose hashes match.
+                return java.util.UUID.randomUUID().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
             }
 
             @Override

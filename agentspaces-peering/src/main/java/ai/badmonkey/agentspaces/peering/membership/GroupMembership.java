@@ -50,11 +50,25 @@ public final class GroupMembership implements PeerSampler {
      * @param pingTimeout   how long to wait for an ACK before indirect probing
      * @param indirectPeers how many peers to ask in the indirect round
      */
-    public record Config(Duration memberTtl, Duration pingTimeout, int indirectPeers) {
+    public record Config(Duration memberTtl, Duration pingTimeout, int indirectPeers, Duration probeInterval) {
 
-        /** Returns defaults: TTL 30s, ping timeout 2s, 2 indirect peers. */
+        /** The SWIM protocol period: one probe per member per interval (memberlist's default, 1 s). */
+        public static final Duration DEFAULT_PROBE_INTERVAL = Duration.ofSeconds(1);
+
+        public Config {
+            if (probeInterval == null) {
+                probeInterval = DEFAULT_PROBE_INTERVAL;
+            }
+        }
+
+        /** The three-argument form, probing once per second. */
+        public Config(Duration memberTtl, Duration pingTimeout, int indirectPeers) {
+            this(memberTtl, pingTimeout, indirectPeers, DEFAULT_PROBE_INTERVAL);
+        }
+
+        /** Returns defaults: TTL 30s, ping timeout 2s, 2 indirect peers, one probe per second. */
         public static Config defaults() {
-            return new Config(Duration.ofSeconds(30), Duration.ofSeconds(2), 2);
+            return new Config(Duration.ofSeconds(30), Duration.ofSeconds(2), 2, DEFAULT_PROBE_INTERVAL);
         }
     }
 
@@ -124,6 +138,20 @@ public final class GroupMembership implements PeerSampler {
     private final Random random;
     private final Config config;
     private final Map<PeerId, Member> members = new ConcurrentHashMap<>();
+    /** Peers removed by {@link #evict} rather than by silence, until the owner consumes the mark. */
+    private final java.util.Set<PeerId> ejected = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Whether a peer left this view by an authoritative {@link #evict} rather than by lapsing,
+     * consuming the mark: the owner retries lost members' endpoints for a while, and an ejected
+     * peer is not lost but refused, so it is not courted (v0.1.17).
+     *
+     * @param peer the peer that left the view
+     * @return true once, if it was ejected
+     */
+    public boolean consumeEjected(PeerId peer) {
+        return ejected.remove(peer);
+    }
     private final Map<Long, Pending> pendingProbes = new ConcurrentHashMap<>();
     /** Probe nonces are unguessable (ASF-011): a sequential counter let any
      * member cancel or satisfy probes it never saw by guessing the next value. */
@@ -168,6 +196,10 @@ public final class GroupMembership implements PeerSampler {
         }
         long now = nowMillis();
         members.compute(ad.issuer(), (id, existing) -> {
+            if (existing == null) {
+                activeSinceProbe = true; // a newcomer: probe on the base interval again
+                quietCycles = 0;
+            }
             Member member = existing == null
                     ? new Member(id, ad.endpoints(), now) : existing;
             member.endpoints = ad.endpoints();
@@ -185,7 +217,8 @@ public final class GroupMembership implements PeerSampler {
      * @param peer the peer to evict
      */
     public void evict(PeerId peer) {
-        members.remove(Objects.requireNonNull(peer, "peer"));
+        ejected.add(Objects.requireNonNull(peer, "peer"));
+        members.remove(peer);
     }
 
     /**
@@ -232,9 +265,60 @@ public final class GroupMembership implements PeerSampler {
      *
      * @param prober the frame sender
      */
+    private long lastProbeMillis = Long.MIN_VALUE;
+    /** How far the probe interval has stretched on a quiet fleet: the interval is the base times two to this. */
+    private volatile int quietCycles;
+    /** Whether anything moved (gossip activity, a member admitted) since the last probe. */
+    private volatile boolean activeSinceProbe = true;
+    /** The probe interval stretches to the base times two to this at most (v0.1.17). */
+    public static final int MAX_QUIET_STRETCH = 2;
+    /** The members still to probe in this cycle, in a shuffled order; refilled when exhausted. */
+    private final java.util.ArrayDeque<PeerId> probeCycle = new java.util.ArrayDeque<>();
+
+    private PeerId nextProbeTarget() {
+        while (true) {
+            PeerId next = probeCycle.pollFirst();
+            if (next == null) {
+                List<PeerId> ids = new ArrayList<>();
+                for (PeerId id : members.keySet()) {
+                    if (!id.equals(self)) {
+                        ids.add(id);
+                    }
+                }
+                if (ids.isEmpty()) {
+                    return null;
+                }
+                Collections.shuffle(ids, random);
+                probeCycle.addAll(ids);
+                continue;
+            }
+            if (members.containsKey(next)) {
+                return next;
+            }
+        }
+    }
+
     public synchronized void tick(Prober prober) {
+        tick(prober, false);
+    }
+
+    /**
+     * One membership tick. While the fleet is quiet (no gossip activity reported by the caller
+     * since the last tick, no member admitted) the probe interval doubles at each probe up to
+     * {@link #MAX_QUIET_STRETCH} doublings, and snaps back to the base on the first active
+     * tick, so an idle fleet probes at a quarter of the rate and a busy one as before. Probe
+     * timeouts are judged on every tick regardless.
+     *
+     * @param prober the prober
+     * @param quiet  whether nothing moved since the last tick
+     */
+    public synchronized void tick(Prober prober, boolean quiet) {
         Objects.requireNonNull(prober, "prober");
         long now = nowMillis();
+        if (!quiet) {
+            activeSinceProbe = true;
+            quietCycles = 0;
+        }
 
         // Expire members whose lease of our attention ran out.
         members.values().removeIf(m -> now - m.lastHeardMillis > config.memberTtl().toMillis());
@@ -252,6 +336,8 @@ public final class GroupMembership implements PeerSampler {
             }
             if (!pending.indirectStage()) {
                 target.suspect = true;
+                activeSinceProbe = true; // doubt about a member: probe on the base interval again
+                quietCycles = 0;
                 List<PeerId> relays = randomMembersExcluding(config.indirectPeers(), pending.target());
                 if (relays.isEmpty()) {
                     members.remove(pending.target());
@@ -269,10 +355,22 @@ public final class GroupMembership implements PeerSampler {
             }
         }
 
-        // Probe one random member.
-        List<PeerId> candidates = randomMembers(1);
-        if (!candidates.isEmpty()) {
-            PeerId target = candidates.get(0);
+        // Probe one random member once per protocol period (SWIM): probing on every 250 ms tick
+        // was four fifths of an idle peer's frames, and detection speed comes from the suspicion
+        // timeout, not the probe rate. Timeouts above are still judged on every tick.
+        long interval = config.probeInterval().toMillis() * (1L << quietCycles);
+        if (lastProbeMillis != Long.MIN_VALUE && now - lastProbeMillis < interval) {
+            return;
+        }
+        lastProbeMillis = now;
+        if (!activeSinceProbe) {
+            quietCycles = Math.min(quietCycles + 1, MAX_QUIET_STRETCH);
+        }
+        activeSinceProbe = false;
+        // Round-robin over a shuffled order (SWIM's protocol period), so every member is probed
+        // once per cycle and detection time is bounded, rather than a random draw each period.
+        PeerId target = nextProbeTarget();
+        if (target != null) {
             long nonce = nextNonce();
             pendingProbes.put(nonce, new Pending(target,
                     now + config.pingTimeout().toMillis(), false, java.util.Set.of()));

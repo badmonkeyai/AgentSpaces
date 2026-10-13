@@ -61,6 +61,12 @@ public class AgentSpacesProperties {
     private List<String> roles = new ArrayList<>();
     private long tickMillis = 250;
     private long cardRefreshMillis = 300_000;
+    /** How often a node re-floods its peer advertisement (ms); between refreshes newcomers get it directly. */
+    private long peerAdIntervalMillis = 30_000;
+    /** The frame coalescing window (ms): rumors and pipe frames to one peer batch into one signed frame; 0 turns it off. */
+    private long coalesceMillis = 20;
+    /** Lazy push (PERF2 §3.4): rumors ride a self-pruning tree toward members that understand it; off gossips with random fan-out only. */
+    private boolean lazyPush = true;
     private List<Group> groups = new ArrayList<>();
 
     /** Transport and channel-authentication settings (spec §5.6). */
@@ -347,6 +353,30 @@ public class AgentSpacesProperties {
 
     public void setCardRefreshMillis(long cardRefreshMillis) {
         this.cardRefreshMillis = cardRefreshMillis;
+    }
+
+    public long getPeerAdIntervalMillis() {
+        return peerAdIntervalMillis;
+    }
+
+    public long getCoalesceMillis() {
+        return coalesceMillis;
+    }
+
+    public void setCoalesceMillis(long coalesceMillis) {
+        this.coalesceMillis = coalesceMillis;
+    }
+
+    public boolean isLazyPush() {
+        return lazyPush;
+    }
+
+    public void setLazyPush(boolean lazyPush) {
+        this.lazyPush = lazyPush;
+    }
+
+    public void setPeerAdIntervalMillis(long peerAdIntervalMillis) {
+        this.peerAdIntervalMillis = peerAdIntervalMillis;
     }
 
     public List<Group> getGroups() {

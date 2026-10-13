@@ -35,4 +35,15 @@ public interface PeerSampler {
      * @return the sampled members, possibly fewer than {@code n}
      */
     List<PeerId> randomMembers(int n);
+
+    /**
+     * Returns every live member, excluding the local peer, in a random order. The default draws
+     * the whole view through {@link #randomMembers(int)}; an implementation with a cheaper full
+     * listing may override it.
+     *
+     * @return all members, shuffled
+     */
+    default List<PeerId> members() {
+        return randomMembers(Integer.MAX_VALUE);
+    }
 }

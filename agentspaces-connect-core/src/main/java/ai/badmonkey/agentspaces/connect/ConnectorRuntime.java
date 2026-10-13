@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.connect;
 
 import ai.badmonkey.agentspaces.api.ad.AssetCard;
 import ai.badmonkey.agentspaces.api.space.Lease;
+import ai.badmonkey.agentspaces.api.space.Matchers;
 import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
@@ -70,7 +71,7 @@ public final class ConnectorRuntime implements AutoCloseable {
     private final InstantSource clock;
     private final Duration defaultFreshness;
     private final AdvertisementSigner signer = new AdvertisementSigner();
-    private final Map<String, Duration> freshnessByAsset = new HashMap<>();
+    private final Map<String, Duration> freshnessByAsset = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicInteger executed = new AtomicInteger();
     private final AtomicInteger servedFromSpace = new AtomicInteger();
     private final AtomicInteger materialized = new AtomicInteger();
@@ -226,8 +227,18 @@ public final class ConnectorRuntime implements AutoCloseable {
         while (running) {
             Optional<TakenEntry<DataQuery>> taken;
             try {
-                taken = dataSpace.take(Template.of(DataQuery.class),
-                        Lease.of(Duration.ofMinutes(1)), Duration.ofSeconds(1));
+                // Only the queries for assets this connector advertises: several connectors may
+                // share one data space (a vector store and a knowledge graph, say), and a take
+                // of every DataQuery would let one of them claim, and fail, the other's queries.
+                Template<DataQuery> mine = ownQueries();
+                if (mine == null) {
+                    Thread.sleep(Duration.ofSeconds(1));
+                    continue;
+                }
+                taken = dataSpace.take(mine, Lease.of(Duration.ofMinutes(1)), Duration.ofSeconds(1));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
             } catch (RuntimeException e) {
                 if (running) {
                     LOG.log(System.Logger.Level.WARNING, "query take failed", e);
@@ -239,6 +250,15 @@ public final class ConnectorRuntime implements AutoCloseable {
             }
             answer(taken.get());
         }
+    }
+
+    /** The take template for this connector's assets, or null while it advertises none. */
+    private Template<DataQuery> ownQueries() {
+        Object[] assets = freshnessByAsset.keySet().toArray();
+        if (assets.length == 0) {
+            return null;
+        }
+        return Template.of(DataQuery.class).where("asset", Matchers.in(assets));
     }
 
     private void answer(TakenEntry<DataQuery> taken) {

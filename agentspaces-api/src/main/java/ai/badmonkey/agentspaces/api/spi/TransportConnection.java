@@ -70,6 +70,18 @@ public interface TransportConnection extends AutoCloseable {
      */
     void onReceive(Consumer<byte[]> receiver);
 
+    /**
+     * Registers a listener run once when this connection ends, whether the remote end closed
+     * it, it failed, or {@link #close()} was called here (v0.1.17). A node uses it to drop the
+     * connection and re-introduce itself on its next tick instead of waiting for a later send
+     * to fail, so a peer cut off by the other end notices at once. Transports should call it
+     * from their read loop's end; the default does nothing, for transports that cannot tell.
+     *
+     * @param listener the listener
+     */
+    default void onClose(Runnable listener) {
+    }
+
     /** Closes the connection. Idempotent. */
     @Override
     void close();

@@ -131,9 +131,27 @@ public final class TcpTransport implements Transport {
                     receiver.accept(frame);
                 }
             } catch (EOFException | java.net.SocketException e) {
-                // Peer closed; nothing to do (spec P2: absence is the signal).
+                // Peer closed (spec P2: absence is the signal); the node is told below.
             } catch (IOException e) {
-                // Connection failed; membership will notice via probes.
+                // Connection failed; the node is told below and membership confirms by probe.
+            } finally {
+                notifyClosed();
+            }
+        }
+
+        private final java.util.concurrent.atomic.AtomicBoolean closeNotified =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        private volatile Runnable closeListener = () -> {
+        };
+
+        @Override
+        public void onClose(Runnable listener) {
+            this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        private void notifyClosed() {
+            if (closeNotified.compareAndSet(false, true)) {
+                closeListener.run();
             }
         }
 
@@ -144,6 +162,7 @@ public final class TcpTransport implements Transport {
             } catch (IOException ignored) {
                 // Closing is best-effort.
             }
+            notifyClosed();
         }
     }
 }

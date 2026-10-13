@@ -108,6 +108,65 @@ public final class WireCodec {
      * @param envelope the envelope
      * @return the frame bytes
      */
+    /** How a decoded frame was authenticated. */
+    public enum Auth {
+        /** The identity signature verified. */
+        SIGNED,
+        /** Bare, on a connection whose transport attested the sender. */
+        ATTESTED,
+        /** A MAC under the connection's session key verified (spec §5.6, v0.1.17). */
+        SESSION
+    }
+
+    /**
+     * An established session on one connection: the peer it attests and the key its frames
+     * are authenticated with.
+     *
+     * @param peer the attested peer
+     * @param key  the 32-byte session key
+     */
+    public record Session(PeerId peer, byte[] key) {
+    }
+
+    /**
+     * A decoded frame and the way it was authenticated.
+     *
+     * @param envelope the envelope
+     * @param auth     how it was authenticated
+     */
+    public record Decoded(Envelope envelope, Auth auth) {
+    }
+
+    private static final String HMAC = "HmacSHA256";
+    /** The length of a session MAC; a session frame carries exactly this in the signature field. */
+    public static final int SESSION_MAC_LENGTH = 32;
+
+    /**
+     * Encodes a session frame (spec §5.6, v0.1.17): no key, and in place of the signature an
+     * HMAC-SHA-256 of the canonical envelope under the session key. Only self-originated
+     * envelopes may travel this way, on the connection the session belongs to.
+     *
+     * @param envelope   the envelope
+     * @param sessionKey the connection's session key
+     * @return the frame
+     */
+    public byte[] encodeSession(Envelope envelope, byte[] sessionKey) {
+        Objects.requireNonNull(envelope, "envelope");
+        Objects.requireNonNull(sessionKey, "sessionKey");
+        byte[] canonical = codec.toBytes(envelope);
+        return codec.toBytes(new Signed(envelope, null, mac(sessionKey, canonical)));
+    }
+
+    static byte[] mac(byte[] key, byte[] data) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance(HMAC);
+            mac.init(new javax.crypto.spec.SecretKeySpec(key, HMAC));
+            return mac.doFinal(data);
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IllegalStateException("HMAC-SHA-256 unavailable", e);
+        }
+    }
+
     public byte[] encodeBare(Envelope envelope) {
         Objects.requireNonNull(envelope, "envelope");
         return codec.toBytes(new Signed(envelope, null, null));
@@ -136,6 +195,23 @@ public final class WireCodec {
      * @return the accepted envelope, or empty when the frame fails
      */
     public Optional<Envelope> decode(byte[] frame, Optional<PeerId> attestedPeer) {
+        return decodeDetailed(frame, attestedPeer, null).map(Decoded::envelope);
+    }
+
+    /**
+     * Decodes and verifies a frame, reporting how it was authenticated. A frame with a key and
+     * a signature verifies under the key; a frame with neither is accepted when the transport
+     * attested its sender; a frame with no key and a {@link #SESSION_MAC_LENGTH}-byte tag is a
+     * session frame, accepted when {@code session} names its sender and the tag verifies under
+     * the session key (spec §5.6, v0.1.17). A {@code SESSION_HELLO} or {@code CHANNEL_HELLO}
+     * is accepted only when fully signed, because it is what establishes the other two forms.
+     *
+     * @param frame        the raw frame
+     * @param attestedPeer the connection's transport attestation, if any
+     * @param session      the connection's established session, or null
+     * @return the decoded frame and its authentication, or empty if it fails any check
+     */
+    public Optional<Decoded> decodeDetailed(byte[] frame, Optional<PeerId> attestedPeer, Session session) {
         Objects.requireNonNull(frame, "frame");
         Objects.requireNonNull(attestedPeer, "attestedPeer");
         Signed signed;
@@ -149,21 +225,35 @@ public final class WireCodec {
             return Optional.empty(); // unknown wire version: malformed (spec §9)
         }
         byte[] raw = signed.senderPublicKey();
+        Envelope envelope = signed.envelope();
+        boolean hello = envelope.kind() == Envelope.Kind.SESSION_HELLO
+                || envelope.kind() == Envelope.Kind.CHANNEL_HELLO;
         if (raw == null && signed.signature() == null) {
             // Channel-attested frame: the transport's authentication stands in
             // for the signature, for exactly the attested peer.
-            return attestedPeer.isPresent()
-                    && attestedPeer.get().equals(signed.envelope().from())
-                    ? Optional.of(signed.envelope())
+            return !hello && attestedPeer.isPresent() && attestedPeer.get().equals(envelope.from())
+                    ? Optional.of(new Decoded(envelope, Auth.ATTESTED))
+                    : Optional.empty();
+        }
+        if (raw == null && signed.signature() != null) {
+            // Session frame: the connection's session stands in for the signature, for
+            // exactly the peer the session attests, and the tag must verify under its key.
+            if (hello || session == null || signed.signature().length != SESSION_MAC_LENGTH
+                    || !session.peer().equals(envelope.from())) {
+                return Optional.empty();
+            }
+            byte[] expected = mac(session.key(), codec.toBytes(envelope));
+            return java.security.MessageDigest.isEqual(expected, signed.signature())
+                    ? Optional.of(new Decoded(envelope, Auth.SESSION))
                     : Optional.empty();
         }
         if (raw == null || signed.signature() == null
                 || raw.length != Ed25519.RAW_PUBLIC_KEY_LENGTH
-                || !PeerId.fromPublicKey(raw).equals(signed.envelope().from())) {
+                || !PeerId.fromPublicKey(raw).equals(envelope.from())) {
             return Optional.empty();
         }
-        byte[] canonical = codec.toBytes(signed.envelope());
+        byte[] canonical = codec.toBytes(envelope);
         boolean valid = Ed25519.verify(Ed25519.publicKeyFromRaw(raw), canonical, signed.signature());
-        return valid ? Optional.of(signed.envelope()) : Optional.empty();
+        return valid ? Optional.of(new Decoded(envelope, Auth.SIGNED)) : Optional.empty();
     }
 }

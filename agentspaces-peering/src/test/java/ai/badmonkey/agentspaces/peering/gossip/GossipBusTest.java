@@ -288,4 +288,83 @@ class GossipBusTest {
         bus.onRumor(neighbor, new Bodies.Rumor("s", "iLast", 1, bytes("p" + (overflow - 1))));
         assertThat(delivered).as("a recent item still deduplicates").hasSize(overflow + 1);
     }
+
+    /**
+     * v0.1.17: toward a member that understands it, a round opens with a hash per stream, the
+     * partner names the streams that differ, the asker sends their full digests alone, and the
+     * partner answers with deltas as before; two members in sync exchange one small frame.
+     */
+    @Test
+    void aHashedRoundSendsFullDigestsOnlyForTheStreamsThatDiffer() {
+        List<Bodies.Digest> digestsSent = new ArrayList<>();
+        GossipBus.FrameSender recorder = new GossipBus.FrameSender() {
+            @Override public void sendRumor(PeerId to, Bodies.Rumor rumor) { }
+            @Override public void sendDigest(PeerId to, Bodies.Digest digest) { digestsSent.add(digest); }
+            @Override public void sendPullResp(PeerId to, Bodies.PullResp deltas) { pullRespsSent.add(deltas); }
+        };
+        GossipBus asker = new GossipBus(sampler, recorder, CborCodec.defaultCodec(), 3, 6);
+        asker.hashedDigests(p -> true);
+        asker.reconcile("same", digestState("s"));
+        asker.reconcile("differs", digestState("mine"));
+        asker.reconcile("only-mine", digestState("x"));
+        // The partner holds "same" identically, "differs" differently, and "only-theirs".
+        List<Bodies.Digest> partnerSent = new ArrayList<>();
+        GossipBus partner = new GossipBus(sampler, new GossipBus.FrameSender() {
+            @Override public void sendRumor(PeerId to, Bodies.Rumor rumor) { }
+            @Override public void sendDigest(PeerId to, Bodies.Digest digest) { partnerSent.add(digest); }
+            @Override public void sendPullResp(PeerId to, Bodies.PullResp deltas) { pullRespsSent.add(deltas); }
+        }, CborCodec.defaultCodec(), 3, 6);
+        partner.reconcile("same", digestState("s"));
+        partner.reconcile("differs", digestState("theirs"));
+        partner.reconcile("only-theirs", digestState("y"));
+
+        asker.antiEntropyTick();
+        assertThat(digestsSent).hasSize(1);
+        Bodies.Digest opening = digestsSent.get(0);
+        assertThat(opening.digests()).isNull();
+        assertThat(opening.hashes()).containsOnlyKeys("same", "differs", "only-mine");
+        assertThat(opening.hashes().get("same")).isEqualTo(ai.badmonkey.agentspaces.common.crypto.Digests.sha256(bytes("s")));
+
+        partner.onDigest(neighbor, opening);
+        assertThat(partnerSent).hasSize(1);
+        assertThat(partnerSent.get(0).want()).as("only the stream both hold that differs").containsExactly("differs");
+
+        asker.onDigest(neighbor, partnerSent.get(0));
+        assertThat(digestsSent).hasSize(2);
+        assertThat(digestsSent.get(1).digests()).as("full digests for the wanted streams alone").containsOnlyKeys("differs");
+        assertThat(digestsSent.get(1).digests().get("differs")).isEqualTo(bytes("mine"));
+
+        partner.onDigest(neighbor, digestsSent.get(1));
+        assertThat(pullRespsSent).hasSize(1);
+        assertThat(pullRespsSent.get(0).deltas()).containsOnlyKeys("differs");
+
+        // In sync: the opening is answered with nothing at all.
+        partnerSent.clear();
+        partner.onDigest(neighbor, new Bodies.Digest(null, java.util.Map.of("same",
+                ai.badmonkey.agentspaces.common.crypto.Digests.sha256(bytes("s"))), null));
+        assertThat(partnerSent).isEmpty();
+
+        // A stranger's "want" is not answered: full digests go only to the partner this node asked.
+        digestsSent.clear();
+        asker.onDigest(attacker, new Bodies.Digest(null, null, List.of("differs", "same")));
+        assertThat(digestsSent).isEmpty();
+
+        // Toward a member without the hint the round opens with full digests, as before.
+        GossipBus legacy = new GossipBus(sampler, recorder, CborCodec.defaultCodec(), 3, 6);
+        legacy.reconcile("same", digestState("s"));
+        legacy.antiEntropyTick();
+        assertThat(digestsSent).hasSize(1);
+        assertThat(digestsSent.get(0).digests()).containsOnlyKeys("same");
+        assertThat(digestsSent.get(0).hashes()).isNull();
+    }
+
+    private static ReconcilableState digestState(String digest) {
+        return new ReconcilableState() {
+            @Override public byte[] digest() { return bytes(digest); }
+            @Override public byte[] deltaFor(byte[] remoteDigest) {
+                return java.util.Arrays.equals(remoteDigest, bytes(digest)) ? new byte[0] : bytes("delta");
+            }
+            @Override public void applyDelta(byte[] delta) { }
+        };
+    }
 }

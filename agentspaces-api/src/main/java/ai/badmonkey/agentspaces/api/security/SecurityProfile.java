@@ -41,21 +41,21 @@ public enum SecurityProfile {
      * every frame envelope-signed, membership-rooted authorization. The network
      * itself is the boundary; never expose this profile beyond one.
      */
-    DEV_LOCAL(false, true, false),
+    DEV_LOCAL(false, true, false, true),
 
     /**
      * The shipped default: mutual TLS with identity-endorsed channel
      * certificates, envelope signatures elided on attested links (the
      * originator signatures always remain), membership-rooted authorization.
      */
-    MTLS(true, false, false),
+    MTLS(true, false, false, false),
 
     /**
      * {@link #MTLS} plus authorization deferred to the organization's identity
      * provider: privileged operations require JWT scopes (the
      * {@code OidcAuthorizer} in {@code agentspaces-auth-oidc}).
      */
-    MTLS_OIDC(true, false, true),
+    MTLS_OIDC(true, false, true, false),
 
     /**
      * Untrusted intermediaries or cross-organization federation: mutual TLS,
@@ -63,17 +63,32 @@ public enum SecurityProfile {
      * hop, so provenance survives relays that were never trusted to
      * authenticate the origin.
      */
-    ZERO_TRUST(true, true, true);
+    ZERO_TRUST(true, true, true, false);
 
     private final boolean tlsTransport;
     private final boolean envelopeSignatureEveryHop;
     private final boolean oidcAuthorization;
+    private final boolean sessionAuthentication;
 
     SecurityProfile(boolean tlsTransport, boolean envelopeSignatureEveryHop,
-                    boolean oidcAuthorization) {
+                    boolean oidcAuthorization, boolean sessionAuthentication) {
         this.tlsTransport = tlsTransport;
         this.envelopeSignatureEveryHop = envelopeSignatureEveryHop;
         this.oidcAuthorization = oidcAuthorization;
+        this.sessionAuthentication = sessionAuthentication;
+    }
+
+    /**
+     * Whether a connection the transport cannot attest is attested by a signed session
+     * handshake instead (spec §5.6, v0.1.17), after which frames on it carry a MAC under the
+     * session key rather than an identity signature. True for the plain-TCP profile only: the
+     * TLS profiles attest through the handshake already, and zero trust signs every hop by
+     * choice.
+     *
+     * @return whether session authentication stands in for per-frame signatures
+     */
+    public boolean sessionAuthentication() {
+        return sessionAuthentication;
     }
 
     /** Whether the profile's transport is mutual TLS with channel attestation. */

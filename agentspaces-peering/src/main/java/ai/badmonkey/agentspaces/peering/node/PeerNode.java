@@ -89,7 +89,17 @@ public final class PeerNode implements AutoCloseable {
      * pass only on a connection whose transport attested their sender.
      */
     public enum ChannelAuth {
-        SIGNED, ATTESTED
+        /** Every frame carries the identity signature. */
+        SIGNED,
+        /** Frames toward a peer that announced it accepts them travel bare on a connection the transport attested. */
+        ATTESTED,
+        /**
+         * As ATTESTED where the transport attests, and on a connection it cannot attest a
+         * signed SESSION_HELLO on each side establishes a session key, after which frames
+         * carry a MAC under it instead of a signature (spec §5.6, v0.1.17). The dev-local
+         * profile's mode: plain TCP with one signature per connection rather than per frame.
+         */
+        SESSION
     }
 
     /** Wire protocol version this node emits and the only one it accepts
@@ -130,6 +140,96 @@ public final class PeerNode implements AutoCloseable {
     private final WireCodec wire;
     private final HybridLogicalClock hlc;
     private final Duration peerAdTtl;
+    /** How often the self-advertisement is re-flooded through the group (the refresh); between refreshes
+     *  it goes directly, once, to each member this node has not introduced itself to yet. */
+    private final Duration peerAdInterval;
+    /** The coalescing window, or null when frames go out one by one (PERF2 §3.3). */
+    private final Duration coalesceWindow;
+    /** Members whose advertisement said they accept BATCH frames. */
+    private final Set<PeerId> batchPeers = ConcurrentHashMap.newKeySet();
+    private final Map<PeerId, Outbox> outboxes = new ConcurrentHashMap<>();
+    private final java.util.concurrent.ScheduledExecutorService flusher;
+    /** The hint a node advertises when it accepts BATCH frames. */
+    public static final String BATCH_HINT = "wire.batch";
+    /** The hint a node advertises when it understands lazy push (HAVE, GRAFT, PRUNE; PERF2 §3.4). */
+    public static final String TREE_HINT = "wire.tree";
+    /** The hint a node advertises when it establishes sessions on unattested connections (spec §5.6, v0.1.17). */
+    public static final String SESSION_HINT = "wire.session";
+    /** The hint a node advertises when it answers a DIGEST of hashes (spec §5.3, v0.1.17). */
+    public static final String HASHES_HINT = "wire.hashes";
+    /** Members whose advertisement carries {@link #HASHES_HINT}. */
+    private final Set<PeerId> hashPeers = ConcurrentHashMap.newKeySet();
+    /** Members admitted since the last tick, per group: each gets a targeted anti-entropy round on the next tick. */
+    private final Map<GroupId, Set<PeerId>> newlyAdmitted = new ConcurrentHashMap<>();
+    /** The seeds each group was joined with, re-dialed when the view is empty (ROBUSTNESS.md §3.3, §3.6). */
+    private final Map<GroupId, List<PeerAdvertisement.Endpoint>> groupSeeds = new ConcurrentHashMap<>();
+    /** The endpoints each member last advertised, kept past its departure for the lost-member retry. */
+    private final Map<PeerId, List<PeerAdvertisement.Endpoint>> lastEndpoints = new ConcurrentHashMap<>();
+    /** Members that left each group's view and when: introduced to again for a while, in case they are back. */
+    private final Map<GroupId, Map<PeerId, Long>> lostMembers = new ConcurrentHashMap<>();
+    private final Map<GroupId, Long> lastLostRetryMillis = new ConcurrentHashMap<>();
+    /** How long after a member's loss this node keeps introducing itself to its last endpoints. */
+    static final long LOST_RETRY_WINDOW_MILLIS = 10 * 60_000L;
+    /** How often, within the window, the lost members and (on an empty view) the seeds are tried. */
+    static final long LOST_RETRY_INTERVAL_MILLIS = 5_000L;
+    /** Groups whose view changed since the last self-advertisement: the next one is flooded, not sent directly. */
+    private final Set<GroupId> viewChanged = ConcurrentHashMap.newKeySet();
+    /** When a probe's digests last started a targeted pull from a peer, so a persistent mismatch pulls once per period. */
+    private final Map<PeerId, Long> probePulls = new ConcurrentHashMap<>();
+    /** Members whose advertisement carries {@link #SESSION_HINT}. */
+    private final Set<PeerId> sessionPeers = ConcurrentHashMap.newKeySet();
+    /** Session state per connection: this node's ephemeral half, the remote half once heard, the derived key. */
+    private final Map<TransportConnection, Session> sessions = new ConcurrentHashMap<>();
+    private final AtomicLong sessionFramesSent = new AtomicLong();
+    private static final java.security.SecureRandom SESSION_RANDOM = new java.security.SecureRandom();
+    private static final byte[] SESSION_INFO = "agentspaces session v1".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    private static final int SESSION_NONCE_LENGTH = 32;
+
+    private static final class Session {
+        final java.security.KeyPair ephemeral = ai.badmonkey.agentspaces.common.crypto.X25519.generate();
+        final byte[] nonce = new byte[SESSION_NONCE_LENGTH];
+        volatile boolean helloSent;
+        volatile long helloSentAtMillis;
+        /** Whether this node's hello was the answering one. */
+        volatile boolean answered;
+        volatile PeerId remote;
+        volatile byte[] remoteKey;
+        volatile byte[] remoteNonce;
+        volatile byte[] key;
+        /** Whether the other end provably holds the key: outbound frames carry a MAC only then. */
+        volatile boolean confirmed;
+
+        Session() {
+            SESSION_RANDOM.nextBytes(nonce);
+        }
+
+        WireCodec.Session established() {
+            byte[] k = key;
+            return k == null ? null : new WireCodec.Session(remote, k);
+        }
+    }
+    /** Members whose advertisement carries {@link #TREE_HINT}: the gossip bus pushes to them lazily. */
+    private final Set<PeerId> treePeers = ConcurrentHashMap.newKeySet();
+    private final boolean lazyPush;
+    private static final int BATCH_MAX_FRAMES = 64;
+    private static final int BATCH_MAX_BYTES = 48 * 1024;
+
+    /** Frames waiting for one destination, flushed as one signed BATCH. */
+    private static final class Outbox {
+        final GroupId group;
+        final List<byte[]> frames = new ArrayList<>();
+        int bytes;
+
+        Outbox(GroupId group) {
+            this.group = group;
+        }
+    }
+    private final Map<GroupId, Long> lastSelfAdMillis = new ConcurrentHashMap<>();
+    private final Map<GroupId, Set<PeerId>> selfAdSentTo = new ConcurrentHashMap<>();
+    /** The content the last flooded advertisement carried per group; a change floods at once. */
+    private final Map<GroupId, Integer> lastSelfAdFingerprint = new ConcurrentHashMap<>();
+    /** The membership view at the end of the last tick, per group, to notice drops between ticks. */
+    private final Map<GroupId, Set<PeerId>> lastView = new ConcurrentHashMap<>();
     private final ChannelAuth channelAuth;
     /** The revocation authority check (remediation plan §9): founder-rooted by
      * default; enterprise deployments swap in an IdP- or CA-backed validator. */
@@ -268,6 +368,35 @@ public final class PeerNode implements AutoCloseable {
     /** Attested peer per connection that announced it accepts bare frames. */
     private final Map<TransportConnection, PeerId> bareAccepted = new ConcurrentHashMap<>();
     private final AtomicLong signedFramesSent = new AtomicLong();
+    private final AtomicLong bytesSent = new AtomicLong();
+    private final AtomicLong bytesReceived = new AtomicLong();
+    private final Map<Envelope.Kind, AtomicLong> sentByKind = new java.util.EnumMap<>(Envelope.Kind.class);
+    private final Map<Envelope.Kind, AtomicLong> receivedByKind = new java.util.EnumMap<>(Envelope.Kind.class);
+
+    /** A snapshot of this node's wire traffic since it started (PERF2 §4: frames per kind, and bytes). */
+    public record Traffic(long framesSent, long framesReceived, long bytesSent, long bytesReceived,
+                          Map<Envelope.Kind, Long> sentByKind, Map<Envelope.Kind, Long> receivedByKind,
+                          Map<Envelope.Kind, Long> bytesSentByKind) {
+    }
+
+    public Traffic traffic() {
+        Map<Envelope.Kind, Long> sent = new java.util.EnumMap<>(Envelope.Kind.class);
+        sentByKind.forEach((k, v) -> sent.put(k, v.get()));
+        Map<Envelope.Kind, Long> received = new java.util.EnumMap<>(Envelope.Kind.class);
+        receivedByKind.forEach((k, v) -> received.put(k, v.get()));
+        long framesSent = sent.values().stream().mapToLong(Long::longValue).sum();
+        long framesReceived = received.values().stream().mapToLong(Long::longValue).sum();
+        Map<Envelope.Kind, Long> bytesByKind = new java.util.EnumMap<>(Envelope.Kind.class);
+        bytesSentByKind.forEach((k, v) -> bytesByKind.put(k, v.get()));
+        return new Traffic(framesSent, framesReceived, bytesSent.get(), bytesReceived.get(), sent, received, bytesByKind);
+    }
+
+    private void countSent(Envelope.Kind kind, int bytes) {
+        sentByKind.computeIfAbsent(kind, k -> new AtomicLong()).incrementAndGet();
+        bytesSentByKind.computeIfAbsent(kind, k -> new AtomicLong()).addAndGet(bytes);
+        bytesSent.addAndGet(bytes);
+    }
+    private final Map<Envelope.Kind, AtomicLong> bytesSentByKind = new ConcurrentHashMap<>();
     private final AtomicLong bareFramesSent = new AtomicLong();
     private java.util.concurrent.ScheduledExecutorService ticker;
     /** The period {@link #startTicking} was called with; null while hand-driven. */
@@ -326,6 +455,29 @@ public final class PeerNode implements AutoCloseable {
         this.wire = new WireCodec(codec);
         this.hlc = new HybridLogicalClock(builder.clock, builder.identity.peerId().value());
         this.peerAdTtl = builder.peerAdTtl;
+        this.peerAdInterval = builder.peerAdInterval.compareTo(builder.peerAdTtl.dividedBy(2)) > 0
+                ? builder.peerAdTtl.dividedBy(2) : builder.peerAdInterval;
+        this.coalesceWindow = builder.coalesceWindow;
+        this.lazyPush = builder.lazyPush;
+        if (lazyPush) {
+            nodeHints.put(TREE_HINT, "1");
+        }
+        if (builder.channelAuth == ChannelAuth.SESSION) {
+            nodeHints.put(SESSION_HINT, "1");
+        }
+        nodeHints.put(HASHES_HINT, "1");
+        if (coalesceWindow != null) {
+            nodeHints.put(BATCH_HINT, "1");
+            flusher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "peer-flush-" + builder.identity.peerId().display());
+                t.setDaemon(true);
+                return t;
+            });
+            flusher.scheduleAtFixedRate(this::flushOutboxes, coalesceWindow.toMillis(), coalesceWindow.toMillis(),
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        } else {
+            flusher = null;
+        }
         this.channelAuth = builder.channelAuth;
         this.revocationValidator = builder.revocationValidator;
         this.credentialRevocationValidator = builder.credentialRevocationValidator;
@@ -368,6 +520,9 @@ public final class PeerNode implements AutoCloseable {
         private InstantSource clock = InstantSource.system();
         private Random random = new Random();
         private Duration peerAdTtl = Duration.ofMinutes(10);
+        private Duration peerAdInterval = Duration.ofSeconds(30);
+        private boolean lazyPush = true;
+        private Duration coalesceWindow;
         private ChannelAuth channelAuth = ChannelAuth.SIGNED;
         private RevocationRegistry.RevocationValidator revocationValidator =
                 RevocationRegistry.RevocationValidator.founderRooted();
@@ -439,6 +594,59 @@ public final class PeerNode implements AutoCloseable {
          */
         public Builder peerAdTtl(Duration ttl) {
             this.peerAdTtl = Objects.requireNonNull(ttl, "ttl");
+            return this;
+        }
+
+        /**
+         * How often this node re-floods its self-advertisement through each group (default 30 s,
+         * capped at half the advertisement TTL). The advertisement used to go out on every tick,
+         * which at a 250 ms tick with fanout 3 and six hops had every member re-verifying every
+         * other member's signature several times a second, growing with the fleet. Between
+         * refreshes a member this node has not yet introduced itself to receives the advertisement
+         * directly, once, so discovery of a newcomer is not slowed by the interval.
+         *
+         * @param interval the refresh interval
+         * @return this builder
+         */
+        /**
+         * Coalesces rumors, digests, pull responses and pipe frames to one destination into one
+         * signed BATCH frame per window (PERF2 §3.3): one signature and one verification where
+         * there were many. Only toward peers that advertise {@code wire.batch=1}; other peers get
+         * single frames. Off by default (hand-driven tests expect immediate delivery); the starter
+         * turns it on with {@code agentspaces.wire.coalesce-millis}. Adds up to one window of
+         * latency per hop, which must stay well under a space's settle window.
+         *
+         * @param window the flush period, or null to send every frame at once
+         * @return this builder
+         */
+        public Builder coalesce(Duration window) {
+            if (window != null && (window.isZero() || window.isNegative())) {
+                throw new IllegalArgumentException("the coalescing window must be positive");
+            }
+            this.coalesceWindow = window;
+            return this;
+        }
+
+        /**
+         * Whether this node pushes rumors lazily to members that understand it (PERF2 §3.4,
+         * Plumtree): on by default, which advertises the {@link #TREE_HINT}. Off, the node
+         * neither advertises the hint nor treats any member as capable, so it gossips with the
+         * random fan-out alone and is indistinguishable on the wire from an older node.
+         *
+         * @param enabled whether to push lazily
+         * @return this builder
+         */
+        public Builder lazyPush(boolean enabled) {
+            this.lazyPush = enabled;
+            return this;
+        }
+
+        public Builder peerAdInterval(Duration interval) {
+            Objects.requireNonNull(interval, "interval");
+            if (interval.isZero() || interval.isNegative()) {
+                throw new IllegalArgumentException("peerAdInterval must be positive");
+            }
+            this.peerAdInterval = interval;
             return this;
         }
 
@@ -698,6 +906,21 @@ public final class PeerNode implements AutoCloseable {
         return bareFramesSent.get();
     }
 
+    /** Returns how many session-authenticated (MAC, unsigned) frames this node has sent. */
+    public long sessionFramesSent() {
+        return sessionFramesSent.get();
+    }
+
+    /** The groups this node has joined, a snapshot (diagnostics). */
+    public java.util.Collection<GroupRuntime> groups() {
+        return List.copyOf(groups.values());
+    }
+
+    /** The live connection this node holds toward a peer, if any (diagnostics and tests). */
+    TransportConnection connectionFor(PeerId peer) {
+        return connections.get(peer);
+    }
+
     /**
      * Returns how many inbound frames the wire codec refused outright (spec
      * §9): failed signature, half-signed, unknown wire version, or garbage.
@@ -724,18 +947,44 @@ public final class PeerNode implements AutoCloseable {
         Map<PeerId, String> modes = new java.util.HashMap<>();
         connections.forEach((peer, connection) -> {
             PeerId announced = bareAccepted.get(connection);
-            boolean attested = channelAuth == ChannelAuth.ATTESTED
+            boolean attested = channelAuth != ChannelAuth.SIGNED
                     && announced != null
                     && connection.attestedPeer().filter(announced::equals).isPresent();
-            modes.put(peer, attested ? "attested" : "signed");
+            Session session = sessions.get(connection);
+            boolean inSession = session != null && session.confirmed && peer.equals(session.remote);
+            modes.put(peer, attested ? "attested" : inSession ? "session" : "signed");
         });
         return modes;
+    }
+
+    /**
+     * A connection ended (the transport tells us at once, v0.1.17): forget it under whichever
+     * peer it served, so the next tick re-dials and re-introduces this node to that peer
+     * rather than a later send discovering the loss. Idempotent, and safe from any thread.
+     */
+    private void onConnectionClosed(TransportConnection connection) {
+        for (Map.Entry<PeerId, TransportConnection> entry : List.copyOf(connections.entrySet())) {
+            if (entry.getValue() == connection) {
+                dropConnection(entry.getKey(), connection);
+            }
+        }
+        sessions.remove(connection);
+        bareAccepted.remove(connection);
+        helloSent.remove(connection);
+        chained.remove(connection);
     }
 
     private void dropConnection(PeerId peer, TransportConnection connection) {
         connections.remove(peer, connection);
         bareAccepted.remove(connection);
         helloSent.remove(connection);
+        sessions.remove(connection);
+        // A link this node gives up on is closed, not merely forgotten: the other end then learns
+        // of it (onClose) and re-dials with a fresh handshake, rather than keeping a session this
+        // node no longer holds and sending frames into it that would be dropped here unverified.
+        connection.close();
+        // A peer whose channel went away is introduced to again on the next tick (publishSelfAd).
+        selfAdSentTo.values().forEach(sent -> sent.remove(peer));
     }
 
     /**
@@ -982,9 +1231,32 @@ public final class PeerNode implements AutoCloseable {
             public void sendPullResp(PeerId to, Bodies.PullResp resp) {
                 send(groupId, to, Envelope.Kind.PULL_RESP, resp);
             }
+
+            @Override
+            public void sendHave(PeerId to, Bodies.Have have) {
+                send(groupId, to, Envelope.Kind.HAVE, have);
+            }
+
+            @Override
+            public void sendGraft(PeerId to, Bodies.Graft graft) {
+                send(groupId, to, Envelope.Kind.GRAFT, graft);
+            }
+
+            @Override
+            public void sendPrune(PeerId to, Bodies.Prune prune) {
+                send(groupId, to, Envelope.Kind.PRUNE, prune);
+            }
         };
         GossipBus gossip = new GossipBus(membership, sender, codec,
                 groupAd.gossip().fanout(), GossipBus.DEFAULT_HOPS);
+        if (lazyPush) {
+            gossip.lazyPush(treePeers::contains);
+            gossip.directDelivery(PEER_AD_STREAM); // introduced directly and flooded: never a tree duplicate
+            gossip.alwaysEager(PEER_AD_STREAM);
+            gossip.alwaysEager(REVOCATION_STREAM);
+            gossip.alwaysEager(CREDENTIAL_REVOCATION_STREAM);
+        }
+        gossip.hashedDigests(hashPeers::contains);
         RevocationRegistry revocations = new RevocationRegistry(groupAd,
                 revocationValidator, codec, clock,
                 ad -> onPeerRevoked(membership, ad));
@@ -1015,6 +1287,7 @@ public final class PeerNode implements AutoCloseable {
         groups.put(groupId, runtime);
 
         // Introduce ourselves to the seeds directly; gossip takes it from there.
+        groupSeeds.put(groupId, List.copyOf(seeds));
         introduceTo(groupId, seeds);
         return runtime;
     }
@@ -1035,11 +1308,54 @@ public final class PeerNode implements AutoCloseable {
             try {
                 TransportConnection connection = transport.dial(seed.address());
                 attach(connection);
-                maybeAnnounceChannel(groupId, connection);
+                maybeAnnounceChannel(groupId, connection, null); // the seed's identity is not known yet
                 sendOn(connection, groupId, null, Envelope.Kind.RUMOR, selfAdRumor(groupId));
             } catch (IOException e) {
                 // Seed unreachable; others may work, and gossip is redundant.
             }
+        }
+    }
+
+    /**
+     * Two members that dropped each other (a partition longer than the membership TTL, a stale
+     * backlog, a one-way loss) have no third party to reintroduce them and nobody dials anybody:
+     * they would stay apart for good. So, every few seconds for a while after a member's loss,
+     * this node introduces itself to the member's last endpoints as it would to a seed, and when
+     * its view is empty it dials its seeds again; a member that is back answers with its own
+     * introduction and both re-admit. A revoked peer is never retried.
+     */
+    private void retryLost(GroupRuntime runtime, long nowMillis) {
+        GroupId groupId = runtime.id();
+        Long last = lastLostRetryMillis.get(groupId);
+        if (last != null && nowMillis - last < LOST_RETRY_INTERVAL_MILLIS) {
+            return;
+        }
+        Map<PeerId, Long> lost = lostMembers.get(groupId);
+        boolean tried = false;
+        if (lost != null) {
+            for (Map.Entry<PeerId, Long> entry : List.copyOf(lost.entrySet())) {
+                PeerId peer = entry.getKey();
+                if (nowMillis - entry.getValue() > LOST_RETRY_WINDOW_MILLIS || runtime.revocations().revoked(peer)
+                        || runtime.membership().member(peer).isPresent()) {
+                    lost.remove(peer);
+                    continue;
+                }
+                List<PeerAdvertisement.Endpoint> endpoints = lastEndpoints.get(peer);
+                if (endpoints != null && !endpoints.isEmpty()) {
+                    tried = true;
+                    introduceTo(groupId, endpoints);
+                }
+            }
+        }
+        if (runtime.membership().allMembers().isEmpty()) {
+            List<PeerAdvertisement.Endpoint> seeds = groupSeeds.get(groupId);
+            if (seeds != null && !seeds.isEmpty()) {
+                tried = true;
+                introduceTo(groupId, seeds);
+            }
+        }
+        if (tried) {
+            lastLostRetryMillis.put(groupId, nowMillis);
         }
     }
 
@@ -1074,12 +1390,15 @@ public final class PeerNode implements AutoCloseable {
         rejudgeIfTrustChanged();
         for (GroupRuntime runtime : groups.values()) {
             GossipBus gossip = runtime.gossip();
-            Bodies.Rumor selfAd = selfAdRumor(runtime.id());
-            gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload());
+            publishSelfAd(runtime, gossip, nowMillis);
+            boolean active = gossip.consumeActivity();
             runtime.membership().tick(new GroupMembership.Prober() {
                 @Override
                 public void ping(PeerId target, long nonce) {
-                    send(runtime.id(), target, Envelope.Kind.PING, new Bodies.Ping(nonce));
+                    // The probe carries the anti-entropy digests and the recent items (v0.1.17).
+                    Map<String, byte[]> hashes = gossip.probeHashes();
+                    send(runtime.id(), target, Envelope.Kind.PING, new Bodies.Ping(nonce,
+                            hashes == null ? gossip.rootDigest() : null, hashes, gossip.piggyback(target)));
                 }
 
                 @Override
@@ -1087,9 +1406,52 @@ public final class PeerNode implements AutoCloseable {
                     send(runtime.id(), relay, Envelope.Kind.PING_REQ,
                             new Bodies.PingReq(target, nonce));
                 }
-            });
-            if (runtime.claimAntiEntropyRound(nowMillis)) {
-                gossip.antiEntropyTick();
+            }, !active);
+            // A member that left the view since the last tick (the failure detector dropped it, or
+            // an eviction did) is outside the data plane: only its own introduction re-admits it,
+            // and it sends one on the channel it dials next (see connectionTo), so the stale
+            // channel is closed here to make that happen.
+            Set<PeerId> view = new java.util.HashSet<>();
+            for (GroupMembership.Member member : runtime.membership().allMembers()) {
+                view.add(member.id());
+            }
+            Set<PeerId> previous = lastView.put(runtime.id(), view);
+            if (previous != null) {
+                for (PeerId dropped : previous) {
+                    if (!view.contains(dropped)) {
+                        viewChanged.add(runtime.id());
+                        gossip.memberLeft(dropped);
+                        probePulls.remove(dropped);
+                        boolean ejected = runtime.membership().consumeEjected(dropped);
+                        if (!ejected && !runtime.revocations().revoked(dropped)) {
+                            lostMembers.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, nowMillis);
+                        }
+                        TransportConnection stale = connections.get(dropped);
+                        if (stale != null) {
+                            dropConnection(dropped, stale);
+                            stale.close();
+                        }
+                    }
+                }
+            }
+            retryLost(runtime, nowMillis);
+            gossip.tick(nowMillis); // lazy push: grafts and announcements (PERF2 §3.4)
+            PeerId periodicPartner = null;
+            if (runtime.claimAntiEntropyRound(nowMillis, active)) {
+                periodicPartner = gossip.antiEntropyTick().orElse(null);
+            }
+            // A member admitted since the last tick is reconciled with now, after this node's own
+            // introduction went out above, so it holds this node and answers: the newcomer pulls
+            // the cards and space state the fleet already has instead of waiting for the random
+            // periodic partner to be one that holds them. The periodic round's partner is not
+            // asked twice.
+            Set<PeerId> admitted = newlyAdmitted.remove(runtime.id());
+            if (admitted != null) {
+                for (PeerId member : admitted) {
+                    if (!member.equals(periodicPartner) && runtime.membership().member(member).isPresent()) {
+                        gossip.antiEntropyWith(member);
+                    }
+                }
             }
             // Layers above peering join this same clock through
             // GroupRuntime.onTick (QA3 A3-1): capability protocols advance here,
@@ -1103,6 +1465,77 @@ public final class PeerNode implements AutoCloseable {
                 lastBeaconMillis = nowMillis;
                 beacon.announce();
             }
+        }
+    }
+
+    /**
+     * The self-advertisement's cadence: a flooded refresh every {@code peerAdInterval}, and between
+     * refreshes a direct, non-forwarded copy to each member this node has not introduced itself to
+     * since the last refresh (a newcomer, or a member that left and came back). Liveness is the
+     * membership protocol's job; the advertisement only has to stay fresher than its TTL and reach
+     * every member once per version.
+     */
+    private void publishSelfAd(GroupRuntime runtime, GossipBus gossip, long nowMillis) {
+        GroupId groupId = runtime.id();
+        Set<PeerId> sentTo = selfAdSentTo.computeIfAbsent(groupId, g -> ConcurrentHashMap.newKeySet());
+        List<GroupMembership.Member> members = runtime.membership().allMembers();
+        Set<PeerId> current = new java.util.HashSet<>();
+        for (GroupMembership.Member member : members) {
+            current.add(member.id());
+        }
+        sentTo.retainAll(current);
+        Long last = lastSelfAdMillis.get(groupId);
+        int fingerprint = Objects.hash(List.copyOf(advertisedEndpoints), roles, selfHints(groupId));
+        boolean changed = !Integer.valueOf(fingerprint).equals(lastSelfAdFingerprint.get(groupId));
+        boolean viewChange = viewChanged.remove(groupId);
+        if (last == null || changed || viewChange) {
+            // Flooded: the content is new, or the view changed and the flood is what lets two
+            // members that dropped each other find each other again through a third.
+            // Mark before publishing: a member whose send fails is dropped from the set by
+            // dropConnection during the publish, and is introduced to again on the next tick.
+            sentTo.addAll(current);
+            lastSelfAdMillis.put(groupId, nowMillis);
+            lastSelfAdFingerprint.put(groupId, fingerprint);
+            Bodies.Rumor selfAd = selfAdRumor(groupId);
+            gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload());
+            return;
+        }
+        if (nowMillis - last >= peerAdInterval.toMillis()) {
+            // The interval refresh goes to each member directly and unforwarded (v0.1.17): the
+            // flood cost every member several copies when nothing else had pruned the tree, and
+            // a refresh has to reach each member exactly once anyway.
+            sentTo.addAll(current);
+            lastSelfAdMillis.put(groupId, nowMillis);
+            Bodies.Rumor selfAd = selfAdRumor(groupId);
+            Bodies.Rumor refresh = new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload());
+            for (PeerId member : current) {
+                if (!member.equals(peerId()) && !send(groupId, member, Envelope.Kind.RUMOR, refresh)) {
+                    gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload()); // unreachable: flood
+                    return;
+                }
+            }
+            return;
+        }
+        Bodies.Rumor direct = null;
+        for (PeerId member : current) {
+            if (member.equals(peerId()) || sentTo.contains(member)) {
+                continue;
+            }
+            if (direct == null) {
+                Bodies.Rumor selfAd = selfAdRumor(groupId);
+                direct = new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload());
+            }
+            if (send(groupId, member, Envelope.Kind.RUMOR, direct)) {
+                sentTo.add(member);
+                continue;
+            }
+            // Unreachable directly (a partition, a dial-only peer behind another member): let
+            // the group carry the introduction instead, as the per-tick flood used to.
+            Bodies.Rumor flooded = selfAdRumor(groupId);
+            gossip.publish(flooded.streamId(), flooded.itemId(), flooded.payload());
+            lastSelfAdMillis.put(groupId, nowMillis);
+            sentTo.addAll(current);
+            return;
         }
     }
 
@@ -1137,16 +1570,126 @@ public final class PeerNode implements AutoCloseable {
      * @param kind    the frame kind
      * @param body    the body object
      */
-    void send(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+    boolean send(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+        if (quarantined(to)) {
+            return false; // cautious: a sentenced peer is sent nothing, and no link is opened to it
+        }
+        // Never coalesce an introduction: a peer that has not admitted this node yet discards a
+        // BATCH whole, and the peer advertisement inside it is what would have admitted it.
+        boolean introduction = body instanceof Bodies.Rumor rumor && PEER_AD_STREAM.equals(rumor.streamId());
+        if (coalesceWindow != null && batchable(kind) && !introduction && batchPeers.contains(to)
+                && !to.equals(peerId())) {
+            enqueue(groupId, to, kind, body);
+            return true;
+        }
+        return sendNow(groupId, to, kind, body);
+    }
+
+    private static boolean batchable(Envelope.Kind kind) {
+        return kind == Envelope.Kind.RUMOR || kind == Envelope.Kind.DIGEST
+                || kind == Envelope.Kind.PULL_RESP || kind == Envelope.Kind.PIPE_DATA
+                || kind == Envelope.Kind.HAVE || kind == Envelope.Kind.GRAFT || kind == Envelope.Kind.PRUNE;
+    }
+
+    private void enqueue(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+        byte[] bodyBytes = body instanceof byte[] raw ? raw : codec.toBytes(body);
+        byte[] inner = codec.toBytes(new Envelope(WIRE_VERSION, groupId, kind, peerId(), to, hlc.now(), bodyBytes));
+        Outbox full = null;
+        Outbox outbox = outboxes.computeIfAbsent(to, p -> new Outbox(groupId));
+        synchronized (outbox) {
+            outbox.frames.add(inner);
+            outbox.bytes += inner.length;
+            if (outbox.frames.size() >= BATCH_MAX_FRAMES || outbox.bytes >= BATCH_MAX_BYTES) {
+                full = outbox;
+            }
+        }
+        if (full != null) {
+            flush(to, full);
+        }
+    }
+
+    private void flushOutboxes() {
+        for (Map.Entry<PeerId, Outbox> e : outboxes.entrySet()) {
+            flush(e.getKey(), e.getValue());
+        }
+    }
+
+    private void flush(PeerId to, Outbox outbox) {
+        List<byte[]> frames;
+        GroupId group;
+        synchronized (outbox) {
+            if (outbox.frames.isEmpty()) {
+                return;
+            }
+            frames = List.copyOf(outbox.frames);
+            outbox.frames.clear();
+            outbox.bytes = 0;
+            group = outbox.group;
+        }
+        if (frames.size() == 1) {
+            // Nothing to coalesce: forward the inner frame as itself, re-signed as a plain frame.
+            Envelope inner = codec.fromBytes(frames.get(0), Envelope.class);
+            sendNow(group, to, inner.kind(), inner.body());
+            return;
+        }
+        sendNow(group, to, Envelope.Kind.BATCH, new Bodies.Batch(frames));
+    }
+
+    private void onBatch(GroupRuntime runtime, Envelope envelope, TransportConnection connection) {
+        Bodies.Batch batch;
+        try {
+            batch = codec.fromBytes(envelope.body(), Bodies.Batch.class);
+        } catch (RuntimeException e) {
+            strike(envelope.from(), "malformed BATCH body");
+            return;
+        }
+        if (batch == null || batch.frames() == null) {
+            return;
+        }
+        for (byte[] bytes : batch.frames()) {
+            Envelope inner;
+            try {
+                inner = codec.fromBytes(bytes, Envelope.class);
+            } catch (RuntimeException e) {
+                strike(envelope.from(), "malformed frame in BATCH");
+                return;
+            }
+            // An inner frame inherits the outer signature: it must claim the same sender and
+            // group, and may not nest. Each is then judged and dispatched as if it had arrived alone.
+            if (inner == null || inner.kind() == Envelope.Kind.BATCH || inner.ver() != WIRE_VERSION
+                    || !envelope.from().equals(inner.from()) || !envelope.group().equals(inner.group())) {
+                strike(envelope.from(), "BATCH frame from another sender or group");
+                return;
+            }
+            receivedByKind.computeIfAbsent(inner.kind(), k -> new AtomicLong()).incrementAndGet();
+            dispatch(inner, connection);
+        }
+    }
+
+    boolean sendNow(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
         TransportConnection connection = connectionTo(groupId, to);
         if (connection == null) {
-            sendViaRelay(groupId, to, kind, body);
-            return;
+            return sendViaRelay(groupId, to, kind, body);
         }
         try {
             sendOn(connection, groupId, to, kind, body);
+            return true;
         } catch (IOException e) {
+            // The channel died under us (the peer closed it: a quarantine, an eviction, a
+            // restart). Drop it and try once more over a fresh dial, which also carries this
+            // node's introduction, so a request is not lost to a stale channel.
             dropConnection(to, connection);
+            TransportConnection fresh = connectionTo(groupId, to);
+            if (fresh == null || fresh == connection) {
+                return sendViaRelay(groupId, to, kind, body);
+            }
+            try {
+                sendOn(fresh, groupId, to, kind, body);
+                return true;
+            } catch (IOException again) {
+                dropConnection(to, fresh);
+                return false;
+            }
         }
     }
 
@@ -1155,13 +1698,13 @@ public final class PeerNode implements AutoCloseable {
      * RELAY-role member. One relay hop only: the relay dials the target
      * directly, and relay frames themselves are never re-relayed.
      */
-    private void sendViaRelay(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+    private boolean sendViaRelay(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
         if (kind == Envelope.Kind.RELAY_FRAME) {
-            return;
+            return false;
         }
         GroupRuntime runtime = groups.get(groupId);
         if (runtime == null) {
-            return;
+            return false;
         }
         // The inner frame is addressed to the ultimate target; the outer
         // RELAY_FRAME is addressed to the relay that carries it.
@@ -1178,11 +1721,12 @@ public final class PeerNode implements AutoCloseable {
             try {
                 sendOn(connection, groupId, relay, Envelope.Kind.RELAY_FRAME,
                         new Bodies.RelayFrame(to, inner));
-                return;
+                return true;
             } catch (IOException e) {
                 dropConnection(relay, connection);
             }
         }
+        return false;
     }
 
     /**
@@ -1205,6 +1749,14 @@ public final class PeerNode implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        if (flusher != null) {
+            flusher.shutdownNow();
+            try {
+                flushOutboxes();
+            } catch (RuntimeException e) {
+                // closing anyway
+            }
+        }
         if (ticker != null) {
             // Let an in-flight tick finish rather than interrupt it: a tick may be
             // persisting state (a rotated content-key ring), and an interrupted
@@ -1231,6 +1783,7 @@ public final class PeerNode implements AutoCloseable {
         connections.clear();
         bareAccepted.clear();
         helloSent.clear();
+        sessions.clear();
         if (beacon != null) {
             beacon.close();
         }
@@ -1240,6 +1793,7 @@ public final class PeerNode implements AutoCloseable {
 
     private void attach(TransportConnection connection) {
         connection.onReceive(frame -> onFrame(connection, frame));
+        connection.onClose(() -> onConnectionClosed(connection));
         java.security.cert.X509Certificate[] chain = connection.remoteChain();
         if (chain.length == 0) {
             return;
@@ -1350,14 +1904,21 @@ public final class PeerNode implements AutoCloseable {
     }
 
     private void onFrame(TransportConnection connection, byte[] frame) {
-        Optional<Envelope> decoded = wire.decode(frame, connection.attestedPeer());
+        bytesReceived.addAndGet(frame.length);
+        Session session = sessions.get(connection);
+        Optional<WireCodec.Decoded> decoded = wire.decodeDetailed(frame, connection.attestedPeer(),
+                session == null ? null : session.established());
+        decoded.ifPresent(d -> receivedByKind.computeIfAbsent(d.envelope().kind(), k -> new AtomicLong()).incrementAndGet());
         if (decoded.isEmpty()) {
             // Bad signature, unknown wire version, or malformed: drop before
             // any handler sees it (spec §9). No verified sender, so no strike.
             framesDropped.incrementAndGet();
             return;
         }
-        dispatch(decoded.get(), connection);
+        if (session != null && decoded.get().auth() == WireCodec.Auth.SESSION) {
+            session.confirmed = true; // the other end holds the key: key confirmation (spec §5.6)
+        }
+        dispatch(decoded.get().envelope(), connection);
     }
 
     /**
@@ -1434,7 +1995,18 @@ public final class PeerNode implements AutoCloseable {
         hlc.update(envelope.stamp());
         if (connection != null) {
             connections.putIfAbsent(envelope.from(), connection);
-            maybeAnnounceChannel(envelope.group(), connection);
+            // A session opens only after a non-introduction frame from a member: probes, digests
+            // and forwards go to members alone, so such a frame proves the peer admitted this
+            // node too, and its answer to a hello will not be ignored as a stranger's.
+            maybeAnnounceChannel(envelope.group(), connection, null);
+            if (envelope.kind() != Envelope.Kind.RUMOR && envelope.kind() != Envelope.Kind.SESSION_HELLO) {
+                // On the connection this node sends over, which with two links between a pair
+                // (each dialed the other) is not the one the frame arrived on.
+                TransportConnection outbound = connections.get(envelope.from());
+                if (outbound != null) {
+                    maybeSessionHello(envelope.group(), outbound, envelope.from());
+                }
+            }
         }
         runtime.membership().recordHeard(envelope.from());
         try {
@@ -1451,8 +2023,11 @@ public final class PeerNode implements AutoCloseable {
         switch (envelope.kind()) {
             case PING -> {
                 Bodies.Ping ping = codec.fromBytes(envelope.body(), Bodies.Ping.class);
-                send(runtime.id(), envelope.from(), Envelope.Kind.ACK,
-                        new Bodies.Ack(ping.nonce(), null));
+                onProbePiggyback(runtime, envelope.from(), ping.root(), ping.hashes(), ping.have());
+                GossipBus gossip = runtime.gossip();
+                Map<String, byte[]> hashes = gossip.probeHashes();
+                send(runtime.id(), envelope.from(), Envelope.Kind.ACK, new Bodies.Ack(ping.nonce(), null,
+                        hashes == null ? gossip.rootDigest() : null, hashes, gossip.piggyback(envelope.from())));
             }
             case PING_REQ -> {
                 Bodies.PingReq req = codec.fromBytes(envelope.body(), Bodies.PingReq.class);
@@ -1474,6 +2049,9 @@ public final class PeerNode implements AutoCloseable {
                     }
                 } else {
                     runtime.membership().onAck(ack.nonce(), envelope.from());
+                    if (ack.onBehalf() == null) {
+                        onProbePiggyback(runtime, envelope.from(), ack.root(), ack.hashes(), ack.have());
+                    }
                 }
             }
             case RUMOR -> runtime.gossip().onRumor(envelope.from(),
@@ -1482,14 +2060,22 @@ public final class PeerNode implements AutoCloseable {
                     codec.fromBytes(envelope.body(), Bodies.Digest.class));
             case PULL_RESP -> runtime.gossip().onPullResp(envelope.from(),
                     codec.fromBytes(envelope.body(), Bodies.PullResp.class));
+            case HAVE -> runtime.gossip().onHave(envelope.from(),
+                    codec.fromBytes(envelope.body(), Bodies.Have.class));
+            case GRAFT -> runtime.gossip().onGraft(envelope.from(),
+                    codec.fromBytes(envelope.body(), Bodies.Graft.class));
+            case PRUNE -> runtime.gossip().onPrune(envelope.from(),
+                    codec.fromBytes(envelope.body(), Bodies.Prune.class));
             case QUERY, QUERY_HIT, BLOCK_WANT, BLOCK, PIPE_DATA -> {
                 var handler = runtime.handlerFor(envelope.kind());
                 if (handler != null) {
                     handler.accept(envelope.from(), envelope.body());
                 }
             }
+            case BATCH -> onBatch(runtime, envelope, connection);
             case RELAY_FRAME -> onRelayFrame(runtime, envelope);
             case CHANNEL_HELLO -> onChannelHello(envelope, connection);
+            case SESSION_HELLO -> onSessionHello(envelope, connection);
             case GROUP_AD_WANT -> runtime.founding().ifPresent(founding ->
                     send(runtime.id(), envelope.from(), Envelope.Kind.GROUP_AD, founding));
             case GROUP_AD -> onGroupAdAnswer(envelope); // only a pending fetch cares
@@ -1649,7 +2235,21 @@ public final class PeerNode implements AutoCloseable {
             hlc.update(envelope.stamp());
             if (connection != null) {
                 connections.putIfAbsent(envelope.from(), connection);
-                maybeAnnounceChannel(envelope.group(), connection);
+                maybeAnnounceChannel(envelope.group(), connection, null); // the newcomer may not hold us yet
+                // An introduction is answered with an introduction, on the same connection and
+                // before anything else: this node is about to push the newcomer data (the cards
+                // it forwards, its own items), and until the newcomer holds this node every such
+                // frame is a non-member's and dropped. Waiting for the next tick's direct
+                // introduction left a window of a tick in which a dozen frames were lost and
+                // recovered only by anti-entropy (found by example 18, 2026-10-12).
+                try {
+                    Bodies.Rumor selfAd = selfAdRumor(runtime.id());
+                    sendOn(connection, runtime.id(), envelope.from(), Envelope.Kind.RUMOR,
+                            new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload()));
+                    selfAdSentTo.computeIfAbsent(runtime.id(), g -> ConcurrentHashMap.newKeySet()).add(envelope.from());
+                } catch (IOException e) {
+                    // the next tick introduces this node directly, as before
+                }
             }
             runtime.membership().recordHeard(envelope.from());
             runtime.gossip().publish(rumor.streamId(), rumor.itemId(), rumor.payload());
@@ -1815,6 +2415,13 @@ public final class PeerNode implements AutoCloseable {
             if (connection != null) {
                 connection.close();
             }
+            // The peer may have been a gossip-tree forwarder for this node: ask every other
+            // member to push eagerly again, so nothing routes through the sentenced peer.
+            for (GroupRuntime runtime : groups.values()) {
+                if (runtime.membership().member(peer).isPresent()) {
+                    runtime.gossip().forwarderLost(peer);
+                }
+            }
             LOG.log(System.Logger.Level.WARNING,
                     "quarantined " + peer.display() + " after " + count
                             + " witnessed violations; last: " + reason);
@@ -1890,12 +2497,16 @@ public final class PeerNode implements AutoCloseable {
      * this node accepts channel-attested frames there. The announcement itself
      * travels as a fully signed frame.
      */
-    private void maybeAnnounceChannel(GroupId groupId, TransportConnection connection) {
-        if (channelAuth != ChannelAuth.ATTESTED) {
+    private void maybeAnnounceChannel(GroupId groupId, TransportConnection connection, PeerId peer) {
+        if (channelAuth == ChannelAuth.SIGNED) {
             return;
         }
         Optional<PeerId> attested = connection.attestedPeer();
-        if (attested.isEmpty() || !helloSent.add(connection)) {
+        if (attested.isEmpty()) {
+            maybeSessionHello(groupId, connection, peer);
+            return;
+        }
+        if (!helloSent.add(connection)) {
             return;
         }
         try {
@@ -1905,6 +2516,166 @@ public final class PeerNode implements AutoCloseable {
         } catch (IOException e) {
             helloSent.remove(connection); // retry on the next trigger
         }
+    }
+
+    /**
+     * Opens this node's half of a session on a connection the transport could not attest
+     * (spec §5.6, v0.1.17): once per connection, in SESSION mode, toward a member whose
+     * advertisement carries the session hint. The hello travels fully signed; the key is
+     * derived when the other half arrives.
+     */
+    private void maybeSessionHello(GroupId groupId, TransportConnection connection, PeerId peer) {
+        if (channelAuth != ChannelAuth.SESSION || peer == null || !sessionPeers.contains(peer)
+                || peer.equals(peerId()) || connection.attestedPeer().isPresent()) {
+            return; // an attested connection keeps the bare form of §5.6
+        }
+        Session session = sessions.computeIfAbsent(connection, c -> new Session());
+        synchronized (session) {
+            long now = clock.millis();
+            if (session.key != null || session.answered
+                    || (session.helloSent && now - session.helloSentAtMillis < SESSION_HELLO_RETRY_MILLIS)) {
+                return;
+            }
+            sendSessionHello(session, groupId, connection, peer, null);
+        }
+    }
+
+    /** How long an unanswered opening hello stands before the next trigger may repeat it. */
+    private static final long SESSION_HELLO_RETRY_MILLIS = 5_000;
+
+    /** Sends this node's half (opening when {@code echo} is null, answering otherwise), fully signed. */
+    private void sendSessionHello(Session session, GroupId groupId, TransportConnection connection,
+                                  PeerId peer, byte[] echo) {
+        Bodies.SessionHello hello = new Bodies.SessionHello(
+                ai.badmonkey.agentspaces.common.crypto.X25519.rawPublicKey(session.ephemeral.getPublic()),
+                session.nonce, peer, echo);
+        // Marked before the send: a synchronous fabric delivers the peer's reaction, which can
+        // trigger this node again, before send() returns.
+        boolean wasSent = session.helloSent;
+        boolean wasAnswered = session.answered;
+        long wasAt = session.helloSentAtMillis;
+        session.helloSent = true;
+        session.helloSentAtMillis = clock.millis();
+        session.answered = echo != null;
+        try {
+            byte[] frame = encodeFrame(groupId, peer, Envelope.Kind.SESSION_HELLO, hello);
+            connection.send(frame);
+            signedFramesSent.incrementAndGet();
+            countSent(Envelope.Kind.SESSION_HELLO, frame.length);
+        } catch (IOException e) {
+            session.helloSent = wasSent; // the next trigger repeats it
+            session.answered = wasAnswered;
+            session.helloSentAtMillis = wasAt;
+        }
+    }
+
+    /**
+     * Handles a SESSION_HELLO (spec §5.6, v0.1.17). The codec admits it only fully signed, so
+     * the sender's identity stands behind the ephemeral key; it counts only when it names this
+     * node as the remote end and arrives on a real connection. An opening hello is answered
+     * with this node's half echoing the opener's nonce, and the key is derived at once but
+     * used for outbound frames only once the opener's first MAC frame verifies (key
+     * confirmation); an answering hello that echoes this node's nonce confirms at once. When
+     * both ends open at the same time, the lower PeerID stays the opener. The key is HKDF
+     * over the X25519 agreement, bound to both PeerIDs and both nonces.
+     */
+    private void onSessionHello(Envelope envelope, TransportConnection connection) {
+        if (channelAuth != ChannelAuth.SESSION || connection == null || connection.attestedPeer().isPresent()) {
+            return;
+        }
+        Bodies.SessionHello hello;
+        try {
+            hello = codec.fromBytes(envelope.body(), Bodies.SessionHello.class);
+        } catch (RuntimeException e) {
+            return;
+        }
+        if (hello == null || !peerId().equals(hello.remote()) || hello.ephemeralKey() == null
+                || hello.ephemeralKey().length != ai.badmonkey.agentspaces.common.crypto.X25519.RAW_PUBLIC_KEY_LENGTH
+                || hello.nonce() == null || hello.nonce().length < 16 || hello.nonce().length > 64) {
+            return;
+        }
+        Session session = sessions.computeIfAbsent(connection, c -> new Session());
+        synchronized (session) {
+            if (session.key != null || (session.remote != null && !session.remote.equals(envelope.from()))) {
+                return; // one session per connection, with one peer
+            }
+            boolean opening = hello.echo() == null;
+            if (opening) {
+                if (session.helloSent && !session.answered
+                        && peerId().value().compareTo(envelope.from().value()) < 0) {
+                    return; // both opened at once: this node is the opener and waits for the answer
+                }
+            } else if (!session.helloSent || session.answered
+                    || !java.security.MessageDigest.isEqual(hello.echo(), session.nonce)) {
+                return; // an answer to a hello this node never opened
+            }
+            session.remote = envelope.from();
+            session.remoteKey = hello.ephemeralKey();
+            session.remoteNonce = hello.nonce();
+            // The key is in place before anything leaves, so the opener's first MAC frame, which
+            // a synchronous fabric delivers before the answer's send returns, already verifies.
+            session.key = deriveSessionKey(session);
+            session.confirmed = !opening;
+            if (opening) {
+                sendSessionHello(session, envelope.group(), connection, envelope.from(), hello.nonce());
+                if (!session.answered) {
+                    session.key = null; // the answer did not leave: the opener will open again
+                    session.remote = null;
+                }
+            }
+        }
+    }
+
+    /** HKDF over the X25519 agreement, bound to both PeerIDs and both nonces in PeerID order. */
+    private byte[] deriveSessionKey(Session session) {
+        byte[] shared = ai.badmonkey.agentspaces.common.crypto.X25519.agree(
+                session.ephemeral.getPrivate(), session.remoteKey);
+        PeerId self = peerId();
+        boolean selfFirst = self.value().compareTo(session.remote.value()) < 0;
+        PeerId first = selfFirst ? self : session.remote;
+        PeerId second = selfFirst ? session.remote : self;
+        byte[] firstNonce = selfFirst ? session.nonce : session.remoteNonce;
+        byte[] secondNonce = selfFirst ? session.remoteNonce : session.nonce;
+        java.io.ByteArrayOutputStream info = new java.io.ByteArrayOutputStream();
+        info.writeBytes(SESSION_INFO);
+        info.writeBytes(first.value().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        info.write(0);
+        info.writeBytes(second.value().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        info.write(0);
+        info.writeBytes(firstNonce);
+        info.writeBytes(secondNonce);
+        return ai.badmonkey.agentspaces.common.crypto.Hkdf.derive(
+                shared, new byte[0], info.toByteArray(), WireCodec.SESSION_MAC_LENGTH);
+    }
+
+    /**
+     * Handles what a member's probe carried (v0.1.17): its recently forwarded items go to the
+     * lazy-push machinery as an announcement, and a digest that differs from this node's on a
+     * shared stream starts a targeted anti-entropy round with that member, at most once per
+     * gossip period per member, so a persistent difference (a stream only one side holds
+     * behind a root hash) costs one round per period and no more.
+     */
+    private void onProbePiggyback(GroupRuntime runtime, PeerId from, byte[] root,
+                                  Map<String, byte[]> hashes, List<Bodies.HaveItem> have) {
+        GossipBus gossip = runtime.gossip();
+        if (have != null && !have.isEmpty()) {
+            gossip.onHave(from, new Bodies.Have(have));
+        }
+        if (!runtime.antiEntropyStretched()) {
+            return; // the periodic round is on its base period and reconciles what moves
+        }
+        boolean mismatch = hashes != null ? gossip.differs(hashes) : gossip.differs(root);
+        if (!mismatch) {
+            return;
+        }
+        long now = clock.millis();
+        long period = runtime.advertisement().gossip().period().toMillis();
+        Long last = probePulls.get(from);
+        if (last != null && now - last < period) {
+            return;
+        }
+        probePulls.put(from, now);
+        gossip.antiEntropyWith(from);
     }
 
     private void onRelayFrame(GroupRuntime runtime, Envelope envelope) {
@@ -1945,18 +2716,34 @@ public final class PeerNode implements AutoCloseable {
         // attestation can stand in for the envelope signature (spec §5.6):
         // elide only in ATTESTED mode, toward a peer that announced it accepts
         // bare frames, on the connection whose transport attested that peer.
-        PeerId announced = channelAuth == ChannelAuth.ATTESTED
+        Session session = channelAuth == ChannelAuth.SESSION ? sessions.get(connection) : null;
+        byte[] sessionKey = session == null || !session.confirmed ? null : session.key;
+        if (sessionKey != null && to != null && to.equals(session.remote)
+                && kind != Envelope.Kind.SESSION_HELLO && kind != Envelope.Kind.CHANNEL_HELLO) {
+            byte[] bodyBytes = body instanceof byte[] raw ? raw : codec.toBytes(body);
+            byte[] frame = wire.encodeSession(
+                    new Envelope(WIRE_VERSION, groupId, kind, peerId(), to, hlc.now(), bodyBytes), sessionKey);
+            connection.send(frame);
+            sessionFramesSent.incrementAndGet();
+            countSent(kind, frame.length);
+            return;
+        }
+        PeerId announced = channelAuth != ChannelAuth.SIGNED
                 ? bareAccepted.get(connection) : null;
         if (announced != null
                 && connection.attestedPeer().filter(announced::equals).isPresent()) {
             byte[] bodyBytes = body instanceof byte[] raw ? raw : codec.toBytes(body);
-            connection.send(wire.encodeBare(
-                    new Envelope(WIRE_VERSION, groupId, kind, peerId(), to, hlc.now(), bodyBytes)));
+            byte[] bare = wire.encodeBare(
+                    new Envelope(WIRE_VERSION, groupId, kind, peerId(), to, hlc.now(), bodyBytes));
+            connection.send(bare);
             bareFramesSent.incrementAndGet();
+            countSent(kind, bare.length);
             return;
         }
-        connection.send(encodeFrame(groupId, to, kind, body));
+        byte[] frame = encodeFrame(groupId, to, kind, body);
+        connection.send(frame);
         signedFramesSent.incrementAndGet();
+        countSent(kind, frame.length);
     }
 
     private byte[] encodeFrame(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
@@ -1991,7 +2778,17 @@ public final class PeerNode implements AutoCloseable {
                         dialed.close();
                         return raced;
                     }
-                    maybeAnnounceChannel(groupId, dialed);
+                    maybeAnnounceChannel(groupId, dialed, null); // a session opens once the peer answers
+                    // Introduce ourselves on the new channel, as to a seed: a peer that forgot
+                    // this node (its view expired, or it was quarantined) re-admits it from its
+                    // own advertisement and from nothing else.
+                    try {
+                        Bodies.Rumor selfAd = selfAdRumor(groupId);
+                        sendOn(dialed, groupId, to, Envelope.Kind.RUMOR,
+                                new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload()));
+                    } catch (IOException e) {
+                        // The channel is dead already; the caller's send will notice and drop it.
+                    }
                     return dialed;
                 } catch (IOException e) {
                     // Try the next endpoint.
@@ -2035,6 +2832,37 @@ public final class PeerNode implements AutoCloseable {
         }
         boolean admission = runtime.membership().member(ad.issuer()).isEmpty();
         runtime.membership().onPeerAdvertisement(ad);
+        lastEndpoints.put(ad.issuer(), List.copyOf(ad.endpoints()));
+        Map<PeerId, Long> lost = lostMembers.get(runtime.id());
+        if (lost != null) {
+            lost.remove(ad.issuer());
+        }
+        if (admission && runtime.membership().member(ad.issuer()).isPresent()) {
+            newlyAdmitted.computeIfAbsent(runtime.id(), g -> ConcurrentHashMap.newKeySet()).add(ad.issuer());
+            viewChanged.add(runtime.id());
+            runtime.gossip().topologyChanged();
+            runtime.gossip().memberAdmitted(ad.issuer());
+        }
+        if ("1".equals(ad.resourceHints().get(BATCH_HINT))) {
+            batchPeers.add(ad.issuer());
+        } else {
+            batchPeers.remove(ad.issuer());
+        }
+        if (lazyPush && "1".equals(ad.resourceHints().get(TREE_HINT))) {
+            treePeers.add(ad.issuer());
+        } else {
+            treePeers.remove(ad.issuer());
+        }
+        if (channelAuth == ChannelAuth.SESSION && "1".equals(ad.resourceHints().get(SESSION_HINT))) {
+            sessionPeers.add(ad.issuer());
+        } else {
+            sessionPeers.remove(ad.issuer());
+        }
+        if ("1".equals(ad.resourceHints().get(HASHES_HINT))) {
+            hashPeers.add(ad.issuer());
+        } else {
+            hashPeers.remove(ad.issuer());
+        }
         if (credentialHintListeners.isEmpty()) {
             return;
         }

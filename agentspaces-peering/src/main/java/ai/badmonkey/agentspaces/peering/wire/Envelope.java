@@ -78,6 +78,29 @@ public record Envelope(
         /** Direct capability frame (spec §9 pipes, v0.1 datagram form). */
         PIPE_DATA,
         /**
+         * Several frames from one sender to one receiver in one signed envelope (PERF2 §3.3): the
+         * body is a {@code Bodies.Batch} of encoded inner envelopes, each with its own kind and
+         * stamp, dispatched in order as if received separately. Sent only to a peer whose
+         * advertisement carries the hint {@code wire.batch=1}.
+         */
+        BATCH,
+        /**
+         * Lazy push (PERF2 §3.4, Plumtree): the sender names rumor items it forwarded, by stream
+         * and payload hash, without carrying them. Sent only to a peer whose advertisement carries
+         * the hint {@code wire.tree=1}, and only on the gossip period.
+         */
+        HAVE,
+        /**
+         * Lazy push: the sender asks for an announced item it never received, and in doing so
+         * makes the receiver an eager peer again. Answered with the item as a RUMOR.
+         */
+        GRAFT,
+        /**
+         * Lazy push: the sender received the named item from the receiver as a duplicate and will
+         * take announcements rather than payloads from it from now on.
+         */
+        PRUNE,
+        /**
          * A frame carried on behalf of a peer that cannot be dialed directly
          * (spec §5.4 relay): the body holds the target and the origin's complete
          * signed frame, forwarded verbatim by a RELAY-role peer.
@@ -90,6 +113,14 @@ public record Envelope(
          * for the remote end so the announcement binds to this channel.
          */
         CHANNEL_HELLO,
+        /**
+         * Session attestation (spec §5.6, v0.1.17): a signed, per-connection statement carrying
+         * the sender's ephemeral X25519 key and nonce and naming the remote end, from which both
+         * ends derive the session key that authenticates the connection's later frames by MAC.
+         * Only ever accepted fully signed; sent only to a peer whose advertisement carries the
+         * hint {@code wire.session=1}.
+         */
+        SESSION_HELLO,
         /**
          * Join-by-GroupID bootstrap request (spec §10.1, v0.1.10): a peer that
          * knows only a GroupID and a seed endpoint asks the seed for the

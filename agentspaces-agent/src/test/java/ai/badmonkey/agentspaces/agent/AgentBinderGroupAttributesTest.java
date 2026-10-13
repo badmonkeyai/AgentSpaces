@@ -148,6 +148,9 @@ class AgentBinderGroupAttributesTest {
         // Beta's decision closes when beta's vote capability gets a ballot; alpha's never reaches the recorder.
         vote(betaVotes).castBallot("p-beta", "no", HOUR);
         await(() -> split.decided.contains("p-beta"));
+        // The recorder's return value is written by the binder after the method returns, a
+        // moment after the list above was appended to: wait for the write itself.
+        await(() -> !betaVotes.readAll(Template.of(Verdict.class), 10).isEmpty());
         assertThat(betaVotes.readAll(Template.of(Verdict.class), 10)).singleElement()
                 .satisfies(v -> assertThat(v.winner()).isEqualTo("no"));
         alphaNotes.write(new Note("alpha"), HOUR);

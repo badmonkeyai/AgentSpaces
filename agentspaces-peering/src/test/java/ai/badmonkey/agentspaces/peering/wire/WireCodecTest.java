@@ -171,4 +171,74 @@ class WireCodecTest {
                 sender.peerId(), sender.peerId(), new HlcTimestamp(42L, 0, "n"), new byte[0]))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    // ------------------------------------------------------------ §5.6 session frames (v0.1.17)
+
+    private static byte[] key(int fill) {
+        byte[] k = new byte[WireCodec.SESSION_MAC_LENGTH];
+        java.util.Arrays.fill(k, (byte) fill);
+        return k;
+    }
+
+    @Test
+    void aSessionFrameVerifiesUnderItsKeyForItsPeerOnly() {
+        byte[] frame = wire.encodeSession(envelope(sender), key(7));
+        WireCodec.Session session = new WireCodec.Session(sender.peerId(), key(7));
+
+        Optional<WireCodec.Decoded> decoded = wire.decodeDetailed(frame, Optional.empty(), session);
+        assertThat(decoded).isPresent();
+        assertThat(decoded.get().auth()).isEqualTo(WireCodec.Auth.SESSION);
+        assertThat(decoded.get().envelope().body()).containsExactly(1, 2, 3);
+
+        assertThat(wire.decodeDetailed(frame, Optional.empty(), new WireCodec.Session(sender.peerId(), key(8))))
+                .as("the wrong key").isEmpty();
+        assertThat(wire.decodeDetailed(frame, Optional.empty(),
+                new WireCodec.Session(PeerIdentity.generate().peerId(), key(7))))
+                .as("a session attesting someone else, even with the same key").isEmpty();
+        assertThat(wire.decodeDetailed(frame, Optional.empty(), null)).as("no session on this connection").isEmpty();
+        assertThat(wire.decode(frame)).as("the plain decoder has no session and drops it").isEmpty();
+        assertThat(wire.decodeDetailed(frame, Optional.of(sender.peerId()), null))
+                .as("transport attestation does not vouch for a MAC it cannot check").isEmpty();
+    }
+
+    @Test
+    void aTamperedSessionFrameIsDropped() {
+        byte[] frame = wire.encodeSession(envelope(sender), key(7));
+        WireCodec.Session session = new WireCodec.Session(sender.peerId(), key(7));
+        byte[] tampered = frame.clone();
+        tampered[tampered.length - 40] ^= 0x01; // inside the tag or the body
+        assertThat(wire.decodeDetailed(tampered, Optional.empty(), session)).isEmpty();
+        // A hand-built frame with a tag of the wrong length is malformed.
+        CborCodec codec = CborCodec.defaultCodec();
+        byte[] shortTag = codec.toBytes(new WireCodec.Signed(envelope(sender), null, new byte[16]));
+        assertThat(wire.decodeDetailed(shortTag, Optional.empty(), session)).isEmpty();
+    }
+
+    @Test
+    void signedAndBareFramesStillDecodeBesideASession() {
+        WireCodec.Session session = new WireCodec.Session(sender.peerId(), key(7));
+        Optional<WireCodec.Decoded> signed = wire.decodeDetailed(wire.encode(envelope(sender), sender),
+                Optional.empty(), session);
+        assertThat(signed).isPresent();
+        assertThat(signed.get().auth()).isEqualTo(WireCodec.Auth.SIGNED);
+        Optional<WireCodec.Decoded> bare = wire.decodeDetailed(wire.encodeBare(envelope(sender)),
+                Optional.of(sender.peerId()), session);
+        assertThat(bare).isPresent();
+        assertThat(bare.get().auth()).isEqualTo(WireCodec.Auth.ATTESTED);
+    }
+
+    @Test
+    void aHelloIsAcceptedOnlyFullySigned() {
+        Envelope hello = new Envelope(WireCodec.WIRE_VERSION, GroupId.of("zG"), Envelope.Kind.SESSION_HELLO,
+                sender.peerId(), sender.peerId(), new HlcTimestamp(42L, 0, "n"), new byte[]{1});
+        WireCodec.Session session = new WireCodec.Session(sender.peerId(), key(7));
+        assertThat(wire.decodeDetailed(wire.encodeSession(hello, key(7)), Optional.empty(), session))
+                .as("a hello under the session it would replace").isEmpty();
+        assertThat(wire.decodeDetailed(wire.encodeBare(hello), Optional.of(sender.peerId()), null))
+                .as("a bare hello").isEmpty();
+        assertThat(wire.decodeDetailed(wire.encode(hello, sender), Optional.empty(), null)).isPresent();
+        Envelope channelHello = new Envelope(WireCodec.WIRE_VERSION, GroupId.of("zG"), Envelope.Kind.CHANNEL_HELLO,
+                sender.peerId(), sender.peerId(), new HlcTimestamp(43L, 0, "n"), new byte[]{1});
+        assertThat(wire.decodeDetailed(wire.encodeBare(channelHello), Optional.of(sender.peerId()), null)).isEmpty();
+    }
 }

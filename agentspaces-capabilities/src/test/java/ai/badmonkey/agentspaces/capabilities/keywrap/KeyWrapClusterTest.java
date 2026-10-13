@@ -201,7 +201,8 @@ class KeyWrapClusterTest {
                 .as("an evicted peer is refused").isEmpty();
 
         // The OPEN group re-admits the member on its next self-introduction, and
-        // the same policy, consulted per request, serves it again.
+        // the same policy, consulted per request, serves it again. The holder's close reaches
+        // the member at once (TransportConnection.onClose, v0.1.17), so its next tick re-introduces.
         tickAll(3);
         assertThat(holder.runtime().membership().member(member.identity().peerId())).isPresent();
         assertThat(member.keys().request(holder.identity().peerId(), Duration.ofSeconds(2)))

@@ -211,6 +211,52 @@ public final class PushSumAggregate implements CapabilityProvider {
 
     // ----------------------------------------------------------------- state
 
+    /** Ticks of an unchanged estimate before an epoch stops being gossiped (30 s at a 250 ms tick). */
+    public static final int DEFAULT_QUIET_AFTER_TICKS = 120;
+    /** The relative change below which an estimate counts as unchanged between ticks. */
+    public static final double DEFAULT_QUIET_TOLERANCE = 1e-3;
+    /** Ticks of an unchanged estimate before an epoch's state is forgotten (one hour at 250 ms). */
+    public static final int DEFAULT_EVICT_AFTER_TICKS = 14_400;
+
+    /**
+     * Tracks how long one keyed state has been unchanged. Push-sum conserves mass, so once every
+     * participant's estimate has stopped moving, further halving and sending changes nothing; an
+     * epoch that stays active forever costs one signed frame per participant per tick for the
+     * rest of the process's life, and a fleet that opens an epoch per time window (usage sinks
+     * do) grows that cost without bound. A settled epoch therefore goes silent, wakes if a share
+     * moves its estimate again, and is evicted after a retention period.
+     */
+    private static final class Quiet {
+        private Object last;
+        private double lastValue = Double.NaN;
+        private int stableTicks;
+
+        /** Records this tick's state; returns how many consecutive ticks it has been unchanged. */
+        synchronized int observe(Object fingerprint) {
+            if (java.util.Objects.equals(last, fingerprint)) {
+                stableTicks++;
+            } else {
+                last = fingerprint;
+                stableTicks = 0;
+            }
+            return stableTicks;
+        }
+
+        /** The same for a numeric estimate: unchanged when within a relative tolerance of the last value. */
+        synchronized int observe(double value, double tolerance) {
+            boolean same = Double.isNaN(value) ? Double.isNaN(lastValue)
+                    : !Double.isNaN(lastValue)
+                    && Math.abs(value - lastValue) <= tolerance * Math.max(Math.max(Math.abs(value), Math.abs(lastValue)), 1e-12);
+            if (same) {
+                stableTicks++;
+            } else {
+                lastValue = value;
+                stableTicks = 0;
+            }
+            return stableTicks;
+        }
+    }
+
     private static final class Epoch {
         volatile double value;
         volatile double weight;
@@ -378,6 +424,16 @@ public final class PushSumAggregate implements CapabilityProvider {
     private final Map<String, Declared> declared = new ConcurrentHashMap<>();
     /** Frames received per epoch: the evidence a settle rule needs (see {@link #evaluateWatches}). */
     private final Map<String, Long> received = new ConcurrentHashMap<>();
+    /** Per-key stability trackers: a settled state goes silent, a long-settled one is evicted. */
+    private final Map<String, Quiet> quiet = new ConcurrentHashMap<>();
+    private volatile int quietAfterTicks = DEFAULT_QUIET_AFTER_TICKS;
+    private volatile double quietTolerance = DEFAULT_QUIET_TOLERANCE;
+    private volatile int evictAfterTicks = DEFAULT_EVICT_AFTER_TICKS;
+    /** Gossip every this many ticks: one round per gossip period under a real driver, every tick when hand-driven. */
+    private volatile int roundEveryTicks = 1;
+    private long ticks;
+    /** The round period a driven aggregate gossips on (push-sum converges in rounds, not wall time). */
+    public static final Duration ROUND_PERIOD = Duration.ofSeconds(1);
     /** Which sampled members may receive a share; everyone until a rule is set. */
     private volatile Predicate<PeerId> participants;
 
@@ -632,30 +688,120 @@ public final class PushSumAggregate implements CapabilityProvider {
      */
     private volatile boolean exchanged;
 
+    /**
+     * Tunes when a settled state goes silent and when it is forgotten.
+     *
+     * @param quietAfterTicks ticks of an unchanged estimate before gossip for it stops
+     * @param tolerance       the relative change that counts as unchanged
+     * @param evictAfterTicks ticks of an unchanged estimate before the state is evicted
+     * @return this aggregate
+     */
+    public PushSumAggregate quiet(int quietAfterTicks, double tolerance, int evictAfterTicks) {
+        if (quietAfterTicks <= 0 || evictAfterTicks < quietAfterTicks || tolerance < 0) {
+            throw new IllegalArgumentException("quietAfterTicks > 0, evictAfterTicks >= quietAfterTicks, tolerance >= 0");
+        }
+        this.quietAfterTicks = quietAfterTicks;
+        this.quietTolerance = tolerance;
+        this.evictAfterTicks = evictAfterTicks;
+        return this;
+    }
+
+    /** Whether gossip for this key has stopped because its state settled (for tests and panels). */
+    public boolean quiet(String key) {
+        Quiet q = quiet.get(key);
+        return q != null && q.stableTicks >= quietAfterTicks;
+    }
+
+    /** Observes a key's state; returns true when it should be gossiped this tick, evicting it when due. */
+    private boolean active(String key, Object fingerprint, Runnable evict) {
+        return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(fingerprint), evict);
+    }
+
+    /** The same for a numeric estimate, judged within the relative tolerance. */
+    private boolean activeValue(String key, double estimate, Runnable evict) {
+        return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(estimate, quietTolerance), evict);
+    }
+
+    private boolean judge(String key, int stableTicks, Runnable evict) {
+        if (stableTicks >= evictAfterTicks) {
+            quiet.remove(key);
+            evict.run();
+            return false;
+        }
+        return stableTicks < quietAfterTicks;
+    }
+
+    @Override
+    public void driverCadence(Duration period) {
+        if (period != null && !period.isZero() && !period.isNegative()) {
+            roundEveryTicks = (int) Math.max(1, Math.round((double) ROUND_PERIOD.toMillis() / period.toMillis()));
+        }
+    }
+
     @Override
     public void tick() {
         exchanged = true;
+        boolean round = (ticks++ % roundEveryTicks) == 0;
         for (Map.Entry<String, Epoch> e : epochs.entrySet()) {
+            Epoch epoch = e.getValue();
+            double estimate = epoch.weight == 0.0 ? Double.NaN : epoch.value / epoch.weight;
+            if (!activeValue(e.getKey(), estimate, () -> forget(e.getKey())) || !round) {
+                continue; // settled: silent until a share moves it, forgotten after the retention
+            }
             // Halve only when a participant takes the other half: mass held is
             // mass kept, mass sent to nobody is mass lost.
-            sampled().ifPresent(to -> send(to, Frame.of(e.getValue().halve(e.getKey()))));
+            sampled().ifPresent(to -> send(to, Frame.of(epoch.halve(e.getKey()))));
         }
-        evaluateWatches();
+        evaluateWatches(round);
         for (Map.Entry<String, ExtremumState> e : extrema.entrySet()) {
             ExtremumState state = e.getValue();
             if (Double.isNaN(state.value)) {
                 continue; // nothing to say yet
             }
+            if (!activeValue("x:" + e.getKey(), state.value, () -> extrema.remove(e.getKey())) || !round) {
+                continue;
+            }
             sampled().ifPresent(to -> send(to,
                     Frame.of(new Extremum(e.getKey(), state.max, state.value))));
         }
         for (Map.Entry<String, HistogramState> e : histograms.entrySet()) {
-            sampled().ifPresent(to -> send(to, Frame.of(e.getValue().halve(e.getKey()))));
+            HistogramState state = e.getValue();
+            if (!active("h:" + e.getKey(), histogramFingerprint(state), () -> histograms.remove(e.getKey())) || !round) {
+                continue;
+            }
+            sampled().ifPresent(to -> send(to, Frame.of(state.halve(e.getKey()))));
         }
         for (Map.Entry<String, RosterState> e : rosters.entrySet()) {
-            sampled().ifPresent(to -> send(to,
-                    Frame.of(new Roster(e.getKey(), e.getValue().snapshot()))));
+            RosterState state = e.getValue();
+            long[] snapshot = state.snapshot();
+            if (!active("r:" + e.getKey(), java.util.Arrays.hashCode(snapshot), () -> rosters.remove(e.getKey())) || !round) {
+                continue;
+            }
+            sampled().ifPresent(to -> send(to, Frame.of(new Roster(e.getKey(), snapshot))));
         }
+    }
+
+    private Object histogramFingerprint(HistogramState state) {
+        double[] buckets = state.buckets;
+        double total = 0;
+        for (double b : buckets) {
+            total += b;
+        }
+        if (total == 0) {
+            return 0L;
+        }
+        long hash = 7;
+        for (double b : buckets) {
+            hash = 31 * hash + Math.round(b / total / quietTolerance);
+        }
+        return hash;
+    }
+
+    /** Forgets an epoch's state after the retention: the estimate is no longer readable. */
+    private void forget(String epochId) {
+        epochs.remove(epochId);
+        declared.remove(epochId);
+        received.remove(epochId);
     }
 
     /**
@@ -693,7 +839,7 @@ public final class PushSumAggregate implements CapabilityProvider {
      * with judges every tick, since its own value is then the only estimate
      * there is.
      */
-    private void evaluateWatches() {
+    private void evaluateWatches(boolean round) {
         if (watches.isEmpty()) {
             for (String epochId : knownEpochs()) {
                 epochTicks.merge(epochId, 1, Integer::sum);
@@ -713,13 +859,24 @@ public final class PushSumAggregate implements CapabilityProvider {
                 if (track.fired || now.isEmpty()) {
                     continue;
                 }
-                boolean heard = receipts > track.seenReceipts;
-                if (!heard && !alone) {
-                    continue; // no new evidence: the streak neither grows nor resets
+                boolean settledAfterHearing = receipts > 0 && quiet(epochId);
+                boolean roundHeard = receipts > 0 && round;
+                if (!roundHeard && !alone && !settledAfterHearing) {
+                    continue; // between rounds, or never heard: the streak neither grows nor resets
                 }
+                // A step of the streak is a round this node took part in, once it has heard the
+                // epoch at all (the annotation's "consecutive protocol ticks", with rounds paced
+                // to the gossip period since v0.1.16), or an epoch heard and since gone quiet,
+                // which is the full streak. Counting receipts made the streak depend on fan-in
+                // (several frames a round fired on a short plateau; none, once quiet, starved it),
+                // and counting receipts and rounds both double-counted (found by example 18 and
+                // the LangChain4j passthrough test, 2026-10-12).
                 track.seenReceipts = receipts;
                 double value = now.getAsDouble();
                 track.stable = watch.settle.unchanged(value, track.last) ? track.stable + 1 : 0;
+                if (settledAfterHearing && watch.settle.unchanged(value, track.last)) {
+                    track.stable = Math.max(track.stable, watch.settle.ticks()); // quiet is settled: fire now, not after more silence
+                }
                 track.last = value;
                 if (track.stable >= watch.settle.ticks()) {
                     track.fired = true;

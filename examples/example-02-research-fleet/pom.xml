@@ -65,13 +65,18 @@
     </dependency>
   </dependencies>
 
+  <properties>
+    <exec.mainClass>ai.badmonkey.agentspaces.examples.fleet.ResearchFleet</exec.mainClass>
+  </properties>
+
   <build>
     <plugins>
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
         <configuration>
-          <mainClass>ai.badmonkey.agentspaces.examples.fleet.ResearchFleet</mainClass>
+          <!-- A property, so run-trilingual-demo.sh can pick CouncilFleet with -Dexec.mainClass. -->
+          <mainClass>${exec.mainClass}</mainClass>
         </configuration>
       </plugin>
     </plugins>

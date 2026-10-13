@@ -146,6 +146,49 @@ class ConnectorClusterTest {
 
     @Test
     @Timeout(60)
+    void twoConnectorsOnOneDataSpaceAnswerOnlyTheirOwnAssets() throws Exception {
+        // Two assets on one data space, a shape the superfriends example runs (a vector store and a
+        // knowledge graph): each connector must claim only the queries for the assets it advertises,
+        // or one of them takes, and fails, the other's queries.
+        Wired ordersPeer = newPeer("orders-conn", 1);
+        Wired shipmentsPeer = newPeer("shipments-conn", 2, "orders-conn");
+        Wired agent = newPeer("agent", 3, "orders-conn");
+        tickAll(4);
+        connector = new ConnectorRuntime(ordersPeer.data(), ordersPeer.discovery(),
+                ordersPeer.identity(), "pg-connector", ordersProvider(Duration.ofMinutes(5)),
+                groupId, clock, Duration.ofMinutes(1));
+        connector.start();
+        TableAssetProvider shipments = new TableAssetProvider("shipments", "postgres://ops/public.shipments",
+                "Shipments by order", "com.example.ShipmentRow#v1", Duration.ofMinutes(5),
+                List.of(Map.of("order", "1", "carrier", "dhl"), Map.of("order", "2", "carrier", "ups")));
+        ConnectorRuntime second = new ConnectorRuntime(shipmentsPeer.data(), shipmentsPeer.discovery(),
+                shipmentsPeer.identity(), "shipments-connector", shipments, groupId, clock,
+                Duration.ofMinutes(1));
+        second.start();
+        tickAll(2);
+        try {
+            DataQueryClient client = new DataQueryClient(agent.data(), "analyst");
+            for (int i = 0; i < 3; i++) {
+                Optional<DataQueryClient.Fetched> orders = client.fetch("orders",
+                        Map.of("region", "eu", "round", Integer.toString(i)), Duration.ofSeconds(10));
+                assertThat(orders).isPresent();
+                assertThat(orders.get().result().error()).isNull();
+                assertThat(orders.get().result().servedBy()).isEqualTo("pg-connector");
+                Optional<DataQueryClient.Fetched> shipped = client.fetch("shipments",
+                        Map.of("order", "1", "round", Integer.toString(i)), Duration.ofSeconds(10));
+                assertThat(shipped).isPresent();
+                assertThat(shipped.get().result().error()).isNull();
+                assertThat(shipped.get().result().servedBy()).isEqualTo("shipments-connector");
+            }
+            assertThat(connector.executed()).isEqualTo(3);
+            assertThat(second.executed()).isEqualTo(3);
+        } finally {
+            second.close();
+        }
+    }
+
+    @Test
+    @Timeout(60)
     void aForgedResultCannotPoisonThePullOnceCache() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired agent = newPeer("agent", 2, "conn");
@@ -351,9 +394,15 @@ class ConnectorClusterTest {
         assertThat(provider.executions()).isEqualTo(2);
     }
 
+    /**
+     * A connector takes only the queries for the assets it advertises, so a query for an asset
+     * nobody serves is never claimed: it waits out its lease and the client times out. (Before
+     * several connectors could share one data space, the sole connector answered it with an
+     * error result; that would now let a vector-store connector fail a knowledge-graph query.)
+     */
     @Test
     @Timeout(60)
-    void unknownAssetsFailWithAnErrorResult() throws Exception {
+    void queriesForAssetsNobodyServesAreNotTakenAndTimeOut() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired agent = newPeer("agent", 2, "conn");
         tickAll(4);
@@ -366,10 +415,9 @@ class ConnectorClusterTest {
 
         DataQueryClient client = new DataQueryClient(agent.data(), "analyst");
         Optional<DataQueryClient.Fetched> fetched = client.fetch("no-such-table",
-                Map.of(), Duration.ofSeconds(10));
-        assertThat(fetched).isPresent();
-        assertThat(fetched.get().result().error()).contains("no-such-table");
-        assertThat(fetched.get().result().rows()).isEmpty();
+                Map.of(), Duration.ofSeconds(3));
+        assertThat(fetched).isEmpty();
+        assertThat(connector.executed()).isZero();
     }
 
     /** SPEC §6.1a/§6.2: the AssetCard carries the 15-minute default TTL and the declared freshness, refreshCards re-issues it past the original TTL, and an unrefreshed card ages out. */

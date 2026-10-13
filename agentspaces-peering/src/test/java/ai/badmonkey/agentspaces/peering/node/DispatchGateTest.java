@@ -248,7 +248,11 @@ class DispatchGateTest {
         assertThat(b.quarantined(a.peerId())).as("the local sentence lapsed").isFalse();
         tickAll(3);
         ra.gossip().publish("news", "after", bytes("after"));
-        assertThat(newsAtB).containsExactly("before", "after");
+        // Since v0.1.17 A's first probe after the sentence carries the items it forwarded
+        // meanwhile and B grafts them: gossip catches up once the sentence is over, which is
+        // not a breach of it. Only the order and the absence of duplicates are fixed.
+        assertThat(newsAtB).containsSubsequence("before", "after").doesNotHaveDuplicates();
+        assertThat(newsAtB.get(0)).isEqualTo("before");
     }
 
     /** Spec §11 (ASF-010) reversed: a stale or replayed frame is never a strike, so replaying a victim cannot quarantine it. */

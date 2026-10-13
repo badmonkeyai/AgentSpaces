@@ -44,6 +44,137 @@ public final class SimNetwork {
     private final Map<String, ai.badmonkey.agentspaces.common.id.PeerId> attestations =
             new ConcurrentHashMap<>();
 
+    // ---- controlled mode (ROBUSTNESS.md §2): script the sequence instead of hoping for it ----
+
+    /** How a held queue is released. */
+    public enum Order { FIFO, REVERSED, SHUFFLED, DUPLICATED }
+
+    private record Held(SimConnection target, byte[] frame) {
+    }
+
+    private final Map<String, java.util.Deque<Held>> held = new ConcurrentHashMap<>();
+    private final Set<String> holding = new CopyOnWriteArraySet<>();
+    private final Set<String> oneWayDrops = new CopyOnWriteArraySet<>();
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> oneWayDropped = new ConcurrentHashMap<>();
+    private final Map<String, java.util.List<Consumer<byte[]>>> taps = new ConcurrentHashMap<>();
+    private final Map<String, java.util.function.UnaryOperator<byte[]>> corruptors = new ConcurrentHashMap<>();
+    private final Map<String, Set<SimConnection>> live = new ConcurrentHashMap<>();
+
+    private static String directed(String from, String to) {
+        return from + ">" + to;
+    }
+
+    /** Frames from one node to another queue instead of delivering, until released. */
+    public void hold(String from, String to) {
+        holding.add(directed(from, to));
+    }
+
+    /** Delivers everything held from one node to another, in the given order; returns how many frames were delivered. */
+    public int release(String from, String to, Order order, long seed) {
+        String key = directed(from, to);
+        holding.remove(key);
+        java.util.Deque<Held> queue = held.remove(key);
+        if (queue == null) {
+            return 0;
+        }
+        java.util.List<Held> frames = new java.util.ArrayList<>(queue);
+        switch (order) {
+            case REVERSED -> java.util.Collections.reverse(frames);
+            case SHUFFLED -> java.util.Collections.shuffle(frames, new java.util.Random(seed));
+            case DUPLICATED -> {
+                java.util.List<Held> twice = new java.util.ArrayList<>();
+                for (Held h : frames) {
+                    twice.add(h);
+                    twice.add(h);
+                }
+                frames = twice;
+            }
+            default -> { }
+        }
+        for (Held h : frames) {
+            deliver(h.target(), h.frame());
+        }
+        return frames.size();
+    }
+
+    /** Delivers the oldest held frame from one node to another, keeping the rest held; false when none. */
+    public boolean releaseOne(String from, String to) {
+        java.util.Deque<Held> queue = held.get(directed(from, to));
+        Held h = queue == null ? null : queue.pollFirst();
+        if (h == null) {
+            return false;
+        }
+        deliver(h.target(), h.frame());
+        return true;
+    }
+
+    /** How many frames are held from one node to another. */
+    public int heldCount(String from, String to) {
+        java.util.Deque<Held> queue = held.get(directed(from, to));
+        return queue == null ? 0 : queue.size();
+    }
+
+    /** Drops frames from one node to another silently, as a lost direction of a link does; the reverse direction flows. */
+    public void oneWay(String from, String to) {
+        oneWayDrops.add(directed(from, to));
+    }
+
+    /** Restores the direction {@link #oneWay} dropped. */
+    public void twoWay(String from, String to) {
+        oneWayDrops.remove(directed(from, to));
+    }
+
+    /** How many frames {@link #oneWay} dropped on a direction. */
+    public long oneWayDropped(String from, String to) {
+        java.util.concurrent.atomic.AtomicLong n = oneWayDropped.get(directed(from, to));
+        return n == null ? 0 : n.get();
+    }
+
+    /** Captures every frame sent from one node to another (the bytes on the wire), for a later {@link #inject}. */
+    public void tap(String from, String to, Consumer<byte[]> consumer) {
+        taps.computeIfAbsent(directed(from, to), k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(consumer);
+    }
+
+    /** Removes every tap on a direction. */
+    public void untap(String from, String to) {
+        taps.remove(directed(from, to));
+    }
+
+    /** Rewrites every frame sent on a direction (truncate, flip bytes); null restores the wire. */
+    public void corrupt(String from, String to, java.util.function.UnaryOperator<byte[]> mutator) {
+        if (mutator == null) {
+            corruptors.remove(directed(from, to));
+        } else {
+            corruptors.put(directed(from, to), mutator);
+        }
+    }
+
+    /**
+     * Delivers a raw frame to {@code to} on a live connection from {@code from}, as if {@code from}
+     * had sent it: a replay, a stale frame, a frame from a stranger. False when no connection is
+     * live in that direction.
+     */
+    public boolean inject(String from, String to, byte[] frame) {
+        Set<SimConnection> connections = live.get(directed(from, to));
+        if (connections == null) {
+            return false;
+        }
+        for (SimConnection c : connections) {
+            SimConnection target = c.peer;
+            if (!c.closed && target != null && !target.closed) {
+                target.receiver.accept(frame.clone());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void deliver(SimConnection target, byte[] frame) {
+        if (!target.closed) {
+            target.receiver.accept(frame);
+        }
+    }
+
     private record Listener(Consumer<TransportConnection> onAccept) {
     }
 
@@ -122,6 +253,8 @@ public final class SimNetwork {
             SimConnection callee = new SimConnection(address, nodeId);
             caller.peer = callee;
             callee.peer = caller;
+            live.computeIfAbsent(directed(nodeId, address), k -> new CopyOnWriteArraySet<>()).add(caller);
+            live.computeIfAbsent(directed(address, nodeId), k -> new CopyOnWriteArraySet<>()).add(callee);
             listener.onAccept().accept(callee);
             return caller;
         }
@@ -138,6 +271,8 @@ public final class SimNetwork {
         private final String remoteNode;
         private volatile SimConnection peer;
         private volatile Consumer<byte[]> receiver = frame -> {
+        };
+        private volatile Runnable closeListener = () -> {
         };
         private volatile boolean closed;
 
@@ -165,7 +300,27 @@ public final class SimNetwork {
             if (blocked(localNode, remoteNode)) {
                 throw new IOException("partitioned: " + localNode + " -> " + remoteNode);
             }
-            target.receiver.accept(frame.clone());
+            String key = directed(localNode, remoteNode);
+            java.util.List<Consumer<byte[]>> watching = taps.get(key);
+            if (watching != null) {
+                for (Consumer<byte[]> t : watching) {
+                    t.accept(frame.clone());
+                }
+            }
+            if (oneWayDrops.contains(key)) {
+                oneWayDropped.computeIfAbsent(key, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
+                return; // lost on the wire: no error, as a dead direction looks to the sender
+            }
+            byte[] wire = frame.clone();
+            java.util.function.UnaryOperator<byte[]> mutator = corruptors.get(key);
+            if (mutator != null) {
+                wire = mutator.apply(wire);
+            }
+            if (holding.contains(key)) {
+                held.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedDeque<>()).add(new Held(target, wire));
+                return;
+            }
+            target.receiver.accept(wire);
         }
 
         @Override
@@ -174,8 +329,26 @@ public final class SimNetwork {
         }
 
         @Override
+        public void onClose(Runnable listener) {
+            this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        @Override
         public void close() {
+            if (closed) {
+                return;
+            }
             closed = true;
+            Set<SimConnection> mine = live.get(directed(localNode, remoteNode));
+            if (mine != null) {
+                mine.remove(this);
+            }
+            closeListener.run();
+            SimConnection other = peer;
+            if (other != null && !other.closed) {
+                other.closed = true;      // the remote end sees the close at once, as a socket would
+                other.closeListener.run();
+            }
         }
     }
 }

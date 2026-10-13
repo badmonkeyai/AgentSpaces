@@ -248,6 +248,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
                     .sync()
                     .getNow();
             connection.stream = stream;
+            stream.closeFuture().addListener(f -> connection.notifyClosed());
             return connection;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -299,6 +300,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
                             QuicConnection connection = new QuicConnection(
                                     remoteOf(stream), null);
                             connection.stream = stream;
+            stream.closeFuture().addListener(f -> connection.notifyClosed());
                             // Attested lazily, on first ask: a stream can be
                             // initialized before the handshake's last flight is
                             // processed, and attesting then would read an honest
@@ -478,6 +480,22 @@ public final class QuicTransport implements Transport, AutoCloseable {
             this.udp = udp;
         }
 
+        private final java.util.concurrent.atomic.AtomicBoolean closeNotified =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        private volatile Runnable closeListener = () -> {
+        };
+
+        @Override
+        public void onClose(Runnable listener) {
+            this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        void notifyClosed() {
+            if (closeNotified.compareAndSet(false, true)) {
+                closeListener.run();
+            }
+        }
+
         @Override
         public String remoteAddress() {
             return remoteAddress;
@@ -561,6 +579,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
             if (udp != null) {
                 udp.close();
             }
+            notifyClosed();
         }
     }
 }

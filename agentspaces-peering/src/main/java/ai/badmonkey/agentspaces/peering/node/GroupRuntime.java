@@ -121,12 +121,48 @@ public final class GroupRuntime {
      * @param nowMillis the node clock, in epoch millis
      * @return whether the caller should run anti-entropy now
      */
+    /** Consecutive anti-entropy rounds that found nothing to do; the period doubles per round, capped. */
+    private volatile int quietRounds;
+    /** The longest the anti-entropy period stretches to on an idle group, as a multiple of the base period. */
+    static final int MAX_BACKOFF_MULTIPLIER = 32;
+
     boolean claimAntiEntropyRound(long nowMillis) {
+        return claimAntiEntropyRound(nowMillis, false);
+    }
+
+    /**
+     * Whether the periodic anti-entropy round has backed off because the group is quiet. While
+     * it has not, the round runs at the base period and reconciles whatever moves; a probe that
+     * carries a differing digest starts a targeted round only while it has (v0.1.17), since
+     * under load digests differ on every probe for the moment gossip takes to deliver.
+     */
+    public boolean antiEntropyStretched() {
+        return quietRounds > 0;
+    }
+
+    /**
+     * Whether an anti-entropy round is due. The base period is the group's gossip period; while
+     * rounds find nothing to reconcile and no rumor moves, the period doubles per round up to
+     * {@link #MAX_BACKOFF_MULTIPLIER} times (Demers et al.: anti-entropy is the rare backstop),
+     * and any activity resets it to the base.
+     *
+     * @param nowMillis the clock
+     * @param active    whether anything moved on the gossip bus since the last round
+     */
+    boolean claimAntiEntropyRound(long nowMillis, boolean active) {
+        if (active) {
+            quietRounds = 0;
+        }
+        long base = advertisement.gossip().period().toMillis();
+        long period = base * Math.min(MAX_BACKOFF_MULTIPLIER, 1L << Math.min(quietRounds, 5));
         Long last = lastAntiEntropyMillis;
-        if (last != null && nowMillis - last < advertisement.gossip().period().toMillis()) {
+        if (last != null && nowMillis - last < period) {
             return false;
         }
         lastAntiEntropyMillis = nowMillis;
+        if (!active) {
+            quietRounds = Math.min(quietRounds + 1, 5);
+        }
         return true;
     }
 

@@ -220,10 +220,12 @@ class ClaimsFlowTest {
             assertThat(sensed).isPresent();
             assertThat(sensed.getAsDouble()).isCloseTo(expected, within(expected * 0.02));
             // ...and the supervisor reported it exactly once, when it settled.
+            // Rounds are paced to the gossip period (one a second), so twenty settled steps are
+            // twenty-odd seconds after convergence, not five: a minute's budget.
             List<ReserveReport> reports = await(() -> {
                 List<ReserveReport> all = c.ledger().readAll(Template.of(ReserveReport.class), 10);
                 return all.isEmpty() ? Optional.<List<ReserveReport>>empty() : Optional.of(all);
-            }, Duration.ofSeconds(30)).orElseThrow();
+            }, Duration.ofSeconds(60)).orElseThrow();
             Thread.sleep(1500);
             assertThat(c.ledger().readAll(Template.of(ReserveReport.class), 10)).hasSize(1);
             assertThat(reports.get(0).averageReserve()).isCloseTo(expected, within(expected * 0.05));

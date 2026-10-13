@@ -164,6 +164,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
 
     private final Object lock = new Object();
     private SpaceStateCrdt crdt = SpaceStateCrdt.empty();
+    /** Bumped under the lock on every change of the reconciled state; the digest cache is keyed on it. */
+    private long generation;
+    private byte[] digestCache;
+    private long digestGeneration = -1;
+    private long digestComputations;
     private final Map<EntryId, SpaceWire.SignedClaim> claims = new HashMap<>();
     /**
      * Entries whose current claim was decided by the ordered log, with the
@@ -1122,6 +1127,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         SpaceWire.EntryStateDto dto;
         synchronized (lock) {
             crdt = crdt.add(prepared.signed(), prepared.dot(), prepared.lease());
+            generation++;
             issuerKeys.put(prepared.entryId(), identity.rawPublicKey());
             if (prepared.certificate() != null) {
                 issuerCertificates.put(prepared.entryId(), prepared.certificate());
@@ -1427,6 +1433,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         synchronized (lock) {
             claims.merge(entryId, attested, SpaceWire.SignedClaim::merge);
+            generation++;
             logDecidedEpochs.merge(entryId, claim.epoch(), Math::max);
         }
     }
@@ -1491,6 +1498,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Objects.requireNonNull(claim, "claim");
         synchronized (lock) {
             claims.merge(entryId, sign(claim, writer), SpaceWire.SignedClaim::merge);
+            generation++;
             logDecidedEpochs.merge(entryId, claim.epoch(), Math::max);
         }
     }
@@ -1632,6 +1640,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 }
                 claims.merge(candidate.entry().entryId(), sign(myClaim, actor),
                         SpaceWire.SignedClaim::merge);
+                generation++;
                 claimedId = candidate.entry().entryId();
                 claimedValue = candidate.value();
                 claimedRecord = candidate.entry();
@@ -1691,6 +1700,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                         "take lease lapsed or lost for entry " + t.entryId());
             }
             crdt = crdt.complete(t.entryId());
+            generation++;
             completedValue = valueCache.get(t.entryId());
             // The completed state is signed by us, the holder; the receiver
             // authenticates it against our winning claim, which we carry along.
@@ -1780,6 +1790,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             synchronized (lock) {
                 if (!crdt.state(entryId).isPresent()) {
                     shardDropped.put(entryId, stateHash(dto.toState()));
+                    generation++;
                     return;
                 }
             }
@@ -1791,6 +1802,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             boolean wasKnown = crdt.state(entryId).isPresent();
             boolean wasCompleted = crdt.state(entryId).map(EntryState::completed).orElse(false);
             crdt = crdt.merge(SpaceStateCrdt.of(entryId, dto.toState()));
+            generation++;
             issuerKeys.putIfAbsent(entryId, dto.issuerPublicKey());
             if (dto.agentCertificate() != null) {
                 issuerCertificates.putIfAbsent(entryId, dto.agentCertificate());
@@ -1974,6 +1986,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // the claim's stamp, since a renewal keeps it; its take lapses.
             synchronized (lock) {
                 refusedAck.put("c:" + entryId.value() + "=" + claimHash(claim.claim()), Boolean.TRUE);
+                generation++;
                 refusedClaimEntries.add(entryId);
             }
             return;
@@ -2027,6 +2040,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             if (violation == null) {
                 claims.merge(entryId, claim, SpaceWire.SignedClaim::merge);
+                generation++;
                 hlc.update(offered.stamp()); // spec §11: bounded-drift regime
                 observeLease(offered.expiresAtMillis() - offered.stamp().physical());
             } else {
@@ -2079,6 +2093,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             if (refused) {
                 refusedAck.put("e:" + entryId.value() + "=" + stateHash(dto.toState()), Boolean.TRUE);
+                generation++;
             }
         }
         return refused;
@@ -2182,6 +2197,32 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
 
     byte[] digest() { // package-private for tests
         sweepNow(); // spec §7.3: collect tombstones before advertising what we hold
+        long at;
+        synchronized (lock) {
+            if (digestCache != null && digestGeneration == generation) {
+                return digestCache; // nothing changed since the last round (PERF2 §3.2)
+            }
+            at = generation;
+        }
+        byte[] computed = computeDigest();
+        synchronized (lock) {
+            if (generation == at) {
+                digestCache = computed;
+                digestGeneration = at;
+            }
+            digestComputations++;
+        }
+        return computed;
+    }
+
+    /** How many times the digest was rebuilt (for tests of the cache). */
+    long digestComputations() {
+        synchronized (lock) {
+            return digestComputations;
+        }
+    }
+
+    private byte[] computeDigest() {
         TreeMap<String, String> summary = new TreeMap<>();
         synchronized (lock) {
             for (EntryRecord record : allRecords()) {
@@ -2509,6 +2550,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Set<EntryId> collected = crdt.collectable(now, maxLeaseMillis());
         if (!collected.isEmpty()) {
             crdt = crdt.without(collected);
+            generation++;
             for (EntryId entryId : collected) {
                 if (credentialRule != null) {
                     credentialRule.index().remove(entryId);
@@ -2517,9 +2559,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 issuerCertificates.remove(entryId);
                 logDecidedEpochs.remove(entryId);
                 claims.remove(entryId);
+                generation++;
                 signedStates.remove(entryId);
                 valueCache.remove(entryId);
                 shardDropped.remove(entryId);
+                generation++;
                 expiredFired.remove(entryId);
                 reappearedEpochs.remove(entryId);
             }
@@ -2922,6 +2966,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 LeaseInfo renewed = new LeaseInfo(actor.id(),
                         nowMillis() + extension.toMillis(), LeaseKind.WRITE);
                 crdt = crdt.setLease(entryId, new LwwRegister<>(hlc.now(), renewed));
+                generation++;
                 indexCredential(entryId);
                 dto = signedDto(entryId,
                         issuerKeys.getOrDefault(entryId, identity.rawPublicKey()), actor);
@@ -2936,6 +2981,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 if (crdt.state(entryId).isPresent()) {
                     requireIssuerActs(entryId, crdt.state(entryId).get().record(), actor);
                     crdt = crdt.remove(entryId);
+                    generation++;
                     indexCredential(entryId);
                     dto = signedDto(entryId,
                             issuerKeys.getOrDefault(entryId, identity.rawPublicKey()), actor);
@@ -2989,6 +3035,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                         current.epoch(), current.stamp(), actor.id(),
                         current.bid(), nowMillis() + extension.toMillis());
                 claims.merge(entryId, sign(renewed, actor), SpaceWire.SignedClaim::merge);
+                generation++;
             }
             publishDelta(new SpaceWire.Delta(null, entryId, sign(renewed, actor)),
                     "c:" + entryId + ":renew:" + nowMillis());

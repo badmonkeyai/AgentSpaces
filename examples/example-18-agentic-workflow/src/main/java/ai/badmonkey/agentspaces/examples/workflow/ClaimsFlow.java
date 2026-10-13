@@ -137,7 +137,7 @@ public final class ClaimsFlow {
         // decided here, once, and every stage inherits them by naming the space.
         ReplicatedSpace intake = space(runtime, identity, name, Intake.SPACE);
         ReplicatedSpace assessment = ReplicatedSpace.builder(runtime, Pricing.SPACE, identity, name)
-                .settleWindow(Duration.ofMillis(150))
+                .settleWindow(Duration.ofMillis(500)) // two ticks: a rival's reaction time plus delivery (ROBUSTNESS.md §4a)
                 .strategy(ConflictStrategyType.AUCTION)      // the bound @BidFunction prices takes
                 .build();
         ReplicatedSpace decisions = space(runtime, identity, name, Decisions.SPACE);
@@ -171,7 +171,7 @@ public final class ClaimsFlow {
     private static ReplicatedSpace space(GroupRuntime runtime, PeerIdentity identity, String name,
                                          String spaceName) {
         return ReplicatedSpace.builder(runtime, spaceName, identity, name)
-                .settleWindow(Duration.ofMillis(150))
+                .settleWindow(Duration.ofMillis(500)) // two ticks: a rival's reaction time plus delivery (ROBUSTNESS.md §4a)
                 .build();
     }
 

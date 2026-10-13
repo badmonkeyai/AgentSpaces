@@ -194,6 +194,7 @@ public class AgentSpacesAutoConfiguration {
         String channelAuthOverride = properties.getTransport().getChannelAuth();
         PeerNode.ChannelAuth channelAuth = channelAuthOverride != null
                 ? PeerNode.ChannelAuth.valueOf(channelAuthOverride.trim().toUpperCase())
+                : profile.sessionAuthentication() ? PeerNode.ChannelAuth.SESSION
                 : (profile.envelopeSignatureEveryHop()
                         ? PeerNode.ChannelAuth.SIGNED : PeerNode.ChannelAuth.ATTESTED);
         boolean tlsEnabled = tlsEnabled(properties);
@@ -210,6 +211,10 @@ public class AgentSpacesAutoConfiguration {
         }
         PeerNode.Builder builder = PeerNode.builder(identity)
                 .roles(roles)
+                .peerAdInterval(java.time.Duration.ofMillis(properties.getPeerAdIntervalMillis()))
+                .lazyPush(properties.isLazyPush())
+                .coalesce(properties.getCoalesceMillis() > 0
+                        ? java.time.Duration.ofMillis(properties.getCoalesceMillis()) : null)
                 .channelAuth(channelAuth)
                 .requireAttestation(requireAttestation);
         // SPEC §5.6 v0.1.13 (item 9): the CA trust is built before the node, so

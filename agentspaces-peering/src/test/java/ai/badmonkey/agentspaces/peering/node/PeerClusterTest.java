@@ -513,7 +513,7 @@ class PeerClusterTest {
         }
     }
 
-    /** Spec §5.3: the anti-entropy channel pulls once per GossipParameters.period of the node's clock; rumors and probes are unpaced. */
+    /** Spec §5.3: the anti-entropy channel pulls once per GossipParameters.period of the node's clock while anything moves, and backs off by doubling while idle (PERF2 §3.2); rumors are unpaced. */
     @Test
     void antiEntropyCadenceFollowsTheGroupsGossipPeriod() throws Exception {
         PeerIdentity founderId = PeerIdentity.generate();
@@ -536,14 +536,262 @@ class PeerClusterTest {
         CountingState fastState = new CountingState();
         slowAtB.gossip().reconcile("count", slowState);
         fastAtB.gossip().reconcile("count", fastState);
+        long slowBase = slowAtB.gossip().antiEntropyRounds();
+        long fastBase = fastAtB.gossip().antiEntropyRounds();
 
-        // Ten one-second ticks of B alone: the 1 s group pulls every tick,
-        // the 5 s group only when five seconds have passed since its last pull.
+        // Ten one-second ticks of B alone with nothing moving after one rumor on each group (which
+        // resets any backoff the convergence ticks built up): the first round is on the base period,
+        // then the idle backoff doubles it, so the 1 s group pulls at 0, 1, 3 and 7 s and the 5 s
+        // group at 0 and 5 s (its second period is already 10 s).
+        fastAtB.gossip().publish("news", "warm-fast", new byte[] {0});
+        slowAtB.gossip().publish("news", "warm-slow", new byte[] {0});
+        clock.advance(Duration.ofSeconds(5)); // both groups are due at the start of the window
         for (int i = 0; i < 10; i++) {
             b.tick();
             clock.advance(Duration.ofSeconds(1));
         }
-        assertThat(fastState.digests.get()).isEqualTo(10);
-        assertThat(slowState.digests.get()).isEqualTo(2);
+        // Rounds, not digest computations: since v0.1.17 the probes compute digests too.
+        assertThat(fastAtB.gossip().antiEntropyRounds() - fastBase).isEqualTo(4);
+        assertThat(slowAtB.gossip().antiEntropyRounds() - slowBase).isEqualTo(2);
+
+        // Activity resets the backoff: a rumor on the fast group, and the next tick pulls again.
+        fastAtB.gossip().publish("news", "item", new byte[] {1});
+        long before = fastAtB.gossip().antiEntropyRounds();
+        b.tick();
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(fastAtB.gossip().antiEntropyRounds()).isEqualTo(before + 1);
+    }
+
+    /**
+     * A set-union state: the digest is the sorted members joined by commas, the delta for a
+     * differing digest is the whole set, and a merge is the union, so pulls in any order and any
+     * number converge on the same set and a repeated pull changes nothing. {@code applied}
+     * records each delta that changed the set.
+     */
+    private static final class InventoryState implements ai.badmonkey.agentspaces.peering.gossip.ReconcilableState {
+        final java.util.concurrent.ConcurrentSkipListSet<String> members = new java.util.concurrent.ConcurrentSkipListSet<>();
+        final java.util.List<String> applied = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        InventoryState(String own) {
+            members.add(own);
+        }
+
+        void add(String member) {
+            members.add(member);
+        }
+
+        String digestString() {
+            return String.join(",", members);
+        }
+
+        @Override
+        public byte[] digest() {
+            return digestString().getBytes(StandardCharsets.UTF_8);
+        }
+
+        @Override
+        public byte[] deltaFor(byte[] theirDigest) {
+            return java.util.Arrays.equals(theirDigest, digest()) ? new byte[0] : digest();
+        }
+
+        @Override
+        public void applyDelta(byte[] delta) {
+            String text = new String(delta, StandardCharsets.UTF_8);
+            boolean changed = false;
+            for (String member : text.split(",")) {
+                changed |= members.add(member);
+            }
+            if (changed) {
+                applied.add(text);
+            }
+        }
+    }
+
+    /**
+     * A newcomer reconciles with each member it admits within a tick of admission, so it holds
+     * what the fleet already had (cards, space state) long before its periodic round would have
+     * picked that member: here the group's period is five seconds and the pull lands in two.
+     */
+    @Test
+    void aNewMemberIsReconciledWithinATickOfAdmission() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        SignedGroupAdvertisement slow =
+                founded(founderId, GroupAdvertisement.MembershipPolicy.OPEN, Duration.ofSeconds(5));
+        PeerNode a = nodeWithIdentity("a", 70, founderId);
+        GroupRuntime atA = a.joinGroup(slow, GroupMembership.Config.defaults(), List.of());
+        InventoryState stateA = new InventoryState("a-holds-this");
+        atA.gossip().reconcile("inventory", stateA);
+        tickAll(2); // A's own first round found nobody; its next is five seconds out
+        PeerNode b = newNode("b", 71);
+        GroupRuntime atB = b.joinGroup(slow, GroupMembership.Config.defaults(), seed("a"));
+        InventoryState stateB = new InventoryState("b-empty");
+        atB.gossip().reconcile("inventory", stateB);
+        tickAll(2);
+        assertThat(atB.membership().member(a.peerId())).isPresent();
+        assertThat(stateB.members).as("B pulled A's state on admitting A, not five seconds later")
+                .contains("a-holds-this");
+        assertThat(stateA.members).as("A pulled B's state on admitting B").contains("b-empty");
+        assertThat(stateA.digestString()).as("converged").isEqualTo(stateB.digestString());
+    }
+
+    /**
+     * v0.1.17: the probe carries the anti-entropy digests, so a change on a member is pulled
+     * within a probe of it, long before the group's own period (five seconds here, and backed
+     * off) would have picked that member.
+     */
+    @Test
+    void aProbeThatCarriesADifferingDigestPullsWithinAProbe() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        SignedGroupAdvertisement slow =
+                founded(founderId, GroupAdvertisement.MembershipPolicy.OPEN, Duration.ofSeconds(5));
+        PeerNode a = nodeWithIdentity("a", 80, founderId);
+        PeerNode b = newNode("b", 81);
+        GroupRuntime atA = a.joinGroup(slow, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime atB = b.joinGroup(slow, GroupMembership.Config.defaults(), seed("a"));
+        InventoryState stateA = new InventoryState("v1");
+        InventoryState stateB = new InventoryState("v1");
+        atA.gossip().reconcile("inventory", stateA);
+        atB.gossip().reconcile("inventory", stateB);
+        tickAll(8);
+        assertThat(atB.membership().member(a.peerId())).isPresent();
+        stateB.applied.clear();
+        long roundsBefore = atB.gossip().antiEntropyRounds();
+        stateA.add("v2");
+        tickAll(6); // at most one stretched probe interval each way
+        assertThat(stateB.members).as("B pulled A's change on a probe").contains("v2");
+        assertThat(atB.gossip().antiEntropyRounds() - roundsBefore).as("one targeted round, not one per probe")
+                .isBetween(1L, 2L);
+    }
+
+    /**
+     * v0.1.17: an idle fleet refreshes its advertisements directly (one frame per member per
+     * interval) and probes at a quarter of the base rate, so thirty idle seconds of four members
+     * cost a dozen refresh frames rather than the flood's several copies each.
+     */
+    @Test
+    void anIdleFleetRefreshesDirectlyAndProbesSlowly() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        SignedGroupAdvertisement group =
+                founded(founderId, GroupAdvertisement.MembershipPolicy.OPEN, Duration.ofSeconds(1));
+        PeerNode a = nodeWithIdentity("a", 90, founderId);
+        PeerNode b = newNode("b", 91);
+        PeerNode c = newNode("c", 92);
+        PeerNode d = newNode("d", 93);
+        a.joinGroup(group, GroupMembership.Config.defaults(), List.of());
+        for (PeerNode node : List.of(b, c, d)) {
+            node.joinGroup(group, GroupMembership.Config.defaults(), seed("a"));
+        }
+        tickAll(12);
+        for (PeerNode node : List.of(a, b, c, d)) {
+            assertThat(node.group(group.advertisement().group()).orElseThrow().membership().allMembers()).hasSize(3);
+        }
+        long rumorsBefore = 0;
+        long pingsBefore = 0;
+        for (PeerNode node : List.of(a, b, c, d)) {
+            rumorsBefore += node.traffic().sentByKind().getOrDefault(Envelope.Kind.RUMOR, 0L);
+            pingsBefore += node.traffic().sentByKind().getOrDefault(Envelope.Kind.PING, 0L);
+        }
+        tickAll(30);
+        long rumors = 0;
+        long pings = 0;
+        for (PeerNode node : List.of(a, b, c, d)) {
+            rumors += node.traffic().sentByKind().getOrDefault(Envelope.Kind.RUMOR, 0L);
+            pings += node.traffic().sentByKind().getOrDefault(Envelope.Kind.PING, 0L);
+        }
+        assertThat(rumors - rumorsBefore).as("one refresh interval: each member sent its advertisement to each other once")
+                .isEqualTo(4L * 3);
+        assertThat(pings - pingsBefore).as("probes stretched to four seconds: about eight per member, not thirty")
+                .isBetween(4L * 6, 4L * 12);
+    }
+
+    /**
+     * v0.1.17: a connection the other end closed is noticed at once, not when a later send
+     * fails, so the node re-dials and re-introduces itself on its very next tick. Here A
+     * evicts B and closes the link on its tick; B's next tick re-introduces B, and A, whose
+     * group is open, admits it again, two ticks after the eviction.
+     */
+    @Test
+    void aRemoteCloseIsNoticedAtOnceAndTheNodeReintroducesItself() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        SignedGroupAdvertisement group =
+                founded(founderId, GroupAdvertisement.MembershipPolicy.OPEN, Duration.ofSeconds(1));
+        PeerNode a = nodeWithIdentity("a", 60, founderId);
+        PeerNode b = newNode("b", 61);
+        GroupRuntime atA = a.joinGroup(group, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime atB = b.joinGroup(group, GroupMembership.Config.defaults(), seed("a"));
+        tickAll(4);
+        assertThat(atA.membership().member(b.peerId())).isPresent();
+        assertThat(b.connectionFor(a.peerId())).isNotNull();
+
+        atA.membership().evict(b.peerId());
+        a.tick();                       // A's view changed: it closes its channel to B
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(b.connectionFor(a.peerId())).as("B learned of the close without sending anything").isNull();
+        assertThat(atB.membership().member(a.peerId())).as("a closed link is not a verdict on A").isPresent();
+
+        b.tick();                       // B re-dials A and introduces itself
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(atA.membership().member(b.peerId())).as("re-admitted on the next tick").isPresent();
+        assertThat(a.connectionFor(b.peerId())).isNotNull();
+    }
+
+    /**
+     * ROBUSTNESS.md §3.6: two members that lost each other (a partition longer than the
+     * membership TTL), with no third party to carry an introduction, find each other again:
+     * each keeps the other's last endpoints and introduces itself to them every few seconds for
+     * a while after the loss. A member ejected on purpose is not courted that way.
+     */
+    @Test
+    void twoMembersThatLostEachOtherFindEachOtherAgainButAnEjectedOneIsNotCourted() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        SignedGroupAdvertisement group =
+                founded(founderId, GroupAdvertisement.MembershipPolicy.OPEN, Duration.ofSeconds(1));
+        PeerNode a = nodeWithIdentity("a", 62, founderId);
+        PeerNode b = newNode("b", 63);
+        GroupRuntime atA = a.joinGroup(group, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime atB = b.joinGroup(group, GroupMembership.Config.defaults(), seed("a"));
+        tickAll(4);
+        network.partition("a", "b");
+        tickAll(40); // past the 30 s membership TTL: each drops the other for silence
+        assertThat(atA.membership().allMembers()).isEmpty();
+        assertThat(atB.membership().allMembers()).isEmpty();
+        network.heal();
+        tickAll(8); // the lost-member retry runs every five seconds
+        assertThat(atA.membership().member(b.peerId())).as("A found B again").isPresent();
+        assertThat(atB.membership().member(a.peerId())).as("B found A again").isPresent();
+
+        // An ejection is a verdict, not a loss: A does not introduce itself to B again on its own.
+        atA.membership().evict(b.peerId());
+        network.partition("a", "b"); // and B cannot reach A to re-introduce itself either
+        tickAll(12);
+        assertThat(atA.membership().member(b.peerId())).as("not courted").isEmpty();
+        assertThat(a.traffic().sentByKind().getOrDefault(Envelope.Kind.RUMOR, 0L))
+                .as("no introductions attempted toward an ejected peer while cut off")
+                .isEqualTo(a.traffic().sentByKind().getOrDefault(Envelope.Kind.RUMOR, 0L));
+    }
+
+    /**
+     * An introduction is answered with an introduction (v0.1.17): the moment a seed admits a
+     * newcomer from its dial, it introduces itself back on that connection, so the newcomer
+     * holds the seed before the seed's next frame, with no tick in between. Before, the seed's
+     * introduction waited for its next tick, and every frame it pushed meanwhile was dropped at
+     * the newcomer as a non-member's.
+     */
+    @Test
+    void aSeedIntroducesItselfBackTheMomentItAdmitsANewcomer() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        SignedGroupAdvertisement group =
+                founded(founderId, GroupAdvertisement.MembershipPolicy.OPEN, Duration.ofSeconds(1));
+        PeerNode a = nodeWithIdentity("a", 64, founderId);
+        PeerNode b = newNode("b", 65);
+        GroupRuntime atA = a.joinGroup(group, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime atB = b.joinGroup(group, GroupMembership.Config.defaults(), seed("a"));
+        // No tick has run anywhere yet.
+        assertThat(atA.membership().member(b.peerId())).as("A admitted B from its dial").isPresent();
+        assertThat(atB.membership().member(a.peerId())).as("B holds A from A's answer, before any tick").isPresent();
+        List<String> atBNews = new CopyOnWriteArrayList<>();
+        atB.gossip().onStream("news", (from, id, payload) -> atBNews.add(new String(payload, StandardCharsets.UTF_8)));
+        atA.gossip().publish("news", "first", "first frame after admission".getBytes(StandardCharsets.UTF_8));
+        assertThat(atBNews).as("nothing A pushes right after admitting B is lost").containsExactly("first frame after admission");
     }
 }

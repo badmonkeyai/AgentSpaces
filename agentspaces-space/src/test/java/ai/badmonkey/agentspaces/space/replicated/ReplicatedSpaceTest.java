@@ -95,6 +95,30 @@ class ReplicatedSpaceTest {
     }
 
     /** Tag conditions select on read, the blocking read, readAll, readAllIssued and take. */
+    /** PERF2 §3.2: the anti-entropy digest is rebuilt only when the reconciled state changed. */
+    @Test
+    void theDigestIsCachedUntilTheStateChanges() {
+        byte[] first = space.digest();
+        byte[] again = space.digest();
+        assertThat(again).isSameAs(first);
+        assertThat(space.digestComputations()).isEqualTo(1);
+
+        space.write(new TaskEntry("task", 1), MINUTES_30);
+        byte[] after = space.digest();
+        assertThat(after).isNotEqualTo(first);
+        assertThat(space.digestComputations()).isEqualTo(2);
+        assertThat(space.digest()).isSameAs(after);
+
+        // A take claims the entry (a claim line in the digest) and its completion changes it again.
+        var taken = space.take(Template.of(TaskEntry.class), MINUTES_10, Duration.ofMillis(50)).orElseThrow();
+        assertThat(space.digest()).isNotSameAs(after);
+        space.complete(taken);
+        long computations = space.digestComputations();
+        assertThat(space.digest()).isNotNull();
+        assertThat(space.digestComputations()).isEqualTo(computations + 1);
+        assertThat(space.digest()).isSameAs(space.digest());
+    }
+
     @Test
     void tagConditionsSelectOnReadReadAllAndTake() {
         space.write(new TaskEntry("eu-task", 5), MINUTES_30, Map.of("region", "eu"));

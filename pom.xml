@@ -114,7 +114,7 @@
          application runs the canonical CBOR codec on the Jackson it was tested
          with. Any Jackson bump must keep the golden-vector suites green
          (they pin the canonical bytes); see docs/BUILD-ENVIRONMENTS.md. -->
-    <jackson.version>2.21.7</jackson.version>
+    <jackson.version>2.22.3</jackson.version>
     <caffeine.version>3.2.0</caffeine.version>
     <nimbus-jose-jwt.version>10.3</nimbus-jose-jwt.version>
     <bouncycastle.version>1.86</bouncycastle.version>

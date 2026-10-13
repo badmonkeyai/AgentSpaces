@@ -45,6 +45,10 @@
  * each panel contributes a titled section to the UI and a JSON document at
  * {@code /api/v1/panels/{id}/data}, with an optional HTML fragment when the
  * default rendering is not enough. Under Spring Boot, {@code ConsolePanel}
- * beans are collected automatically.
+ * beans are collected automatically. One panel ships with the module:
+ * {@link ai.badmonkey.agentspaces.console.TrafficPanel}, the wire as the
+ * console peer sees it (frames and bytes by kind as rates, the signed, session
+ * and bare split, stale, replayed and unverifiable drops, each group's gossip
+ * figures), which the Spring auto-configuration registers for every fleet.
  */
 package ai.badmonkey.agentspaces.console;

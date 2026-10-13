@@ -80,6 +80,15 @@ public final class GossipBus {
         void sendRumor(PeerId to, Bodies.Rumor rumor);
 
         /**
+         * Sends a rumor and says whether it left: a node that cannot reach the peer (no link,
+         * no endpoint, a failed dial) returns false, so the fan-out can spend the slot elsewhere.
+         */
+        default boolean trySendRumor(PeerId to, Bodies.Rumor rumor) {
+            sendRumor(to, rumor);
+            return true;
+        }
+
+        /**
          * Sends a DIGEST frame.
          *
          * @param to      the destination peer
@@ -217,6 +226,14 @@ public final class GossipBus {
 
     /** Whether a member understands HAVE, GRAFT and PRUNE; the owning node judges it from the wire hint. */
     private volatile java.util.function.Predicate<PeerId> lazyCapable;
+    /** Members this node holds a live link to, and members with no endpoint of their own (dial-only clients). */
+    private volatile java.util.function.Predicate<PeerId> linked = peer -> true;
+    private volatile java.util.function.Predicate<PeerId> dialOnly = peer -> false;
+    /** The tick each hint-less member was last pushed to, and last failed, for the fan-out's weak slot. */
+    private final Map<PeerId, Long> plainServed = new ConcurrentHashMap<>();
+    private final Map<PeerId, Long> plainFailed = new ConcurrentHashMap<>();
+    /** How long a failed push keeps a hint-less member out of the strong slots. */
+    static final int PLAIN_FAILURE_TICKS = 8;
     private volatile long ticks;
     /** Streams whose items are also delivered point to point, so a duplicate on them says nothing about the tree. */
     private final java.util.Set<String> directStreams = ConcurrentHashMap.newKeySet();
@@ -865,6 +882,16 @@ public final class GossipBus {
     }
 
     /**
+     * Tells the fan-out toward hint-less members what the node knows about reaching them:
+     * {@code linked} holds a live link now, {@code dialOnly} has no endpoint of its own (a
+     * client behind its seed), so only a linked node can push to it at all.
+     */
+    public void plainReach(java.util.function.Predicate<PeerId> linked, java.util.function.Predicate<PeerId> dialOnly) {
+        this.linked = Objects.requireNonNull(linked, "linked");
+        this.dialOnly = Objects.requireNonNull(dialOnly, "dialOnly");
+    }
+
+    /**
      * Marks a stream whose items this node also delivers point to point (the peer
      * advertisement: introduced directly on a dial and flooded on the interval), so a
      * duplicate on it never prunes a tree edge.
@@ -1050,11 +1077,11 @@ public final class GossipBus {
      */
     private void forward(String key, byte[] hash, Bodies.Rumor rumor, PeerId exclude) {
         java.util.function.Predicate<PeerId> capable = lazyCapable;
-        int quota = fanout;
         boolean anyCapable = false;
         // In a group too small for the tree every capable member is pushed to, whatever a PRUNE
         // said: nothing prunes there, and a prune honoured there could only cost a repair.
         boolean eager = eagerStreams.contains(rumor.streamId()) || !treeWorthwhile();
+        List<PeerId> plain = new ArrayList<>();
         for (PeerId peer : sampler.members()) {
             if (peer.equals(exclude)) {
                 continue;
@@ -1065,18 +1092,84 @@ public final class GossipBus {
                     countRumor(rumor.streamId());
                     sender.sendRumor(peer, rumor);
                 }
-            } else if (quota > 0) {
-                quota--;
-                countRumor(rumor.streamId());
-                sender.sendRumor(peer, rumor);
+            } else {
+                plain.add(peer);
             }
         }
+        pushToPlain(plain, rumor, exclude == null || !anyCapable);
         if (anyCapable && (!eager || !treeWorthwhile() && !eagerStreams.contains(rumor.streamId()))) {
             recent.put(key, rumor);
             Forwarded forwarded = new Forwarded(new Bodies.HaveItem(rumor.streamId(), hash), ticks);
             pendingHaves.put(key, forwarded);
             recentForwarded.put(key, forwarded);
         }
+    }
+
+    /**
+     * The fan-out toward members without the tree hint (older nodes, dial-only clients), PERF2
+     * §3 item 4's other half. At the origin, or anywhere in a group with no tree at all, the
+     * {@code fanout} slots go two ways: all but one to <em>strong</em> members, those this node
+     * holds a live link to and has not failed to reach lately, in the sampler's random order;
+     * the last to the <em>weak</em> one, the member pushed to least recently (never, first),
+     * ties in that same random order. The strong keep the push reliable, the weak slot sees
+     * that nobody is left out for long, and the randomness keeps it from settling on one pair.
+     * A forwarder along the tree pushes only to dial-only members it is linked to, which nobody
+     * else can reach: every other hint-less member had its chance at the origin and gets the rest
+     * by anti-entropy, where every tree member pushing to every one of them cost each of them
+     * four copies of every item. A push that could not leave frees its slot for the next pick.
+     */
+    private void pushToPlain(List<PeerId> plain, Bodies.Rumor rumor, boolean origin) {
+        if (plain.isEmpty()) {
+            return;
+        }
+        long now = ticks;
+        if (!origin) {
+            for (PeerId peer : plain) {
+                if (dialOnly.test(peer) && linked.test(peer)) {
+                    push(peer, rumor, now);
+                }
+            }
+            return;
+        }
+        List<PeerId> strong = new ArrayList<>();
+        List<PeerId> weak = new ArrayList<>(plain);
+        for (PeerId peer : plain) {
+            Long failed = plainFailed.get(peer);
+            if (linked.test(peer) && (failed == null || now - failed > PLAIN_FAILURE_TICKS)) {
+                strong.add(peer);
+            }
+        }
+        weak.sort(java.util.Comparator.comparingLong(peer -> plainServed.getOrDefault(peer, -1L)));
+        int sent = 0;
+        java.util.Set<PeerId> chosen = new java.util.HashSet<>();
+        int strongSlots = Math.max(0, fanout - 1);
+        for (PeerId peer : strong) {
+            if (sent >= strongSlots) {
+                break;
+            }
+            if (push(peer, rumor, now)) {
+                sent++;
+            }
+            chosen.add(peer);
+        }
+        for (PeerId peer : weak) {
+            if (sent >= fanout) {
+                break;
+            }
+            if (chosen.add(peer) && push(peer, rumor, now)) {
+                sent++;
+            }
+        }
+    }
+
+    private boolean push(PeerId peer, Bodies.Rumor rumor, long now) {
+        if (sender.trySendRumor(peer, rumor)) {
+            countRumor(rumor.streamId());
+            plainServed.put(peer, now);
+            return true;
+        }
+        plainFailed.put(peer, now);
+        return false;
     }
 
     /**

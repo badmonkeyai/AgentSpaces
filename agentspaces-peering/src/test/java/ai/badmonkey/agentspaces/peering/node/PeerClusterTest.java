@@ -738,8 +738,8 @@ class PeerClusterTest {
     /**
      * ROBUSTNESS.md §3.6: two members that lost each other (a partition longer than the
      * membership TTL), with no third party to carry an introduction, find each other again:
-     * each keeps the other's last endpoints and introduces itself to them every few seconds for
-     * a while after the loss. A member ejected on purpose is not courted that way.
+     * each keeps the other's last endpoints and introduces itself to them, backing off to thirty
+     * seconds, for a while after the loss. A member ejected on purpose is not courted that way.
      */
     @Test
     void twoMembersThatLostEachOtherFindEachOtherAgainButAnEjectedOneIsNotCourted() throws Exception {
@@ -756,7 +756,9 @@ class PeerClusterTest {
         assertThat(atA.membership().allMembers()).isEmpty();
         assertThat(atB.membership().allMembers()).isEmpty();
         network.heal();
-        tickAll(8); // the lost-member retry runs every five seconds
+        // The lost-member retry backs off while nobody answers (5, 10, 20, then 30 s), so after a
+        // forty-second cut the next try is up to the cap away: the heal is bounded by the cap.
+        tickAll((int) (PeerNode.LOST_RETRY_MAX_INTERVAL_MILLIS / 1000) + 2);
         assertThat(atA.membership().member(b.peerId())).as("A found B again").isPresent();
         assertThat(atB.membership().member(a.peerId())).as("B found A again").isPresent();
 

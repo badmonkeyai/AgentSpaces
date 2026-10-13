@@ -126,8 +126,9 @@ class LazyPushTest {
         enable();
         bus.onRumor(p1, rumor("x"));
         assertThat(delivered).containsExactly("x");
-        assertThat(sentTo("RUMOR")).as("forwarded to everyone but the sender; the legacy quota is three, two exist")
-                .containsExactlyInAnyOrder(p2, p3, p4, legacy1, legacy2);
+        assertThat(sentTo("RUMOR")).as("forwarded along the tree only: a hint-less member with an endpoint of its "
+                + "own had its chance at the origin and gets the rest by anti-entropy (PERF2 §3 item 4)")
+                .containsExactlyInAnyOrder(p2, p3, p4);
         sent.clear();
         bus.onRumor(p2, rumor("x"));
         assertThat(delivered).as("a duplicate is not delivered twice").containsExactly("x");

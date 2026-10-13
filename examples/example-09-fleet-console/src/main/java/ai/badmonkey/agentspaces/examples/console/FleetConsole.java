@@ -30,6 +30,7 @@ import ai.badmonkey.agentspaces.console.ConsoleView;
 import ai.badmonkey.agentspaces.console.DirectiveGate;
 import ai.badmonkey.agentspaces.console.FleetCommander;
 import ai.badmonkey.agentspaces.console.FleetConsoleServer;
+import ai.badmonkey.agentspaces.console.TrafficPanel;
 import ai.badmonkey.agentspaces.discovery.AdCache;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
@@ -320,6 +321,7 @@ public final class FleetConsole {
              FleetConsoleServer server = FleetConsoleServer.builder(view)
                      .fleetName("console-fleet")
                      .panel(storyPanel(view))
+                     .panel(TrafficPanel.of(console.node()))   // the wire as the console peer sees it
                      .commandAndControl(commander(console, audit, view), token)
                      .build()) {
             int bound = server.start(httpPort);

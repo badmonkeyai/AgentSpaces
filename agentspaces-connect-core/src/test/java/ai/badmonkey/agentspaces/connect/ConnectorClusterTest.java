@@ -351,7 +351,17 @@ class ConnectorClusterTest {
 
         assertThat(clientA.fetch("orders", Map.of("region", "eu"),
                 Duration.ofSeconds(10))).isPresent();
-        tickAll(4); // the result replicates to every replica
+        tickAll(4);
+        // A's fetch returns the instant the connector's push reaches A; the same push is still
+        // on the connector's thread on its way to B, so B's replica is awaited, not assumed.
+        String hash = DataQueryEntries.canonicalHash("orders", Map.of("region", "eu"));
+        var replicated = ai.badmonkey.agentspaces.api.space.Template.of(DataQueryEntries.DataResult.class)
+                .where("queryHash", ai.badmonkey.agentspaces.api.space.Matchers.eq(hash));
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (agentB.data().readAllIssued(replicated, 16).isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertThat(agentB.data().readAllIssued(replicated, 16)).as("the result replicated to B").hasSize(1);
 
         // B asks the same question, parameter order shuffled: pure cache hit.
         Optional<DataQueryClient.Fetched> second = clientB.fetch("orders",

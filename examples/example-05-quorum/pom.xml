@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces-examples</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
   </parent>
 
   <artifactId>example-05-quorum</artifactId>

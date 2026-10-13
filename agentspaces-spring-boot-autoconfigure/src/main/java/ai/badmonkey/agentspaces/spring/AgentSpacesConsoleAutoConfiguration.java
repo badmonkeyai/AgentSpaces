@@ -23,6 +23,7 @@ import ai.badmonkey.agentspaces.console.ConsolePanel;
 import ai.badmonkey.agentspaces.console.ConsoleView;
 import ai.badmonkey.agentspaces.console.FleetCommander;
 import ai.badmonkey.agentspaces.console.FleetConsoleServer;
+import ai.badmonkey.agentspaces.console.TrafficPanel;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -138,6 +139,21 @@ public class AgentSpacesConsoleAutoConfiguration {
      * @param commanders the commander bean when C2 is enabled, else empty
      * @return the server, not yet started
      */
+    /**
+     * The wire-traffic panel (PERF2 §4): the node's frame and byte counters as rates by kind,
+     * the signed, session and bare split, the stale, replayed and unverifiable drops, and each
+     * group's gossip figures, one more section on the UI and one more document under
+     * {@code /api/v1/panels}. Define a {@link TrafficPanel} bean to replace it.
+     *
+     * @param node the peer node whose counters the panel reads
+     * @return the panel
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public TrafficPanel agentSpacesTrafficPanel(ai.badmonkey.agentspaces.peering.node.PeerNode node) {
+        return TrafficPanel.of(node);
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public FleetConsoleServer agentSpacesConsoleServer(AgentSpacesProperties properties,

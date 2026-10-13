@@ -114,10 +114,20 @@ public final class PeerNode implements AutoCloseable {
     private static final long MAX_FRAME_AGE_MILLIS = 300_000L;
 
     /** Bound on the recent-frame dedup set; oldest entries evict (ASF-019). */
-    private static final int RECENT_FRAMES_CAPACITY = 8_192;
+    static final int RECENT_FRAMES_CAPACITY = 8_192;
+    /**
+     * How old a SESSION_HELLO may be and still be answered (ROBUSTNESS.md §5, the hello replay
+     * window). A live hello is seconds old at most, its stamp merged toward what the opener last
+     * heard from this node, so thirty seconds covers every honest one; a captured hello replayed
+     * on a fresh link after the exact-replay cache has turned over is the one frame kind that can
+     * create state at its recipient, and this bound is what makes that capture worthless.
+     */
+    static final long SESSION_HELLO_MAX_AGE_MILLIS = 30_000L;
 
     /** The gossip stream peer advertisements travel on. */
     private static final String PEER_AD_STREAM = "peers";
+    /** The anti-entropy state carrying the live members' signed self-advertisements. */
+    static final String VIEW_STATE = "view";
 
     /** How far in the future an ad's issuer-signed {@code issued} may run
      * before the ad is refused (ASF-027). */
@@ -167,13 +177,24 @@ public final class PeerNode implements AutoCloseable {
     private final Map<PeerId, List<PeerAdvertisement.Endpoint>> lastEndpoints = new ConcurrentHashMap<>();
     /** Members that left each group's view and when: introduced to again for a while, in case they are back. */
     private final Map<GroupId, Map<PeerId, Long>> lostMembers = new ConcurrentHashMap<>();
+    /** The signed self-advertisement last admitted from each live member, for the view's anti-entropy. */
+    private final Map<GroupId, Map<PeerId, HeldAd>> heldAds = new ConcurrentHashMap<>();
+
+    private record HeldAd(long issuedMillis, byte[] payload) {
+    }
     private final Map<GroupId, Long> lastLostRetryMillis = new ConcurrentHashMap<>();
     /** How long after a member's loss this node keeps introducing itself to its last endpoints. */
     static final long LOST_RETRY_WINDOW_MILLIS = 10 * 60_000L;
-    /** How often, within the window, the lost members and (on an empty view) the seeds are tried. */
+    /** How soon after a loss the lost members and (on an empty view) the seeds are first tried. */
     static final long LOST_RETRY_INTERVAL_MILLIS = 5_000L;
-    /** Groups whose view changed since the last self-advertisement: the next one is flooded, not sent directly. */
-    private final Set<GroupId> viewChanged = ConcurrentHashMap.newKeySet();
+    /**
+     * The retry interval doubles after each round that admitted nobody, up to this cap, and snaps
+     * back on an admission (ROBUSTNESS.md §5, the retry bound): a pair alone under a one-way loss
+     * otherwise re-introduces, re-admits and re-drops at full rate for as long as the loss lasts.
+     */
+    static final long LOST_RETRY_MAX_INTERVAL_MILLIS = 30_000L;
+    /** The current retry interval per group: the base after an admission, doubling while nobody answers. */
+    private final Map<GroupId, Long> lostRetryIntervalMillis = new ConcurrentHashMap<>();
     /** When a probe's digests last started a targeted pull from a peer, so a persistent mismatch pulls once per period. */
     private final Map<PeerId, Long> probePulls = new ConcurrentHashMap<>();
     /** Members whose advertisement carries {@link #SESSION_HINT}. */
@@ -356,6 +377,8 @@ public final class PeerNode implements AutoCloseable {
      * synchronized on the map. Each honest frame has a unique stamp (the HLC
      * advances on every {@code now()}), so this never drops a distinct frame.
      */
+    private final AtomicLong framesStale = new AtomicLong();
+    private final AtomicLong framesReplayed = new AtomicLong();
     private final Map<String, Boolean> recentFrames =
             java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(1024, 0.75f, false) {
                 @Override
@@ -927,6 +950,24 @@ public final class PeerNode implements AutoCloseable {
      * Such frames name no verified sender, so they count here and strike
      * nobody.
      */
+    /**
+     * How many verified frames this node dropped as stale, older than five minutes by its own
+     * clock (ROBUSTNESS.md §3.3). Not a strike and not in {@link #framesDropped()}: a late frame
+     * is the network's doing, not its signer's.
+     */
+    public long framesStale() {
+        return framesStale.get();
+    }
+
+    /**
+     * How many verified frames this node dropped as exact replays, a sender-and-stamp pair seen
+     * before (ROBUSTNESS.md §3.4). Not a strike and not in {@link #framesDropped()}: a duplicate
+     * delivery is the network's doing, and a replayed capture its signer never sent twice.
+     */
+    public long framesReplayed() {
+        return framesReplayed.get();
+    }
+
     public long framesDropped() {
         return framesDropped.get();
     }
@@ -1223,6 +1264,11 @@ public final class PeerNode implements AutoCloseable {
             }
 
             @Override
+            public boolean trySendRumor(PeerId to, Bodies.Rumor rumor) {
+                return send(groupId, to, Envelope.Kind.RUMOR, rumor);
+            }
+
+            @Override
             public void sendDigest(PeerId to, Bodies.Digest digest) {
                 send(groupId, to, Envelope.Kind.DIGEST, digest);
             }
@@ -1281,6 +1327,12 @@ public final class PeerNode implements AutoCloseable {
         gossip.reconcile(CREDENTIAL_REVOCATION_STREAM, credentialRevocations);
         gossip.onStream(PEER_AD_STREAM,
                 (from, itemId, payload) -> onPeerAdItem(runtime, from, payload));
+        gossip.plainReach(this::connectedTo, peer -> runtime.membership().member(peer)
+                .map(m -> m.endpoints().isEmpty()).orElse(false));
+        // The view converges by anti-entropy, not by flood luck (ROBUSTNESS.md §6b): two members
+        // whose introductions reached each other's random fan-out never would otherwise stay
+        // strangers for good once nothing re-floods them.
+        gossip.reconcile(VIEW_STATE, new ViewState(runtime));
         // ASF-012: this node forwards only peer ads it can verify end-to-end,
         // so its identity and rate budget never amplify unverifiable content.
         gossip.forwardFilter(PEER_AD_STREAM, payload -> forwardsPeerAd(revocations, payload));
@@ -1327,7 +1379,8 @@ public final class PeerNode implements AutoCloseable {
     private void retryLost(GroupRuntime runtime, long nowMillis) {
         GroupId groupId = runtime.id();
         Long last = lastLostRetryMillis.get(groupId);
-        if (last != null && nowMillis - last < LOST_RETRY_INTERVAL_MILLIS) {
+        long interval = lostRetryIntervalMillis.getOrDefault(groupId, LOST_RETRY_INTERVAL_MILLIS);
+        if (last != null && nowMillis - last < interval) {
             return;
         }
         Map<PeerId, Long> lost = lostMembers.get(groupId);
@@ -1356,6 +1409,7 @@ public final class PeerNode implements AutoCloseable {
         }
         if (tried) {
             lastLostRetryMillis.put(groupId, nowMillis);
+            lostRetryIntervalMillis.put(groupId, Math.min(interval * 2, LOST_RETRY_MAX_INTERVAL_MILLIS));
         }
     }
 
@@ -1419,13 +1473,13 @@ public final class PeerNode implements AutoCloseable {
             if (previous != null) {
                 for (PeerId dropped : previous) {
                     if (!view.contains(dropped)) {
-                        viewChanged.add(runtime.id());
                         gossip.memberLeft(dropped);
                         probePulls.remove(dropped);
                         boolean ejected = runtime.membership().consumeEjected(dropped);
                         if (!ejected && !runtime.revocations().revoked(dropped)) {
                             lostMembers.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, nowMillis);
                         }
+                        heldAds.getOrDefault(runtime.id(), Map.of()).remove(dropped);
                         TransportConnection stale = connections.get(dropped);
                         if (stale != null) {
                             dropConnection(dropped, stale);
@@ -1475,6 +1529,24 @@ public final class PeerNode implements AutoCloseable {
      * membership protocol's job; the advertisement only has to stay fresher than its TTL and reach
      * every member once per version.
      */
+    /**
+     * How often this node's advertisement is refreshed to each member of a group. The configured
+     * interval, unless the group's probe cycle (one member per period, stretched up to
+     * {@link GroupMembership#MAX_QUIET_STRETCH} times when quiet) has outgrown the member TTL: a
+     * member is kept by hearing from it, and past that size the probes cannot reach every member
+     * inside the TTL, so the refresh takes over as the keepalive at half the TTL (ROBUSTNESS.md
+     * §6b, scale). Small groups keep their cadence unchanged.
+     */
+    long refreshIntervalMillis(GroupRuntime runtime, int members) {
+        GroupMembership.Config config = runtime.membership().config();
+        long probeCycle = (long) (members + 1) * config.probeInterval().toMillis() * (1L << GroupMembership.MAX_QUIET_STRETCH);
+        long ttl = config.memberTtl().toMillis();
+        if (probeCycle < ttl) {
+            return peerAdInterval.toMillis();
+        }
+        return Math.min(peerAdInterval.toMillis(), ttl / 2);
+    }
+
     private void publishSelfAd(GroupRuntime runtime, GossipBus gossip, long nowMillis) {
         GroupId groupId = runtime.id();
         Set<PeerId> sentTo = selfAdSentTo.computeIfAbsent(groupId, g -> ConcurrentHashMap.newKeySet());
@@ -1487,10 +1559,11 @@ public final class PeerNode implements AutoCloseable {
         Long last = lastSelfAdMillis.get(groupId);
         int fingerprint = Objects.hash(List.copyOf(advertisedEndpoints), roles, selfHints(groupId));
         boolean changed = !Integer.valueOf(fingerprint).equals(lastSelfAdFingerprint.get(groupId));
-        boolean viewChange = viewChanged.remove(groupId);
-        if (last == null || changed || viewChange) {
-            // Flooded: the content is new, or the view changed and the flood is what lets two
-            // members that dropped each other find each other again through a third.
+        if (last == null || changed) {
+            // Flooded: the content is new and has to reach every member, through a third where a
+            // direct link is cut. A view change no longer floods (ROBUSTNESS.md §6b, scale): a
+            // newcomer gets this node's advertisement directly below, a lost member by the
+            // lost-member retry, and at fifty members one expiry made forty-nine floods.
             // Mark before publishing: a member whose send fails is dropped from the set by
             // dropConnection during the publish, and is introduced to again on the next tick.
             sentTo.addAll(current);
@@ -1500,7 +1573,7 @@ public final class PeerNode implements AutoCloseable {
             gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload());
             return;
         }
-        if (nowMillis - last >= peerAdInterval.toMillis()) {
+        if (nowMillis - last >= refreshIntervalMillis(runtime, members.size())) {
             // The interval refresh goes to each member directly and unforwarded (v0.1.17): the
             // flood cost every member several copies when nothing else had pruned the tree, and
             // a refresh has to reach each member exactly once anyway.
@@ -2459,10 +2532,15 @@ public final class PeerNode implements AutoCloseable {
         // is also the reference the sender's HLC stamp was merged toward.
         long ageMillis = clock.millis() - envelope.stamp().physical();
         if (ageMillis > MAX_FRAME_AGE_MILLIS) {
+            framesStale.incrementAndGet();
             return true;
         }
         String id = envelope.from().value() + '|' + envelope.stamp().encoded();
-        return recentFrames.put(id, Boolean.TRUE) != null;
+        if (recentFrames.put(id, Boolean.TRUE) != null) {
+            framesReplayed.incrementAndGet();
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -2592,6 +2670,13 @@ public final class PeerNode implements AutoCloseable {
         if (hello == null || !peerId().equals(hello.remote()) || hello.ephemeralKey() == null
                 || hello.ephemeralKey().length != ai.badmonkey.agentspaces.common.crypto.X25519.RAW_PUBLIC_KEY_LENGTH
                 || hello.nonce() == null || hello.nonce().length < 16 || hello.nonce().length > 64) {
+            return;
+        }
+        if (clock.millis() - envelope.stamp().physical() > SESSION_HELLO_MAX_AGE_MILLIS) {
+            // A live hello is seconds old; a captured one replayed on a fresh link after the
+            // exact-replay cache turned over would otherwise be answered. Ignored, never a strike:
+            // its signer sent it once, honestly (ROBUSTNESS.md §5, the hello replay window).
+            framesStale.incrementAndGet();
             return;
         }
         Session session = sessions.computeIfAbsent(connection, c -> new Session());
@@ -2816,6 +2901,113 @@ public final class PeerNode implements AutoCloseable {
             return;
         }
         admitAdvertisement(runtime, ad);
+        hold(runtime, ad, payload);
+    }
+
+    /** Keeps the signed advertisement of a live member for the view's anti-entropy, newest issue wins. */
+    private void hold(GroupRuntime runtime, PeerAdvertisement ad, byte[] payload) {
+        if (ad.issuer().equals(peerId()) || runtime.membership().member(ad.issuer()).isEmpty()) {
+            return;
+        }
+        long issued = ad.issued().toEpochMilli();
+        heldAds.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>())
+                .merge(ad.issuer(), new HeldAd(issued, payload), (a, b) -> b.issuedMillis() >= a.issuedMillis() ? b : a);
+    }
+
+    /**
+     * The group's view as anti-entropy state: a digest naming the live members (the set alone:
+     * an advertisement's issue time changes at every refresh, at a different moment on every
+     * member, and a digest carrying it never agreed on an idle fleet, so deltas flowed every
+     * round and nothing backed off), a delta of the signed advertisements of the members the
+     * partner lacks, and an application that admits them as a forwarded copy would, with two
+     * exceptions: under attestation a copy admits nobody (as above), and a member this node
+     * dropped for silence comes back only on an advertisement issued after the drop, which only
+     * a member alive since could have made, so a dead member's still-valid advertisement held
+     * by a relay cannot bounce it back (the relay's copy may be newer than this node's and still
+     * predate the drop). A changed advertisement (endpoints, roles, hints) travels by the flood.
+     */
+    private final class ViewState implements ai.badmonkey.agentspaces.peering.gossip.ReconcilableState {
+        private final GroupRuntime runtime;
+
+        ViewState(GroupRuntime runtime) {
+            this.runtime = runtime;
+        }
+
+        /** The live set as this node sees it, itself included: two partners' digests then agree. */
+        private java.util.TreeMap<String, Long> lines() {
+            java.util.TreeMap<String, Long> lines = new java.util.TreeMap<>();
+            Map<PeerId, HeldAd> held = heldAds.getOrDefault(runtime.id(), Map.of());
+            for (GroupMembership.Member member : runtime.membership().allMembers()) {
+                HeldAd ad = held.get(member.id());
+                if (ad != null) {
+                    lines.put(member.id().value(), ad.issuedMillis());
+                }
+            }
+            lines.put(peerId().value(), 0L);
+            return lines;
+        }
+
+        @Override
+        public byte[] digest() {
+            StringBuilder sb = new StringBuilder();
+            lines().forEach((issuer, issued) -> sb.append(issuer).append('\n'));
+            return sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        }
+
+        @Override
+        public byte[] deltaFor(byte[] remoteDigest) {
+            java.util.Set<String> remote = new java.util.HashSet<>(List.of(
+                    new String(remoteDigest, java.nio.charset.StandardCharsets.UTF_8).split("\n")));
+            Map<PeerId, HeldAd> held = heldAds.getOrDefault(runtime.id(), Map.of());
+            List<byte[]> missing = new ArrayList<>();
+            lines().forEach((issuer, issued) -> {
+                if (!remote.contains(issuer)) {
+                    if (issuer.equals(peerId().value())) {
+                        missing.add(selfAdRumor(runtime.id()).payload()); // the partner lacks this node itself
+                    } else {
+                        HeldAd ad = held.get(PeerId.of(issuer));
+                        if (ad != null) {
+                            missing.add(ad.payload());
+                        }
+                    }
+                }
+            });
+            return missing.isEmpty() ? new byte[0] : codec.toBytes(missing);
+        }
+
+        @Override
+        public void applyDelta(byte[] delta) {
+            if (delta.length == 0) {
+                return;
+            }
+            byte[][] payloads;
+            try {
+                payloads = codec.fromBytes(delta, byte[][].class);
+            } catch (RuntimeException e) {
+                return;
+            }
+            for (byte[] payload : payloads) {
+                PeerAdvertisement ad = verifiedPeerAd(payload).orElse(null);
+                if (ad == null || ad.issuer().equals(peerId()) || !admits(runtime.advertisement(), ad)) {
+                    continue;
+                }
+                boolean member = runtime.membership().member(ad.issuer()).isPresent();
+                if (requireAttestation && !member) {
+                    continue; // a copy admits nobody under attestation
+                }
+                Long droppedAt = lostMembers.getOrDefault(runtime.id(), Map.of()).get(ad.issuer());
+                if (!member && droppedAt != null && ad.issued().toEpochMilli() <= droppedAt) {
+                    continue; // issued before this node dropped it: no evidence it lives
+                }
+                if (!member && droppedAt == null && lastView.getOrDefault(runtime.id(), Set.of()).contains(ad.issuer())) {
+                    // Dropped inside this very tick (a failed probe), its loss not yet recorded:
+                    // the probe's own ACK carried the view hash that started this pull.
+                    continue;
+                }
+                admitAdvertisement(runtime, ad);
+                hold(runtime, ad, payload);
+            }
+        }
     }
 
     /**
@@ -2838,8 +3030,8 @@ public final class PeerNode implements AutoCloseable {
             lost.remove(ad.issuer());
         }
         if (admission && runtime.membership().member(ad.issuer()).isPresent()) {
+            lostRetryIntervalMillis.remove(runtime.id()); // somebody answered: retries start fresh
             newlyAdmitted.computeIfAbsent(runtime.id(), g -> ConcurrentHashMap.newKeySet()).add(ad.issuer());
-            viewChanged.add(runtime.id());
             runtime.gossip().topologyChanged();
             runtime.gossip().memberAdmitted(ad.issuer());
         }

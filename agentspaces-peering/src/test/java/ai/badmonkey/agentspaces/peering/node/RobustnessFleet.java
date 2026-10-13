@@ -101,8 +101,15 @@ final class RobustnessFleet {
 
     PeerNode add(String address, String seedAddress, PeerNode.ChannelAuth mode, GroupMembership.Config config)
             throws IOException {
+        return add(address, seedAddress, mode, config, true);
+    }
+
+    /** With {@code lazyPush} false the member advertises no tree hint: an older node, or a client. */
+    PeerNode add(String address, String seedAddress, PeerNode.ChannelAuth mode, GroupMembership.Config config,
+                 boolean lazyPush) throws IOException {
         PeerIdentity identity = identities.computeIfAbsent(address, a -> PeerIdentity.generate());
-        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seeds++).channelAuth(mode).build();
+        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seeds++).channelAuth(mode)
+                .lazyPush(lazyPush).build();
         node.listen(network.register(address), address);
         GroupRuntime runtime = node.joinGroup(groupAd, config, seedAddress == null ? List.of()
                 : List.of(new PeerAdvertisement.Endpoint("mem", seedAddress, 0)));

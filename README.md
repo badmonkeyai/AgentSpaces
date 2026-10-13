@@ -124,7 +124,7 @@ With `agentspaces.identity.agent-keys=subordinate` every bound agent signs with 
 
 ## Add it to your build
 
-Release artifacts are on Maven Central under the group `ai.badmonkey.agentspaces`, version `0.2.0` ([central.sonatype.com/namespace/ai.badmonkey.agentspaces](https://central.sonatype.com/namespace/ai.badmonkey.agentspaces)). Maven and Gradle resolve Maven Central by default, so no repository configuration is needed. The libraries are Java 21 bytecode.
+Release artifacts are on Maven Central under the group `ai.badmonkey.agentspaces`, version `0.3.0` ([central.sonatype.com/namespace/ai.badmonkey.agentspaces](https://central.sonatype.com/namespace/ai.badmonkey.agentspaces)). Maven and Gradle resolve Maven Central by default, so no repository configuration is needed. The libraries are Java 21 bytecode.
 
 One dependency matches each way an application is built:
 
@@ -147,7 +147,7 @@ The bill of materials, `agentspaces-dependencies`, manages the version of every 
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-dependencies</artifactId>
-      <version>0.2.0</version>
+      <version>0.3.0</version>
       <type>pom</type>
       <scope>import</scope>
     </dependency>
@@ -162,13 +162,13 @@ The bill of materials, `agentspaces-dependencies`, manages the version of every 
 </dependencies>
 ```
 
-A project that inherits from `spring-boot-starter-parent` imports the BOM the same way; Spring Boot's dependency management does not know the AgentSpaces artifacts, so either the import or an explicit `<version>0.2.0</version>` on each dependency is needed.
+A project that inherits from `spring-boot-starter-parent` imports the BOM the same way; Spring Boot's dependency management does not know the AgentSpaces artifacts, so either the import or an explicit `<version>0.3.0</version>` on each dependency is needed.
 
 ### Gradle Kotlin DSL (`build.gradle.kts`)
 
 ```kotlin
 dependencies {
-    implementation(platform("ai.badmonkey.agentspaces:agentspaces-dependencies:0.2.0"))
+    implementation(platform("ai.badmonkey.agentspaces:agentspaces-dependencies:0.3.0"))
     implementation("ai.badmonkey.agentspaces:agentspaces-spring-boot-starter")
 }
 ```
@@ -177,12 +177,12 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation platform('ai.badmonkey.agentspaces:agentspaces-dependencies:0.2.0')
+    implementation platform('ai.badmonkey.agentspaces:agentspaces-dependencies:0.3.0')
     implementation 'ai.badmonkey.agentspaces:agentspaces-spring-boot-starter'
 }
 ```
 
-Without the BOM, write the version on the dependency: `implementation("ai.badmonkey.agentspaces:agentspaces-agent:0.2.0")`. The optional modules (`agentspaces-transport-quic`, `agentspaces-console`, `agentspaces-a2a`, `agentspaces-connect-core`, `agentspaces-auth-oidc`) are added the same way and are all managed by the BOM.
+Without the BOM, write the version on the dependency: `implementation("ai.badmonkey.agentspaces:agentspaces-agent:0.3.0")`. The optional modules (`agentspaces-transport-quic`, `agentspaces-console`, `agentspaces-a2a`, `agentspaces-connect-core`, `agentspaces-auth-oidc`) are added the same way and are all managed by the BOM.
 
 ### Unreleased versions
 
@@ -245,9 +245,9 @@ Honest boundaries:
 
 Each layer depends only on the layers below it. A conforming minimal implementation comprises Layers 0 through 3 on a single LAN with the default conflict strategy; capability services and WAN topology are additive.
 
-The full design lives in `SPEC.md` (v0.1.13) with implementation detail in `TECH-SPEC.md`, both in `agentspaces-spec/` beside this repository, together with the golden vectors they define conformance by (`golden.json`, vendored here as `tools/golden/golden.json`).
+The full design lives in `SPEC.md` (v0.1.17) with implementation detail in `TECH-SPEC.md`, both in `agentspaces-spec/` beside this repository, together with the golden vectors they define conformance by (`golden.json`, vendored here as `tools/golden/golden.json`).
 
-## Version 0.2.0 Capabilities
+## Version 0.3.0 Capabilities
 
 Every specification layer (0 through 4) has a working implementation, and every clause the specification does not mark as planned has a pinning test.
 
@@ -396,7 +396,7 @@ Build success should look like:
 
 ```
 [INFO] ------------------------------------------------------------------------
-[INFO] Reactor Summary for AgentSpaces 0.2.0:
+[INFO] Reactor Summary for AgentSpaces 0.3.0:
 [INFO]
 [INFO] AgentSpaces :: Dependencies (BOM) .................. SUCCESS [  0.044 s]
 [INFO] AgentSpaces ........................................ SUCCESS [  0.044 s]

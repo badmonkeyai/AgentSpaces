@@ -226,6 +226,11 @@ public final class GroupMembership implements PeerSampler {
      *
      * @param peer the peer heard from
      */
+    /** This group's failure-detection parameters. */
+    public Config config() {
+        return config;
+    }
+
     public void recordHeard(PeerId peer) {
         Member member = members.get(peer);
         if (member != null) {

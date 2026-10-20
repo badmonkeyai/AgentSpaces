@@ -467,6 +467,8 @@ public final class FleetConsoleServer implements AutoCloseable {
             row.put("suspect", member.suspect());
             row.put("endpoints", member.endpoints());
             row.put("channel", member.channel());
+            row.put("scheme", member.scheme());
+            row.put("residency", member.residency());
             return row;
         }).toList());
         doc.put("_links", links(Map.of("self", "/api/v1/peers", "root", "/api/v1")));

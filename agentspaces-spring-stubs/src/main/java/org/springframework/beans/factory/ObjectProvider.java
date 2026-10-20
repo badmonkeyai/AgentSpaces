@@ -28,4 +28,16 @@ public interface ObjectProvider<T> {
     T getObject();
 
     T getIfAvailable();
+
+    /** Spring's default: the available instance, or the supplier's when none. */
+    default T getIfAvailable(java.util.function.Supplier<T> defaultSupplier) {
+        T available = getIfAvailable();
+        return available != null ? available : defaultSupplier.get();
+    }
+
+    /** Spring's default: every matching bean in {@code @Order} order; the stub streams the one instance or none. */
+    default java.util.stream.Stream<T> orderedStream() {
+        T available = getIfAvailable();
+        return available == null ? java.util.stream.Stream.empty() : java.util.stream.Stream.of(available);
+    }
 }

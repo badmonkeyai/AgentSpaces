@@ -154,6 +154,7 @@ public final class Authorizers {
         AgentSpacesProperties.Security.Grants config = properties.getSecurity().getGrants();
         Map<Authorizer.Operation, Set<PeerId>> grants = new EnumMap<>(Authorizer.Operation.class);
         put(grants, agents, Authorizer.Operation.RAFT_VOTER, config.getRaftVoter(), "raft-voter");
+        put(grants, agents, Authorizer.Operation.RAFT_CLIENT, config.getRaftClient(), "raft-client");
         put(grants, agents, Authorizer.Operation.DIRECTIVE_ISSUER, config.getDirectiveIssuer(),
                 "directive-issuer");
         put(grants, agents, Authorizer.Operation.CONNECTOR_SERVE, config.getConnectorServe(),

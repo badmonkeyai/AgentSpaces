@@ -38,7 +38,9 @@ import java.util.function.BiConsumer;
  * use to receive frames and publish rumors. Obtained from
  * {@link PeerNode#joinGroup}.
  */
-public final class GroupRuntime {
+public final class GroupRuntime implements AutoCloseable {
+
+    private static final System.Logger LOG = System.getLogger(GroupRuntime.class.getName());
 
     private final GroupId groupId;
     private final GroupAdvertisement advertisement;
@@ -61,6 +63,9 @@ public final class GroupRuntime {
             new java.util.concurrent.CopyOnWriteArrayList<>();
     /** Node-clock millis of the last anti-entropy round; null before the first. */
     private volatile Long lastAntiEntropyMillis;
+    /** Told when the group is left (ISSUE-PeerRobustness-2, R2-2.5); copy-on-write, run in registration order. */
+    private final java.util.List<Runnable> closeListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private volatile boolean closed;
 
     GroupRuntime(GroupId groupId, GroupAdvertisement advertisement,
                  GroupMembership membership, GossipBus gossip,
@@ -255,6 +260,25 @@ public final class GroupRuntime {
     }
 
     /**
+     * Revokes a delegation (an invite key) by its hash, refusing every
+     * credential issued under it at once and evicting the members admitted
+     * under it. Only the founder's revocation verifies.
+     *
+     * @param delegationOrCredential the delegation string, or any credential issued under it
+     * @param reason                 the reason
+     * @return the revocation, or empty when this peer may not issue it or the string is not delegated
+     */
+    public Optional<ai.badmonkey.agentspaces.api.ad.CredentialRevocation> revokeDelegation(
+            String delegationOrCredential, String reason) {
+        byte[] hash = JoinCredentials.delegationHash(delegationOrCredential);
+        if (hash == null) {
+            return Optional.empty();
+        }
+        return revoke(ai.badmonkey.agentspaces.api.ad.CredentialRevocation.Target.joinCredential(hash),
+                reason, null);
+    }
+
+    /**
      * Issues a revocation of any certified target (SPEC §6.1, v0.1.13), signed
      * by this node and honoured fleet-wide only when the group's validator
      * ranks this node's authority for that target.
@@ -324,7 +348,12 @@ public final class GroupRuntime {
      * @param handler receives (sender, body bytes)
      */
     public void onKind(Envelope.Kind kind, BiConsumer<PeerId, byte[]> handler) {
-        kindHandlers.put(Objects.requireNonNull(kind), Objects.requireNonNull(handler));
+        Objects.requireNonNull(kind);
+        Objects.requireNonNull(handler);
+        if (closed) {
+            return; // a left group dispatches nothing
+        }
+        kindHandlers.put(kind, handler);
     }
 
     /**
@@ -346,6 +375,9 @@ public final class GroupRuntime {
      */
     public AutoCloseable onTick(Runnable work) {
         Objects.requireNonNull(work, "work");
+        if (closed) {
+            return () -> { }; // a left group ticks nothing
+        }
         tickWork.add(work);
         return () -> tickWork.remove(work);
     }
@@ -394,5 +426,65 @@ public final class GroupRuntime {
 
     BiConsumer<PeerId, byte[]> handlerFor(Envelope.Kind kind) {
         return kindHandlers.get(kind);
+    }
+
+    /**
+     * Registers a listener told when this group is left, by
+     * {@link PeerNode#leaveGroup} or by {@link #close()} (ISSUE-PeerRobustness-2,
+     * R2-2.5): a layer above peering (a replicated space, a capability runtime)
+     * tears down what it built on the group. Listeners run on the leaving
+     * thread, in registration order, after the node stopped sending in the
+     * group; one that throws is logged and the rest still run. A listener
+     * registered after the group was left runs at once.
+     *
+     * @param listener the listener
+     * @return a handle that removes the listener when closed; closing twice is safe
+     */
+    public AutoCloseable onClose(Runnable listener) {
+        Objects.requireNonNull(listener, "listener");
+        if (closed) {
+            listener.run();
+            return () -> { };
+        }
+        closeListeners.add(listener);
+        return () -> closeListeners.remove(listener);
+    }
+
+    /** Whether the node has left this group; a left runtime sends nothing and runs no tick work. */
+    public boolean closed() {
+        return closed;
+    }
+
+    /**
+     * Leaves the group: the same as {@link PeerNode#leaveGroup} for this group's
+     * id. Everything the node holds for the group goes; every other group is
+     * untouched; the {@link #onClose} listeners are told.
+     */
+    @Override
+    public void close() {
+        node.leaveGroup(groupId);
+    }
+
+    /**
+     * The teardown {@link PeerNode#leaveGroup} runs once the group is out of the
+     * node's tables: periodic work and kind handlers are dropped so nothing of
+     * the group's runs on a later tick or frame, and the listeners are told.
+     * Idempotent.
+     */
+    void release() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        tickWork.clear();
+        kindHandlers.clear();
+        for (Runnable listener : closeListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "a close listener of group " + groupId.value() + " failed", e);
+            }
+        }
+        closeListeners.clear();
     }
 }

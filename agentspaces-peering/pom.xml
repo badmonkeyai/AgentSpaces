@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
   </parent>
 
   <artifactId>agentspaces-peering</artifactId>
@@ -46,6 +46,10 @@
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-identity</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-identity-tls</artifactId>
     </dependency>
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>

@@ -82,7 +82,12 @@ public final class ConsoleView implements AutoCloseable {
      * otherwise.
      */
     public record MemberRow(String peer, List<String> roles, boolean suspect,
-                            List<String> endpoints, String channel) {
+                            List<String> endpoints, String channel, String scheme, String residency) {
+
+        /** The pre-0.4.0 shape: no connection scheme and no residency hint. */
+        public MemberRow(String peer, List<String> roles, boolean suspect, List<String> endpoints, String channel) {
+            this(peer, roles, suspect, endpoints, channel, "", "");
+        }
     }
 
     /** One advertisement as the console shows it. */
@@ -96,6 +101,8 @@ public final class ConsoleView implements AutoCloseable {
     private final Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>>
             channelModes;
     private final Supplier<List<? extends Advertisement>> ads;
+    /** Peer to the scheme of its connection ({@code PeerNode.connectionSchemes}); empty for a peer not connected here. */
+    private final Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>> connectionSchemes;
     private final InstantSource clock;
     private final int eventCapacity;
     private final Deque<ConsoleEvent> events = new ArrayDeque<>();
@@ -106,6 +113,7 @@ public final class ConsoleView implements AutoCloseable {
         this.watched = builder.watched;
         this.members = builder.members;
         this.channelModes = builder.channelModes;
+        this.connectionSchemes = builder.connectionSchemes;
         this.ads = builder.ads;
         this.clock = builder.clock;
         this.eventCapacity = builder.eventCapacity;
@@ -211,19 +219,50 @@ public final class ConsoleView implements AutoCloseable {
     /** The group's live members, one row each. */
     public List<MemberRow> members() {
         var modes = channelModes.get();
+        var schemes = connectionSchemes.get();
+        // The residency hint a JavaScript host advertises (srad/agentspaces-js.md JS-R-07): shown,
+        // never trusted for anything; a JVM peer advertises none.
+        Map<String, String> residencies = new java.util.HashMap<>();
+        for (Advertisement ad : ads.get()) {
+            if (ad instanceof PeerAdvertisement peer && peer.resourceHints() != null) {
+                String hint = peer.resourceHints().get("js.residency");
+                if (hint != null) {
+                    residencies.put(peer.issuer().value(), hint);
+                }
+            }
+        }
         return members.get().stream().map(member -> new MemberRow(
                 member.id().value(),
                 member.roles().stream().map(Enum::name).sorted().toList(),
                 member.suspect(),
                 member.endpoints().stream()
                         .map(e -> e.transport() + "://" + e.address()).toList(),
-                modes.getOrDefault(member.id(), "signed")))
+                modes.getOrDefault(member.id(), "signed"),
+                schemes.getOrDefault(member.id(), ""),
+                residencies.getOrDefault(member.id().value(), "")))
                 .toList();
     }
 
     /** The group's current advertisements, one row each. */
     public List<AdRow> ads() {
         return ads.get().stream().map(ConsoleView::toRow).toList();
+    }
+
+    /** The operations an AssetCard's open {@code access} map lists (SPEC §6.1a, v0.1.21), for the row. */
+    private static String operationsOf(AssetCard card) {
+        if (card.access() == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        String read = card.access().get("read-ops");
+        String invoke = card.access().get("invoke-ops");
+        if (read != null && !read.isBlank()) {
+            sb.append("read: ").append(read.trim());
+        }
+        if (invoke != null && !invoke.isBlank()) {
+            sb.append(sb.isEmpty() ? "" : "; ").append("invoke: ").append(invoke.trim());
+        }
+        return sb.isEmpty() ? "" : " [" + sb + "]";
     }
 
     private static AdRow toRow(Advertisement ad) {
@@ -235,7 +274,7 @@ public final class ConsoleView implements AutoCloseable {
                                             ai.badmonkey.agentspaces.api.ad.CardAction::name).toList())
                             + ")");
             case AssetCard card -> new AdRow("asset", card.asset(),
-                    card.issuer().display(), card.description() + " (" + card.uri() + ")");
+                    card.issuer().display(), card.description() + " (" + card.uri() + ")" + operationsOf(card));
             case CapabilityAdvertisement cap -> new AdRow("capability",
                     cap.capabilityType(), cap.issuer().display(),
                     "v" + cap.version() + " via " + cap.binding()
@@ -305,6 +344,8 @@ public final class ConsoleView implements AutoCloseable {
         private Supplier<List<GroupMembership.Member>> members = List::of;
         private Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>>
                 channelModes = java.util.Map::of;
+        private Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>>
+                connectionSchemes = java.util.Map::of;
         private Supplier<List<? extends Advertisement>> ads = List::of;
         private InstantSource clock = InstantSource.system();
         private int eventCapacity = 512;
@@ -375,6 +416,19 @@ public final class ConsoleView implements AutoCloseable {
                 Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>>
                         channelModes) {
             this.channelModes = java.util.Objects.requireNonNull(channelModes, "channelModes");
+            return this;
+        }
+
+        /**
+         * Supplies each connected peer's connection scheme, typically {@code node::connectionSchemes}
+         * (srad/agentspaces-js.md JS-N-07); peers absent from the map show no scheme.
+         *
+         * @param connectionSchemes the scheme supplier
+         * @return this builder
+         */
+        public Builder connectionSchemes(
+                Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>> connectionSchemes) {
+            this.connectionSchemes = java.util.Objects.requireNonNull(connectionSchemes, "connectionSchemes");
             return this;
         }
 

@@ -80,6 +80,60 @@ public final class Ed25519 {
      * @param bytes      the bytes to sign
      * @return the 64-byte signature
      */
+    /**
+     * Builds the key pair whose private key is exactly {@code seed} (RFC 8032
+     * §5.1.5: the 32-byte private key from which the signing scalar and the
+     * public key derive). Deterministic: the same seed always yields the same
+     * key pair, which is what lets an invite secret derive a signing key on
+     * every holder's device without ever transmitting the key itself.
+     *
+     * <p>The JDK exposes no public API that derives a public key from a
+     * private one, so the pair is generated through the platform generator
+     * with a source of randomness that hands it the seed; the generator draws
+     * exactly the 32 private-key bytes from it. The result is checked: the
+     * private key's bytes must equal the seed, or the platform drew
+     * differently and the method fails rather than returning a pair the seed
+     * does not name.
+     *
+     * @param seed the 32-byte private key
+     * @return the key pair
+     * @throws IllegalArgumentException when the seed is not 32 bytes
+     * @throws IllegalStateException    when the platform generator does not derive from the seed
+     */
+    public static KeyPair fromSeed(byte[] seed) {
+        if (seed == null || seed.length != RAW_PUBLIC_KEY_LENGTH) {
+            throw new IllegalArgumentException("an Ed25519 seed is 32 bytes");
+        }
+        byte[] copy = seed.clone();
+        java.security.SecureRandom seeded = new java.security.SecureRandom() {
+            private boolean drawn;
+
+            @Override
+            public void nextBytes(byte[] out) {
+                if (drawn || out.length != copy.length) {
+                    throw new IllegalStateException("the Ed25519 generator drew more than the seed");
+                }
+                drawn = true;
+                System.arraycopy(copy, 0, out, 0, copy.length);
+            }
+        };
+        try {
+            java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("Ed25519");
+            generator.initialize(java.security.spec.NamedParameterSpec.ED25519, seeded);
+            KeyPair pair = generator.generateKeyPair();
+            byte[] drawn = ((java.security.interfaces.EdECPrivateKey) pair.getPrivate()).getBytes()
+                    .orElseThrow(() -> new IllegalStateException("the platform withholds Ed25519 private bytes"));
+            if (!java.util.Arrays.equals(drawn, copy)) {
+                throw new IllegalStateException("the platform generator did not derive the key from the seed");
+            }
+            return pair;
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IllegalStateException("Ed25519 is unavailable", e);
+        } finally {
+            java.util.Arrays.fill(copy, (byte) 0);
+        }
+    }
+
     public static byte[] sign(PrivateKey privateKey, byte[] bytes) {
         return provider.sign(privateKey, bytes);
     }

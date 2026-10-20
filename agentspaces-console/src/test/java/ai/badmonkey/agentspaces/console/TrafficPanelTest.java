@@ -138,6 +138,12 @@ class TrafficPanelTest {
         assertThat(group.get("group")).isEqualTo(groupId.value());
         assertThat(group.get("members")).isEqualTo(1);
         assertThat(group.get("suspects")).isEqualTo(0L);
+        Map<String, Object> relay = (Map<String, Object>) group.get("relay");
+        assertThat(relay).containsKeys("framesForwarded", "bytesForwarded", "droppedNotMember", "droppedByPolicy", "targets",
+                "offloadAttempts", "offloadOpened", "offloadFailed");
+        Map<String, Object> bootstrap = (Map<String, Object>) group.get("bootstrap");
+        assertThat(bootstrap).containsKeys("trace", "advertised");
+        assertThat((List<String>) bootstrap.get("advertised")).isNotEmpty();
         assertThat((Map<String, Long>) group.get("treeFramesSent")).containsKeys("HAVE", "GRAFT", "PRUNE");
         assertThat((Map<String, Long>) group.get("rumorsSentByStream")).isNotNull();
         assertThat(group).containsKeys("antiEntropyRounds", "lazyPeers");

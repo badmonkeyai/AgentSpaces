@@ -167,9 +167,46 @@ public final class TrafficPanel implements ConsolePanel {
         return rates;
     }
 
-    private static Map<String, Object> group(GroupRuntime runtime) {
+    private Map<String, Object> group(GroupRuntime runtime) {
         Map<String, Object> doc = new LinkedHashMap<>();
         doc.put("group", runtime.id().value());
+        // ISSUE-BootstrapCore FR-2 and FR-5: what this node relayed for the group, and how it found it.
+        PeerNode.RelayStats relay = node.relayStats().get(runtime.id());
+        Map<String, Object> relayed = new LinkedHashMap<>();
+        relayed.put("framesForwarded", relay == null ? 0L : relay.framesForwarded());
+        relayed.put("bytesForwarded", relay == null ? 0L : relay.bytesForwarded());
+        relayed.put("droppedNotMember", relay == null ? 0L : relay.droppedNotMember());
+        relayed.put("droppedByPolicy", relay == null ? 0L : relay.droppedByPolicy());
+        relayed.put("targets", node.relayStats(runtime.id()).size());
+        // JS-W-11: what this node did about being relayed (dials of a member's signalled endpoint).
+        PeerNode.OffloadStats offload = node.relayOffloadStats().get(runtime.id());
+        relayed.put("offloadAttempts", offload == null ? 0L : offload.attempts());
+        relayed.put("offloadOpened", offload == null ? 0L : offload.opened());
+        relayed.put("offloadFailed", offload == null ? 0L : offload.failed());
+        doc.put("relay", relayed);
+        Map<String, Object> bootstrap = new LinkedHashMap<>();
+        node.lastBeaconHint(runtime.id()).ifPresent(hint -> {
+            bootstrap.put("evidence", hint.evidence());
+            bootstrap.put("endpoints", hint.endpoints().stream()
+                    .map(e -> e.transport() + "://" + e.address()).toList());
+            bootstrap.put("ttlSeconds", hint.ttl().toSeconds());
+        });
+        List<Map<String, Object>> rows = new java.util.ArrayList<>();
+        for (ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain.Trace row : node.lastBootstrapTrace(runtime.id())) {
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("locator", row.locator());
+            r.put("millis", row.millis());
+            r.put("endpoints", row.endpoints());
+            r.put("evidence", row.evidence());
+            if (row.error() != null) {
+                r.put("error", row.error());
+            }
+            rows.add(r);
+        }
+        bootstrap.put("trace", rows);
+        bootstrap.put("advertised", node.advertisedEndpoints().stream()
+                .map(e -> e.transport() + "://" + e.address()).toList());
+        doc.put("bootstrap", bootstrap);
         List<GroupMembership.Member> members = runtime.membership().allMembers();
         doc.put("members", members.size());
         doc.put("suspects", members.stream().filter(GroupMembership.Member::suspect).count());

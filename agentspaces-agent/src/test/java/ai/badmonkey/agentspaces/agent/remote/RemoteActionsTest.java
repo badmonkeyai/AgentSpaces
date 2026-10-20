@@ -137,6 +137,57 @@ class RemoteActionsTest {
 
     @Test
     @Timeout(90)
+    void aForeignAssetCardListsItsOperationsBesideTheCardActions() throws Exception {
+        int seedPort = freePort();
+        Peer connector = startPeer(seedPort, 0);
+        Peer caller = startPeer(freePort(), seedPort);
+        Instant issued = Instant.now();
+        var signer = new ai.badmonkey.agentspaces.identity.AdvertisementSigner();
+        connector.discovery().publish(signer.sign(new ai.badmonkey.agentspaces.api.ad.AssetCard(
+                "aspace://" + connector.runtime().id().value() + "/asset/do/Inventory",
+                connector.identity().peerId(), connector.runtime().id(), issued, Duration.ofMinutes(10),
+                "do/Inventory", "workers://inventory/do/Inventory", "The inventory object",
+                "{sku, onHand}", "PT30S", Map.of(),
+                Map.of("read-ops", "getInventory", "invoke-ops", "reserveStock, releaseStock", "runtime", "workerd")),
+                connector.identity()));
+        // The caller's own asset is never an operation of its own.
+        caller.discovery().publish(signer.sign(new ai.badmonkey.agentspaces.api.ad.AssetCard(
+                "aspace://" + caller.runtime().id().value() + "/asset/kv/own",
+                caller.identity().peerId(), caller.runtime().id(), issued, Duration.ofMinutes(10),
+                "kv/own", "workers://inventory/kv/own", "mine", "{}", "PT30S", Map.of(), Map.of("read-ops", "get")),
+                caller.identity()));
+        RemoteActions remote = new RemoteActions(caller.discovery(), caller.identity().peerId(),
+                Map.of("work", caller.work()));
+        List<AssetOperation> operations = List.of();
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (operations.size() < 3 && System.nanoTime() < deadline) {
+            operations = remote.assetOperations();
+            Thread.sleep(100);
+        }
+        assertThat(operations.stream().map(AssetOperation::name)).containsExactly(
+                "getInventory on workers://inventory/do/Inventory",
+                "reserveStock on workers://inventory/do/Inventory",
+                "releaseStock on workers://inventory/do/Inventory");
+        assertThat(operations.get(0).kind()).isEqualTo(AssetOperation.Kind.READ);
+        assertThat(operations.get(1).kind()).isEqualTo(AssetOperation.Kind.INVOKE);
+        assertThat(operations.get(1).description()).isEqualTo("The inventory object");
+        // Without a carrier the operation is listed and refuses to run, naming what to wire.
+        AssetOperation reserve = operations.get(1);
+        assertThatThrownBy(() -> reserve.invoke(Map.of("sku", "a"), Duration.ofSeconds(1)))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("AssetInvocations");
+        // With one, the call carries the card, the operation, and the parameters.
+        List<String> carried = new ArrayList<>();
+        remote.assetInvoker((card, operation, params, timeout) -> {
+            carried.add(card.asset() + ":" + operation + ":" + params.get("sku"));
+            return Optional.of(Map.of("ok", true));
+        });
+        assertThat(remote.assetOperations().get(1).invoke(Map.of("sku", "a"), Duration.ofSeconds(1)))
+                .contains(Map.of("ok", true));
+        assertThat(carried).containsExactly("do/Inventory:reserveStock:a");
+    }
+
+    @Test
+    @Timeout(90)
     void aForeignCardBecomesATypedActionWhoseInvocationRoundTripsTheFleet() throws Exception {
         int seedPort = freePort();
         Peer worker = startPeer(seedPort, 0);

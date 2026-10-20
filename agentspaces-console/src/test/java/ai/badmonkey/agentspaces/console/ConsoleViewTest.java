@@ -200,6 +200,59 @@ class ConsoleViewTest {
     }
 
     @Test
+    void memberRowsCarryTheConnectionSchemeAndTheResidencyHintAndAssetRowsTheirOperations() {
+        // srad/agentspaces-js.md JS-N-07: a browser member behind a ws listener, a Java member on tls.
+        PeerIdentity browser = PeerIdentity.generate();
+        PeerIdentity jvm = PeerIdentity.generate();
+        GroupId group = GroupId.of("zConsoleGroup");
+        var membership = new ai.badmonkey.agentspaces.peering.membership.GroupMembership(self, clock,
+                new java.util.Random(1), ai.badmonkey.agentspaces.peering.membership.GroupMembership.Config.defaults());
+        ai.badmonkey.agentspaces.api.ad.PeerAdvertisement browserAd = new ai.badmonkey.agentspaces.api.ad.PeerAdvertisement(
+                "aspace://" + group.value() + "/peer/" + browser.peerId().value(), browser.peerId(), group,
+                clock.instant(), Duration.ofMinutes(10), List.of(), java.util.Set.of(),
+                Map.of("js.residency", "resident", "wire.session", "1"));
+        ai.badmonkey.agentspaces.api.ad.PeerAdvertisement javaAd = new ai.badmonkey.agentspaces.api.ad.PeerAdvertisement(
+                "aspace://" + group.value() + "/peer/" + jvm.peerId().value(), jvm.peerId(), group,
+                clock.instant(), Duration.ofMinutes(10),
+                List.of(new ai.badmonkey.agentspaces.api.ad.PeerAdvertisement.Endpoint("tls", "10.0.0.5:7501", 0)),
+                java.util.Set.of(ai.badmonkey.agentspaces.api.ad.PeerAdvertisement.PeerRole.RELAY), Map.of());
+        membership.onPeerAdvertisement(browserAd);
+        membership.onPeerAdvertisement(javaAd);
+        AssetCard inventory = new AssetCard("inventory:do/Inventory", jvm.peerId(), group, clock.instant(),
+                Duration.ofMinutes(10), "do/Inventory", "workers://inventory/do/Inventory", "The inventory object",
+                "{sku, onHand}", "PT30S", Map.of(),
+                Map.of("read-ops", "getInventory", "invoke-ops", "reserveStock, releaseStock", "runtime", "workerd"));
+        ConsoleView v = ConsoleView.builder()
+                .space("tasks", space, TaskEntry.class)
+                .clock(clock)
+                .members(membership::allMembers)
+                .channelModes(() -> Map.of(browser.peerId(), "session", jvm.peerId(), "attested"))
+                .connectionSchemes(() -> Map.of(browser.peerId(), "ws", jvm.peerId(), "tls"))
+                .ads(() -> List.of(browserAd, javaAd, inventory))
+                .build();
+        try {
+            Map<String, ConsoleView.MemberRow> rows = new java.util.HashMap<>();
+            v.members().forEach(row -> rows.put(row.peer(), row));
+            ConsoleView.MemberRow browserRow = rows.get(browser.peerId().value());
+            assertThat(browserRow.scheme()).isEqualTo("ws");
+            assertThat(browserRow.channel()).isEqualTo("session");
+            assertThat(browserRow.residency()).isEqualTo("resident");
+            assertThat(browserRow.endpoints()).isEmpty();
+            ConsoleView.MemberRow javaRow = rows.get(jvm.peerId().value());
+            assertThat(javaRow.scheme()).isEqualTo("tls");
+            assertThat(javaRow.residency()).as("a JVM peer advertises no residency").isEmpty();
+            assertThat(javaRow.endpoints()).containsExactly("tls://10.0.0.5:7501");
+            assertThat(javaRow.roles()).containsExactly("RELAY");
+            ConsoleView.AdRow asset = v.ads().stream().filter(row -> row.kind().equals("asset")).findFirst().orElseThrow();
+            assertThat(asset.title()).isEqualTo("do/Inventory");
+            assertThat(asset.detail()).contains("workers://inventory/do/Inventory")
+                    .contains("read: getInventory").contains("invoke: reserveStock, releaseStock");
+        } finally {
+            v.close();
+        }
+    }
+
+    @Test
     void membersDefaultsEmptyWithoutASupplier() {
         ConsoleView v = newView();
         assertThat(v.members()).isEmpty();

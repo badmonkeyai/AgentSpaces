@@ -150,6 +150,44 @@ class MulticastBeaconTest {
         assertThat(atB).containsExactly("hello over the LAN");
     }
 
+    /**
+     * SPEC §10.1 v0.1.19 (SRAD dtls-support scenario 9): members holding the group's content key
+     * find each other through sealed datagrams; the air carries no group id or PeerID; a node
+     * holding another key reads none of them, nor they its.
+     */
+    @Test
+    void sealedBeaconsAreFoundByKeyHoldersAndReadByNobodyElse() throws Exception {
+        byte[] contentKey = new byte[32];
+        java.util.Arrays.fill(contentKey, (byte) 3);
+        PeerNode a = beaconing("a", 1);
+        PeerNode b = beaconing("b", 2);
+        PeerNode outsider = beaconing("c", 3);
+        a.beaconKey(groupId, contentKey);
+        b.beaconKey(groupId, contentKey);
+        byte[] otherKey = new byte[32];
+        java.util.Arrays.fill(otherKey, (byte) 4);
+        outsider.beaconKey(groupId, otherKey); // seals under another key: neither side reads the other
+        GroupRuntime ra = a.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime rb = b.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime rc = outsider.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+
+        tickAll(3);
+
+        assertThat(ra.membership().allMembers()).extracting(GroupMembership.Member::id)
+                .contains(b.peerId()).doesNotContain(outsider.peerId());
+        assertThat(rb.membership().allMembers()).extracting(GroupMembership.Member::id).contains(a.peerId());
+        assertThat(rc.membership().allMembers()).extracting(GroupMembership.Member::id)
+                .doesNotContain(a.peerId(), b.peerId());
+        for (SimDatagrams.Endpoint endpoint : air.endpoints) {
+            for (byte[] datagram : endpoint.sent) {
+                if (BeaconSeal.isSealed(datagram)) {
+                    String text = new String(datagram, java.nio.charset.StandardCharsets.ISO_8859_1);
+                    assertThat(text).doesNotContain(groupId.value()).doesNotContain(a.peerId().value());
+                }
+            }
+        }
+    }
+
     /** Spec §10.1/§11: a datagram whose advertisement is tampered, foreign, or oversized is dropped with no side effect. */
     @Test
     void tamperedForeignAndOversizedDatagramsAreIgnored() throws Exception {
@@ -216,5 +254,28 @@ class MulticastBeaconTest {
                 .fromBytes(signed.adBytes(), PeerAdvertisement.class);
         assertThat(ad.issuer()).isEqualTo(a.peerId());
         assertThat(ad.group()).isEqualTo(groupId);
+    }
+
+    /** The beacon as a locator (DB-L-08): what a node heard on the segment, with the ad's remaining life. */
+    @Test
+    void theMulticastLocatorReportsWhatTheBeaconHeard() throws Exception {
+        PeerNode a = beaconing("a", 1);
+        PeerNode b = beaconing("b", 2);
+        a.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        b.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        ai.badmonkey.agentspaces.peering.bootstrap.MulticastLocator locator =
+                new ai.badmonkey.agentspaces.peering.bootstrap.MulticastLocator(b);
+        ai.badmonkey.agentspaces.api.spi.BeaconRequest request = new ai.badmonkey.agentspaces.api.spi.BeaconRequest(
+                "lan", java.util.Optional.of(groupAd.group()), "mem", java.util.Set.of("mem"));
+        assertThat(locator.locate(request).isEmpty()).as("nothing heard yet").isTrue();
+        tickAll(3);
+        ai.badmonkey.agentspaces.api.spi.BeaconHint hint = locator.locate(request);
+        assertThat(hint.endpoints()).extracting(ai.badmonkey.agentspaces.api.ad.PeerAdvertisement.Endpoint::address)
+                .containsExactly("a");
+        assertThat(hint.ttl()).isPositive();
+        assertThat(hint.evidence()).contains("1 peer");
+        assertThat(b.beaconLearned(groupAd.group()).peers()).isEqualTo(1);
+        assertThat(locator.locate(new ai.badmonkey.agentspaces.api.spi.BeaconRequest("lan", java.util.Optional.empty(),
+                "mem", java.util.Set.of("mem"))).isEmpty()).as("no group, nothing to report").isTrue();
     }
 }

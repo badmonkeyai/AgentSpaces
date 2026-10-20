@@ -58,6 +58,14 @@ public class AgentSpacesProperties {
 
     private String keystore;
     private String bind;
+    /**
+     * The address other peers dial, carried in this peer's self-advertisement
+     * in place of {@code bind}: {@code host:port} or {@code scheme://host:port}.
+     * Set it on a host that binds every interface, sits behind a NAT, or runs
+     * in a pod whose routable address the platform assigns. Blank: the bind
+     * address is advertised, as before.
+     */
+    private String advertise;
     private List<String> roles = new ArrayList<>();
     private long tickMillis = 250;
     private long cardRefreshMillis = 300_000;
@@ -96,6 +104,35 @@ public class AgentSpacesProperties {
     /** The opt-in LAN multicast bootstrap beacon ({@code agentspaces.multicast.*}, spec §10.1). */
     private Multicast multicast = new Multicast();
 
+    /** Relay settings ({@code agentspaces.relay.*}). */
+    private Relay relay = new Relay();
+
+    /**
+     * What this peer forwards as a {@code RELAY} (SPEC §5.4; ISSUE-BootstrapCore FR-2):
+     * a byte budget per group per day, enforced through {@code RelayPolicy.dailyBudget}
+     * when no {@code RelayPolicy} bean is defined. Unset: every forward the membership
+     * check allows.
+     */
+    public static class Relay {
+        private Long budgetBytesPerDay;
+
+        public Long getBudgetBytesPerDay() {
+            return budgetBytesPerDay;
+        }
+
+        public void setBudgetBytesPerDay(Long budgetBytesPerDay) {
+            this.budgetBytesPerDay = budgetBytesPerDay;
+        }
+    }
+
+    public Relay getRelay() {
+        return relay;
+    }
+
+    public void setRelay(Relay relay) {
+        this.relay = relay;
+    }
+
     /**
      * One group to join. Exactly one of {@code founding} and {@code join}
      * identifies the group: {@code founding} derives a GroupId every member
@@ -115,6 +152,70 @@ public class AgentSpacesProperties {
         private ContentKeyRotation contentKeyRotation = new ContentKeyRotation();
         private List<String> seeds = new ArrayList<>();
         private List<SpaceDef> spaces = new ArrayList<>();
+        /**
+         * Who may join (spec §5.1): {@code open} (default) or {@code invite},
+         * under which a candidate must present a join credential issued by the
+         * founder, or under a delegation the founder signed, in its
+         * self-advertisement. With {@code founding}, the founder is the peer
+         * named by {@code founder}, or this peer when that is unset; every
+         * member must name the same founder or they admit differently.
+         */
+        private String membership = "open";
+        /**
+         * The founder's PeerId for an {@code invite} group founded from a
+         * string: the issuer whose credentials admit. Unset on the founder
+         * itself (its own identity is the founder); required on every other
+         * member, which the startup refusal says when a credential is set
+         * without it.
+         */
+        private String founder;
+        /**
+         * The join credential this peer presents ({@code aspace:join}): a
+         * founder-issued or delegated credential string, as
+         * {@code JoinCredentials} produces. Blank for the founder and for
+         * open groups.
+         */
+        private String joinCredential;
+        /**
+         * The signed founding advertisement this peer joins with, as the
+         * base64 CBOR a beacon document carries: the self-certifying group
+         * this peer founded itself (a social creator), or one it was handed
+         * out of band. Exclusive with {@code founding} and {@code join}; the
+         * GroupId is the document's own.
+         */
+        private String foundingDocument;
+
+        public String getFoundingDocument() {
+            return foundingDocument;
+        }
+
+        public void setFoundingDocument(String foundingDocument) {
+            this.foundingDocument = foundingDocument;
+        }
+
+        public String getMembership() {
+            return membership;
+        }
+
+        public void setMembership(String membership) {
+            this.membership = membership;
+        }
+
+        public String getFounder() {
+            return founder;
+        }
+
+        public void setFounder(String founder) {
+            this.founder = founder;
+        }
+
+        public String getJoinCredential() {
+            return joinCredential;
+        }
+
+        public void setJoinCredential(String joinCredential) {
+            this.joinCredential = joinCredential;
+        }
 
         /**
          * Content-key rotation for this group (SPEC §11a.3, v0.1.13). Every
@@ -321,6 +422,14 @@ public class AgentSpacesProperties {
 
     public void setKeystore(String keystore) {
         this.keystore = keystore;
+    }
+
+    public String getAdvertise() {
+        return advertise;
+    }
+
+    public void setAdvertise(String advertise) {
+        this.advertise = advertise;
     }
 
     public String getBind() {
@@ -557,7 +666,21 @@ public class AgentSpacesProperties {
     public static class Multicast {
 
         private boolean enabled;
+        private boolean seal;
         private String group = "239.255.42.99:7787";
+
+        /**
+         * Seal each beacon datagram under its group's {@code content-key} (SPEC
+         * §10.1 v0.1.19): members holding the key find each other and a
+         * bystander reads nothing; groups with no content key stay plain.
+         */
+        public boolean isSeal() {
+            return seal;
+        }
+
+        public void setSeal(boolean seal) {
+            this.seal = seal;
+        }
         private long intervalMillis = 5_000;
 
         public boolean isEnabled() {
@@ -755,6 +878,7 @@ public class AgentSpacesProperties {
         public static class Grants {
 
             private List<String> raftVoter = new ArrayList<>();
+            private List<String> raftClient = new ArrayList<>();
             private List<String> directiveIssuer = new ArrayList<>();
             private List<String> connectorServe = new ArrayList<>();
             private List<String> keyHolder = new ArrayList<>();
@@ -771,6 +895,18 @@ public class AgentSpacesProperties {
 
             public void setRaftVoter(List<String> raftVoter) {
                 this.raftVoter = raftVoter;
+            }
+
+            /**
+             * Peers (or agents) that may submit commands to an ordered log without voting
+             * ({@code RAFT_CLIENT}, srad/agentspaces-js.md JS-V-05); empty permits every admitted member.
+             */
+            public List<String> getRaftClient() {
+                return raftClient;
+            }
+
+            public void setRaftClient(List<String> raftClient) {
+                this.raftClient = raftClient;
             }
 
             public List<String> getDirectiveIssuer() {
@@ -898,6 +1034,459 @@ public class AgentSpacesProperties {
 
         private String channelAuth;
         private Tls tls = new Tls();
+        private Listener quic = new Listener();
+        private Dtls dtls = new Dtls();
+        private Udp udp = new Udp();
+        private Http ws = new Http("/aspace");
+        private Http wss = new Http("/aspace");
+        private Http http = new Http("/aspace/h");
+        private Http https = new Http("/aspace/h");
+        private Webrtc webrtc = new Webrtc();
+
+        /** The {@code webrtc} block ({@code agentspaces.transport.webrtc.*}); needs agentspaces-transport-webrtc. */
+        public Webrtc getWebrtc() {
+            return webrtc;
+        }
+
+        public void setWebrtc(Webrtc webrtc) {
+            this.webrtc = webrtc;
+        }
+
+        /** The {@code ws} listener block ({@code agentspaces.transport.ws.*}); needs agentspaces-transport-http. */
+        public Http getWs() {
+            return ws;
+        }
+
+        public void setWs(Http ws) {
+            this.ws = ws;
+        }
+
+        /** The {@code wss} listener block ({@code agentspaces.transport.wss.*}); needs agentspaces-transport-http. */
+        public Http getWss() {
+            return wss;
+        }
+
+        public void setWss(Http wss) {
+            this.wss = wss;
+        }
+
+        /** The {@code http} exchange block ({@code agentspaces.transport.http.*}); needs agentspaces-transport-http. */
+        public Http getHttp() {
+            return http;
+        }
+
+        public void setHttp(Http http) {
+            this.http = http;
+        }
+
+        /** The {@code https} exchange block ({@code agentspaces.transport.https.*}); needs agentspaces-transport-http. */
+        public Http getHttps() {
+            return https;
+        }
+
+        public void setHttps(Http https) {
+            this.https = https;
+        }
+
+        /**
+         * An HTTP binding's block (SRAD agentspaces-js §3.3, JS-H-10): the
+         * listener keys plus the path, the browser-origin allowlist, and the
+         * binding's tunables. {@code ws} and {@code http} may share a
+         * {@code bind}, as may {@code wss} and {@code https}.
+         */
+        /**
+         * The {@code webrtc} block (SRAD agentspaces-js §3.4, §4.3, JS-N-04): {@code enabled}
+         * registers the binding and accepts offers, advertising {@code Endpoint("webrtc", "sig",
+         * priority)} with the priority defaulting after every stream endpoint (JS-W-08); the
+         * address is always {@code sig}, so {@code bind} and {@code advertise} are not used.
+         * The ICE servers default to none (JS-W-07, decision 9); every other value is a
+         * per-peer rate, a per-session count, or a per-body size (JS-W-10).
+         */
+        public static class Webrtc extends Listener {
+
+            private java.util.List<IceServer> iceServers = java.util.List.of();
+            private java.time.Duration dialTimeout = java.time.Duration.ofSeconds(15);
+            private int offersPerPeerPerMinute = 6;
+            private int candidatesPerSession = 64;
+            private int maxSignalBytes = 64 * 1024;
+            private Offload offload = new Offload();
+
+            /**
+             * The relay offload (SRAD agentspaces-js JS-W-11, {@code PeerNode.RelayOffload}): a node
+             * whose frames to or from a member cross a relay dials the member's {@code webrtc}
+             * endpoint from its tick once more than {@code frames-per-minute} of them did in a
+             * sliding minute, and after a failed dial waits {@code retry-after} before the next.
+             * Settings, not caps; they apply to the node whether or not this block is enabled,
+             * since the node dials only a member whose endpoint a registered binding signals.
+             */
+            public static class Offload {
+
+                private int framesPerMinute = 30;
+                private java.time.Duration retryAfter = java.time.Duration.ofMinutes(5);
+
+                public int getFramesPerMinute() {
+                    return framesPerMinute;
+                }
+
+                public void setFramesPerMinute(int framesPerMinute) {
+                    this.framesPerMinute = framesPerMinute;
+                }
+
+                public java.time.Duration getRetryAfter() {
+                    return retryAfter;
+                }
+
+                public void setRetryAfter(java.time.Duration retryAfter) {
+                    this.retryAfter = retryAfter;
+                }
+            }
+
+            /** One ICE server entry: {@code urls}, and the TURN {@code username} and {@code credential}. */
+            public static class IceServer {
+
+                private java.util.List<String> urls = java.util.List.of();
+                private String username;
+                private String credential;
+
+                public java.util.List<String> getUrls() {
+                    return urls;
+                }
+
+                public void setUrls(java.util.List<String> urls) {
+                    this.urls = urls;
+                }
+
+                public String getUsername() {
+                    return username;
+                }
+
+                public void setUsername(String username) {
+                    this.username = username;
+                }
+
+                public String getCredential() {
+                    return credential;
+                }
+
+                public void setCredential(String credential) {
+                    this.credential = credential;
+                }
+            }
+
+            /** STUN and TURN servers; empty gathers host and mDNS candidates alone. */
+            public java.util.List<IceServer> getIceServers() {
+                return iceServers;
+            }
+
+            public void setIceServers(java.util.List<IceServer> iceServers) {
+                this.iceServers = iceServers;
+            }
+
+            /** The bound on a dial (signalling, ICE, DTLS, channel open) and the life of a pending session. */
+            public java.time.Duration getDialTimeout() {
+                return dialTimeout;
+            }
+
+            public void setDialTimeout(java.time.Duration dialTimeout) {
+                this.dialTimeout = dialTimeout;
+            }
+
+            public int getOffersPerPeerPerMinute() {
+                return offersPerPeerPerMinute;
+            }
+
+            public void setOffersPerPeerPerMinute(int offersPerPeerPerMinute) {
+                this.offersPerPeerPerMinute = offersPerPeerPerMinute;
+            }
+
+            public int getCandidatesPerSession() {
+                return candidatesPerSession;
+            }
+
+            public void setCandidatesPerSession(int candidatesPerSession) {
+                this.candidatesPerSession = candidatesPerSession;
+            }
+
+            public int getMaxSignalBytes() {
+                return maxSignalBytes;
+            }
+
+            public void setMaxSignalBytes(int maxSignalBytes) {
+                this.maxSignalBytes = maxSignalBytes;
+            }
+
+            /** The relay offload settings ({@code agentspaces.transport.webrtc.offload.*}). */
+            public Offload getOffload() {
+                return offload;
+            }
+
+            public void setOffload(Offload offload) {
+                this.offload = offload;
+            }
+        }
+
+        public static class Http extends Listener {
+
+            private String path;
+            private java.util.List<String> allowedOrigins = java.util.List.of();
+            private java.time.Duration idleTimeout = java.time.Duration.ofSeconds(60);
+            private java.time.Duration pingInterval = java.time.Duration.ofSeconds(30);
+            private java.time.Duration longPoll = java.time.Duration.ofSeconds(25);
+            private int opensPerSourcePerSecond = 4;
+
+            public Http() {
+                this("/aspace");
+            }
+
+            Http(String path) {
+                this.path = path;
+            }
+
+            /** The path served: {@code /aspace} for ws and wss, {@code /aspace/h} for http and https. */
+            public String getPath() {
+                return path;
+            }
+
+            public void setPath(String path) {
+                this.path = path;
+            }
+
+            /** Browser origins allowed to connect ({@code scheme://host[:port]}); empty refuses every browser. */
+            public java.util.List<String> getAllowedOrigins() {
+                return allowedOrigins;
+            }
+
+            public void setAllowedOrigins(java.util.List<String> allowedOrigins) {
+                this.allowedOrigins = allowedOrigins == null ? java.util.List.of() : allowedOrigins;
+            }
+
+            /** A connection or exchange session silent this long closes (60s). */
+            public java.time.Duration getIdleTimeout() {
+                return idleTimeout;
+            }
+
+            public void setIdleTimeout(java.time.Duration idleTimeout) {
+                this.idleTimeout = idleTimeout;
+            }
+
+            /** A WebSocket idle this long for writing sends a ping (30s). */
+            public java.time.Duration getPingInterval() {
+                return pingInterval;
+            }
+
+            public void setPingInterval(java.time.Duration pingInterval) {
+                this.pingInterval = pingInterval;
+            }
+
+            /** How long an exchange download request is held with nothing to send (25s). */
+            public java.time.Duration getLongPoll() {
+                return longPoll;
+            }
+
+            public void setLongPoll(java.time.Duration longPoll) {
+                this.longPoll = longPoll;
+            }
+
+            /** Exchange sessions one source address may open per second (4); a rate, never a cap. */
+            public int getOpensPerSourcePerSecond() {
+                return opensPerSourcePerSecond;
+            }
+
+            public void setOpensPerSourcePerSecond(int opensPerSourcePerSecond) {
+                this.opensPerSourcePerSecond = opensPerSourcePerSecond;
+            }
+        }
+
+        /**
+         * The bare UDP listener block ({@code agentspaces.transport.udp.*}): plaintext,
+         * registered only under the dev-local profile or with {@code allow-plaintext};
+         * needs agentspaces-transport-dtls.
+         */
+        public Udp getUdp() {
+            return udp;
+        }
+
+        public void setUdp(Udp udp) {
+            this.udp = udp;
+        }
+
+        /** The bare UDP block: the listener keys plus the explicit plaintext opt-in. */
+        public static class Udp extends Listener {
+
+            private boolean allowPlaintext;
+
+            /** Permit plaintext UDP outside the dev-local profile (SRAD dtls-support DT-U-04). */
+            public boolean isAllowPlaintext() {
+                return allowPlaintext;
+            }
+
+            public void setAllowPlaintext(boolean allowPlaintext) {
+                this.allowPlaintext = allowPlaintext;
+            }
+        }
+
+        /** The QUIC listener block ({@code agentspaces.transport.quic.*}); needs agentspaces-transport-quic. */
+        public Listener getQuic() {
+            return quic;
+        }
+
+        public void setQuic(Listener quic) {
+            this.quic = quic;
+        }
+
+        /** The DTLS listener block ({@code agentspaces.transport.dtls.*}); needs agentspaces-transport-dtls. */
+        public Dtls getDtls() {
+            return dtls;
+        }
+
+        public void setDtls(Dtls dtls) {
+            this.dtls = dtls;
+        }
+
+        /**
+         * One optional binding's listener block (SRAD dtls-support §3.6):
+         * {@code enabled} registers the binding; with a {@code bind} it also
+         * listens and advertises, at {@code priority} (default: after the
+         * {@code agentspaces.bind} endpoint, in block order). Attesting
+         * bindings take their credential and trust from
+         * {@code agentspaces.transport.tls.*}.
+         */
+        public static class Listener {
+
+            private boolean enabled;
+            private String bind;
+            private String advertise;
+            private Integer priority;
+
+            /** Register the binding. */
+            public boolean isEnabled() {
+                return enabled;
+            }
+
+            public void setEnabled(boolean enabled) {
+                this.enabled = enabled;
+            }
+
+            /** {@code host:port} to listen on and advertise; blank for a dial-only binding. */
+            public String getBind() {
+                return bind;
+            }
+
+            public void setBind(String bind) {
+                this.bind = bind;
+            }
+
+            /** {@code host:port} carried in the advertisement in place of {@code bind}. */
+            public String getAdvertise() {
+                return advertise;
+            }
+
+            public void setAdvertise(String advertise) {
+                this.advertise = advertise;
+            }
+
+            /** Advertised priority (spec §5.5); lower dials first. */
+            public Integer getPriority() {
+                return priority;
+            }
+
+            public void setPriority(Integer priority) {
+                this.priority = priority;
+            }
+        }
+
+        /**
+         * The DTLS listener block ({@code agentspaces.transport.dtls.*}, SRAD
+         * dtls-support appendix C): the listener keys plus the binding's
+         * tunables, each defaulted.
+         */
+        public static class Dtls extends Listener {
+
+            private String attestation = "identity";
+            private java.util.List<String> protocols = java.util.List.of("DTLSv1.2");
+            private boolean connectionId = true;
+            private int mtu = 1_200;
+            private int window = 64;
+            private java.time.Duration idleTimeout = java.time.Duration.ofSeconds(60);
+            private int maxHalfOpen = 1_024;
+            private int helloRatePerSource = 8;
+
+            /**
+             * {@code identity} (the default: the identity-endorsed channel
+             * certificate, or CA mode when a trust store is set) or {@code none}
+             * (encryption only, never attesting).
+             */
+            public String getAttestation() {
+                return attestation;
+            }
+
+            public void setAttestation(String attestation) {
+                this.attestation = attestation;
+            }
+
+            /** DTLS versions offered; DTLSv1.2 is what BouncyCastle negotiates today. */
+            public java.util.List<String> getProtocols() {
+                return protocols;
+            }
+
+            public void setProtocols(java.util.List<String> protocols) {
+                this.protocols = protocols;
+            }
+
+            /** Negotiate RFC 9146 Connection ID, so associations survive NAT rebinding. */
+            public boolean isConnectionId() {
+                return connectionId;
+            }
+
+            public void setConnectionId(boolean connectionId) {
+                this.connectionId = connectionId;
+            }
+
+            /** Datagram budget in bytes (576 to 9,000). */
+            public int getMtu() {
+                return mtu;
+            }
+
+            public void setMtu(int mtu) {
+                this.mtu = mtu;
+            }
+
+            /** DATA PDUs in flight per association (4 to 1,024). */
+            public int getWindow() {
+                return window;
+            }
+
+            public void setWindow(int window) {
+                this.window = window;
+            }
+
+            /** Silence after which an association fails (10 s to 10 min); keepalive at a quarter of it. */
+            public java.time.Duration getIdleTimeout() {
+                return idleTimeout;
+            }
+
+            public void setIdleTimeout(java.time.Duration idleTimeout) {
+                this.idleTimeout = idleTimeout;
+            }
+
+            /** Unfinished handshakes per listener (16 to 65,536). */
+            public int getMaxHalfOpen() {
+                return maxHalfOpen;
+            }
+
+            public void setMaxHalfOpen(int maxHalfOpen) {
+                this.maxHalfOpen = maxHalfOpen;
+            }
+
+            /** ClientHellos accepted per second from one source address (1 to 1,000). */
+            public int getHelloRatePerSource() {
+                return helloRatePerSource;
+            }
+
+            public void setHelloRatePerSource(int helloRatePerSource) {
+                this.helloRatePerSource = helloRatePerSource;
+            }
+        }
 
         public String getChannelAuth() {
             return channelAuth;

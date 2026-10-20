@@ -59,6 +59,54 @@ public interface AssetProvider {
     QueryResult query(String asset, Map<String, String> parameters);
 
     /**
+     * Runs one operation the asset's card allowlists in {@code invoke-ops}
+     * (srad/agentspaces-js.md JS-C-03, appendix F). The {@link ConnectorRuntime}
+     * refuses an operation the card does not list before this is called, and
+     * passes the invocation's id so the target can deduplicate a retry
+     * (JS-C-04). The default refuses every operation: a provider that exposes
+     * none needs no override.
+     *
+     * @param asset        the asset name from the card
+     * @param operation    the operation, one of the card's {@code invoke-ops}
+     * @param params       the operation's parameters, by declared name
+     * @param invocationId the invocation's id, constant across retries
+     * @return the result, or an error naming the rule that refused it
+     */
+    default InvokeResult invoke(String asset, String operation, Map<String, String> params,
+                                String invocationId) {
+        return InvokeResult.failed("unknown-operation", "provider",
+                "the provider of '" + asset + "' exposes no operations");
+    }
+
+    /**
+     * One operation's answer.
+     *
+     * @param ok     whether the operation ran and succeeded
+     * @param result the operation's result on success; {@code rule} and
+     *               {@code detail} on an error
+     * @param error  the appendix F error code when {@code ok} is false
+     *               ({@code unknown-operation}, {@code bad-params},
+     *               {@code refused-scope}, {@code target-error},
+     *               {@code timeout}); {@code null} on success
+     */
+    record InvokeResult(boolean ok, Map<String, String> result, String error) {
+
+        public InvokeResult {
+            result = Map.copyOf(java.util.Objects.requireNonNull(result, "result"));
+        }
+
+        /** Returns a successful result. */
+        public static InvokeResult of(Map<String, String> result) {
+            return new InvokeResult(true, result, null);
+        }
+
+        /** Returns a failed result naming the rule that refused the operation. */
+        public static InvokeResult failed(String error, String rule, String detail) {
+            return new InvokeResult(false, Map.of("rule", rule, "detail", detail), error);
+        }
+    }
+
+    /**
      * One query's answer.
      *
      * @param rows  the result rows; column name to value

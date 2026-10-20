@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
   </parent>
 
   <artifactId>agentspaces-spring-boot-starter</artifactId>
@@ -49,6 +49,27 @@
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-capabilities</artifactId>
       <version>${project.version}</version>
+    </dependency>
+    <!-- The listener blocks' bindings (SRAD dtls-support DT-H-08): optional, so
+         an application adds agentspaces-transport-dtls or -quic to turn a block on. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-dtls</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-quic</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <!-- The ws, wss, http, https blocks (SRAD agentspaces-js JS-H-10). -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-http</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
     </dependency>
     <!-- Off unless agentspaces.a2a.enabled=true (TODO item 7). -->
     <dependency>

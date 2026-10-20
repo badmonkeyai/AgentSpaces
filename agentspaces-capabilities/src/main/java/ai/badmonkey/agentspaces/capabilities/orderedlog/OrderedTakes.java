@@ -171,6 +171,30 @@ public final class OrderedTakes {
     public static OrderedTakes over(CapabilityPipes pipes, CborCodec codec, PeerIdentity identity,
                                     String agentName, List<PeerId> members, InstantSource clock,
                                     long seed, ReplicatedSpace space) {
+        return over(pipes, codec, identity, agentName, members, clock, seed, space,
+                new MemoryLogStore());
+    }
+
+    /**
+     * As {@link #over(CapabilityPipes, CborCodec, PeerIdentity, String, List, InstantSource, long,
+     * ReplicatedSpace)}, with the log's term, vote, and entries kept in {@code store}
+     * (srad/agentspaces-js.md JS-N-06), so a voter built over a {@link FileLogStore}
+     * rejoins after a restart with its vote intact.
+     *
+     * @param pipes     the group's capability pipes
+     * @param codec     the codec
+     * @param identity  this peer's identity
+     * @param agentName the agent the coordinator takes as
+     * @param members   every log member's PeerId, the same list on every member
+     * @param clock     the time source
+     * @param seed      a per-member election-timer seed
+     * @param space     the space takes are coordinated over
+     * @param store     the log's durable state
+     * @return the coordinator, its {@link #raft()} constructed and wired
+     */
+    public static OrderedTakes over(CapabilityPipes pipes, CborCodec codec, PeerIdentity identity,
+                                    String agentName, List<PeerId> members, InstantSource clock,
+                                    long seed, ReplicatedSpace space, LogStore store) {
         java.util.concurrent.atomic.AtomicReference<OrderedTakes> ref =
                 new java.util.concurrent.atomic.AtomicReference<>();
         RaftLog raft = new RaftLog(pipes, codec, identity.peerId(), members, clock, seed,
@@ -179,7 +203,7 @@ public final class OrderedTakes {
                     if (ordered != null) {
                         ordered.onCommand(command, index);
                     }
-                });
+                }, store);
         OrderedTakes ordered = new OrderedTakes(raft, space, identity, agentName, codec, clock);
         ref.set(ordered);
         return ordered;
@@ -194,6 +218,19 @@ public final class OrderedTakes {
                                     ai.badmonkey.agentspaces.api.spi.AgentIdentity holder,
                                     List<PeerId> members, InstantSource clock, long seed,
                                     ReplicatedSpace space) {
+        return over(pipes, codec, identity, holder, members, clock, seed, space,
+                new MemoryLogStore());
+    }
+
+    /**
+     * As {@link #over(CapabilityPipes, CborCodec, PeerIdentity,
+     * ai.badmonkey.agentspaces.api.spi.AgentIdentity, List, InstantSource, long,
+     * ReplicatedSpace)}, with the log's durable state in {@code store} (JS-N-06).
+     */
+    public static OrderedTakes over(CapabilityPipes pipes, CborCodec codec, PeerIdentity identity,
+                                    ai.badmonkey.agentspaces.api.spi.AgentIdentity holder,
+                                    List<PeerId> members, InstantSource clock, long seed,
+                                    ReplicatedSpace space, LogStore store) {
         java.util.concurrent.atomic.AtomicReference<OrderedTakes> ref =
                 new java.util.concurrent.atomic.AtomicReference<>();
         RaftLog raft = new RaftLog(pipes, codec, identity.peerId(), members, clock, seed,
@@ -202,7 +239,7 @@ public final class OrderedTakes {
                     if (ordered != null) {
                         ordered.onCommand(command, index);
                     }
-                });
+                }, store);
         OrderedTakes ordered = new OrderedTakes(raft, space, identity, holder, codec, clock);
         ref.set(ordered);
         return ordered;

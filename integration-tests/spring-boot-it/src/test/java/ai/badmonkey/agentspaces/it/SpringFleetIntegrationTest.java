@@ -153,6 +153,55 @@ class SpringFleetIntegrationTest {
         }
     }
 
+    /**
+     * SRAD dtls-support DT-H-11: two applications form one fleet over DTLS from
+     * properties alone, with attestation required and no TCP listener at all.
+     */
+    @Test
+    @Timeout(180)
+    void twoSpringApplicationsFormOneFleetOverDtlsFromPropertiesAlone() throws Exception {
+        int seedPort;
+        try (java.net.DatagramSocket probe = new java.net.DatagramSocket(0)) {
+            seedPort = probe.getLocalPort();
+        }
+        try (ConfigurableApplicationContext first = bootDtls(WriterOnlyApp.class, seedPort, 0);
+             ConfigurableApplicationContext second = bootDtls(FleetItApp.class, 0, seedPort)) {
+            AgentSpaces writer = first.getBean(AgentSpaces.class);
+            writer.group("it-fleet").space("tasks")
+                    .write(new ItTask("over-dtls", 3), Lease.of(Duration.ofMinutes(10)));
+            assertThat(writer.group("it-fleet").space("findings")
+                    .read(Template.of(ItFinding.class), Duration.ofSeconds(60)))
+                    .hasValueSatisfying(finding -> assertThat(finding.summary())
+                            .isEqualTo("done: over-dtls"));
+            ai.badmonkey.agentspaces.peering.node.PeerNode node =
+                    first.getBean(ai.badmonkey.agentspaces.peering.node.PeerNode.class);
+            assertThat(node.requiresAttestation()).isTrue();
+            assertThat(node.transportSchemes()).containsExactly("dtls");
+        }
+    }
+
+    private static ConfigurableApplicationContext bootDtls(Class<?> app, int port, int seedPort) {
+        java.util.Map<String, Object> properties = new java.util.HashMap<>(Map.of(
+                "spring.main.web-application-type", "none",
+                "agentspaces.tick-millis", "200",
+                "agentspaces.transport.tls.enabled", "false",
+                "agentspaces.transport.tls.require-attestation", "true",
+                "agentspaces.transport.dtls.enabled", "true",
+                "agentspaces.groups[0].name", "it-fleet",
+                "agentspaces.groups[0].founding", "spring-it-fleet-dtls-v1",
+                "agentspaces.groups[0].spaces[0].name", "tasks",
+                "agentspaces.groups[0].spaces[0].settle-window-millis", "100",
+                "agentspaces.groups[0].spaces[1].name", "findings"));
+        properties.put("agentspaces.groups[0].spaces[1].settle-window-millis", "100");
+        if (port > 0) {
+            properties.put("agentspaces.transport.dtls.bind", "127.0.0.1:" + port);
+        }
+        if (seedPort > 0) {
+            properties.put("agentspaces.groups[0].seeds[0]", "dtls://127.0.0.1:" + seedPort);
+        }
+        return new SpringApplicationBuilder(app).properties(properties).run();
+    }
+
     @Test
     @Timeout(120)
     void theConsoleServesWhenEnabledAndStaysOffOtherwise() throws Exception {

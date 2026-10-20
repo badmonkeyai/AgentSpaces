@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
   </parent>
 
   <artifactId>agentspaces-connect-core</artifactId>
@@ -67,6 +67,13 @@
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-test-support</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- the ws listener the workerd connector cell dials (WorkerdCellConnectorTest) -->
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-http</artifactId>
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>

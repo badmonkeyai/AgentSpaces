@@ -240,6 +240,16 @@ public final class SimNetwork {
             return "mem";
         }
 
+        /**
+         * The fabric can attest ({@link SimNetwork#attest}), so it stands in
+         * for TLS under {@code requireAttestation}; a node without a
+         * declaration stays unattested, as a TLS peer without a certificate does.
+         */
+        @Override
+        public java.util.Set<Capability> capabilities() {
+            return java.util.Set.of(Capability.ATTESTING, Capability.RELIABLE, Capability.ORDERED);
+        }
+
         @Override
         public TransportConnection dial(String address) throws IOException {
             Listener listener = listeners.get(address);

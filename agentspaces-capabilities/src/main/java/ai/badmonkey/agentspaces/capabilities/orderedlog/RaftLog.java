@@ -66,10 +66,27 @@ import java.util.function.ObjLongConsumer;
  * through {@link #driverCadence(Duration)} and the constructor's value becomes a
  * fallback for hand-driven hosts (QA3 A3-4).
  *
+ * <p>Durability (srad/agentspaces-js.md JS-N-06): the term, the vote, and the
+ * entries live in a {@link LogStore}, written before any reply that depends on
+ * them leaves this member — a candidacy or a vote before the RequestVote or
+ * VoteReply, a term bump before it is acted on, appended entries before the
+ * AppendReply, and the leader's own entry before any AppendEntries carries it.
+ * A store write that fails restores the in-memory state to what is durable,
+ * sends nothing (the peer retries), and is counted in {@link #storeFailures()};
+ * it never fails a tick. The constructors without a store use a
+ * {@link MemoryLogStore}, which is the pre-JS-N-06 behaviour exactly: such a
+ * voter forgets everything on restart. With a {@link FileLogStore} a restarted
+ * voter rejoins at its last term with its vote and entries, so it cannot vote
+ * twice in a term; its commit index starts at zero, so the applied listener
+ * sees the committed prefix again from index 1 (Raft's usual replay; the
+ * ordered-take applier is idempotent per generation, so that is harmless).
+ *
  * <p>Thread-safety: all mutation happens under one lock; the applied listener is
  * invoked outside it.
  */
 public final class RaftLog implements CapabilityProvider {
+
+    private static final System.Logger LOG = System.getLogger(RaftLog.class.getName());
 
     /** The capability type URI. */
     public static final String TYPE = "aspace:cap/ordered-log";
@@ -100,6 +117,11 @@ public final class RaftLog implements CapabilityProvider {
     private volatile Duration tickPeriod;
     private final Random random;
     private final ObjLongConsumer<byte[]> applied;
+    /** Where term, vote, and entries are made durable before a reply leaves (JS-N-06). */
+    private final LogStore store;
+    /** Store writes that failed; each left a reply unsent and the memory state as it was. */
+    private final java.util.concurrent.atomic.AtomicLong storeFailures =
+            new java.util.concurrent.atomic.AtomicLong();
 
     private final Object lock = new Object();
     private Role role = Role.FOLLOWER;
@@ -137,6 +159,27 @@ public final class RaftLog implements CapabilityProvider {
     }
 
     /**
+     * Creates a Raft member whose term, vote, and entries are kept in
+     * {@code store} (JS-N-06): the log loads the store's state before it joins
+     * any election, and writes to it before every reply that depends on it.
+     *
+     * @param pipes   the group's capability pipes
+     * @param codec   the CBOR codec
+     * @param self    this member's peer id
+     * @param members the fixed member set, including {@code self}
+     * @param clock   the time source (advertisement freshness)
+     * @param seed    randomness seed for election timeouts (vary per member)
+     * @param applied receives each committed command with its log index, in order
+     * @param store   the durable state; a {@link FileLogStore} survives a restart
+     * @throws java.io.UncheckedIOException when the store cannot be read
+     */
+    public RaftLog(CapabilityPipes pipes, CborCodec codec, PeerId self, List<PeerId> members,
+                   InstantSource clock, long seed, ObjLongConsumer<byte[]> applied,
+                   LogStore store) {
+        this(pipes, codec, self, members, clock, DEFAULT_TICK_PERIOD, seed, applied, store);
+    }
+
+    /**
      * Creates a Raft member whose advertised leader lease is sized from the tick
      * cadence the host drives it at.
      *
@@ -153,8 +196,29 @@ public final class RaftLog implements CapabilityProvider {
     public RaftLog(CapabilityPipes pipes, CborCodec codec, PeerId self, List<PeerId> members,
                    InstantSource clock, Duration tickPeriod, long seed,
                    ObjLongConsumer<byte[]> applied) {
+        this(pipes, codec, self, members, clock, tickPeriod, seed, applied, new MemoryLogStore());
+    }
+
+    /**
+     * As {@link #RaftLog(CapabilityPipes, CborCodec, PeerId, List, InstantSource, Duration, long,
+     * ObjLongConsumer)}, with the member's durable state in {@code store} (JS-N-06).
+     *
+     * @param pipes      the group's capability pipes
+     * @param codec      the CBOR codec
+     * @param self       this member's peer id
+     * @param members    the fixed member set, including {@code self}
+     * @param clock      the time source (advertisement freshness)
+     * @param tickPeriod the wall-clock period between {@link #tick()} calls
+     * @param seed       randomness seed for election timeouts (vary per member)
+     * @param applied    receives each committed command with its log index, in order
+     * @param store      the durable state; a {@link FileLogStore} survives a restart
+     * @throws java.io.UncheckedIOException when the store cannot be read
+     */
+    public RaftLog(CapabilityPipes pipes, CborCodec codec, PeerId self, List<PeerId> members,
+                   InstantSource clock, Duration tickPeriod, long seed,
+                   ObjLongConsumer<byte[]> applied, LogStore store) {
         this(pipes, codec, self, members, clock, tickPeriod, seed, applied,
-                membersOnly(members), "");
+                membersOnly(members), "", store);
     }
 
     /**
@@ -182,16 +246,44 @@ public final class RaftLog implements CapabilityProvider {
     public RaftLog(CapabilityPipes pipes, CborCodec codec, PeerId self, List<PeerId> members,
                    InstantSource clock, Duration tickPeriod, long seed,
                    ObjLongConsumer<byte[]> applied, Authorizer authorizer, GroupId group) {
+        this(pipes, codec, self, members, clock, tickPeriod, seed, applied, authorizer, group,
+                new MemoryLogStore());
+    }
+
+    /**
+     * As {@link #RaftLog(CapabilityPipes, CborCodec, PeerId, List, InstantSource, Duration, long,
+     * ObjLongConsumer, Authorizer, GroupId)}, with the member's durable state in
+     * {@code store} (JS-N-06).
+     *
+     * @param pipes      the group's capability pipes
+     * @param codec      the CBOR codec
+     * @param self       this member's peer id
+     * @param members    the fixed member set, including {@code self}
+     * @param clock      the time source (advertisement freshness)
+     * @param tickPeriod the wall-clock period between {@link #tick()} calls
+     * @param seed       randomness seed for election timeouts (vary per member)
+     * @param applied    receives each committed command with its log index, in order
+     * @param authorizer decides {@code RAFT_VOTER} per authenticated sender
+     * @param group      the group the log runs in; the authorizer's scope
+     * @param store      the durable state; a {@link FileLogStore} survives a restart
+     * @throws java.io.UncheckedIOException when the store cannot be read
+     */
+    public RaftLog(CapabilityPipes pipes, CborCodec codec, PeerId self, List<PeerId> members,
+                   InstantSource clock, Duration tickPeriod, long seed,
+                   ObjLongConsumer<byte[]> applied, Authorizer authorizer, GroupId group,
+                   LogStore store) {
         this(pipes, codec, self, members, clock, tickPeriod, seed, applied,
                 Objects.requireNonNull(authorizer, "authorizer"),
-                Objects.requireNonNull(group, "group").value());
+                Objects.requireNonNull(group, "group").value(), store);
     }
 
     private RaftLog(CapabilityPipes pipes, CborCodec codec, PeerId self, List<PeerId> members,
                     InstantSource clock, Duration tickPeriod, long seed,
-                    ObjLongConsumer<byte[]> applied, Authorizer authorizer, String scope) {
+                    ObjLongConsumer<byte[]> applied, Authorizer authorizer, String scope,
+                    LogStore store) {
         this.authorizer = authorizer;
         this.scope = scope;
+        this.store = Objects.requireNonNull(store, "store");
         this.pipes = Objects.requireNonNull(pipes, "pipes");
         this.tickPeriod = Objects.requireNonNull(tickPeriod, "tickPeriod");
         if (tickPeriod.isZero() || tickPeriod.isNegative()) {
@@ -207,13 +299,26 @@ public final class RaftLog implements CapabilityProvider {
             throw new IllegalArgumentException("member set must include self");
         }
         this.electionTimeout = newElectionTimeout();
+        // The store is read before the first frame or tick: a restarted voter
+        // rejoins at its durable term, holding its vote and its entries (JS-N-06).
+        LogStore.State durable;
+        try {
+            durable = store.load();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("cannot read the ordered log's store", e);
+        }
+        this.term = durable.term();
+        this.votedFor = durable.votedFor();
+        this.log.addAll(durable.entries());
         pipes.onCapability(TYPE, this::onFrame);
     }
 
-    /** The membership-rooted default: exactly the fixed member set may drive the log. */
+    /** The membership-rooted default: exactly the fixed member set drives the log; any admitted peer may submit as a client. */
     private static Authorizer membersOnly(List<PeerId> members) {
-        Set<PeerId> allowed = Set.copyOf(members);
-        return (peer, operation, scope) -> allowed.contains(peer);
+        // Voting, leading, and replicating stay with the fixed member set (ASF-005); a command
+        // from any admitted group peer is a Raft client's (JS-V-05), judged by onCommand.
+        return (peer, operation, scope) -> operation == Authorizer.Operation.RAFT_CLIENT
+                || members.contains(peer);
     }
 
     @Override
@@ -271,20 +376,45 @@ public final class RaftLog implements CapabilityProvider {
         }
     }
 
+    /** Returns the highest log index this member holds, committed or not (0 = empty). */
+    public long lastLogIndex() {
+        synchronized (lock) {
+            return log.size();
+        }
+    }
+
+    /**
+     * Store writes that failed (JS-N-06). Each left the in-memory state as the
+     * store had it and the dependent reply, request, or submit undone, so the
+     * peer retries; a rising count means the store needs attention.
+     *
+     * @return the number of failed durable writes since construction
+     */
+    public long storeFailures() {
+        return storeFailures.get();
+    }
+
     /**
      * Submits a command: appended directly when this member leads, forwarded to
      * the known leader otherwise.
      *
      * @param command the opaque command bytes
      * @return {@code true} when accepted locally or forwarded; {@code false} when
-     *         no leader is known yet (retry after ticks)
+     *         no leader is known yet (retry after ticks), or when this leader's
+     *         store refused the entry (counted in {@link #storeFailures()})
      */
     public boolean submit(byte[] command) {
         Objects.requireNonNull(command, "command");
         PeerId forwardTo = null;
         synchronized (lock) {
             if (role == Role.LEADER) {
-                log.add(new LogEntry(term, command));
+                LogEntry entry = new LogEntry(term, command);
+                log.add(entry);
+                // The leader's own entry is durable before any AppendEntries carries it.
+                if (!persistAppendLocked(log.size(), List.of(entry))) {
+                    log.remove(log.size() - 1);
+                    return false;
+                }
                 advanceCommitLocked();
             } else if (leaderHint != null) {
                 forwardTo = leaderHint;
@@ -348,18 +478,24 @@ public final class RaftLog implements CapabilityProvider {
 
     // ---------------------------------------------------------------- receive
 
+    /** Client submits one non-member may make per second (a rate against floods, never a cap on clients). */
+    public static final int CLIENT_SUBMITS_PER_SECOND = 32;
+    private final Map<PeerId, long[]> clientBudgets = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong clientSubmits = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong clientSubmitsRefused =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Commands accepted from Raft clients (admitted non-members, {@code RAFT_CLIENT}). */
+    public long clientSubmits() {
+        return clientSubmits.get();
+    }
+
+    /** Client submits refused: not permitted, over the per-sender rate, or not a submit at all. */
+    public long clientSubmitsRefused() {
+        return clientSubmitsRefused.get();
+    }
+
     private void onFrame(PeerId from, byte[] payload) {
-        if (!members.contains(from)) {
-            // ASF-005: only the fixed member set may drive elections, replicate
-            // entries, or submit commands. Any other authenticated group peer
-            // (or, before the dispatch gate, any keypair) is dropped here.
-            return;
-        }
-        if (!authorizer.permits(from, Authorizer.Operation.RAFT_VOTER, scope)) {
-            // TODO-EFG §4: a member the profile's authorizer refuses is a
-            // replica, not a voter — its votes, appends, and submits are dropped.
-            return;
-        }
         Frame frame;
         try {
             frame = codec.fromBytes(payload, Frame.class);
@@ -367,6 +503,27 @@ public final class RaftLog implements CapabilityProvider {
             return;
         }
         if (frame == null) {
+            return;
+        }
+        if (!members.contains(from)) {
+            // ASF-005: only the fixed member set may drive elections or replicate
+            // entries. An admitted non-member may submit a command as a Raft client
+            // (srad/agentspaces-js.md JS-V-05) when the profile permits RAFT_CLIENT,
+            // within a per-sender rate; the command's own signature is what onCommand
+            // judges, so the log orders it and grants nothing by itself.
+            if (frame.clientSubmit() == null || frame.clientSubmit().command() == null
+                    || !authorizer.permits(from, Authorizer.Operation.RAFT_CLIENT, scope)
+                    || !clientBudgetAdmits(from)) {
+                clientSubmitsRefused.incrementAndGet();
+                return;
+            }
+            clientSubmits.incrementAndGet();
+            submit(frame.clientSubmit().command());
+            return;
+        }
+        if (!authorizer.permits(from, Authorizer.Operation.RAFT_VOTER, scope)) {
+            // TODO-EFG §4: a member the profile's authorizer refuses is a
+            // replica, not a voter — its votes, appends, and submits are dropped.
             return;
         }
         if (frame.requestVote() != null) {
@@ -383,11 +540,31 @@ public final class RaftLog implements CapabilityProvider {
         applyCommitted();
     }
 
+    /** A token bucket per client sender: CLIENT_SUBMITS_PER_SECOND, refilled each second of the log's clock. */
+    private boolean clientBudgetAdmits(PeerId from) {
+        long second = clock.instant().getEpochSecond();
+        long[] bucket = clientBudgets.computeIfAbsent(from, f -> new long[]{second, 0});
+        synchronized (bucket) {
+            if (bucket[0] != second) {
+                bucket[0] = second;
+                bucket[1] = 0;
+            }
+            if (bucket[1] >= CLIENT_SUBMITS_PER_SECOND) {
+                return false;
+            }
+            bucket[1]++;
+        }
+        if (clientBudgets.size() > 4096) {
+            clientBudgets.entrySet().removeIf(e -> e.getValue()[0] < second - 60); // forget idle senders
+        }
+        return true;
+    }
+
     private void onRequestVote(PeerId from, RequestVote request) {
         Frame reply;
         synchronized (lock) {
-            if (request.term() > term) {
-                becomeFollowerLocked(request.term());
+            if (request.term() > term && !becomeFollowerLocked(request.term())) {
+                return; // the term bump is not durable: unanswered, the candidate retries
             }
             boolean upToDate = request.lastLogTerm() > lastLogTerm()
                     || (request.lastLogTerm() == lastLogTerm()
@@ -395,8 +572,14 @@ public final class RaftLog implements CapabilityProvider {
             boolean grant = request.term() == term && upToDate
                     && (votedFor == null || votedFor.equals(request.candidate()));
             if (grant) {
+                PeerId priorVote = votedFor;
                 votedFor = request.candidate();
                 electionElapsed = 0;
+                // The vote is durable before the reply leaves (JS-N-06): a voter
+                // that restarts cannot grant this term to a second candidate.
+                if (!persistTermVoteLocked(term, priorVote)) {
+                    return;
+                }
             }
             reply = Frame.of(new VoteReply(term, grant));
         }
@@ -437,9 +620,9 @@ public final class RaftLog implements CapabilityProvider {
     private void onAppendEntries(PeerId from, AppendEntries append) {
         Frame reply;
         synchronized (lock) {
-            if (append.term() > term
-                    || (append.term() == term && role != Role.FOLLOWER)) {
-                becomeFollowerLocked(append.term());
+            if ((append.term() > term || (append.term() == term && role != Role.FOLLOWER))
+                    && !becomeFollowerLocked(append.term())) {
+                return; // the term bump is not durable: unanswered, the leader retries
             }
             if (append.term() < term) {
                 reply = Frame.of(new AppendReply(term, self, false, 0));
@@ -454,18 +637,38 @@ public final class RaftLog implements CapabilityProvider {
                     reply = Frame.of(new AppendReply(term, self, false, 0));
                 } else {
                     long index = append.prevLogIndex();
+                    // The first index this append changes, and the conflicting tail it
+                    // displaced there, so a failed store write can put memory back.
+                    long firstChange = -1;
+                    List<LogEntry> displaced = List.of();
                     for (LogEntry entry : append.entries()) {
                         index++;
                         if (index <= log.size()) {
                             if (log.get((int) index - 1).term() != entry.term()) {
+                                firstChange = index;
+                                displaced = new ArrayList<>(log.subList((int) index - 1, log.size()));
                                 while (log.size() >= index) {
                                     log.remove(log.size() - 1);
                                 }
                                 log.add(entry);
                             }
                         } else {
+                            if (firstChange < 0) {
+                                firstChange = index;
+                            }
                             log.add(entry);
                         }
+                    }
+                    // The entries are durable before the acknowledgement (JS-N-06):
+                    // the leader may count this member toward a commit once it hears
+                    // success, so what it hears must survive this member's restart.
+                    if (firstChange > 0 && !persistAppendLocked(firstChange,
+                            new ArrayList<>(log.subList((int) firstChange - 1, log.size())))) {
+                        while (log.size() >= firstChange) {
+                            log.remove(log.size() - 1);
+                        }
+                        log.addAll(displaced);
+                        return;
                     }
                     commitIndex = Math.max(commitIndex,
                             Math.min(append.leaderCommit(), log.size()));
@@ -500,6 +703,8 @@ public final class RaftLog implements CapabilityProvider {
     // ---------------------------------------------------------------- internals
 
     private void startElectionLocked(List<Runnable> sends) {
+        long priorTerm = term;
+        PeerId priorVote = votedFor;
         role = Role.CANDIDATE;
         term++;
         votedFor = self;
@@ -507,6 +712,14 @@ public final class RaftLog implements CapabilityProvider {
         votesGranted.add(self);
         electionElapsed = 0;
         electionTimeout = newElectionTimeout();
+        // The candidacy (new term, vote for self) is durable before any request
+        // leaves (JS-N-06); if it cannot be, no request leaves and the timer
+        // simply runs again.
+        if (!persistTermVoteLocked(priorTerm, priorVote)) {
+            role = Role.FOLLOWER;
+            votesGranted.clear();
+            return;
+        }
         RequestVote request = new RequestVote(term, self, log.size(), lastLogTerm());
         for (PeerId member : members) {
             if (!member.equals(self)) {
@@ -515,7 +728,17 @@ public final class RaftLog implements CapabilityProvider {
         }
     }
 
-    private void becomeFollowerLocked(long newTerm) {
+    /**
+     * Steps down, adopting {@code newTerm} when it is higher. A higher term is
+     * written to the store before it is acted on (JS-N-06).
+     *
+     * @return {@code true} when the resulting term is durable; {@code false} when
+     *         the bump could not be written and the prior term stands, in which
+     *         case the caller must not reply or act on the higher term
+     */
+    private boolean becomeFollowerLocked(long newTerm) {
+        long priorTerm = term;
+        PeerId priorVote = votedFor;
         if (newTerm > term) {
             term = newTerm;
             votedFor = null;
@@ -524,6 +747,49 @@ public final class RaftLog implements CapabilityProvider {
         votesGranted.clear();
         electionElapsed = 0;
         electionTimeout = newElectionTimeout();
+        return term == priorTerm || persistTermVoteLocked(priorTerm, priorVote);
+    }
+
+    /**
+     * Writes the current term and vote to the store. On failure the prior
+     * values are restored, so memory never claims more than the store holds.
+     *
+     * @return whether the write became durable
+     */
+    private boolean persistTermVoteLocked(long priorTerm, PeerId priorVote) {
+        try {
+            store.saveTermVote(term, votedFor);
+            return true;
+        } catch (java.io.IOException | RuntimeException e) {
+            term = priorTerm;
+            votedFor = priorVote;
+            storeFailed("term " + term + " and vote", e);
+            return false;
+        }
+    }
+
+    /**
+     * Writes entries from {@code fromIndex} to the store. The caller restores
+     * the in-memory log on failure, since only it knows what it displaced.
+     *
+     * @return whether the write became durable
+     */
+    private boolean persistAppendLocked(long fromIndex, List<LogEntry> entries) {
+        try {
+            store.append(fromIndex, entries);
+            return true;
+        } catch (java.io.IOException | RuntimeException e) {
+            storeFailed(entries.size() + " entries from index " + fromIndex, e);
+            return false;
+        }
+    }
+
+    private void storeFailed(String what, Exception e) {
+        storeFailures.incrementAndGet();
+        // The message, not the trace: a store that fails on every tick must not
+        // flood the log with stacks; storeFailures() is the signal to watch.
+        LOG.log(System.Logger.Level.WARNING, "ordered log " + self.display()
+                + ": store refused " + what + " (" + e + "); nothing sent, the peer will retry");
     }
 
     private Runnable appendFor(PeerId member) {

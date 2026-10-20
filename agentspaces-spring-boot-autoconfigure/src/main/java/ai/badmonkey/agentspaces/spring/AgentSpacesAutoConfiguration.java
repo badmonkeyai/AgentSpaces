@@ -22,7 +22,12 @@ import ai.badmonkey.agentspaces.api.ad.SpaceAdvertisement;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.api.spi.Authorizer;
 import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
+import ai.badmonkey.agentspaces.api.spi.BeaconHint;
+import ai.badmonkey.agentspaces.api.spi.BeaconLocator;
+import ai.badmonkey.agentspaces.api.spi.BeaconRequest;
 import ai.badmonkey.agentspaces.api.spi.Transport;
+import ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator;
+import ai.badmonkey.agentspaces.peering.node.JoinCredentials;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor;
 import ai.badmonkey.agentspaces.capabilities.learn.GossipLearning;
@@ -69,6 +74,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.EnumSet;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
@@ -184,7 +190,103 @@ public class AgentSpacesAutoConfiguration {
      */
     @Bean
     @ConditionalOnMissingBean
+    public PeerNode agentSpacesNode(AgentSpacesProperties properties, PeerIdentity identity,
+                                    ObjectProvider<Transport> transports,
+                                    ObjectProvider<PeerNodeCustomizer> customizers,
+                                    ObjectProvider<PeerNodeConfigurer> configurers,
+                                    ObjectProvider<ai.badmonkey.agentspaces.peering.node.RelayPolicy> relayPolicy) {
+        return buildNode(properties, identity, transports.orderedStream().toList(),
+                customizers.orderedStream().toList(), configurers.orderedStream().toList(),
+                relayPolicy.getIfAvailable());
+    }
+
+    /**
+     * The node with no application beans: the starter's transports and
+     * settings alone. Hosts that collect beans themselves call the five-argument
+     * form.
+     */
     public PeerNode agentSpacesNode(AgentSpacesProperties properties, PeerIdentity identity) {
+        return buildNode(properties, identity, List.of(), List.of(), List.of(), null);
+    }
+
+    /**
+     * Builds the node (SRAD DB-C-04, DB-C-05, DB-C-06): the starter's settings
+     * on the builder, then every {@link PeerNodeCustomizer} in order; the
+     * default TCP (and TLS) transport unless an application {@link Transport}
+     * bean has the same scheme, every other application transport registered
+     * for dialing; the bind and advertised addresses; then every
+     * {@link PeerNodeConfigurer} in order, before any group is joined.
+     *
+     * @param properties   the properties
+     * @param identity     the peer identity
+     * @param transports   application transports, in order
+     * @param customizers  builder hooks, in order
+     * @param configurers  node hooks, in order
+     * @return the node
+     */
+    /**
+     * @deprecated since 0.4.0: the list form is {@link #buildNode}, a name of its own so a
+     * host without Spring on its classpath resolves it without seeing the bean method's
+     * {@code ObjectProvider} parameters (ISSUE-BootstrapCore FR-7). Removed in 0.5.0.
+     */
+    @Deprecated(since = "0.4.0", forRemoval = true)
+    public PeerNode agentSpacesNode(AgentSpacesProperties properties, PeerIdentity identity,
+                                    List<Transport> transports,
+                                    List<PeerNodeCustomizer> customizers,
+                                    List<PeerNodeConfigurer> configurers) {
+        return buildNode(properties, identity, transports, customizers, configurers, null);
+    }
+
+    /**
+     * As the five-argument form, with the application's {@code RelayPolicy} bean when it
+     * declares one (ISSUE-PeerRobustness-2, R2-3.2): asked before every frame the node relays,
+     * after the membership check; null keeps the node's default, which allows every forward
+     * the membership check allows. The keystore directory, when one is configured, is also
+     * the node's state directory (R2-1.5), so the admission memory of each INVITE group
+     * survives a restart beside the identity.
+     *
+     * @param properties   the properties
+     * @param identity     the peer identity
+     * @param transports   application transports, in order
+     * @param customizers  builder hooks, in order
+     * @param configurers  node hooks, in order
+     * @param relayPolicy  the relay policy, or null for the default
+     * @return the node
+     */
+    @Deprecated(since = "0.4.0", forRemoval = true)
+    public PeerNode agentSpacesNode(AgentSpacesProperties properties, PeerIdentity identity,
+                                    List<Transport> transports,
+                                    List<PeerNodeCustomizer> customizers,
+                                    List<PeerNodeConfigurer> configurers,
+                                    ai.badmonkey.agentspaces.peering.node.RelayPolicy relayPolicy) {
+        return buildNode(properties, identity, transports, customizers, configurers, relayPolicy);
+    }
+
+    /**
+     * Builds the node from the application's beans (SRAD DB-C-04 to DB-C-06):
+     * the starter's settings on the builder, then every
+     * {@link PeerNodeCustomizer} in order; the default TCP (and TLS) transport
+     * unless an application {@link Transport} bean has the same scheme, every
+     * other application transport registered for dialing; the bind and
+     * advertised addresses; the relay policy (the bean, else
+     * {@code agentspaces.relay.budget-bytes-per-day} when set, else allow);
+     * then every {@link PeerNodeConfigurer} in order, before any group is
+     * joined. A name of its own, so a host without Spring on its classpath
+     * can call it (ISSUE-BootstrapCore FR-7).
+     *
+     * @param properties  the properties
+     * @param identity    the peer identity
+     * @param transports  application transports, in order
+     * @param customizers builder hooks, in order
+     * @param configurers node hooks, in order
+     * @param relayPolicy the application's relay policy, or null
+     * @return the node
+     */
+    public PeerNode buildNode(AgentSpacesProperties properties, PeerIdentity identity,
+                              List<Transport> transports,
+                              List<PeerNodeCustomizer> customizers,
+                              List<PeerNodeConfigurer> configurers,
+                              ai.badmonkey.agentspaces.peering.node.RelayPolicy relayPolicy) {
         Set<PeerAdvertisement.PeerRole> roles = rolesOf(properties);
         // The security profile decides the posture (remediation plan §4);
         // explicit transport properties are deliberate deviations from it.
@@ -203,11 +305,21 @@ public class AgentSpacesAutoConfiguration {
         // fleet that asks for it without TLS is misconfigured and says so at
         // startup rather than serving every frame unattested.
         boolean requireAttestation = properties.getTransport().getTls().isRequireAttestation();
-        if (requireAttestation && !tlsEnabled) {
+        TransportBlocks.validate(properties, requireAttestation);
+        // SRAD dtls-support DT-H-04: any attesting binding satisfies the rule, a
+        // DTLS or QUIC listener as well as TLS.
+        boolean attestingBlock = TransportBlocks.anyAttesting(properties);
+        if (requireAttestation && !tlsEnabled && !attestingBlock) {
             throw new IllegalStateException(
                     "agentspaces.transport.tls.require-attestation needs an attesting "
-                            + "transport: enable agentspaces.transport.tls.enabled, or "
-                            + "select a security profile whose transport is TLS");
+                            + "transport: enable agentspaces.transport.tls.enabled, "
+                            + "agentspaces.transport.dtls.enabled, or agentspaces.transport.quic.enabled, "
+                            + "or select a security profile whose transport is TLS");
+        }
+        if (requireAttestation && !tlsEnabled && !TransportBlocks.blank(properties.getBind())) {
+            throw new IllegalStateException("agentspaces.bind is a plain tcp listener, which cannot attest under"
+                    + " agentspaces.transport.tls.require-attestation: enable agentspaces.transport.tls.enabled,"
+                    + " or listen on agentspaces.transport.dtls.bind instead");
         }
         PeerNode.Builder builder = PeerNode.builder(identity)
                 .roles(roles)
@@ -217,12 +329,35 @@ public class AgentSpacesAutoConfiguration {
                         ? java.time.Duration.ofMillis(properties.getCoalesceMillis()) : null)
                 .channelAuth(channelAuth)
                 .requireAttestation(requireAttestation);
+        // ISSUE-PeerRobustness-2: the keystore directory is the node's state directory, so a
+        // member admitted under an invite delegation is still admitted after a restart (R2-1.5),
+        // and the application's RelayPolicy bean, when it declares one, judges each relayed frame.
+        String stateDirectory = properties.getKeystore();
+        if (stateDirectory != null && !stateDirectory.isBlank()) {
+            builder.stateDirectory(Path.of(stateDirectory.trim()));
+        }
+        if (relayPolicy == null && properties.getRelay().getBudgetBytesPerDay() != null
+                && properties.getRelay().getBudgetBytesPerDay() > 0) {
+            relayPolicy = ai.badmonkey.agentspaces.peering.node.RelayPolicy.dailyBudget(
+                    properties.getRelay().getBudgetBytesPerDay());
+        }
+        if (relayPolicy != null) {
+            builder.relayPolicy(relayPolicy);
+        }
+        // JS-W-11: the relay offload's threshold and retry, settings on the node whatever bindings
+        // it registers; a bad value names its key.
+        AgentSpacesProperties.Transport.Webrtc.Offload offload = properties.getTransport().getWebrtc().getOffload();
+        try {
+            builder.relayOffload(new PeerNode.RelayOffload(offload.getFramesPerMinute(), offload.getRetryAfter()));
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new IllegalStateException("agentspaces.transport.webrtc.offload: " + e.getMessage(), e);
+        }
         // SPEC §5.6 v0.1.13 (item 9): the CA trust is built before the node, so
         // the node judges presented chains by the same refreshable trust the
         // transport attests with, and may accept CA-rooted revocations.
         AgentSpacesProperties.Transport.Tls tls = properties.getTransport().getTls();
         java.util.function.Supplier<ai.badmonkey.agentspaces.identity.ChannelTrust> caTrust =
-                tlsEnabled ? caTrust(tls) : null;
+                tlsEnabled || attestingBlock ? caTrust(tls) : null;
         String validator = tls.getRevocationValidator() == null ? "founder"
                 : tls.getRevocationValidator().trim().toLowerCase();
         if (!validator.equals("founder") && !validator.equals("founder-or-ca")) {
@@ -250,35 +385,82 @@ public class AgentSpacesAutoConfiguration {
             builder.multicast(multicastGroup(multicast.getGroup()),
                     Duration.ofMillis(multicast.getIntervalMillis()));
         }
+        for (PeerNodeCustomizer customizer : customizers) {
+            customizer.customize(builder);
+        }
         PeerNode node = builder.build();
+        java.util.Map<String, Transport> provided = new java.util.LinkedHashMap<>();
+        for (Transport transport : transports) {
+            provided.put(transport.scheme(), transport);
+        }
         Transport transport;
         if (tlsEnabled) {
-            try {
-                transport = tlsTransport(identity, tls, caTrust);
-            } catch (java.security.GeneralSecurityException e) {
-                throw new IllegalStateException(
-                        "cannot create the TLS channel credential", e);
+            if (provided.containsKey("tls")) {
+                transport = provided.remove("tls");
+            } else {
+                try {
+                    transport = tlsTransport(identity, tls, caTrust);
+                } catch (java.security.GeneralSecurityException e) {
+                    throw new IllegalStateException(
+                            "cannot create the TLS channel credential", e);
+                }
             }
             // Plain TCP stays registered for dialing peers that advertise it,
             // except in the attested mode: a plaintext channel attests nobody,
             // so dialing one would evict the honest peer at the far end
             // (gate2-review G2-1).
-            if (!requireAttestation) {
+            if (!requireAttestation && !provided.containsKey("tcp")) {
                 node.transport(new TcpTransport());
             }
         } else {
-            transport = new TcpTransport();
+            transport = provided.containsKey("tcp") ? provided.remove("tcp") : new TcpTransport();
         }
+        // The listener blocks take their scheme's bean, if any, before the rest register.
+        java.util.List<TransportBlocks.Block> blocks;
+        try {
+            blocks = TransportBlocks.build(properties, identity,
+                    caTrust == null ? null : servingCredential(tls), caTrust, provided);
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IllegalStateException("cannot load agentspaces.transport.tls.key-store", e);
+        }
+        // Every other application transport dials only; a configurer may listen on it.
+        provided.values().forEach(node::transport);
         String bind = properties.getBind();
-        if (bind == null || bind.isBlank()) {
+        String advertise = properties.getAdvertise() == null ? "" : properties.getAdvertise().trim();
+        if (!advertise.isEmpty()) {
+            int separator = advertise.indexOf("://");
+            if (separator > 0) {
+                String scheme = advertise.substring(0, separator);
+                if (!scheme.equals(transport.scheme())) {
+                    throw new IllegalStateException("agentspaces.advertise names the scheme '" + scheme
+                            + "' but this peer listens on '" + transport.scheme() + "'");
+                }
+                advertise = advertise.substring(separator + 3);
+            }
+            if (bind == null || bind.isBlank()) {
+                throw new IllegalStateException("agentspaces.advertise needs agentspaces.bind:"
+                        + " a dial-only peer advertises no address");
+            }
+        }
+        if (requireAttestation && !tlsEnabled) {
+            // A plain tcp binding attests nobody; the attesting blocks carry this node.
+        } else if (bind == null || bind.isBlank()) {
             node.transport(transport);
         } else {
             try {
-                node.listen(transport, bind.trim());
+                if (advertise.isEmpty()) {
+                    node.listen(transport, bind.trim());
+                } else {
+                    node.listen(transport, bind.trim(), advertise);
+                }
             } catch (IOException e) {
                 throw new UncheckedIOException("cannot bind AgentSpaces node to '"
                         + bind + "'", e);
             }
+        }
+        TransportBlocks.register(node, blocks);
+        for (PeerNodeConfigurer configurer : configurers) {
+            configurer.configure(node);
         }
         return node;
     }
@@ -321,14 +503,22 @@ public class AgentSpacesAutoConfiguration {
         if (trust == null) {
             return new TlsTcpTransport(identity);
         }
-        ai.badmonkey.agentspaces.identity.ServingCredential serving = null;
-        if (tls.getKeyStore() != null && !tls.getKeyStore().isBlank()) {
-            serving = ai.badmonkey.agentspaces.identity.ServingCredential.fromKeyStore(
-                    java.nio.file.Path.of(tls.getKeyStore().trim()),
-                    tls.getKeyStorePassword() == null
-                            ? new char[0] : tls.getKeyStorePassword().toCharArray());
+        return TlsTcpTransport.withRefreshableTrust(identity, servingCredential(tls), trust);
+    }
+
+    /**
+     * The CA-issued credential from {@code agentspaces.transport.tls.key-store},
+     * presented by every attesting binding; null keeps the identity-endorsed
+     * certificate.
+     */
+    private static ai.badmonkey.agentspaces.identity.ServingCredential servingCredential(
+            AgentSpacesProperties.Transport.Tls tls) throws java.security.GeneralSecurityException {
+        if (tls.getKeyStore() == null || tls.getKeyStore().isBlank()) {
+            return null;
         }
-        return TlsTcpTransport.withRefreshableTrust(identity, serving, trust);
+        return ai.badmonkey.agentspaces.identity.ServingCredential.fromKeyStore(
+                java.nio.file.Path.of(tls.getKeyStore().trim()),
+                tls.getKeyStorePassword() == null ? new char[0] : tls.getKeyStorePassword().toCharArray());
     }
 
     private static java.util.List<java.security.cert.X509Certificate> certificatesIn(
@@ -575,9 +765,12 @@ public class AgentSpacesAutoConfiguration {
                                    PeerIdentity identity, Authorizers authorizers, Embedder embedder,
                                    InstantSource clock,
                                    ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
-                                   ObjectProvider<SchemaRegistry> schemaRegistry) {
+                                   ObjectProvider<SchemaRegistry> schemaRegistry,
+                                   ObjectProvider<BeaconLocator> locators,
+                                   ObjectProvider<BootstrapChainFactory> chains) {
         return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
-                agents, schemaRegistry.getIfAvailable());
+                agents, schemaRegistry.getIfAvailable(), locators.orderedStream().toList(),
+                chains.getIfAvailable(BootstrapChainFactory::defaults));
     }
 
     /**
@@ -599,6 +792,35 @@ public class AgentSpacesAutoConfiguration {
                                    InstantSource clock,
                                    ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
                                    SchemaRegistry schemaRegistry) {
+        return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
+                agents, schemaRegistry, List.of(), BootstrapChainFactory.defaults());
+    }
+
+    /**
+     * The facade with the application's bootstrap beans (SRAD DB-C-01,
+     * DB-C-02): each group joins through the locator its
+     * {@link BootstrapChainFactory} composes from the configured seeds and the
+     * {@link BeaconLocator} beans that apply to it.
+     *
+     * @param properties     the properties
+     * @param node           the node
+     * @param identity       the peer identity
+     * @param authorizers    the authorizers
+     * @param embedder       the embedder
+     * @param clock          the clock
+     * @param agents         the agent identity factory
+     * @param schemaRegistry the schema registry, or null
+     * @param locators       application locators, in order
+     * @param chains         the chain factory
+     * @return the facade
+     */
+    public AgentSpaces agentSpacesWithRegistry(AgentSpacesProperties properties, PeerNode node,
+                                   PeerIdentity identity, Authorizers authorizers, Embedder embedder,
+                                   InstantSource clock,
+                                   ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
+                                   SchemaRegistry schemaRegistry,
+                                   List<BeaconLocator> locators,
+                                   BootstrapChainFactory chains) {
         AgentSpaces spaces = new AgentSpaces(identity, clock, agents);
         if (schemaRegistry != null) {
             // Before any group registers, so every group's binder gets it.
@@ -611,9 +833,19 @@ public class AgentSpacesAutoConfiguration {
         // have their hints ingested (TODO-EFG §4).
         authorizers.attach(node);
         for (AgentSpacesProperties.Group groupConfig : properties.getGroups()) {
-            GroupRuntime runtime = join(node, groupConfig,
-                    seedEndpoints(groupConfig.getSeeds(),
-                            tlsEnabled(properties) ? "tls" : "tcp"));
+            List<BeaconLocator> forGroup = new ArrayList<>();
+            forGroup.add(SeedsLocator.of(groupConfig.getSeeds()));
+            for (BeaconLocator locator : locators) {
+                if (locator.appliesTo(groupConfig.getName())) {
+                    forGroup.add(locator); // the node asks by the configured name too (join below)
+                }
+            }
+            if (properties.getMulticast().isEnabled()) {
+                forGroup.add(new ai.badmonkey.agentspaces.peering.bootstrap.MulticastLocator(node));
+            }
+            boolean hasLocators = !groupConfig.getSeeds().isEmpty() || forGroup.size() > 1;
+            GroupRuntime runtime = join(node, groupConfig, chains.chainFor(groupConfig, forGroup),
+                    hasLocators, identity);
             authorizers.register(groupConfig.getName(), runtime);
             Authorizer authorizer = authorizers.forGroup(groupConfig.getName());
             DiscoveryService discovery = DiscoveryService.create(runtime, codec,
@@ -622,6 +854,10 @@ public class AgentSpacesAutoConfiguration {
                     groupConfig.getName(), runtime.id(), runtime, discovery);
             BlockExchange blocks = new BlockExchange(runtime, codec);
             GroupKey contentKey = contentKeyOf(groupConfig);
+            if (properties.getMulticast().isSeal() && contentKey != null) {
+                // SPEC §10.1 v0.1.19: this group's beacon datagrams travel sealed under its content key.
+                node.beaconKey(runtime.id(), contentKey.rawBytes());
+            }
             // SPEC §11a.3 v0.1.13: one ring per group, shared by its spaces, so a
             // rotation reaches every space at once; persisted with the keystore.
             GroupKeyRing ring = contentKeyRing(properties, groupConfig, runtime, contentKey, codec);
@@ -635,6 +871,11 @@ public class AgentSpacesAutoConfiguration {
                 registerCapabilities(properties.getCapabilities(), context, runtime,
                         discovery, identity, codec, clock, blocks, ring, groupConfig,
                         authorizer, embedder, peerEncryptionKeys(properties), schemaRegistry);
+            }
+            if (properties.getTransport().getWebrtc().isEnabled()
+                    && TransportBlocks.present(TransportBlocks.WEBRTC_CLASS)) {
+                // JS-N-02: the webrtc binding's signalling pipe on this group's capability pipes.
+                WebRtcBlocks.attach(node, runtime, context);
             }
         }
         return spaces;
@@ -771,32 +1012,56 @@ public class AgentSpacesAutoConfiguration {
      * exclusive because they identify the group differently.
      */
     private static GroupRuntime join(PeerNode node, AgentSpacesProperties.Group config,
-                                     List<PeerAdvertisement.Endpoint> seeds) {
+                                     BeaconLocator locator, boolean hasLocators,
+                                     PeerIdentity identity) {
         boolean hasJoin = config.getJoin() != null && !config.getJoin().isBlank();
         boolean hasFounding = config.getFounding() != null && !config.getFounding().isBlank();
-        if (hasJoin && hasFounding) {
-            throw new IllegalStateException("group '" + config.getName() + "' sets both"
-                    + " 'join' and 'founding'; a group is either joined by its GroupId URI"
-                    + " or founded locally from a string, not both");
+        boolean hasDocument = config.getFoundingDocument() != null && !config.getFoundingDocument().isBlank();
+        if ((hasJoin && hasFounding) || (hasDocument && (hasJoin || hasFounding))) {
+            throw new IllegalStateException("group '" + config.getName() + "' sets more than one of"
+                    + " 'join', 'founding', and 'founding-document'; a group is joined by its GroupId URI,"
+                    + " founded locally from a string, or joined with a signed founding document it holds");
+        }
+        Map<String, String> hints = membershipHints(config);
+        if (hasDocument) {
+            ai.badmonkey.agentspaces.peering.node.SignedGroupAdvertisement founding;
+            try {
+                founding = CborCodec.defaultCodec().fromBytes(
+                        Base64.getDecoder().decode(config.getFoundingDocument().trim()),
+                        ai.badmonkey.agentspaces.peering.node.SignedGroupAdvertisement.class);
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("group '" + config.getName() + "': founding-document is not the"
+                        + " base64 CBOR of a signed founding advertisement", e);
+            }
+            return node.joinGroup(founding, GroupMembership.Config.defaults(), locator, hints, null,
+                    config.getName());
         }
         if (!hasJoin) {
-            return node.joinGroup(advertisementFor(config), GroupMembership.Config.defaults(),
-                    seeds);
+            return node.joinGroup(advertisementFor(config, identity), GroupMembership.Config.defaults(),
+                    locator, hints, null, config.getName());
         }
-        if (seeds.isEmpty()) {
+        if (!hasLocators) {
             throw new IllegalStateException("group '" + config.getName() + "' joins by"
-                    + " GroupId URI but configures no seeds to fetch the founding"
+                    + " GroupId URI but configures no seeds and no locator to fetch the founding"
                     + " advertisement from");
         }
         GroupId groupId = groupIdOf(config.getJoin());
         try {
-            return node.joinGroup(groupId, GroupMembership.Config.defaults(), seeds,
-                    Duration.ofMillis(config.getJoinTimeoutMillis()));
+            return node.joinGroup(groupId, GroupMembership.Config.defaults(), locator,
+                    Duration.ofMillis(config.getJoinTimeoutMillis()), hints, null, config.getName());
         } catch (TimeoutException e) {
             throw new IllegalStateException("group '" + config.getName() + "': no seed"
                     + " served a verified founding advertisement for " + groupId
-                    + " within " + config.getJoinTimeoutMillis() + " ms; seeds: " + seeds, e);
+                    + " within " + config.getJoinTimeoutMillis() + " ms; last hint: "
+                    + node.lastBeaconHint(groupId).map(h -> h.evidence()).orElse("none"), e);
         }
+    }
+
+    /** The {@code aspace:join} hint from {@code join-credential}, or none. */
+    static Map<String, String> membershipHints(AgentSpacesProperties.Group config) {
+        String credential = config.getJoinCredential();
+        return credential == null || credential.isBlank() ? Map.of()
+                : Map.of(JoinCredentials.HINT_KEY, credential.trim());
     }
 
     /** Parses {@code aspace://<groupId>} or a bare GroupId (spec §10.1). */
@@ -971,15 +1236,42 @@ public class AgentSpacesAutoConfiguration {
 
     // ---------------------------------------------------------------- internals
 
-    private static GroupAdvertisement advertisementFor(AgentSpacesProperties.Group config) {
+    /**
+     * The literal-id advertisement of a group founded from a string. Under
+     * {@code membership: open} the issuer is a throwaway, as before: nobody is
+     * the founder of an open group. Under {@code membership: invite} the
+     * issuer is the founder whose credentials admit (SRAD DB-C-15): the peer
+     * named by {@code founder}, or this peer when unset.
+     */
+    static GroupAdvertisement advertisementFor(AgentSpacesProperties.Group config, PeerIdentity identity) {
         String founding = config.getFounding() == null || config.getFounding().isBlank()
                 ? config.getName()
                 : config.getFounding();
         GroupId groupId = GroupId.fromFounding(founding.getBytes(StandardCharsets.UTF_8));
+        String membership = config.getMembership() == null ? "open" : config.getMembership().trim().toLowerCase();
+        GroupAdvertisement.MembershipPolicy policy = switch (membership) {
+            case "open" -> GroupAdvertisement.MembershipPolicy.OPEN;
+            case "invite" -> GroupAdvertisement.MembershipPolicy.INVITE;
+            default -> throw new IllegalStateException("group '" + config.getName()
+                    + "': membership must be 'open' or 'invite', not '" + config.getMembership() + "'");
+        };
+        PeerId issuer;
+        if (policy == GroupAdvertisement.MembershipPolicy.INVITE) {
+            boolean hasFounder = config.getFounder() != null && !config.getFounder().isBlank();
+            boolean hasCredential = config.getJoinCredential() != null && !config.getJoinCredential().isBlank();
+            if (!hasFounder && hasCredential) {
+                throw new IllegalStateException("group '" + config.getName() + "' presents a join"
+                        + " credential but names no founder: set agentspaces.groups[].founder to the"
+                        + " PeerId that issued it, or every member admits against a different founder");
+            }
+            issuer = hasFounder ? PeerId.of(config.getFounder().trim()) : identity.peerId();
+        } else {
+            issuer = PeerIdentity.generate().peerId();
+        }
         return new GroupAdvertisement("aspace://" + groupId.value(),
-                PeerIdentity.generate().peerId(), groupId, Instant.EPOCH,
+                issuer, groupId, Instant.EPOCH,
                 Duration.ofDays(365), config.getName(),
-                GroupAdvertisement.MembershipPolicy.OPEN, ConflictStrategyType.LEASE_RACE,
+                policy, ConflictStrategyType.LEASE_RACE,
                 GroupAdvertisement.GossipParameters.defaults());
     }
 
@@ -989,20 +1281,9 @@ public class AgentSpacesAutoConfiguration {
      * {@code host:port} takes {@code defaultScheme}, which follows the node's
      * own transport configuration.
      */
-    private static List<PeerAdvertisement.Endpoint> seedEndpoints(List<String> seeds,
-                                                                  String defaultScheme) {
-        List<PeerAdvertisement.Endpoint> endpoints = new ArrayList<>();
-        for (int i = 0; i < seeds.size(); i++) {
-            String seed = seeds.get(i).trim();
-            String scheme = defaultScheme;
-            int separator = seed.indexOf("://");
-            if (separator > 0) {
-                scheme = seed.substring(0, separator);
-                seed = seed.substring(separator + 3);
-            }
-            endpoints.add(new PeerAdvertisement.Endpoint(scheme, seed, i));
-        }
-        return endpoints;
+    static List<PeerAdvertisement.Endpoint> seedEndpoints(List<String> seeds,
+                                                          String defaultScheme) {
+        return SeedsLocator.parse(seeds, defaultScheme);
     }
 
     /**

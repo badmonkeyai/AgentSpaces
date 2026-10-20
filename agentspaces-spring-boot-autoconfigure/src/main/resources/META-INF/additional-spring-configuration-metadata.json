@@ -1,0 +1,505 @@
+{
+  "properties": [
+    {
+      "name": "agentspaces.transport.quic.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the quic binding. Needs ai.badmonkey.agentspaces:agentspaces-transport-quic on the classpath.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.quic.bind",
+      "type": "java.lang.String",
+      "description": "host:port the quic binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener"
+    },
+    {
+      "name": "agentspaces.transport.quic.advertise",
+      "type": "java.lang.String",
+      "description": "host:port carried in the advertisement in place of bind (a NAT or pod address).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener"
+    },
+    {
+      "name": "agentspaces.transport.quic.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener"
+    },
+    {
+      "name": "agentspaces.transport.dtls.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the dtls binding. Needs ai.badmonkey.agentspaces:agentspaces-transport-dtls on the classpath.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.dtls.bind",
+      "type": "java.lang.String",
+      "description": "host:port the dtls binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls"
+    },
+    {
+      "name": "agentspaces.transport.dtls.advertise",
+      "type": "java.lang.String",
+      "description": "host:port carried in the advertisement in place of bind (a NAT or pod address).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls"
+    },
+    {
+      "name": "agentspaces.transport.dtls.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls"
+    },
+    {
+      "name": "agentspaces.transport.dtls.attestation",
+      "type": "java.lang.String",
+      "description": "identity: attest with the identity-endorsed channel certificate, or CA mode when agentspaces.transport.tls.trust-store is set. none: encryption only, never attesting.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": "identity"
+    },
+    {
+      "name": "agentspaces.transport.dtls.protocols",
+      "type": "java.util.List<java.lang.String>",
+      "description": "DTLS versions offered. DTLSv1.2 is what BouncyCastle negotiates today; DTLSv1.3 is refused until it does.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": [
+        "DTLSv1.2"
+      ]
+    },
+    {
+      "name": "agentspaces.transport.dtls.connection-id",
+      "type": "java.lang.Boolean",
+      "description": "Negotiate RFC 9146 Connection ID so an association survives NAT rebinding.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": true
+    },
+    {
+      "name": "agentspaces.transport.dtls.mtu",
+      "type": "java.lang.Integer",
+      "description": "Datagram budget: the largest UDP payload sent, 576 to 9000 bytes.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": 1200
+    },
+    {
+      "name": "agentspaces.transport.dtls.window",
+      "type": "java.lang.Integer",
+      "description": "DATA PDUs unacknowledged per association, 4 to 1024.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": 64
+    },
+    {
+      "name": "agentspaces.transport.dtls.idle-timeout",
+      "type": "java.time.Duration",
+      "description": "Silence after which an association fails, 10s to 10m; keepalive at a quarter of it.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": "60s"
+    },
+    {
+      "name": "agentspaces.transport.dtls.max-half-open",
+      "type": "java.lang.Integer",
+      "description": "Unfinished handshakes per listener, 16 to 65536.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": 1024
+    },
+    {
+      "name": "agentspaces.transport.dtls.hello-rate-per-source",
+      "type": "java.lang.Integer",
+      "description": "ClientHellos accepted per second from one source address, 1 to 1000. Raise it for many peers behind one NAT address.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
+      "defaultValue": 8
+    },
+    {
+      "name": "agentspaces.multicast.seal",
+      "type": "java.lang.Boolean",
+      "description": "Seal each multicast beacon datagram under its group's content-key (SPEC 10.1 v0.1.19): members holding the key find each other, bystanders read nothing; groups without a content key stay plain.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Multicast",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.udp.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the bare UDP binding (plaintext; frames stay signed). Needs ai.badmonkey.agentspaces:agentspaces-transport-dtls and the dev-local profile or allow-plaintext.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Udp",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.udp.bind",
+      "type": "java.lang.String",
+      "description": "host:port the udp binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Udp"
+    },
+    {
+      "name": "agentspaces.transport.udp.advertise",
+      "type": "java.lang.String",
+      "description": "host:port carried in the advertisement in place of bind.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Udp"
+    },
+    {
+      "name": "agentspaces.transport.udp.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority; default after the other listeners.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Udp"
+    },
+    {
+      "name": "agentspaces.transport.udp.allow-plaintext",
+      "type": "java.lang.Boolean",
+      "description": "Permit plaintext UDP outside the dev-local security profile. No confidentiality, no attestation; an on-path attacker can disrupt delivery.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Udp",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.webrtc.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the webrtc binding and accept offers, advertising Endpoint(webrtc, sig, priority). Needs ai.badmonkey.agentspaces:agentspaces-transport-webrtc (and its native classifier) on the classpath. Attests, so it may run under require-attestation.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.webrtc.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised priority of the sig endpoint (spec 5.5), lower dials first; default: after every stream endpoint.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc"
+    },
+    {
+      "name": "agentspaces.transport.webrtc.ice-servers",
+      "type": "java.util.List<ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc$IceServer>",
+      "description": "ICE servers, each with urls (stun:, turn:, turns:) and the TURN username and credential; empty by default, so only host and mDNS candidates gather.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc"
+    },
+    {
+      "name": "agentspaces.transport.webrtc.dial-timeout",
+      "type": "java.time.Duration",
+      "description": "A dial (signalling, ICE, DTLS, channel open) completes or fails within this; a pending session expires at it.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc",
+      "defaultValue": "15s"
+    },
+    {
+      "name": "agentspaces.transport.webrtc.offers-per-peer-per-minute",
+      "type": "java.lang.Integer",
+      "description": "OFFER signals accepted from one remote peer per minute; excess is dropped and counted.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc",
+      "defaultValue": 6
+    },
+    {
+      "name": "agentspaces.transport.webrtc.candidates-per-session",
+      "type": "java.lang.Integer",
+      "description": "CAND signals accepted for one session; excess is dropped and counted.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc",
+      "defaultValue": 64
+    },
+    {
+      "name": "agentspaces.transport.webrtc.max-signal-bytes",
+      "type": "java.lang.Integer",
+      "description": "The largest signal body accepted.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc",
+      "defaultValue": 65536
+    },
+    {
+      "name": "agentspaces.transport.webrtc.offload.frames-per-minute",
+      "type": "java.lang.Integer",
+      "description": "The relay offload (SRAD agentspaces-js JS-W-11): once more than this many frames crossed a relay to or from one member in a sliding minute, the node dials that member's webrtc endpoint from its tick (never from a send) and sends directly once open. A setting, not a cap.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc$Offload",
+      "defaultValue": 30
+    },
+    {
+      "name": "agentspaces.transport.webrtc.offload.retry-after",
+      "type": "java.time.Duration",
+      "description": "How long the node waits after a failed offload dial to a member before dialing it again; the relay carries the frames meanwhile.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Webrtc$Offload",
+      "defaultValue": "5m"
+    },
+    {
+      "name": "agentspaces.transport.ws.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the ws binding (WebSocket, plaintext). Needs ai.badmonkey.agentspaces:agentspaces-transport-http on the classpath.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.ws.bind",
+      "type": "java.lang.String",
+      "description": "host:port[/path] the ws binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.ws.advertise",
+      "type": "java.lang.String",
+      "description": "host:port[/path] carried in the advertisement in place of bind (an ingress or NAT address).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.ws.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.ws.path",
+      "type": "java.lang.String",
+      "description": "The path served.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "/aspace"
+    },
+    {
+      "name": "agentspaces.transport.ws.allowed-origins",
+      "type": "java.util.List<java.lang.String>",
+      "description": "Browser origins allowed to connect (scheme://host[:port]); empty refuses every browser; * admits any, for demonstrations.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.ws.idle-timeout",
+      "type": "java.time.Duration",
+      "description": "A connection or exchange session silent this long closes.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "60s"
+    },
+    {
+      "name": "agentspaces.transport.ws.ping-interval",
+      "type": "java.time.Duration",
+      "description": "A WebSocket idle this long for writing sends a ping.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "30s"
+    },
+    {
+      "name": "agentspaces.transport.ws.long-poll",
+      "type": "java.time.Duration",
+      "description": "How long an exchange download request is held with nothing to send.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "25s"
+    },
+    {
+      "name": "agentspaces.transport.ws.opens-per-source-per-second",
+      "type": "java.lang.Integer",
+      "description": "Exchange sessions one source address may open per second; a rate, never a cap on sessions.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": 4
+    },
+    {
+      "name": "agentspaces.transport.wss.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the wss binding (WebSocket over TLS 1.3). Needs ai.badmonkey.agentspaces:agentspaces-transport-http on the classpath.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.wss.bind",
+      "type": "java.lang.String",
+      "description": "host:port[/path] the wss binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.wss.advertise",
+      "type": "java.lang.String",
+      "description": "host:port[/path] carried in the advertisement in place of bind (an ingress or NAT address).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.wss.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.wss.path",
+      "type": "java.lang.String",
+      "description": "The path served.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "/aspace"
+    },
+    {
+      "name": "agentspaces.transport.wss.allowed-origins",
+      "type": "java.util.List<java.lang.String>",
+      "description": "Browser origins allowed to connect (scheme://host[:port]); empty refuses every browser; * admits any, for demonstrations.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.wss.idle-timeout",
+      "type": "java.time.Duration",
+      "description": "A connection or exchange session silent this long closes.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "60s"
+    },
+    {
+      "name": "agentspaces.transport.wss.ping-interval",
+      "type": "java.time.Duration",
+      "description": "A WebSocket idle this long for writing sends a ping.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "30s"
+    },
+    {
+      "name": "agentspaces.transport.wss.long-poll",
+      "type": "java.time.Duration",
+      "description": "How long an exchange download request is held with nothing to send.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "25s"
+    },
+    {
+      "name": "agentspaces.transport.wss.opens-per-source-per-second",
+      "type": "java.lang.Integer",
+      "description": "Exchange sessions one source address may open per second; a rate, never a cap on sessions.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": 4
+    },
+    {
+      "name": "agentspaces.transport.http.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the http exchange binding (request and long-poll, plaintext). Needs ai.badmonkey.agentspaces:agentspaces-transport-http on the classpath.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.http.bind",
+      "type": "java.lang.String",
+      "description": "host:port[/path] the http binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.http.advertise",
+      "type": "java.lang.String",
+      "description": "host:port[/path] carried in the advertisement in place of bind (an ingress or NAT address).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.http.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.http.path",
+      "type": "java.lang.String",
+      "description": "The path served.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "/aspace/h"
+    },
+    {
+      "name": "agentspaces.transport.http.allowed-origins",
+      "type": "java.util.List<java.lang.String>",
+      "description": "Browser origins allowed to connect (scheme://host[:port]); empty refuses every browser; * admits any, for demonstrations.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.http.idle-timeout",
+      "type": "java.time.Duration",
+      "description": "A connection or exchange session silent this long closes.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "60s"
+    },
+    {
+      "name": "agentspaces.transport.http.ping-interval",
+      "type": "java.time.Duration",
+      "description": "A WebSocket idle this long for writing sends a ping.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "30s"
+    },
+    {
+      "name": "agentspaces.transport.http.long-poll",
+      "type": "java.time.Duration",
+      "description": "How long an exchange download request is held with nothing to send.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "25s"
+    },
+    {
+      "name": "agentspaces.transport.http.opens-per-source-per-second",
+      "type": "java.lang.Integer",
+      "description": "Exchange sessions one source address may open per second; a rate, never a cap on sessions.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": 4
+    },
+    {
+      "name": "agentspaces.transport.https.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Register the https exchange binding (request and long-poll over TLS). Needs ai.badmonkey.agentspaces:agentspaces-transport-http on the classpath.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.transport.https.bind",
+      "type": "java.lang.String",
+      "description": "host:port[/path] the https binding listens on and advertises; blank registers it for dialing only.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.https.advertise",
+      "type": "java.lang.String",
+      "description": "host:port[/path] carried in the advertisement in place of bind (an ingress or NAT address).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.https.priority",
+      "type": "java.lang.Integer",
+      "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.https.path",
+      "type": "java.lang.String",
+      "description": "The path served.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "/aspace/h"
+    },
+    {
+      "name": "agentspaces.transport.https.allowed-origins",
+      "type": "java.util.List<java.lang.String>",
+      "description": "Browser origins allowed to connect (scheme://host[:port]); empty refuses every browser; * admits any, for demonstrations.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http"
+    },
+    {
+      "name": "agentspaces.transport.https.idle-timeout",
+      "type": "java.time.Duration",
+      "description": "A connection or exchange session silent this long closes.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "60s"
+    },
+    {
+      "name": "agentspaces.transport.https.ping-interval",
+      "type": "java.time.Duration",
+      "description": "A WebSocket idle this long for writing sends a ping.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "30s"
+    },
+    {
+      "name": "agentspaces.transport.https.long-poll",
+      "type": "java.time.Duration",
+      "description": "How long an exchange download request is held with nothing to send.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": "25s"
+    },
+    {
+      "name": "agentspaces.transport.https.opens-per-source-per-second",
+      "type": "java.lang.Integer",
+      "description": "Exchange sessions one source address may open per second; a rate, never a cap on sessions.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Http",
+      "defaultValue": 4
+    },
+    {
+      "name": "agentspaces.security.grants.raft-client",
+      "type": "java.util.List<java.lang.String>",
+      "description": "Peers or agents that may submit commands to an ordered log without voting (RAFT_CLIENT: browsers and the Python and TypeScript peers taking through the log); empty permits every admitted member.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Security$Grants"
+    }
+  ],
+  "hints": [
+    {
+      "name": "agentspaces.transport.dtls.attestation",
+      "values": [
+        {
+          "value": "identity",
+          "description": "Attest with channel certificates (spec 5.6)."
+        },
+        {
+          "value": "none",
+          "description": "Encryption only; refused under require-attestation."
+        }
+      ]
+    },
+    {
+      "name": "agentspaces.transport.dtls.protocols",
+      "values": [
+        {
+          "value": "DTLSv1.2"
+        }
+      ]
+    }
+  ]
+}

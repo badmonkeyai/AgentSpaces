@@ -205,6 +205,15 @@ public final class QuicTransport implements Transport, AutoCloseable {
     }
 
     @Override
+    public java.util.Set<Capability> capabilities() {
+        // QUIC always encrypts; only the identity constructors attest.
+        return attesting
+                ? java.util.Set.of(Capability.ENCRYPTED, Capability.ATTESTING,
+                        Capability.RELIABLE, Capability.ORDERED)
+                : java.util.Set.of(Capability.ENCRYPTED, Capability.RELIABLE, Capability.ORDERED);
+    }
+
+    @Override
     public TransportConnection dial(String address) throws IOException {
         InetSocketAddress target = parse(address);
         try {

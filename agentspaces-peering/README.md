@@ -24,8 +24,9 @@ founding documents, revocation, and containment.
 
 ## Key dependencies
 
-`agentspaces-api`, `agentspaces-common`, `agentspaces-identity`. The QUIC binding is a separate
-module (`agentspaces-transport-quic`).
+`agentspaces-api`, `agentspaces-common`, `agentspaces-identity`. The QUIC and DTLS bindings are separate
+modules (`agentspaces-transport-quic`, `agentspaces-transport-dtls`); the key and trust managers
+the TLS binding shares with them live in `agentspaces-identity-tls`.
 
 ## Notes
 

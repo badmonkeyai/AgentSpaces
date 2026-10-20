@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
   </parent>
 
   <artifactId>agentspaces-spring-boot-autoconfigure</artifactId>
@@ -74,6 +74,35 @@
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-identity</artifactId>
+    </dependency>
+    <!-- The listener blocks (SRAD dtls-support §3.6) build these bindings when
+         the application adds the module; optional, so neither is pulled in. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-dtls</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-quic</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <!-- The ws, wss, http, https blocks (SRAD agentspaces-js JS-H-10). -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-http</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <!-- The webrtc block (SRAD agentspaces-js JS-N-04); optional, so an application
+         opts in by depending on agentspaces-transport-webrtc and its natives. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-webrtc</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
     </dependency>
     <!-- The A2A gateway's auto-configuration (TODO item 7); optional, so an
          application opts in by depending on agentspaces-a2a (the starter does). -->

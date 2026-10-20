@@ -2,7 +2,7 @@
 
 **A peer-to-peer coordination fabric for agents, services, and the people who work with them.**
 
-AgentSpaces gives a fleet of agents, and the software services and human operators around them, a shared space to coordinate. Agents post work, claim tasks, publish results, vote on decisions, and recover from each other's failures. There is no broker, no registry, no scheduler, and no server to keep alive. Coordination is peer-to-peer, signed end to end, and replicated across the fleet.
+AgentSpaces is a P2P framework to quickly discover and join P2P networks, where agents, software services, and people share assets, queries, results, and coordinate. The framework helps you build fleets of agents, tie in other software, and coordinate across them with a replicated tuple space, quorum builing, and more. Agents post work, claim tasks, publish results, vote on decisions, and recover from each other's failures. There is no broker, no registry, no scheduler, and no server to keep alive. Coordination is peer-to-peer, secured end to end, and replicated across the fleet.
 
 ```java
 @AgentSpec(name = "fulfiller", description = "Ships orders")
@@ -15,7 +15,138 @@ public class Fulfiller {
 }
 ```
 
-Drop that in a Spring Boot app. Start a second instance. You now have competing consumers. Kill one mid-order and the order comes back for the other. That's the whole model: shared state is leased, and failure handling is the absence of renewal.
+Drop that in a Spring Boot app. Start a second instance. You now have competing consumers. Kill one mid-order and the order comes back for the other to pick up and run. That's the whole model: shared state across instances, time bound, with integrated failure handling. 
+
+## How to use AI with AgentSpaces
+
+At the end of this section you will have an agent that takes work from a shared space, a second peer that writes that work and reads the result back, a worker whose crash hands its order to a worker on another peer, and the same agent enrolled as a Spring Boot bean by the starter with no peer code of your own. 
+
+**Build an agent.** Two plain classes are a fleet: a worker that takes orders under a lease and an auditor that reacts to every shipment. The group has one space, so no annotation names it; the `@SpaceRef` field gives the worker a handle for a mid-work progress entry.
+
+```java
+@AgentSpec(name = "fulfiller", description = "Ships orders from the shared space",
+        goals = {"fulfill orders"})
+public static class Fulfiller {
+
+    @SpaceRef
+    private Space space;
+
+    @SpaceTake(lease = "10m", pollTimeout = "300ms")
+    public Shipment ship(Order order) {
+        space.write(new Progress(order.orderId(), "picking " + order.item()),
+                Lease.of(Duration.ofMinutes(5)));
+        return new Shipment(order.orderId(), order.item(), "fulfiller");
+    }
+}
+
+@AgentSpec(name = "auditor", description = "Writes a receipt for every shipment",
+        goals = {"account for shipments"})
+public static class Auditor {
+
+    @SpaceNotify
+    public Receipt account(Shipment shipment) {
+        return new Receipt(shipment.orderId(),
+                shipment.item() + " shipped by " + shipment.by());
+    }
+}
+```
+
+Binding is three lines on any peer: `new AgentBinder(identity, runtime.id(), null, InstantSource.system())`, `binder.space("work", space)`, `binder.bind(new Fulfiller())`. Source: [`examples/example-11-quickstart/src/main/java/ai/badmonkey/agentspaces/examples/quickstart/Quickstart.java`](examples/example-11-quickstart/src/main/java/ai/badmonkey/agentspaces/examples/quickstart/Quickstart.java); run it with `mvn -q -pl examples/example-11-quickstart exec:java` (two TCP peers on ports 7591 and 7592); `QuickstartTest` runs the same two agents over one `LocalSpace` with `mvn -q -pl examples/example-11-quickstart test`.
+
+**Share work through the space.** The writer is another peer, and it binds no agent. It writes an `Order` into its replica, the worker on the other peer takes it, and the `Shipment` replicates back to the writer. `startPeer` is example 11's peer assembly on the in-JVM `mem` transport, and `Fulfiller` is the class at the top of this README.
+
+```java
+Peer desk = startPeer("desk", null);            // writes orders, binds no agent
+Peer worker = startPeer("worker", "desk");      // seeds from the desk
+worker.binder().bind(new Fulfiller());
+
+desk.space().write(new Order("ord-1", "kite"), Lease.of(Duration.ofMinutes(10)));
+
+assertThat(desk.space().read(Template.of(Shipment.class), Duration.ofSeconds(20)))
+        .hasValueSatisfying(s -> assertThat(s.by()).isEqualTo("fulfiller"));
+assertThat(desk.space().readAll(Template.of(Order.class), 10)).isEmpty();
+```
+
+**Survive a crash.** A worker that throws lets its take lease lapse, and closing its binder is the process dying: nothing on that peer renews or re-takes. The order reappears for the worker on a third peer, and the desk reads the shipment with no code for retries, dead-letter queues, or heartbeats.
+
+```java
+@AgentSpec(name = "crasher", description = "Dies mid-order")
+public static class Crasher {
+    final AtomicInteger attempts = new AtomicInteger();
+
+    @SpaceTake(lease = "300ms", pollTimeout = "100ms")
+    public Shipment ship(Order order) {
+        attempts.incrementAndGet();
+        throw new IllegalStateException("simulated crash");
+    }
+}
+
+Peer desk = startPeer("desk", null);
+Peer flaky = startPeer("flaky", "desk");
+Peer steady = startPeer("steady", "desk");
+Crasher crasher = new Crasher();
+flaky.binder().bind(crasher);
+
+desk.space().write(new Order("ord-2", "compass"), Lease.of(Duration.ofMinutes(10)));
+await(() -> crasher.attempts.get() >= 1);       // flaky took the order and died
+flaky.binder().close();                         // the process is gone; nothing renews its lease
+
+steady.binder().bind(new Fulfiller());          // the lease lapses; the order reappears here
+assertThat(desk.space().read(Template.of(Shipment.class), Duration.ofSeconds(40)))
+        .hasValueSatisfying(s -> assertThat(s.orderId()).isEqualTo("ord-2"));
+assertThat(desk.space().readAll(Template.of(Order.class), 10)).isEmpty();
+```
+
+Source for both: [`agentspaces-agent/src/test/java/ai/badmonkey/agentspaces/agent/ReadmeExamplesTest.java`](agentspaces-agent/src/test/java/ai/badmonkey/agentspaces/agent/ReadmeExamplesTest.java), tests `anotherPeerWritesWhatTheWorkerTakes` and `aCrashedWorkersOrderReappearsForAWorkerOnAnotherPeer`; run with `mvn -q -o test -pl agentspaces-agent -Dtest=ReadmeExamplesTest -Dsurefire.failIfNoSpecifiedTests=false`. The same hand-off over three TCP peers, six tasks, and a worker that dies after its first completion is [`examples/example-02-research-fleet`](examples/example-02-research-fleet/README.md); the exactly-once variant through the ordered log, where `@OrderedTake` replaces `@SpaceTake` and three clerks confirm each payment once, is [`examples/example-12-exactly-once-desk`](examples/example-12-exactly-once-desk/README.md).
+
+**Enroll it with the starter.** Under Spring Boot the peer, group, spaces, worker loop, and card publication arrive from properties, and a bean post-processor enrolls every annotated bean. The application's only AgentSpaces knowledge is one starter dependency, the properties, and the bean; the `@SpaceAgent` stereotype folds `@Component` and `@AgentSpec` into one annotation.
+
+```java
+@Component
+@AgentSpec(name = "it-researcher", description = "Researches integration topics",
+        goals = {"research"})
+public static class Researcher {
+    public final CopyOnWriteArrayList<String> worked = new CopyOnWriteArrayList<>();
+
+    @SpaceTake(space = "tasks", lease = "PT10M", pollTimeout = "PT0.2S",
+            resultSpace = "findings")
+    public ItFinding research(ItTask task) {
+        worked.add(task.topic());
+        return new ItFinding(task.topic(), "done: " + task.topic());
+    }
+}
+```
+
+The test boots two such applications on free ports from the same keys an `application.yml` would carry, writes a task through the `AgentSpaces` facade of the one with no agent bean, and reads the finding back from it:
+
+```java
+SpringApplicationBuilder builder = new SpringApplicationBuilder(app)
+        .properties(Map.of(
+                "spring.main.web-application-type", "none",
+                "agentspaces.bind", "127.0.0.1:" + port,
+                "agentspaces.tick-millis", "200",
+                "agentspaces.groups[0].name", "it-fleet",
+                "agentspaces.groups[0].founding", "spring-it-fleet-v1",
+                "agentspaces.groups[0].spaces[0].name", "tasks",
+                "agentspaces.groups[0].spaces[0].settle-window-millis", "100",
+                "agentspaces.groups[0].spaces[1].name", "findings",
+                "agentspaces.groups[0].spaces[1].settle-window-millis", "100"));
+if (seedPort > 0) {
+    builder.properties(Map.of(
+            "agentspaces.groups[0].seeds[0]", "127.0.0.1:" + seedPort));
+}
+
+AgentSpaces writer = first.getBean(AgentSpaces.class);
+writer.group("it-fleet").space("tasks")
+        .write(new ItTask("cross-context", 2),
+                Lease.of(Duration.ofMinutes(10)));
+assertThat(writer.group("it-fleet").space("findings")
+        .read(Template.of(ItFinding.class), Duration.ofSeconds(60)))
+        .hasValueSatisfying(finding -> assertThat(finding.summary())
+                .isEqualTo("done: cross-context"));
+```
+
+Source: [`integration-tests/spring-boot-it/src/main/java/ai/badmonkey/agentspaces/it/FleetItApp.java`](integration-tests/spring-boot-it/src/main/java/ai/badmonkey/agentspaces/it/FleetItApp.java) and [`SpringFleetIntegrationTest.twoSpringApplicationsFormOneFleetOverTcp`](integration-tests/spring-boot-it/src/test/java/ai/badmonkey/agentspaces/it/SpringFleetIntegrationTest.java); run with `mvn -q -Pspring-it test -pl integration-tests/spring-boot-it -Dtest=SpringFleetIntegrationTest`. The [starter README](agentspaces-spring-boot-starter/README.md) has the YAML form of the same keys. To put a model inside the worker, see [`agentspaces-springai`](https://github.com/badmonkeyai/agentspaces-springai) (Spring AI) or [`agentspaces-langchain4j`](https://github.com/badmonkeyai/agentspaces-langchain4j) (LangChain4j on any JVM host); the coordination and the model call stay orthogonal.
 
 ## Why this exists
 
@@ -60,7 +191,7 @@ The core provides leases, gossip, and CRDT replication. The stronger semantics a
 - **Leases as failure handling.** Failure recovery is a property of the data model rather than a separate subsystem.
 - **Selectable coordination.** Use the least expensive mechanism that satisfies the workload. Uplift to auction, quorum, or ordered consensus only where consequence requires it.
 - **Extensible.** New coordination patterns arrive as advertised capabilities, with no change to the core.
-- **Polyglot.** Java, Python, TypeScript, and Clojure peers share the same signed wire protocol.
+- **Polyglot.** Java, Python, TypeScript, Clojure, and Groovy peers share the same signed wire protocol.
 - **Trust boundaries.** Self-certifying groups, per-agent keys, group-key encryption, and pluggable membership and authorization let fleets span organizations.
 
 ## Where it came from
@@ -124,7 +255,7 @@ With `agentspaces.identity.agent-keys=subordinate` every bound agent signs with 
 
 ## Add it to your build
 
-Release artifacts are on Maven Central under the group `ai.badmonkey.agentspaces`, version `0.3.0` ([central.sonatype.com/namespace/ai.badmonkey.agentspaces](https://central.sonatype.com/namespace/ai.badmonkey.agentspaces)). Maven and Gradle resolve Maven Central by default, so no repository configuration is needed. The libraries are Java 21 bytecode.
+Release artifacts are on Maven Central under the group `ai.badmonkey.agentspaces`, version `0.4.0` ([central.sonatype.com/namespace/ai.badmonkey.agentspaces](https://central.sonatype.com/namespace/ai.badmonkey.agentspaces)). Maven and Gradle resolve Maven Central by default, so no repository configuration is needed. The libraries are Java 21 bytecode.
 
 One dependency matches each way an application is built:
 
@@ -147,7 +278,7 @@ The bill of materials, `agentspaces-dependencies`, manages the version of every 
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-dependencies</artifactId>
-      <version>0.3.0</version>
+      <version>0.4.0</version>
       <type>pom</type>
       <scope>import</scope>
     </dependency>
@@ -162,13 +293,13 @@ The bill of materials, `agentspaces-dependencies`, manages the version of every 
 </dependencies>
 ```
 
-A project that inherits from `spring-boot-starter-parent` imports the BOM the same way; Spring Boot's dependency management does not know the AgentSpaces artifacts, so either the import or an explicit `<version>0.3.0</version>` on each dependency is needed.
+A project that inherits from `spring-boot-starter-parent` imports the BOM the same way; Spring Boot's dependency management does not know the AgentSpaces artifacts, so either the import or an explicit `<version>0.4.0</version>` on each dependency is needed.
 
 ### Gradle Kotlin DSL (`build.gradle.kts`)
 
 ```kotlin
 dependencies {
-    implementation(platform("ai.badmonkey.agentspaces:agentspaces-dependencies:0.3.0"))
+    implementation(platform("ai.badmonkey.agentspaces:agentspaces-dependencies:0.4.0"))
     implementation("ai.badmonkey.agentspaces:agentspaces-spring-boot-starter")
 }
 ```
@@ -177,12 +308,12 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation platform('ai.badmonkey.agentspaces:agentspaces-dependencies:0.3.0')
+    implementation platform('ai.badmonkey.agentspaces:agentspaces-dependencies:0.4.0')
     implementation 'ai.badmonkey.agentspaces:agentspaces-spring-boot-starter'
 }
 ```
 
-Without the BOM, write the version on the dependency: `implementation("ai.badmonkey.agentspaces:agentspaces-agent:0.3.0")`. The optional modules (`agentspaces-transport-quic`, `agentspaces-console`, `agentspaces-a2a`, `agentspaces-connect-core`, `agentspaces-auth-oidc`) are added the same way and are all managed by the BOM.
+Without the BOM, write the version on the dependency: `implementation("ai.badmonkey.agentspaces:agentspaces-agent:0.4.0")`. The optional modules (`agentspaces-transport-quic`, `agentspaces-transport-dtls`, `agentspaces-console`, `agentspaces-a2a`, `agentspaces-connect-core`, `agentspaces-auth-oidc`) are added the same way and are all managed by the BOM.
 
 ### Unreleased versions
 
@@ -247,7 +378,7 @@ Each layer depends only on the layers below it. A conforming minimal implementat
 
 The full design lives in `SPEC.md` (v0.1.17) with implementation detail in `TECH-SPEC.md`, both in `agentspaces-spec/` beside this repository, together with the golden vectors they define conformance by (`golden.json`, vendored here as `tools/golden/golden.json`).
 
-## Version 0.3.0 Capabilities
+## Version 0.4.0 Capabilities
 
 Every specification layer (0 through 4) has a working implementation, and every clause the specification does not mark as planned has a pinning test.
 
@@ -268,7 +399,8 @@ Every specification layer (0 through 4) has a working implementation, and every 
 - TLS 1.3 with identity-endorsed channel certificates: bare frames on attested links, and CA-issued certificates with CRL or OCSP revocation in enterprise mode.
 - QUIC (RFC 9000).
 - An opt-in multicast bootstrap beacon for LANs.
-- Roadmap: DTLS and WebSocket support
+- DTLS 1.2 (RFC 6347) with Connection ID (RFC 9146), on BouncyCastle, pure Java (`agentspaces-transport-dtls`).
+- Roadmap: WebSocket support
 
 The transport layer is pluggable, so more options can be built over time, including different strategies for initial bootstrap of the P2P network. The multicast option has linits in practice. In the past, we had well known sites for peers to bootstrap from, DHCP options that reference bootstrap locations, etc. We didn't want to prescribe one of these, but leave it open for adopters to build to their network architecture.
 
@@ -385,7 +517,7 @@ mvn -q -pl examples/example-01-hello-space exec:java
 The full workspace gate (about 15 minutes) is `verify-all.sh`, run from the workspace root where all repos have been checked out. It runs this reactor's gate and then every standalone project against the freshly installed libraries, which is how they are kept from drifting (QA4 A4-2) without being part of the core build:
 
 - A check that the golden-vector copies match.
-- The Python, TypeScript, and Clojure clients.
+- The Python, TypeScript, Clojure, and Groovy clients.
 - The example apps and the Party Bus.
 - agentspaces-springai.
 - A compile of the perf harnesses.
@@ -396,7 +528,7 @@ Build success should look like:
 
 ```
 [INFO] ------------------------------------------------------------------------
-[INFO] Reactor Summary for AgentSpaces 0.3.0:
+[INFO] Reactor Summary for AgentSpaces 0.4.0:
 [INFO]
 [INFO] AgentSpaces :: Dependencies (BOM) .................. SUCCESS [  0.044 s]
 [INFO] AgentSpaces ........................................ SUCCESS [  0.044 s]
@@ -471,6 +603,7 @@ architecture.
 | `agentspaces-python/`, `agentspaces-typescript/` (separate repo) | Wire-compatible non-JVM peers. They join Java fleets by seed or by GroupID with the founding document verified, write signed entries, take under the claim lattice, and read through anti-entropy, and both reproduce every shared golden vector byte for byte from their vendored copies of `agentspaces-spec/golden.json`. |
 | `agentspaces-springai/` (separate repo) | AgentSpaces for Spring AI applications, standalone on the published libraries (Spring Boot 4.1, Spring AI 2.0): the fleet's AgentCards as Spring AI tools, discovery and data tools, crash-safe LLM workers (a take lease renewed per model round-trip, chat memory in a space), model access as a fleet service (`FleetChatModel` and `ModelServer`, with streaming), a Spring AI embedder for semantic discovery, fleet-wide token usage, and MCP export. No Embabel dependency; see its README and `agentspaces-springai.md`. |
 | `agentspaces-clj/` (separate repo) | Idiomatic Clojure bindings outside the reactor, consuming the published artifacts: maps in and out over record entry types, a keyword `:where` DSL, and `fleet/start` from a config map mirroring the Spring starter. |
+| `agentspaces-groovy/` (separate repo) | Groovy 6 bindings outside the reactor, consuming the published artifacts: extension methods on the Space API, `Fleet.start { }` mirroring the starter's properties, `agent { }` bound through a generated interface, `FleetScript` for one-file peers, `await` twins, a type-checking extension, a shell, and a channel bridge over the incubating `groovy.concurrent` toolkit. |
 | `integration-tests/` | The real-Spring release gate: a `SpringApplication` boots the starter and works a fleet over TCP. Built under `-Pspring-it`, which CI activates. |
 
 ### Modules by layer

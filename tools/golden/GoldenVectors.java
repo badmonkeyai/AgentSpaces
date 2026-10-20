@@ -154,6 +154,44 @@ public final class GoldenVectors {
     record JoinTicket(String join, String key) {
     }
 
+    /**
+     * Mirror of the WebRTC signalling body (srad/agentspaces-js.md appendix B, JS-W-03):
+     * {@code agentspaces-transport-webrtc}'s {@code RtcSignal}, checked by shape when that
+     * module's classes are on the classpath.
+     */
+    record RtcSignal(int v,
+                     @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL) List<String> fp,
+                     @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL) String mid,
+                     @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL) String sdp,
+                     byte[] sid,
+                     @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL) String cand,
+                     @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL) Integer code,
+                     String kind) {
+    }
+
+    // Mirrors of the connector entries (srad/agentspaces-js.md JS-C-01, JS-C-03): the public
+    // records of agentspaces-connect-core (DataQueryEntries.DataQuery/DataResult/AssetChange and
+    // AssetInvocations.AssetInvocation/AssetInvocationResult), a module outside this program's
+    // documented classpath, so assertMirrorsIfLoadable checks them whenever
+    // agentspaces-connect-core/target/classes is prepended to CP and notes a skip otherwise.
+    record DataQuery(String queryHash, String asset, Map<String, String> parameters, String requester) {
+    }
+
+    record DataResult(String queryHash, String asset, List<Map<String, String>> rows, String error,
+                      String servedBy) {
+    }
+
+    record AssetChange(String asset, String key, Map<String, String> row, String servedBy) {
+    }
+
+    record AssetInvocation(int v, String asset, String operation, Map<String, String> params,
+                           String invocationId) {
+    }
+
+    record AssetInvocationResult(int v, String invocationId, String asset, String operation, boolean ok,
+                                 Map<String, String> result, String error) {
+    }
+
     // Mirrors of PushSumAggregate's private wire records (SPEC §8 aggregate,
     // TECH-SPEC §8.2): one Frame carries exactly one of the four variants.
     record Share(String epochId, double value, double weight) {
@@ -198,6 +236,14 @@ public final class GoldenVectors {
         assertMirrors(ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor.class,
                 "WrapBinding", WrapBinding.class);
         assertMirrorsIfLoadable("ai.badmonkey.agentspaces.agent.join.JoinTicket", JoinTicket.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.transport.webrtc.RtcSignal", RtcSignal.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.DataQueryEntries$DataQuery", DataQuery.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.DataQueryEntries$DataResult", DataResult.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.DataQueryEntries$AssetChange", AssetChange.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.AssetInvocations$AssetInvocation",
+                AssetInvocation.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.AssetInvocations$AssetInvocationResult",
+                AssetInvocationResult.class);
 
         // The golden identity: reloaded from the existing file so signatures
         // stay stable; generated fresh only on the very first run.
@@ -334,6 +380,7 @@ public final class GoldenVectors {
                 new SpaceWire.Delta(null, entryId,
                         new SpaceWire.SignedClaim(claim, identity.rawPublicKey(),
                                 claimSig))))));
+        json.append(servingVectors(dto, claim));
 
         // Digest body sample so Python can politely answer anti-entropy.
         json.append(field("digest_body_cbor", hex.formatHex(codec.toBytes(
@@ -1312,6 +1359,73 @@ public final class GoldenVectors {
         json.append(field("delta_renewed_certificate_cbor",
                 hex.formatHex(codec.toBytes(new SpaceWire.Delta(renewedDto, null, null)))));
 
+        // The DTLS recovery sublayer's PDUs (SPEC annex D, SRAD dtls-support appendix B), laid out
+        // byte by byte from the annex rather than through the binding's codec, so a second
+        // implementation checks its encoder against the text.
+        java.nio.ByteBuffer ackBlock = java.nio.ByteBuffer.allocate(20)
+                .putInt(100).putInt(250).putShort((short) 2).putShort((short) 10)
+                .putShort((short) 8).putShort((short) 10).putShort((short) 63).putShort((short) 0);
+        json.append(field("dtls_pdu_data", hex.formatHex(java.nio.ByteBuffer.allocate(22)
+                .put(new byte[]{1, 1, 0, 0}).putInt(7).putInt(3).putShort((short) 1).putShort((short) 4)
+                .put("aspace".getBytes(StandardCharsets.US_ASCII)).array())));
+        json.append(field("dtls_pdu_data_with_ack", hex.formatHex(java.nio.ByteBuffer.allocate(37)
+                .put(new byte[]{1, 1, 1, 0}).putInt(8).putInt(4).putShort((short) 0).putShort((short) 1)
+                .put(ackBlock.array()).put((byte) 'x').array())));
+        json.append(field("dtls_pdu_ack_three_ranges", hex.formatHex(java.nio.ByteBuffer.allocate(24)
+                .put(new byte[]{1, 2, 0, 0}).put(ackBlock.array()).array())));
+        // The portable field filter grammar (SPEC §7.2, srad/agentspaces-js.md JS-V-03): each case is
+        // a clause, a value as JSON, and the verdict the Java FieldFilter gives; Python and TypeScript
+        // must agree on every one.
+        json.append(filterGrammarCases());
+        json.append(sessionVectors(codec, hex));
+        json.append(raftVectors(codec, hex));
+        json.append(rtcVectors(codec, hex, wire.encode(ping, identity)));
+        json.append(connectVectors(codec, hex));
+        json.append(field("dtls_pdu_ping", "01030000"));
+        json.append(field("dtls_pdu_pong", "01040000"));
+        json.append(field("dtls_pdu_close_idle", "01050300"));
+
+        // The sealed beacon datagram (SPEC §10.1 v0.1.19): HKDF-SHA-256 keys from a fixed
+        // content key, the epoch tag, and one datagram sealed under a fixed nonce, computed
+        // with the JDK's primitives rather than the node's BeaconSeal.
+        byte[] beaconContentKey = new byte[32];
+        java.util.Arrays.fill(beaconContentKey, (byte) 3);
+        long beaconSecond = 1_792_320_000L;
+        javax.crypto.Mac hkdf = javax.crypto.Mac.getInstance("HmacSHA256");
+        hkdf.init(new javax.crypto.spec.SecretKeySpec(new byte[32], "HmacSHA256"));
+        byte[] prk = hkdf.doFinal(beaconContentKey);
+        hkdf.init(new javax.crypto.spec.SecretKeySpec(prk, "HmacSHA256"));
+        hkdf.update("aspace-beacon-v1".getBytes(StandardCharsets.US_ASCII));
+        hkdf.update((byte) 1);
+        byte[] t1 = hkdf.doFinal();
+        hkdf.update(t1);
+        hkdf.update("aspace-beacon-v1".getBytes(StandardCharsets.US_ASCII));
+        hkdf.update((byte) 2);
+        byte[] t2 = hkdf.doFinal();
+        javax.crypto.Mac tagMac = javax.crypto.Mac.getInstance("HmacSHA256");
+        tagMac.init(new javax.crypto.spec.SecretKeySpec(t1, "HmacSHA256"));
+        tagMac.update("aspace-beacon-tag".getBytes(StandardCharsets.US_ASCII));
+        tagMac.update(java.nio.ByteBuffer.allocate(8).putLong(Math.floorDiv(beaconSecond, 300)).array());
+        byte[] beaconTag = java.util.Arrays.copyOf(tagMac.doFinal(), 16);
+        byte[] beaconNonce = new byte[12];
+        for (int i = 0; i < 12; i++) {
+            beaconNonce[i] = (byte) i;
+        }
+        byte[] beaconPlain = "a signed self-advertisement".getBytes(StandardCharsets.US_ASCII);
+        javax.crypto.Cipher gcm = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+        gcm.init(javax.crypto.Cipher.ENCRYPT_MODE, new javax.crypto.spec.SecretKeySpec(t2, "AES"),
+                new javax.crypto.spec.GCMParameterSpec(128, beaconNonce));
+        gcm.updateAAD("ASB2".getBytes(StandardCharsets.US_ASCII));
+        gcm.updateAAD(beaconTag);
+        byte[] beaconSealed = gcm.doFinal(beaconPlain);
+        json.append(field("beacon_seal_content_key", hex.formatHex(beaconContentKey)));
+        json.append(field("beacon_seal_epoch_second", Long.toString(beaconSecond)));
+        json.append(field("beacon_seal_tag", hex.formatHex(beaconTag)));
+        json.append(field("beacon_seal_plaintext", hex.formatHex(beaconPlain)));
+        json.append(field("beacon_seal_datagram", hex.formatHex(java.nio.ByteBuffer.allocate(32 + beaconSealed.length)
+                .put("ASB2".getBytes(StandardCharsets.US_ASCII)).put(beaconTag).put(beaconNonce).put(beaconSealed)
+                .array())));
+
         // The envelope version every frame carries and every receiver checks first (SPEC §9).
         json.append(number("wire_version", WireCodec.WIRE_VERSION));
 
@@ -1404,6 +1518,230 @@ public final class GoldenVectors {
         // The @JsonValue string form, recovered by decoding the CBOR text item.
         byte[] bytes = codec.toBytes(value);
         return codec.fromBytes(bytes, String.class);
+    }
+
+    /**
+     * The {@code session_*} vectors (SPEC §5.6 v0.1.17 session attestation; srad/agentspaces-js.md JS-H-05):
+     * for fixed X25519 scalars, nonces, and PeerIDs, the hello and answer bodies, the derived key, and one
+     * session frame, computed over the same helpers PeerNode uses, so the TypeScript client (and a later
+     * Python one) derive the same key and verify the same tag.
+     */
+    private static String sessionVectors(CborCodec codec, HexFormat hex) throws Exception {
+        byte[] prefix = hex.parseHex("302e020100300506032b656e04220420");
+        java.security.KeyFactory factory = java.security.KeyFactory.getInstance("X25519");
+        byte[] aScalar = new byte[32];
+        java.util.Arrays.fill(aScalar, (byte) 1);
+        byte[] bScalar = new byte[32];
+        java.util.Arrays.fill(bScalar, (byte) 2);
+        java.security.PrivateKey a = factory.generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(
+                concat(prefix, aScalar)));
+        java.security.PrivateKey b = factory.generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(
+                concat(prefix, bScalar)));
+        byte[] base = new byte[32];
+        base[0] = 9;
+        byte[] aPublic = ai.badmonkey.agentspaces.common.crypto.X25519.agree(a, base);
+        byte[] bPublic = ai.badmonkey.agentspaces.common.crypto.X25519.agree(b, base);
+        byte[] aNonce = new byte[32];
+        java.util.Arrays.fill(aNonce, (byte) 0xaa);
+        byte[] bNonce = new byte[32];
+        java.util.Arrays.fill(bNonce, (byte) 0xbb);
+        // PeerNode.deriveSessionKey: HKDF over the agreement, bound to both PeerIDs and nonces in PeerID order.
+        java.io.ByteArrayOutputStream info = new java.io.ByteArrayOutputStream();
+        info.writeBytes("agentspaces session v1".getBytes(StandardCharsets.UTF_8));
+        info.writeBytes("zA".getBytes(StandardCharsets.UTF_8));
+        info.write(0);
+        info.writeBytes("zB".getBytes(StandardCharsets.UTF_8));
+        info.write(0);
+        info.writeBytes(aNonce);
+        info.writeBytes(bNonce);
+        byte[] key = ai.badmonkey.agentspaces.common.crypto.Hkdf.derive(
+                ai.badmonkey.agentspaces.common.crypto.X25519.agree(a, bPublic), new byte[0], info.toByteArray(), 32);
+        ai.badmonkey.agentspaces.peering.wire.WireCodec wire = new ai.badmonkey.agentspaces.peering.wire.WireCodec(codec);
+        ai.badmonkey.agentspaces.peering.wire.Envelope envelope = new ai.badmonkey.agentspaces.peering.wire.Envelope(
+                ai.badmonkey.agentspaces.peering.wire.WireCodec.WIRE_VERSION, GroupId.of("zGroup"),
+                ai.badmonkey.agentspaces.peering.wire.Envelope.Kind.PING, PeerId.of("zA"), PeerId.of("zB"),
+                new HlcTimestamp(1735689600000L, 3, "zA"), codec.toBytes(Map.of("nonce", 42)));
+        StringBuilder out = new StringBuilder();
+        out.append(field("session_a_scalar", hex.formatHex(aScalar)));
+        out.append(field("session_b_scalar", hex.formatHex(bScalar)));
+        out.append(field("session_a_public", hex.formatHex(aPublic)));
+        out.append(field("session_b_public", hex.formatHex(bPublic)));
+        out.append(field("session_a_nonce", hex.formatHex(aNonce)));
+        out.append(field("session_b_nonce", hex.formatHex(bNonce)));
+        out.append(field("session_key", hex.formatHex(key)));
+        out.append(field("session_hello_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.peering.wire.Bodies.SessionHello(aPublic, aNonce, PeerId.of("zB"), null)))));
+        out.append(field("session_answer_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.peering.wire.Bodies.SessionHello(bPublic, bNonce, PeerId.of("zA"), aNonce)))));
+        out.append(field("session_envelope_cbor", hex.formatHex(codec.toBytes(envelope))));
+        out.append(field("session_frame_cbor", hex.formatHex(wire.encodeSession(envelope, key))));
+        return out.toString();
+    }
+
+    private static byte[] concat(byte[] first, byte[] second) {
+        byte[] out = new byte[first.length + second.length];
+        System.arraycopy(first, 0, out, 0, first.length);
+        System.arraycopy(second, 0, out, first.length, second.length);
+        return out;
+    }
+
+    /** The {@code filter_grammar_cases} array: clause, JSON value, and the Java verdict. */
+    /**
+     * The Raft frame union as the capabilities module encodes it (srad/agentspaces-js.md
+     * JS-N-04): one frame per message kind with fixed fields, so a TypeScript voter or
+     * client produces the bytes a Java voter reads.
+     */
+    private static String raftVectors(CborCodec codec, HexFormat hex) {
+        byte[] command = "cmd".getBytes(StandardCharsets.UTF_8);
+        var requestVote = new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.RequestVote(
+                3, PeerId.of("zA"), 7, 2);
+        var voteReply = new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.VoteReply(3, true);
+        var appendEntries = new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.AppendEntries(
+                3, PeerId.of("zA"), 7, 2,
+                List.of(new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.LogEntry(3, command)), 6);
+        var appendReply = new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.AppendReply(
+                3, PeerId.of("zB"), true, 8);
+        var clientSubmit = new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.ClientSubmit(command);
+        StringBuilder out = new StringBuilder();
+        out.append(field("raft_request_vote_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.Frame(
+                        requestVote, null, null, null, null)))));
+        out.append(field("raft_vote_reply_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.Frame(
+                        null, voteReply, null, null, null)))));
+        out.append(field("raft_append_entries_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.Frame(
+                        null, null, appendEntries, null, null)))));
+        out.append(field("raft_append_reply_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.Frame(
+                        null, null, null, appendReply, null)))));
+        out.append(field("raft_client_submit_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.capabilities.orderedlog.RaftMessages.Frame(
+                        null, null, null, null, clientSubmit)))));
+        return out.toString();
+    }
+
+    /**
+     * The connector entries as agentspaces-connect-core encodes them (srad/agentspaces-js.md
+     * JS-C-01, JS-C-03, JS-N-01): the three {@code aspace:cap/data-query} records and the two
+     * {@code aspace:cap/asset-invoke} records from fixed values, plus the canonical query hash
+     * ({@code DataQueryEntries.canonicalHash}: multibase(sha-256) over the asset and the sorted
+     * parameters), so {@code @agentspaces/connect} and the Python client produce the bytes a Java
+     * connector or agent reads. Map-valued fields are in canonical order (wire v3).
+     */
+    private static String connectVectors(CborCodec codec, HexFormat hex) {
+        Map<String, String> parameters = new java.util.TreeMap<>(Map.of("region", "eu", "limit", "10"));
+        StringBuilder canonical = new StringBuilder("orders");
+        parameters.forEach((key, value) -> canonical.append('|').append(key).append('=').append(value));
+        String hash = ai.badmonkey.agentspaces.common.codec.Multibase.base58btc(
+                Digests.sha256(canonical.toString().getBytes(StandardCharsets.UTF_8)));
+        String invocationId = "6f1d2c3b-4a59-4e8f-9b7a-0c1d2e3f4a5b";
+        StringBuilder out = new StringBuilder();
+        out.append(field("data_query_canonical_hash", hash));
+        out.append(field("data_query_cbor", hex.formatHex(codec.toBytes(
+                new DataQuery(hash, "orders", parameters, "zPeer/analyst")))));
+        out.append(field("data_result_cbor", hex.formatHex(codec.toBytes(new DataResult(hash, "orders",
+                List.of(Map.of("id", "1", "region", "eu", "amount", "120.00"),
+                        Map.of("id", "3", "region", "eu", "amount", "45.50")), null, "pg-connector")))));
+        out.append(field("asset_change_cbor", hex.formatHex(codec.toBytes(new AssetChange("orders", "1",
+                Map.of("id", "1", "region", "eu", "amount", "125.00"), "pg-connector")))));
+        out.append(field("asset_invocation_cbor", hex.formatHex(codec.toBytes(new AssetInvocation(1,
+                "do/Inventory", "reserveStock", Map.of("sku", "A-1", "qty", "2"), invocationId)))));
+        out.append(field("asset_invocation_result_cbor", hex.formatHex(codec.toBytes(new AssetInvocationResult(1,
+                invocationId, "do/Inventory", "reserveStock", true, Map.of("reserved", "2"), null)))));
+        return out.toString();
+    }
+
+    /**
+     * The serving half's Java encodings (srad/agentspaces-js.md JS-R-04): ReplicatedSpace's
+     * stateHash and claimHash over the golden delta and claim delta (reflection, the methods
+     * are private), and Double.toString on the values a bid or a filter literal may take, so a
+     * TypeScript host answers a Java DIGEST with the same lines a Java member would.
+     */
+    private static String servingVectors(SpaceWire.EntryStateDto dto,
+                                         ai.badmonkey.agentspaces.space.replicated.TakeClaim claim) throws Exception {
+        StringBuilder out = new StringBuilder();
+        java.lang.reflect.Method stateHash = ReplicatedSpace.class.getDeclaredMethod("stateHash",
+                ai.badmonkey.agentspaces.space.crdt.EntryState.class);
+        stateHash.setAccessible(true);
+        out.append(field("space_state_hash", (String) stateHash.invoke(null, dto.toState())));
+        java.lang.reflect.Method claimHash = ReplicatedSpace.class.getDeclaredMethod("claimHash",
+                ai.badmonkey.agentspaces.space.replicated.TakeClaim.class);
+        claimHash.setAccessible(true);
+        out.append(field("space_claim_hash", (String) claimHash.invoke(null, claim)));
+        double[] doubles = {1.0, 0.5, 100.0, -2.5, 0.001, 1e7, 1.5e-5, 123456789.0, 1e-4, 0.0, 3.25, 9999999.0,
+                1e21, 0.1 + 0.2, 1.0 / 3.0, 2.5e-7, 1234567.125, Double.MAX_VALUE, Double.MIN_VALUE};
+        out.append("  \"java_double_strings\": {");
+        for (int i = 0; i < doubles.length; i++) {
+            // keyed by the JavaScript form of the value (Number's shortest round-trip digits), which
+            // Java's %s is not; the TypeScript test parses the key with Number().
+            String key = new java.math.BigDecimal(doubles[i]).stripTrailingZeros().toPlainString();
+            if (doubles[i] == Double.MAX_VALUE) {
+                key = "1.7976931348623157e+308";
+            } else if (doubles[i] == Double.MIN_VALUE) {
+                key = "5e-324";
+            }
+            out.append(i > 0 ? ", " : "").append("\"").append(key).append("\": \"")
+                    .append(Double.toString(doubles[i])).append("\"");
+        }
+        return out.append("},\n").toString();
+    }
+
+    /**
+     * The WebRTC signalling bodies and the relay wrapper (srad/agentspaces-js.md appendix B,
+     * JS-W-03, JS-N-03): OFFER, ANSWER, CAND, the trickle-end CAND, END(2) under a fixed session
+     * id, and a RELAY_FRAME body carrying the golden ping frame to {@code zB}.
+     */
+    private static String rtcVectors(CborCodec codec, HexFormat hex, byte[] innerFrame) {
+        byte[] sid = hex.parseHex("000102030405060708090a0b0c0d0e0f");
+        String sdp = "v=0\r\na=fingerprint:sha-256 AB:CD\r\n";
+        List<String> fp = List.of("sha-256 AB:CD");
+        StringBuilder out = new StringBuilder();
+        out.append(field("rtc_offer_cbor", hex.formatHex(codec.toBytes(
+                new RtcSignal(1, fp, null, sdp, sid, null, null, "OFFER")))));
+        out.append(field("rtc_answer_cbor", hex.formatHex(codec.toBytes(
+                new RtcSignal(1, fp, null, sdp, sid, null, null, "ANSWER")))));
+        out.append(field("rtc_cand_cbor", hex.formatHex(codec.toBytes(
+                new RtcSignal(1, null, "0", null, sid, "candidate:1 1 UDP 1 192.0.2.1 5000 typ host", null, "CAND")))));
+        out.append(field("rtc_cand_end_cbor", hex.formatHex(codec.toBytes(
+                new RtcSignal(1, null, "0", null, sid, "", null, "CAND")))));
+        out.append(field("rtc_end_timeout_cbor", hex.formatHex(codec.toBytes(
+                new RtcSignal(1, null, null, null, sid, null, 2, "END")))));
+        out.append(field("relay_frame_body_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.peering.wire.Bodies.RelayFrame(PeerId.of("zB"), innerFrame)))));
+        return out.toString();
+    }
+
+    private static String filterGrammarCases() {
+        Object[][] cases = {
+                {"priority>=3", 3}, {"priority>=3", 2.5}, {"priority=3", 3.0}, {"priority=3", "3"},
+                {"priority<10", 9}, {"priority<10", "9"}, {"priority<10", "abc"}, {"priority > 1.5", 2},
+                {"topic=index", "index"}, {"topic!=index", "other"}, {"topic!=index", null},
+                {"topic=index", null}, {"name<m", "alpha"}, {"name>m", "alpha"}, {"name<=alpha", "alpha"},
+                {"region in eu, us", "us"}, {"region in eu, us", "ap"}, {"n in 1,2,3", 2.0},
+                {"flag=true", true}, {"flag!=true", false}, {"topic=a=b", "a=b"}, {"count>=0", 0},
+                {"count<-1", -2}, {"ratio>=0.5", 0.75}, {"ratio>=0.5", "0.25"},
+        };
+        StringBuilder out = new StringBuilder("  \"filter_grammar_cases\": [\n");
+        for (int i = 0; i < cases.length; i++) {
+            String clause = (String) cases[i][0];
+            Object value = cases[i][1];
+            String valueJson = value == null ? "null" : value instanceof String s ? "\"" + s + "\"" : String.valueOf(value);
+            boolean matches = ai.badmonkey.agentspaces.api.space.FieldFilter.parse(clause).matches(value);
+            out.append("    {\"filter\": \"").append(clause).append("\", \"value\": ").append(valueJson)
+                    .append(", \"matches\": ").append(matches).append("}").append(i + 1 < cases.length ? ",\n" : "\n");
+        }
+        out.append("  ],\n  \"filter_grammar_malformed\": [");
+        String[] malformed = {"!=x", "=3", "<x", " in a,b", "nonsense", "topic!", ""};
+        for (int i = 0; i < malformed.length; i++) {
+            try {
+                ai.badmonkey.agentspaces.api.space.FieldFilter.parse(malformed[i]);
+                throw new IllegalStateException("'" + malformed[i] + "' parsed");
+            } catch (IllegalArgumentException expected) {
+                out.append(i > 0 ? ", " : "").append("\"").append(malformed[i]).append("\"");
+            }
+        }
+        return out.append("],\n").toString();
     }
 
     private static String field(String name, String value) {

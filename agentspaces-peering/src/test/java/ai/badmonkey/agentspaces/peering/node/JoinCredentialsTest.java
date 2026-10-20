@@ -174,4 +174,145 @@ class JoinCredentialsTest {
         assertThat(rf.membership().allMembers()).extracting(GroupMembership.Member::id)
                 .as("and the guest's credential admits it to the founder").containsExactly(guest.peerId());
     }
+
+    // ---- delegated credentials (invite keys): the founder signs a key once, the key signs each friend
+
+    private static java.security.KeyPair inviteKey() {
+        return ai.badmonkey.agentspaces.common.crypto.Ed25519.fromSeed(new byte[]{
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32});
+    }
+
+    private String delegation(java.security.KeyPair invite, Duration window) {
+        return JoinCredentials.delegate(founderId, groupId,
+                ai.badmonkey.agentspaces.common.crypto.Ed25519.rawPublicKey(invite.getPublic()),
+                clock.instant().plus(window), "friends");
+    }
+
+    /** A credential issued under a founder-signed delegation admits; the founder was not asked. */
+    @Test
+    void aDelegatedCredentialAdmitsWithoutTheFounderIssuingIt() throws Exception {
+        PeerNode founder = node("f", 1, founderId);
+        PeerIdentity guestId = PeerIdentity.generate();
+        PeerNode guest = node("g", 2, guestId);
+        GroupRuntime rf = join(founder, List.of(), Map.of());
+        java.security.KeyPair invite = inviteKey();
+        String delegation = delegation(invite, Duration.ofDays(7));
+
+        String credential = JoinCredentials.issueDelegated(delegation, invite.getPrivate(), guestId.peerId());
+        assertThat(credential).startsWith(JoinCredentials.DELEGATED_PREFIX);
+        join(guest, seed("f"), Map.of(JoinCredentials.HINT_KEY, credential));
+        tickAll(8);
+
+        assertThat(rf.membership().allMembers()).extracting(GroupMembership.Member::id)
+                .contains(guest.peerId());
+        assertThat(JoinCredentials.describe(delegation)).hasValueSatisfying(info -> {
+            assertThat(info.founder()).isEqualTo(founderId.peerId());
+            assertThat(info.label()).isEqualTo("friends");
+        });
+    }
+
+    /** A delegated credential is bound to its candidate, as a founder-issued one is. */
+    @Test
+    void aDelegatedCredentialIsBoundToTheCandidate() throws Exception {
+        PeerNode founder = node("f", 1, founderId);
+        PeerIdentity guestId = PeerIdentity.generate();
+        PeerNode stranger = node("s", 3, PeerIdentity.generate());
+        GroupRuntime rf = join(founder, List.of(), Map.of());
+        java.security.KeyPair invite = inviteKey();
+        String credential = JoinCredentials.issueDelegated(delegation(invite, Duration.ofDays(7)),
+                invite.getPrivate(), guestId.peerId());
+
+        join(stranger, seed("f"), Map.of(JoinCredentials.HINT_KEY, credential));
+        tickAll(8);
+
+        assertThat(rf.membership().allMembers()).isEmpty();
+    }
+
+    /** A delegation signed by someone other than the founder, or for another group, admits nobody. */
+    @Test
+    void aDelegationNotSignedByTheFounderOrForAnotherGroupIsRefused() throws Exception {
+        PeerNode founder = node("f", 1, founderId);
+        PeerIdentity guestId = PeerIdentity.generate();
+        PeerNode guest = node("g", 2, guestId);
+        PeerIdentity otherId = PeerIdentity.generate();
+        PeerNode other = node("o", 4, otherId);
+        GroupRuntime rf = join(founder, List.of(), Map.of());
+        java.security.KeyPair invite = inviteKey();
+        byte[] raw = ai.badmonkey.agentspaces.common.crypto.Ed25519.rawPublicKey(invite.getPublic());
+
+        String forged = JoinCredentials.delegate(PeerIdentity.generate(), groupId, raw,
+                clock.instant().plus(Duration.ofDays(1)), "forged");
+        join(guest, seed("f"), Map.of(JoinCredentials.HINT_KEY,
+                JoinCredentials.issueDelegated(forged, invite.getPrivate(), guestId.peerId())));
+        String elsewhere = JoinCredentials.delegate(founderId, GroupId.of("zElsewhere"), raw,
+                clock.instant().plus(Duration.ofDays(1)), "elsewhere");
+        join(other, seed("f"), Map.of(JoinCredentials.HINT_KEY,
+                JoinCredentials.issueDelegated(elsewhere, invite.getPrivate(), otherId.peerId())));
+        tickAll(8);
+
+        assertThat(rf.membership().allMembers()).isEmpty();
+    }
+
+    /** A delegation past its expiry (beyond the ten-minute skew) admits nobody. */
+    @Test
+    void anExpiredDelegationIsRefused() throws Exception {
+        PeerNode founder = node("f", 1, founderId);
+        PeerIdentity guestId = PeerIdentity.generate();
+        PeerNode guest = node("g", 2, guestId);
+        GroupRuntime rf = join(founder, List.of(), Map.of());
+        java.security.KeyPair invite = inviteKey();
+        String delegation = delegation(invite, Duration.ofMinutes(5));
+        String credential = JoinCredentials.issueDelegated(delegation, invite.getPrivate(), guestId.peerId());
+
+        clock.advance(Duration.ofMinutes(30));
+        join(guest, seed("f"), Map.of(JoinCredentials.HINT_KEY, credential));
+        tickAll(8);
+
+        assertThat(rf.membership().allMembers()).isEmpty();
+    }
+
+    /** Revoking the delegation by its hash evicts those admitted under it and refuses the next. */
+    @Test
+    void revokingTheDelegationEvictsAndRefusesEveryCredentialUnderIt() throws Exception {
+        PeerNode founder = node("f", 1, founderId);
+        PeerIdentity guestId = PeerIdentity.generate();
+        PeerNode guest = node("g", 2, guestId);
+        PeerIdentity lateId = PeerIdentity.generate();
+        PeerNode late = node("l", 5, lateId);
+        GroupRuntime rf = join(founder, List.of(), Map.of());
+        java.security.KeyPair invite = inviteKey();
+        String delegation = delegation(invite, Duration.ofDays(7));
+        join(guest, seed("f"), Map.of(JoinCredentials.HINT_KEY,
+                JoinCredentials.issueDelegated(delegation, invite.getPrivate(), guestId.peerId())));
+        tickAll(8);
+        assertThat(rf.membership().allMembers()).extracting(GroupMembership.Member::id)
+                .contains(guest.peerId());
+
+        assertThat(rf.revokeDelegation(delegation, ai.badmonkey.agentspaces.api.ad.CredentialRevocation.KEY_COMPROMISE)).isPresent();
+        tickAll(4);
+        assertThat(rf.membership().allMembers()).extracting(GroupMembership.Member::id)
+                .as("the member admitted under the revoked key is evicted")
+                .doesNotContain(guest.peerId());
+
+        join(late, seed("f"), Map.of(JoinCredentials.HINT_KEY,
+                JoinCredentials.issueDelegated(delegation, invite.getPrivate(), lateId.peerId())));
+        tickAll(8);
+        assertThat(rf.membership().allMembers()).extracting(GroupMembership.Member::id)
+                .as("a fresh credential under the revoked key is refused")
+                .doesNotContain(late.peerId());
+    }
+
+    /** The hashes are distinct: the credential's names one friend, the delegation's names the key. */
+    @Test
+    void credentialAndDelegationHashesDiffer() {
+        java.security.KeyPair invite = inviteKey();
+        String delegation = delegation(invite, Duration.ofDays(7));
+        String credential = JoinCredentials.issueDelegated(delegation, invite.getPrivate(),
+                PeerIdentity.generate().peerId());
+        assertThat(JoinCredentials.delegationHash(credential)).isEqualTo(JoinCredentials.delegationHash(delegation));
+        assertThat(JoinCredentials.hash(credential)).isNotEqualTo(JoinCredentials.delegationHash(credential));
+        assertThat(JoinCredentials.delegationHash(JoinCredentials.issue(founderId, groupId,
+                PeerIdentity.generate().peerId()))).as("a founder-issued credential has no delegation").isNull();
+    }
 }

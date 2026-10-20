@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
     <relativePath>../../pom.xml</relativePath>
   </parent>
 
@@ -84,6 +84,12 @@
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-spring-boot-starter</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- What an application adds to turn on the DTLS listener block. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-transport-dtls</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>

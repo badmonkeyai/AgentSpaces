@@ -42,6 +42,13 @@ public interface Authorizer {
     enum Operation {
         /** Participate in the ordered-log Raft quorum: vote, lead, replicate. */
         RAFT_VOTER,
+        /**
+         * Submit a command to the ordered log without voting (a Raft client,
+         * srad/agentspaces-js.md JS-V-05): a browser, a Python or TypeScript
+         * peer, or a Java non-voter that takes through the log. The scope is
+         * the group id. A client never votes, leads, or replicates.
+         */
+        RAFT_CLIENT,
         /** Issue command-and-control directives workers obey. */
         DIRECTIVE_ISSUER,
         /** Serve data-query results a fleet consumes as source-of-truth. */
@@ -71,7 +78,15 @@ public interface Authorizer {
          * other operations, an authorizer with no explicit grant permits nobody;
          * the group's founder may always rotate.
          */
-        KEY_ROTATE
+        KEY_ROTATE,
+        /**
+         * Run an asset operation through {@code aspace:cap/asset-invoke}
+         * (srad/agentspaces-js.md JS-C-02, appendix F): the connector runs an
+         * operation only for a requesting peer this permits. The scope is
+         * {@code <asset>:<operation>}, so the OIDC scope reads
+         * {@code aspace:connector-invoke:<asset>:<operation>}.
+         */
+        CONNECTOR_INVOKE
     }
 
     /**

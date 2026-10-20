@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.agent.remote;
 
 import ai.badmonkey.agentspaces.agent.AgentSpaces;
 import ai.badmonkey.agentspaces.api.ad.AgentCard;
+import ai.badmonkey.agentspaces.api.ad.AssetCard;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
@@ -66,6 +67,8 @@ public final class RemoteActions {
     private final Map<Class<?>, String> resultRoutes = new ConcurrentHashMap<>();
     private volatile Correlation correlation = Correlation.sharedFields();
     private volatile Lease writeLease = Lease.of(Duration.ofMinutes(10));
+    /** Carries asset operations to their connector; null until a host wires one (JS-C-11). */
+    private volatile AssetOperation.AssetInvoker assetInvoker;
 
     /**
      * Creates a registry over explicit pieces.
@@ -243,6 +246,56 @@ public final class RemoteActions {
             }
         }
         return pairs;
+    }
+
+    /**
+     * Wires the carrier of asset operations ({@code AssetInvocations::invoke} of
+     * {@code agentspaces-connect-core}); without one the operations are listed
+     * and {@link AssetOperation#invoke} refuses, naming what to wire.
+     *
+     * @param invoker the carrier
+     * @return this registry
+     */
+    public RemoteActions assetInvoker(AssetOperation.AssetInvoker invoker) {
+        this.assetInvoker = invoker;
+        return this;
+    }
+
+    /**
+     * The operations the group's foreign AssetCards allowlist (SPEC §10.6;
+     * srad/agentspaces-js.md JS-C-11): one {@link AssetOperation} per name in a
+     * card's {@code read-ops} (a data query) and {@code invoke-ops} (an asset
+     * invocation), newest cards first, one per asset and operation.
+     *
+     * @return the listed asset operations
+     */
+    public List<AssetOperation> assetOperations() {
+        List<AssetOperation> operations = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        List<AssetCard> cards = discovery.find(AssetCard.class, card -> !card.issuer().equals(self));
+        cards.sort((a, b) -> b.issued().compareTo(a.issued()));
+        for (AssetCard card : cards) {
+            for (String op : listed(card, "read-ops")) {
+                if (seen.add(card.asset() + "|read|" + op)) {
+                    operations.add(new AssetOperation(card, op, AssetOperation.Kind.READ, assetInvoker));
+                }
+            }
+            for (String op : listed(card, "invoke-ops")) {
+                if (seen.add(card.asset() + "|invoke|" + op)) {
+                    operations.add(new AssetOperation(card, op, AssetOperation.Kind.INVOKE, assetInvoker));
+                }
+            }
+        }
+        return operations;
+    }
+
+    /** A comma-separated operation list of the card's open {@code access} map, trimmed; empty when absent. */
+    private static List<String> listed(AssetCard card, String key) {
+        String value = card.access() == null ? null : card.access().get(key);
+        if (value == null || value.isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(value.split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
     }
 
     /**

@@ -22,7 +22,7 @@
 
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces</artifactId>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <packaging>pom</packaging>
 
   <name>AgentSpaces</name>
@@ -86,10 +86,14 @@
     <module>agentspaces-api</module>
     <module>agentspaces-test-support</module>
     <module>agentspaces-identity</module>
+    <module>agentspaces-identity-tls</module>
     <module>agentspaces-auth-oidc</module>
     <module>agentspaces-space</module>
     <module>agentspaces-peering</module>
     <module>agentspaces-transport-quic</module>
+    <module>agentspaces-transport-dtls</module>
+    <module>agentspaces-transport-http</module>
+    <module>agentspaces-transport-webrtc</module>
     <module>agentspaces-discovery</module>
     <module>agentspaces-capabilities</module>
     <module>agentspaces-agent</module>
@@ -188,6 +192,16 @@
         <version>${bouncycastle.version}</version>
       </dependency>
       <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bctls-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcutil-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
         <groupId>org.junit.jupiter</groupId>
         <artifactId>junit-jupiter</artifactId>
         <version>${junit.version}</version>
@@ -216,6 +230,11 @@
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-identity</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-identity-tls</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>

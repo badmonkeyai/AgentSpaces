@@ -21,7 +21,7 @@
 
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces-dependencies</artifactId>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <packaging>pom</packaging>
 
   <name>AgentSpaces :: Dependencies (BOM)</name>
@@ -107,6 +107,11 @@
       </dependency>
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-identity-tls</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-auth-oidc</artifactId>
         <version>${project.version}</version>
       </dependency>
@@ -148,6 +153,21 @@
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-transport-quic</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-transport-dtls</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-transport-http</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-transport-webrtc</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
@@ -202,6 +222,16 @@
       <dependency>
         <groupId>org.bouncycastle</groupId>
         <artifactId>bcpkix-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bctls-jdk18on</artifactId>
+        <version>${bouncycastle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcutil-jdk18on</artifactId>
         <version>${bouncycastle.version}</version>
       </dependency>
     </dependencies>

@@ -18,7 +18,13 @@ package ai.badmonkey.agentspaces.peering.node;
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.spi.MembershipValidator;
+import ai.badmonkey.agentspaces.api.spi.BeaconHint;
+import ai.badmonkey.agentspaces.api.spi.BeaconLocator;
+import ai.badmonkey.agentspaces.api.spi.BeaconRequest;
+import ai.badmonkey.agentspaces.api.spi.LocatePolicy;
+import ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain;
 import ai.badmonkey.agentspaces.api.spi.Transport;
+import ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator;
 import ai.badmonkey.agentspaces.api.spi.TransportConnection;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.crypto.Ed25519;
@@ -173,6 +179,43 @@ public final class PeerNode implements AutoCloseable {
     private final Map<GroupId, Set<PeerId>> newlyAdmitted = new ConcurrentHashMap<>();
     /** The seeds each group was joined with, re-dialed when the view is empty (ROBUSTNESS.md §3.3, §3.6). */
     private final Map<GroupId, List<PeerAdvertisement.Endpoint>> groupSeeds = new ConcurrentHashMap<>();
+    /** The locator each group was joined with, re-asked on an empty view once its last hint has aged. */
+    private final Map<GroupId, BeaconLocator> groupLocators = new ConcurrentHashMap<>();
+    /** The configured name of each group, for the locator's request. */
+    private final Map<GroupId, String> groupNames = new ConcurrentHashMap<>();
+    /** The last hint each group's locator answered. */
+    private final Map<GroupId, BeaconHint> lastBeaconHints = new ConcurrentHashMap<>();
+    /** When each group's last hint expires (its TTL past the time it was answered). */
+    private final Map<GroupId, Long> hintExpiryMillis = new ConcurrentHashMap<>();
+    /** When each group's locator was last asked. */
+    private final Map<GroupId, Long> lastLocateMillis = new ConcurrentHashMap<>();
+    /** Groups with a locate in flight on a virtual thread. */
+    private final Set<GroupId> locating = ConcurrentHashMap.newKeySet();
+    /** The locator is never re-asked faster than this, whatever its hints' TTL says. */
+    static final long LOCATE_MIN_INTERVAL_MILLIS = 30_000L;
+    /** The node-wide re-ask floor and ceiling (builder-set; a locator's policy overrides per group). */
+    private final long locateMinMillis;
+    private final long locateMaxMillis;
+    /** The trace of each group's last locate, when its locator is a chain. */
+    private final Map<GroupId, List<BootstrapChain.Trace>> lastBootstrapTraces = new ConcurrentHashMap<>();
+    /** The endpoints learned from verified beacon datagrams, per group and sender, with the ad's expiry. */
+    private final Map<GroupId, Map<PeerId, LearnedEndpoints>> beaconLearned = new ConcurrentHashMap<>();
+
+    private record LearnedEndpoints(List<PeerAdvertisement.Endpoint> endpoints, long expiresMillis) {
+    }
+
+    /**
+     * What the multicast beacon heard for a group (SRAD DB-L-08): the
+     * unexpired endpoints, how many senders, and the shortest remaining life.
+     *
+     * @param endpoints the endpoints, priorities by position
+     * @param peers     how many senders contributed
+     * @param ttl       the shortest remaining life, or zero when none
+     */
+    public record BeaconLearned(List<PeerAdvertisement.Endpoint> endpoints, int peers, Duration ttl) {
+    }
+    /** The locator is re-asked at least this often while the view stays empty, whatever its hints' TTL says. */
+    static final long LOCATE_MAX_INTERVAL_MILLIS = 10 * 60_000L;
     /** The endpoints each member last advertised, kept past its departure for the lost-member retry. */
     private final Map<PeerId, List<PeerAdvertisement.Endpoint>> lastEndpoints = new ConcurrentHashMap<>();
     /** Members that left each group's view and when: introduced to again for a while, in case they are back. */
@@ -267,8 +310,68 @@ public final class PeerNode implements AutoCloseable {
     /** Connections whose remote end presented a chain, for re-judging; weak, so closed ones drop away. */
     private final Set<TransportConnection> chained = java.util.Collections.synchronizedSet(
             java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>()));
-    /** Per group, the hash of the join credential each member was admitted under. */
-    private final Map<GroupId, Map<PeerId, String>> admittedUnder = new ConcurrentHashMap<>();
+    /**
+     * Per group, the join credential hash and delegation hash each member was admitted under, kept
+     * past a lapse and across restarts so a member admitted inside an invite window stays admissible
+     * after it (ISSUE-PeerRobustness-2, R2-1).
+     */
+    private final AdmissionMemory admissionMemory;
+    /** Members re-admitted from memory after their delegation expired, logged once each. */
+    private final Set<String> readmittedLogged = ConcurrentHashMap.newKeySet();
+    /** The host's say over what this node relays (R2-3), asked after the membership check. */
+    private final RelayPolicy relayPolicy;
+    /** When a relay policy failure was last logged; once a minute at most (R2-S3). */
+    private volatile Long lastPolicyFailureLogMillis;
+    /** Per group, what this node relayed and dropped (R2-3.3), with the per-target split of ISSUE-BootstrapCore FR-2. */
+    private final Map<GroupId, RelayCounters> relayCounters = new ConcurrentHashMap<>();
+    /** Bound on per-target relay counters per group; least-recently-relayed-to evict (PR-2, ASF-019). */
+    static final int RELAY_TARGETS_CAPACITY = 4_096;
+    /** JS-W-11: when this node dials a member it is otherwise relayed to, and how soon it retries. */
+    private final RelayOffload relayOffload;
+    /**
+     * Per group, per far member, the clock stamps of the frames relayed between this node and
+     * it in the last minute: sent through a relay, or unwrapped from a RELAY_FRAME addressed
+     * here. Bounded as the per-target counters are, least recently relayed-with evicted first.
+     */
+    private final Map<GroupId, Map<PeerId, java.util.ArrayDeque<Long>>> relayedWith = new ConcurrentHashMap<>();
+    /** Per group, per member, when the last offload dial started: the backoff of JS-W-11. */
+    private final Map<GroupId, Map<PeerId, Long>> offloadAttempted = new ConcurrentHashMap<>();
+    /** Members an offload dial is in flight to, so one dial at a time reaches for each. */
+    private final Set<PeerId> offloadInFlight = ConcurrentHashMap.newKeySet();
+
+    private static final class RelayCounters {
+        final AtomicLong framesForwarded = new AtomicLong();
+        final AtomicLong bytesForwarded = new AtomicLong();
+        final AtomicLong droppedNotMember = new AtomicLong();
+        final AtomicLong droppedByPolicy = new AtomicLong();
+        final AtomicLong offloadAttempts = new AtomicLong();
+        final AtomicLong offloadOpened = new AtomicLong();
+        final AtomicLong offloadFailed = new AtomicLong();
+        /**
+         * Per target that passed the membership check, so the key is always a verified member's
+         * PeerId (SR-2): a flood naming fake targets reaches neither this map nor the policy.
+         */
+        final Map<PeerId, RelayCounters> targets;
+
+        RelayCounters(boolean perTarget) {
+            targets = !perTarget ? null : java.util.Collections.synchronizedMap(
+                    new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(Map.Entry<PeerId, RelayCounters> eldest) {
+                            return size() > RELAY_TARGETS_CAPACITY;
+                        }
+                    });
+        }
+
+        RelayCounters target(PeerId target) {
+            return targets.computeIfAbsent(target, t -> new RelayCounters(false));
+        }
+
+        RelayStats snapshot() {
+            return new RelayStats(framesForwarded.get(), bytesForwarded.get(),
+                    droppedNotMember.get(), droppedByPolicy.get());
+        }
+    }
     /** v0.1.9 CA channel mode: admit and serve peers only over connections the
      * transport attested for them, and evict a member whose fresh handshake
      * attests nothing (the CA's revocation as the authoritative eject). */
@@ -287,9 +390,16 @@ public final class PeerNode implements AutoCloseable {
             new ConcurrentHashMap<>();
     private final Set<PeerAdvertisement.PeerRole> roles;
     private final Map<String, Transport> transports = new ConcurrentHashMap<>();
+    /** Groups whose beacon datagrams are sealed ({@link #beaconKey}). */
+    private final Map<GroupId, ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal> beaconSeals =
+            new ConcurrentHashMap<>();
+    /** Resources closed with the node ({@link #closeWith}). */
+    private final java.util.List<AutoCloseable> ownedResources = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<AutoCloseable> listeners = new ArrayList<>();
     private final List<PeerAdvertisement.Endpoint> advertisedEndpoints = new ArrayList<>();
     private final Map<PeerId, TransportConnection> connections = new ConcurrentHashMap<>();
+    /** The scheme each live connection came through (its listener's or its dialer's), for the console (JS-N-07). */
+    private final Map<TransportConnection, String> connectionSchemes = new ConcurrentHashMap<>();
     private final Map<GroupId, GroupRuntime> groups = new ConcurrentHashMap<>();
     /** Per-group resource hints (e.g. an INVITE join credential) put in our self-ad. */
     private final Map<GroupId, Map<String, String>> groupHints = new ConcurrentHashMap<>();
@@ -414,6 +524,226 @@ public final class PeerNode implements AutoCloseable {
         return new Traffic(framesSent, framesReceived, bytesSent.get(), bytesReceived.get(), sent, received, bytesByKind);
     }
 
+    /**
+     * What this node relayed for one group since it joined (ISSUE-PeerRobustness-2, R2-3.3):
+     * frames and bytes forwarded, frames dropped because the target was no member of the group
+     * in this node's view, and frames dropped by the {@link RelayPolicy}.
+     */
+    public record RelayStats(long framesForwarded, long bytesForwarded, long droppedNotMember,
+                             long droppedByPolicy) {
+    }
+
+    /**
+     * The relay counters per group, a snapshot; a group this node never relayed in has no entry,
+     * and leaving a group clears its entry.
+     *
+     * @return group to counters
+     */
+    public Map<GroupId, RelayStats> relayStats() {
+        Map<GroupId, RelayStats> stats = new java.util.HashMap<>();
+        relayCounters.forEach((group, counters) -> stats.put(group, counters.snapshot()));
+        return stats;
+    }
+
+    /**
+     * The relay counters of one group per target (ISSUE-BootstrapCore FR-2, SR-2), a snapshot:
+     * keyed by the target's verified PeerId, held only for targets that were members of the group
+     * in this node's view when the frame arrived, and bounded per group at
+     * {@link #RELAY_TARGETS_CAPACITY} with the least recently relayed-to evicted first. A frame
+     * dropped because its target was no member counts in the group's total alone, since such a
+     * target is whatever id the sender named.
+     *
+     * @param groupId the group
+     * @return target to counters; empty for a group this node never relayed in
+     */
+    public Map<PeerId, RelayStats> relayStats(GroupId groupId) {
+        RelayCounters counters = relayCounters.get(Objects.requireNonNull(groupId, "groupId"));
+        if (counters == null) {
+            return Map.of();
+        }
+        Map<PeerId, RelayStats> stats = new java.util.HashMap<>();
+        synchronized (counters.targets) {
+            counters.targets.forEach((target, c) -> stats.put(target, c.snapshot()));
+        }
+        return stats;
+    }
+
+    private RelayCounters relayCounters(GroupId groupId) {
+        return relayCounters.computeIfAbsent(groupId, g -> new RelayCounters(true));
+    }
+
+    /**
+     * The relay offload of SRAD srad/agentspaces-js.md JS-W-11: a node whose frames to or from
+     * a member travel through a relay dials that member's signalled endpoint (a {@code webrtc}
+     * acceptor, {@link Transport#signalled()}) once more than {@code framesPerMinute} of them
+     * crossed the relay in a sliding minute, from its tick and never from inside a send, and
+     * after a failed dial waits {@code retryAfter} before the next. Both are settings, not
+     * caps: nothing here bounds members or connections.
+     *
+     * @param framesPerMinute the relayed frames in one minute above which the node dials; 30
+     * @param retryAfter      the wait after a failed dial before another; 5 minutes
+     */
+    public record RelayOffload(int framesPerMinute, Duration retryAfter) {
+
+        public RelayOffload {
+            Objects.requireNonNull(retryAfter, "retryAfter");
+            if (framesPerMinute < 1) {
+                throw new IllegalArgumentException("frames-per-minute must be positive: " + framesPerMinute);
+            }
+            if (retryAfter.isNegative() || retryAfter.isZero()) {
+                throw new IllegalArgumentException("retry-after must be positive: " + retryAfter);
+            }
+        }
+
+        /** The SRAD's defaults: 30 frames a minute, a 5 minute retry. */
+        public static RelayOffload defaults() {
+            return new RelayOffload(30, Duration.ofMinutes(5));
+        }
+    }
+
+    /**
+     * What the relay offload did for one group since this node joined (JS-W-11): dials started
+     * because the relayed traffic with a member passed the threshold, the ones that opened a
+     * connection, and the ones that failed and entered the backoff.
+     */
+    public record OffloadStats(long attempts, long opened, long failed) {
+    }
+
+    /** The relay offload settings this node runs with. */
+    public RelayOffload relayOffload() {
+        return relayOffload;
+    }
+
+    /**
+     * The relay offload counters per group, a snapshot; a group this node never relayed in
+     * has no entry.
+     *
+     * @return group to counters
+     */
+    public Map<GroupId, OffloadStats> relayOffloadStats() {
+        Map<GroupId, OffloadStats> stats = new java.util.HashMap<>();
+        relayCounters.forEach((group, c) -> stats.put(group,
+                new OffloadStats(c.offloadAttempts.get(), c.offloadOpened.get(), c.offloadFailed.get())));
+        return stats;
+    }
+
+    /**
+     * How many frames were relayed between this node and a member in the last minute, as the
+     * offload counts them (JS-W-11); zero for a member nothing was relayed with.
+     *
+     * @param groupId the group
+     * @param member  the far member
+     * @return the frames in the sliding minute
+     */
+    public int relayedWithInLastMinute(GroupId groupId, PeerId member) {
+        Map<PeerId, java.util.ArrayDeque<Long>> perMember = relayedWith.get(Objects.requireNonNull(groupId, "groupId"));
+        if (perMember == null) {
+            return 0;
+        }
+        java.util.ArrayDeque<Long> times = perMember.get(Objects.requireNonNull(member, "member"));
+        return times == null ? 0 : windowCount(times, clock.millis());
+    }
+
+    /** Records one frame relayed between this node and {@code member}, stamped by the node's clock. */
+    private void noteRelayed(GroupId groupId, PeerId member) {
+        Map<PeerId, java.util.ArrayDeque<Long>> perMember = relayedWith.computeIfAbsent(groupId, g ->
+                java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<PeerId, java.util.ArrayDeque<Long>> eldest) {
+                        return size() > RELAY_TARGETS_CAPACITY;
+                    }
+                }));
+        java.util.ArrayDeque<Long> times = perMember.computeIfAbsent(member, m -> new java.util.ArrayDeque<>());
+        long now = clock.millis();
+        synchronized (times) {
+            windowCount(times, now);
+            times.addLast(now);
+        }
+    }
+
+    /** Drops stamps older than a minute and returns what remains; the caller holds the deque's lock or owns it. */
+    private static int windowCount(java.util.ArrayDeque<Long> times, long now) {
+        synchronized (times) {
+            while (!times.isEmpty() && now - times.peekFirst() >= 60_000L) {
+                times.pollFirst();
+            }
+            return times.size();
+        }
+    }
+
+    /**
+     * JS-W-11, run from the tick: for each member more than {@code framesPerMinute} frames were
+     * relayed with in the last minute, with no connection here, no dial in flight, and no
+     * failed dial inside the backoff, dial its first signalled endpoint on a thread of its own,
+     * because a signalled dial may take its whole timeout and the tick must not wait for it.
+     * A member whose endpoints this node cannot signal is left to the relay.
+     */
+    private void offloadRelayed(GroupRuntime runtime, long nowMillis) {
+        GroupId groupId = runtime.id();
+        Map<PeerId, java.util.ArrayDeque<Long>> perMember = relayedWith.get(groupId);
+        if (perMember == null) {
+            return;
+        }
+        List<PeerId> members;
+        synchronized (perMember) {
+            members = List.copyOf(perMember.keySet());
+        }
+        for (PeerId member : members) {
+            java.util.ArrayDeque<Long> times = perMember.get(member);
+            if (times == null || windowCount(times, nowMillis) <= relayOffload.framesPerMinute()) {
+                continue;
+            }
+            if (connections.containsKey(member) || offloadInFlight.contains(member)) {
+                continue;
+            }
+            Long attempted = offloadAttempted.getOrDefault(groupId, Map.of()).get(member);
+            if (attempted != null && nowMillis - attempted < relayOffload.retryAfter().toMillis()) {
+                continue;
+            }
+            GroupMembership.Member known = runtime.membership().member(member).orElse(null);
+            if (known == null) {
+                continue;
+            }
+            PeerAdvertisement.Endpoint signalled = null;
+            Transport transport = null;
+            for (PeerAdvertisement.Endpoint endpoint : byPriority(known.endpoints())) {
+                Transport candidate = transports.get(endpoint.transport());
+                if (candidate != null && candidate.signalled()) {
+                    signalled = endpoint;
+                    transport = candidate;
+                    break;
+                }
+            }
+            if (signalled == null || !offloadInFlight.add(member)) {
+                continue;
+            }
+            offloadAttempted.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>()).put(member, nowMillis);
+            RelayCounters counters = relayCounters(groupId);
+            counters.offloadAttempts.incrementAndGet();
+            PeerAdvertisement.Endpoint endpoint = signalled;
+            Transport dialer = transport;
+            Thread.ofVirtual().name("peer-offload-" + member.display()).start(() -> {
+                try {
+                    dialEndpoint(groupId, member, dialer, endpoint);
+                    counters.offloadOpened.incrementAndGet();
+                    offloadAttempted.getOrDefault(groupId, Map.of()).remove(member);
+                    synchronized (times) {
+                        times.clear(); // the next relayed frame starts a fresh count
+                    }
+                    LOG.log(System.Logger.Level.DEBUG, "offloaded " + member.display() + " from the relay onto "
+                            + dialer.scheme() + " in group " + groupId.value());
+                } catch (IOException e) {
+                    counters.offloadFailed.incrementAndGet();
+                    LOG.log(System.Logger.Level.DEBUG, "offload dial to " + member.display() + " over "
+                            + dialer.scheme() + " failed; the relay carries on, retry after "
+                            + relayOffload.retryAfter() + ": " + e.getMessage());
+                } finally {
+                    offloadInFlight.remove(member);
+                }
+            });
+        }
+    }
+
     private void countSent(Envelope.Kind kind, int bytes) {
         sentByKind.computeIfAbsent(kind, k -> new AtomicLong()).incrementAndGet();
         bytesSentByKind.computeIfAbsent(kind, k -> new AtomicLong()).addAndGet(bytes);
@@ -525,6 +855,11 @@ public final class PeerNode implements AutoCloseable {
         this.beacon = carrier == null ? null
                 : new MulticastBeacon(carrier, this::beaconAnnouncements, this::onBeaconDatagram);
         this.credentialHintListeners.addAll(builder.credentialHintListeners);
+        this.admissionMemory = new AdmissionMemory(builder.stateDirectory, builder.admissionMemoryBound, clock);
+        this.relayPolicy = builder.relayPolicy;
+        this.relayOffload = builder.relayOffload;
+        this.locateMinMillis = builder.locateMinMillis;
+        this.locateMaxMillis = builder.locateMaxMillis;
     }
 
     /**
@@ -563,10 +898,93 @@ public final class PeerNode implements AutoCloseable {
         private Duration beaconInterval = Duration.ofSeconds(5);
         private final List<BiConsumer<PeerId, Map<String, String>>> credentialHintListeners =
                 new ArrayList<>();
+        private java.nio.file.Path stateDirectory;
+        private int admissionMemoryBound = AdmissionMemory.DEFAULT_BOUND;
+        private RelayPolicy relayPolicy = RelayPolicy.ALLOW;
+        private RelayOffload relayOffload = RelayOffload.defaults();
 
         private Builder(PeerIdentity identity) {
             this.identity = Objects.requireNonNull(identity, "identity");
         }
+
+        /**
+         * The directory this node keeps state in across restarts (ISSUE-PeerRobustness-2,
+         * R2-1.5): today its admission memory, one file per group under {@code admitted/}.
+         * The Spring starter and the Micronaut factory pass the keystore directory when one
+         * is configured. Without one, a member admitted under a delegation before it
+         * expired is forgotten by a restart, and the node says so once per group.
+         *
+         * @param directory the state directory; created when absent
+         * @return this builder
+         */
+        public Builder stateDirectory(java.nio.file.Path directory) {
+            this.stateDirectory = Objects.requireNonNull(directory, "directory");
+            return this;
+        }
+
+        /**
+         * Bounds the admission memory per group (R2-1.6, default 10,000 peers); past the
+         * bound the member least recently seen is forgotten first.
+         *
+         * @param peers the bound
+         * @return this builder
+         */
+        public Builder admissionMemoryBound(int peers) {
+            if (peers <= 0) {
+                throw new IllegalArgumentException("the admission memory bound must be positive: " + peers);
+            }
+            this.admissionMemoryBound = peers;
+            return this;
+        }
+
+        /**
+         * Sets the policy this node asks before each frame it relays (SPEC §5.4, R2-3.2),
+         * after the membership check that nothing can relax. The default allows every
+         * forward the membership check allows.
+         *
+         * @param policy the policy
+         * @return this builder
+         */
+        public Builder relayPolicy(RelayPolicy policy) {
+            this.relayPolicy = Objects.requireNonNull(policy, "policy");
+            return this;
+        }
+
+        /**
+         * Sets the relay offload of SRAD srad/agentspaces-js.md JS-W-11 ({@link RelayOffload}):
+         * the relayed frames a minute above which this node dials a member's signalled
+         * endpoint, and the wait after a failed dial. Defaults: 30 and 5 minutes.
+         *
+         * @param offload the settings
+         * @return this builder
+         */
+        public Builder relayOffload(RelayOffload offload) {
+            this.relayOffload = Objects.requireNonNull(offload, "offload");
+            return this;
+        }
+
+        /**
+         * The node-wide pacing of a locator's re-ask while a group's view is
+         * empty (SRAD DB-N-03): never faster than {@code min} whatever a
+         * hint's TTL says, and at least once per {@code max}. A locator's own
+         * {@link LocatePolicy} overrides per group. Defaults: 30 s and 10 min.
+         *
+         * @param min the floor
+         * @param max the ceiling
+         * @return this builder
+         */
+        public Builder locateInterval(Duration min, Duration max) {
+            Objects.requireNonNull(min, "min");
+            Objects.requireNonNull(max, "max");
+            if (min.isNegative() || max.compareTo(min) < 0) {
+                throw new IllegalArgumentException("locateInterval needs 0 <= min <= max");
+            }
+            this.locateMinMillis = min.toMillis();
+            this.locateMaxMillis = max.toMillis();
+            return this;
+        }
+        private long locateMinMillis = LOCATE_MIN_INTERVAL_MILLIS;
+        private long locateMaxMillis = LOCATE_MAX_INTERVAL_MILLIS;
 
         /**
          * Registers a listener for members' credential hints (TODO-EFG §4):
@@ -881,6 +1299,30 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
+     * Sets one membership hint of one joined group (SRAD DB-N-12): the join
+     * credential this node presents there, replaced when an invite key
+     * rotates, without touching the hints of other groups this node hosts.
+     * The next self-advertisement carries it.
+     *
+     * @param groupId the group
+     * @param key     the hint key ({@code aspace:join})
+     * @param value   the value, or null to remove the hint
+     */
+    public void groupHint(GroupId groupId, String key, String value) {
+        Objects.requireNonNull(groupId, "groupId");
+        Objects.requireNonNull(key, "key");
+        groupHints.compute(groupId, (g, current) -> {
+            Map<String, String> next = new java.util.HashMap<>(current == null ? Map.of() : current);
+            if (value == null) {
+                next.remove(key);
+            } else {
+                next.put(key, value);
+            }
+            return Map.copyOf(next);
+        });
+    }
+
+    /**
      * Removes one of this node's own credential hints; the next
      * self-advertisement no longer carries it.
      *
@@ -984,6 +1426,20 @@ public final class PeerNode implements AutoCloseable {
      *
      * @return peer to mode, a snapshot
      */
+    /**
+     * Returns the transport scheme of each connected peer's connection ({@code tcp}, {@code tls},
+     * {@code ws}, {@code webrtc}, ...), for the console (srad/agentspaces-js.md JS-N-07): a
+     * snapshot; a peer whose connection came through a transport registered before this
+     * accounting (none in the shipped bindings) shows {@code "?"}.
+     *
+     * @return peer to scheme
+     */
+    public Map<PeerId, String> connectionSchemes() {
+        Map<PeerId, String> schemes = new java.util.HashMap<>();
+        connections.forEach((peer, connection) -> schemes.put(peer, connectionSchemes.getOrDefault(connection, "?")));
+        return schemes;
+    }
+
     public Map<PeerId, String> channelModes() {
         Map<PeerId, String> modes = new java.util.HashMap<>();
         connections.forEach((peer, connection) -> {
@@ -1017,6 +1473,7 @@ public final class PeerNode implements AutoCloseable {
 
     private void dropConnection(PeerId peer, TransportConnection connection) {
         connections.remove(peer, connection);
+        connectionSchemes.remove(connection);
         bareAccepted.remove(connection);
         helloSent.remove(connection);
         sessions.remove(connection);
@@ -1054,10 +1511,72 @@ public final class PeerNode implements AutoCloseable {
      */
     public synchronized void listen(Transport transport, String bindAddress, int priority)
             throws IOException {
+        listen(transport, bindAddress, bindAddress, priority);
+    }
+
+    /**
+     * Registers a transport, starts listening on {@code bindAddress}, and
+     * advertises {@code advertisedAddress}: the address other peers dial,
+     * which differs from the bind address on a host that binds every
+     * interface, sits behind a NAT, or runs in a pod whose routable address
+     * the platform assigns.
+     *
+     * @param transport         the transport
+     * @param bindAddress       the transport-specific bind address
+     * @param advertisedAddress the address carried in this node's self-advertisement
+     * @throws IOException if the address cannot be bound
+     */
+    public synchronized void listen(Transport transport, String bindAddress, String advertisedAddress)
+            throws IOException {
+        listen(transport, bindAddress, advertisedAddress, advertisedEndpoints.size());
+    }
+
+    /**
+     * Registers a transport, starts listening, and advertises an explicit
+     * address at an explicit priority.
+     *
+     * @param transport         the transport
+     * @param bindAddress       the transport-specific bind address
+     * @param advertisedAddress the address carried in this node's self-advertisement
+     * @param priority          the advertised priority; lower dials first
+     * @throws IOException if the address cannot be bound
+     */
+    public synchronized void listen(Transport transport, String bindAddress, String advertisedAddress,
+                                    int priority) throws IOException {
+        Objects.requireNonNull(advertisedAddress, "advertisedAddress");
+        requireAttestingIfRequired(transport);
         transports.put(transport.scheme(), transport);
-        listeners.add(transport.listen(bindAddress, this::attach));
+        listeners.add(transport.listen(bindAddress, accepted -> {
+            connectionSchemes.put(accepted, transport.scheme());
+            attach(accepted);
+        }));
         advertisedEndpoints.add(new PeerAdvertisement.Endpoint(
-                transport.scheme(), bindAddress, priority));
+                transport.scheme(), advertisedAddress, priority));
+    }
+
+    /** The topology roles this node declares ({@code RENDEZVOUS}, {@code RELAY}). */
+    public Set<PeerAdvertisement.PeerRole> roles() {
+        return roles;
+    }
+
+    /**
+     * The wire hints this node advertises ({@code wire.batch}, {@code wire.tree},
+     * {@code wire.session}, {@code wire.hashes}), a copy.
+     *
+     * @return the hints
+     */
+    public Map<String, String> wireHints() {
+        return Map.copyOf(nodeHints);
+    }
+
+    /**
+     * The endpoints this node advertises, in the order they were registered:
+     * the advertised (not the bind) address of each listening transport.
+     *
+     * @return the endpoints; empty for a dial-only node
+     */
+    public List<PeerAdvertisement.Endpoint> advertisedEndpoints() {
+        return List.copyOf(advertisedEndpoints);
     }
 
     /**
@@ -1069,8 +1588,58 @@ public final class PeerNode implements AutoCloseable {
      *
      * @param transport the transport
      */
+    /**
+     * Closes a resource when this node closes, after its listeners and
+     * connections: for a transport a host built for the node (a DTLS or QUIC
+     * binding with sockets and threads of its own) rather than one the
+     * application supplied and owns.
+     *
+     * @param resource the resource
+     */
+    public void closeWith(AutoCloseable resource) {
+        ownedResources.add(Objects.requireNonNull(resource, "resource"));
+    }
+
     public synchronized void transport(Transport transport) {
+        requireAttestingIfRequired(transport);
         transports.put(transport.scheme(), transport);
+    }
+
+    /**
+     * The capabilities of the binding registered for a scheme (spec §5.5),
+     * for hosts' startup checks and the console.
+     *
+     * @param scheme the transport scheme
+     * @return the registered binding's capabilities, or empty when none is registered
+     */
+    public Set<Transport.Capability> transportCapabilities(String scheme) {
+        Transport transport = transports.get(scheme);
+        return transport == null ? Set.of() : transport.capabilities();
+    }
+
+    /**
+     * The binding registered for a scheme, when any: a host's capability wiring reaches the
+     * {@code webrtc} binding this way to attach its signalling pipe to a group (SRAD
+     * srad/agentspaces-js.md JS-N-02), without this layer knowing that binding's type.
+     *
+     * @param scheme the transport scheme
+     * @return the registered binding, or empty when none is
+     */
+    public Optional<Transport> registeredTransport(String scheme) {
+        return Optional.ofNullable(transports.get(scheme));
+    }
+
+    /**
+     * Spec §5.6, gate-2 review G2-1: a node that requires attestation
+     * registers attesting bindings alone. A binding that cannot attest would
+     * carry only frames the node then drops, and dialing over it would evict
+     * an honest peer at the far end.
+     */
+    private void requireAttestingIfRequired(Transport transport) {
+        if (requireAttestation && !transport.capabilities().contains(Transport.Capability.ATTESTING)) {
+            throw new IllegalArgumentException("transport '" + transport.scheme()
+                    + "' cannot attest, and this node requires attestation (spec §5.6)");
+        }
     }
 
     /**
@@ -1101,6 +1670,78 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
+     * Joins a locally configured, literal-id group, finding its first contacts
+     * through a locator rather than a fixed list: the locator is asked now and
+     * again whenever this node's view of the group is empty and the last hint
+     * has aged past its time to live.
+     *
+     * @param groupAd          the group's configured advertisement
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @return the group runtime
+     */
+    public GroupRuntime joinGroup(GroupAdvertisement groupAd,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator) {
+        return joinGroup(groupAd, membershipConfig, locator, Map.of(), null);
+    }
+
+    /**
+     * Joins a literal-id group through a locator, presenting membership hints
+     * and a POLICY validator.
+     *
+     * @param groupAd          the group's configured advertisement
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param membershipHints  resource hints for our self-ad (join credentials)
+     * @param validator        POLICY admission validator, or {@code null}
+     * @return the group runtime
+     */
+    public GroupRuntime joinGroup(GroupAdvertisement groupAd,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Map<String, String> membershipHints,
+                                  MembershipValidator validator) {
+        return joinGroup(groupAd, membershipConfig, locator, membershipHints, validator, null);
+    }
+
+    /**
+     * Joins a literal-id group through a locator, asked by the configured
+     * group name (SRAD DB-N-01, FR-9 of ISSUE-BootstrapCore): the name a host
+     * configured the group under, which is what a locator's
+     * {@code appliesTo} and a beacon document's group entry go by; the
+     * advertisement's own name is used when {@code groupName} is null.
+     *
+     * @param groupAd          the group's configured advertisement
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param membershipHints  resource hints for our self-ad (join credentials)
+     * @param validator        POLICY admission validator, or {@code null}
+     * @param groupName        the configured group name, or null for the advertisement's
+     * @return the group runtime
+     */
+    public GroupRuntime joinGroup(GroupAdvertisement groupAd,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Map<String, String> membershipHints,
+                                  MembershipValidator validator,
+                                  String groupName) {
+        Objects.requireNonNull(groupAd, "groupAd");
+        Objects.requireNonNull(locator, "locator");
+        String name = nameOf(groupAd, groupName);
+        BeaconHint hint = locate(groupAd.group(), name, locator);
+        return join(groupAd, null, membershipConfig, locator, hint, membershipHints, validator, name);
+    }
+
+    /** The configured name when given, else the advertisement's, else the id. */
+    private static String nameOf(GroupAdvertisement groupAd, String groupName) {
+        if (groupName != null && !groupName.isBlank()) {
+            return groupName;
+        }
+        return groupAd.name() == null ? groupAd.group().value() : groupAd.name();
+    }
+
+    /**
      * Joins a self-certifying group with its signed founding advertisement
      * (spec §4.4, §5.1), verifying it first: the founder's key must hash to
      * the issuer, the signature must verify over the founding fields, and the
@@ -1118,6 +1759,79 @@ public final class PeerNode implements AutoCloseable {
                                   GroupMembership.Config membershipConfig,
                                   List<PeerAdvertisement.Endpoint> seeds) {
         return joinGroup(founding, membershipConfig, seeds, Map.of(), null);
+    }
+
+    /**
+     * Joins a self-certifying group with its signed founding advertisement,
+     * finding its first contacts through a locator.
+     *
+     * @param founding         the signed founding advertisement
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @return the group runtime
+     * @throws IllegalArgumentException when the founding document does not verify
+     */
+    public GroupRuntime joinGroup(SignedGroupAdvertisement founding,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator) {
+        return joinGroup(founding, membershipConfig, locator, Map.of(), null);
+    }
+
+    /**
+     * Joins a self-certifying group through a locator, presenting membership
+     * hints and a POLICY validator.
+     *
+     * @param founding         the signed founding advertisement
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param membershipHints  resource hints for our self-ad (join credentials)
+     * @param validator        POLICY admission validator, or {@code null}
+     * @return the group runtime
+     * @throws IllegalArgumentException when the founding document does not verify
+     */
+    public GroupRuntime joinGroup(SignedGroupAdvertisement founding,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Map<String, String> membershipHints,
+                                  MembershipValidator validator) {
+        Objects.requireNonNull(founding, "founding");
+        Objects.requireNonNull(locator, "locator");
+        if (!GroupFounding.verify(founding)) {
+            throw new IllegalArgumentException("refusing to join " + founding.advertisement().group()
+                    + ": the advertisement is not the self-certifying founding document of that group");
+        }
+        return joinGroup(founding, membershipConfig, locator, membershipHints, validator, null);
+    }
+
+    /**
+     * Joins a self-certifying group through a locator, asked by the
+     * configured group name.
+     *
+     * @param founding         the signed founding advertisement
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param membershipHints  resource hints for our self-ad (join credentials)
+     * @param validator        POLICY admission validator, or {@code null}
+     * @param groupName        the configured group name, or null for the advertisement's
+     * @return the group runtime
+     * @throws IllegalArgumentException when the founding document does not verify
+     */
+    public GroupRuntime joinGroup(SignedGroupAdvertisement founding,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Map<String, String> membershipHints,
+                                  MembershipValidator validator,
+                                  String groupName) {
+        Objects.requireNonNull(founding, "founding");
+        Objects.requireNonNull(locator, "locator");
+        if (!GroupFounding.verify(founding)) {
+            throw new IllegalArgumentException("refusing to join " + founding.advertisement().group()
+                    + ": the advertisement is not the self-certifying founding document of that group");
+        }
+        GroupAdvertisement ad = founding.advertisement();
+        String name = nameOf(ad, groupName);
+        BeaconHint hint = locate(ad.group(), name, locator);
+        return join(ad, founding, membershipConfig, locator, hint, membershipHints, validator, name);
     }
 
     /**
@@ -1144,8 +1858,10 @@ public final class PeerNode implements AutoCloseable {
             throw new IllegalArgumentException("refusing to join " + founding.advertisement().group()
                     + ": the advertisement is not the self-certifying founding document of that group");
         }
-        return join(founding.advertisement(), founding, membershipConfig, seeds,
-                membershipHints, validator);
+        SeedsLocator locator = SeedsLocator.fixed(seeds);
+        return join(founding.advertisement(), founding, membershipConfig, locator,
+                locator.locate(request(founding.advertisement().group(), founding.advertisement().name())),
+                membershipHints, validator, null);
     }
 
     /**
@@ -1174,9 +1890,97 @@ public final class PeerNode implements AutoCloseable {
                                   GroupMembership.Config membershipConfig,
                                   List<PeerAdvertisement.Endpoint> seeds,
                                   Duration timeout) throws TimeoutException {
-        Objects.requireNonNull(groupId, "groupId");
         Objects.requireNonNull(seeds, "seeds");
+        return joinGroup(groupId, membershipConfig, SeedsLocator.fixed(seeds), timeout);
+    }
+
+    /**
+     * Joins a group knowing only its GroupID, finding seeds through a locator.
+     * When the locator's hint already carries a founding advertisement that
+     * verifies as the self-certifying document of exactly this GroupID (a
+     * beacon document fetched over HTTPS, say), the fetch is skipped and the
+     * join proceeds at once; otherwise the hint's endpoints are asked for it
+     * as {@link #joinGroup(GroupId, GroupMembership.Config, List, Duration)}
+     * asks seeds.
+     *
+     * @param groupId          the GroupID
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param timeout          how long to wait for a verified founding advertisement
+     * @return the group runtime
+     * @throws TimeoutException      when no seed served a verified founding advertisement within the timeout
+     * @throws IllegalStateException when the group is already joined or a fetch for it is already in progress
+     */
+    public GroupRuntime joinGroup(GroupId groupId,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Duration timeout) throws TimeoutException {
+        return joinGroup(groupId, membershipConfig, locator, timeout, Map.of(), null);
+    }
+
+    /**
+     * Joins a group knowing only its GroupID, finding seeds through a locator
+     * and presenting membership hints (a join credential) and a POLICY
+     * validator once the founding advertisement is in hand.
+     *
+     * @param groupId          the GroupID
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param timeout          how long to wait for a verified founding advertisement
+     * @param membershipHints  resource hints for our self-ad (join credentials)
+     * @param validator        POLICY admission validator, or {@code null}
+     * @return the group runtime
+     * @throws TimeoutException      when no seed served a verified founding advertisement within the timeout
+     * @throws IllegalStateException when the group is already joined or a fetch for it is already in progress
+     */
+    public GroupRuntime joinGroup(GroupId groupId,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Duration timeout,
+                                  Map<String, String> membershipHints,
+                                  MembershipValidator validator) throws TimeoutException {
+        return joinGroup(groupId, membershipConfig, locator, timeout, membershipHints, validator, null);
+    }
+
+    /**
+     * Joins a group knowing only its GroupID, through a locator asked by the
+     * configured group name.
+     *
+     * @param groupId          the GroupID
+     * @param membershipConfig membership tuning
+     * @param locator          how to find existing members
+     * @param timeout          how long to wait for a verified founding advertisement
+     * @param membershipHints  resource hints for our self-ad (join credentials)
+     * @param validator        POLICY admission validator, or {@code null}
+     * @param groupName        the configured group name, or null for the id
+     * @return the group runtime
+     * @throws TimeoutException      when no seed served a verified founding advertisement within the timeout
+     * @throws IllegalStateException when the group is already joined or a fetch for it is already in progress
+     */
+    public GroupRuntime joinGroup(GroupId groupId,
+                                  GroupMembership.Config membershipConfig,
+                                  BeaconLocator locator,
+                                  Duration timeout,
+                                  Map<String, String> membershipHints,
+                                  MembershipValidator validator,
+                                  String groupName) throws TimeoutException {
+        Objects.requireNonNull(groupId, "groupId");
+        Objects.requireNonNull(locator, "locator");
         Objects.requireNonNull(timeout, "timeout");
+        Objects.requireNonNull(membershipHints, "membershipHints");
+        String name = groupName == null || groupName.isBlank() ? groupId.value() : groupName;
+        BeaconHint hint = locate(groupId, name, locator);
+        if (hint.founding().isPresent()) {
+            SignedGroupAdvertisement carried = decodeFounding(hint.founding().get());
+            if (carried != null && GroupFounding.verify(carried)
+                    && carried.advertisement().group().equals(groupId)) {
+                return join(carried.advertisement(), carried, membershipConfig, locator, hint,
+                        membershipHints, validator, name);
+            }
+            LOG.log(System.Logger.Level.WARNING, "the locator's founding advertisement for " + groupId
+                    + " did not verify as that group's; asking the seeds instead");
+        }
+        List<PeerAdvertisement.Endpoint> seeds = hint.endpoints();
         if (groups.containsKey(groupId)) {
             throw new IllegalStateException("already a member of " + groupId);
         }
@@ -1211,11 +2015,187 @@ public final class PeerNode implements AutoCloseable {
             } catch (java.util.concurrent.ExecutionException e) {
                 throw new IllegalStateException(e.getCause());
             }
-            return joinGroup(founding, membershipConfig, seeds);
+            return join(founding.advertisement(), founding, membershipConfig, locator, hint,
+                    membershipHints, validator, name);
         } finally {
             pendingFounding.remove(groupId, pending);
             asked.forEach(TransportConnection::close);
         }
+    }
+
+    /** Decodes a hint's founding bytes, or null when they are not a signed founding advertisement. */
+    private SignedGroupAdvertisement decodeFounding(byte[] bytes) {
+        try {
+            return codec.fromBytes(bytes, SignedGroupAdvertisement.class);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** The request a locator is asked with: what this node knows and can dial. */
+    private BeaconRequest request(GroupId groupId, String groupName) {
+        Set<String> schemes = Set.copyOf(transports.keySet());
+        String defaultScheme = schemes.contains("tls") ? "tls"
+                : schemes.contains("tcp") ? "tcp"
+                : advertisedEndpoints.isEmpty() ? (schemes.isEmpty() ? "tcp" : schemes.iterator().next())
+                : advertisedEndpoints.get(0).transport();
+        return new BeaconRequest(groupName == null ? groupId.value() : groupName,
+                Optional.ofNullable(groupId), defaultScheme, schemes);
+    }
+
+    /** Asks a locator at join: the hint, its expiry, the trace; a required locator that answers nothing refuses. */
+    private BeaconHint locate(GroupId groupId, String groupName, BeaconLocator locator) {
+        BeaconHint hint = locate(groupId, groupName, locator, true);
+        if (locator.policy().require() && hint.isEmpty()) {
+            throw new IllegalStateException("no locator answered for " + groupName + " (" + groupId.value()
+                    + ") and bootstrap.require is set; " + traceText(groupId, hint));
+        }
+        return hint;
+    }
+
+    /**
+     * Asks a locator now, recording the hint, its expiry under the locator's
+     * policy or the node's pacing, and the chain's trace (SRAD DB-N-07): the
+     * first answer is logged at INFO, a re-ask at INFO when its endpoints
+     * changed, every row at INFO under {@code trace}, otherwise at DEBUG. A
+     * locator that throws yields nothing. A hint's {@code wire.*} parameters
+     * seed the channel expectations of the beacon it names (DB-N-08).
+     */
+    private BeaconHint locate(GroupId groupId, String groupName, BeaconLocator locator, boolean joining) {
+        long now = clock.millis();
+        lastLocateMillis.put(groupId, now);
+        BeaconHint hint;
+        try {
+            hint = locator.locate(request(groupId, groupName));
+            if (hint == null) {
+                hint = BeaconHint.none();
+            }
+        } catch (IOException | RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING, "locator " + locator.name() + " failed for " + groupId
+                    + ": " + e);
+            hint = BeaconHint.none();
+        }
+        List<PeerAdvertisement.Endpoint> previous = groupSeeds.get(groupId);
+        lastBeaconHints.put(groupId, hint);
+        if (locator instanceof BootstrapChain chain) {
+            lastBootstrapTraces.put(groupId, chain.lastTrace());
+        } else {
+            lastBootstrapTraces.remove(groupId);
+        }
+        LocatePolicy policy = locator.policy();
+        long min = policy.minInterval().map(Duration::toMillis).orElse(locateMinMillis);
+        long max = policy.maxInterval().map(Duration::toMillis).orElse(locateMaxMillis);
+        long ttl = hint.ttl().isZero() ? min : hint.ttl().toMillis();
+        hintExpiryMillis.put(groupId, now + Math.max(min, Math.min(ttl, Math.max(min, max))));
+        boolean changed = previous == null || !previous.equals(hint.endpoints());
+        System.Logger.Level level = joining || changed || policy.trace() || hint.isEmpty()
+                ? System.Logger.Level.INFO : System.Logger.Level.DEBUG;
+        LOG.log(level, "bootstrap " + groupName + (joining ? " (join): " : " (re-ask): ") + traceText(groupId, hint));
+        seedChannelHints(hint);
+        return hint;
+    }
+
+    /** One line: the hint's evidence and endpoints, then the chain's rows when there are any. */
+    private String traceText(GroupId groupId, BeaconHint hint) {
+        StringBuilder out = new StringBuilder(hint.evidence()).append(' ').append(hint.endpoints());
+        for (BootstrapChain.Trace row : lastBootstrapTraces.getOrDefault(groupId, List.of())) {
+            out.append("; ").append(row.locator()).append(' ').append(row.millis()).append(" ms ")
+                    .append(row.endpoints()).append(" endpoint(s)");
+            if (row.error() != null) {
+                out.append(" error: ").append(row.error());
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * A beacon document names its beacon ({@code beacon}) and the wire hints
+     * it advertises ({@code wire.*}); taking them as expectations before the
+     * beacon's advertisement arrives saves the first session hello a retry.
+     * The advertisement, when it arrives, is authoritative.
+     */
+    private void seedChannelHints(BeaconHint hint) {
+        String beacon = hint.parameters().get("beacon");
+        if (beacon == null || beacon.isBlank()) {
+            return;
+        }
+        PeerId peer;
+        try {
+            peer = PeerId.of(beacon.trim());
+        } catch (RuntimeException e) {
+            return;
+        }
+        if (channelAuth == ChannelAuth.SESSION && "1".equals(hint.parameters().get(SESSION_HINT))) {
+            sessionPeers.add(peer);
+        }
+        if (lazyPush && "1".equals(hint.parameters().get(TREE_HINT))) {
+            treePeers.add(peer);
+        }
+        if ("1".equals(hint.parameters().get(BATCH_HINT))) {
+            batchPeers.add(peer);
+        }
+        if ("1".equals(hint.parameters().get(HASHES_HINT))) {
+            hashPeers.add(peer);
+        }
+    }
+
+    /** Whether this node expects to open a session with the peer (a hint seeded it, or its advertisement said so). */
+    boolean expectsSession(PeerId peer) {
+        return sessionPeers.contains(peer);
+    }
+
+    /**
+     * The trace of a group's last locate: one row per locator the chain
+     * asked, with its duration, endpoint count, evidence, and error; empty
+     * when the group's locator is not a chain or nothing was asked yet.
+     *
+     * @param groupId the group
+     * @return the rows
+     */
+    public List<BootstrapChain.Trace> lastBootstrapTrace(GroupId groupId) {
+        return lastBootstrapTraces.getOrDefault(groupId, List.of());
+    }
+
+    /**
+     * What the multicast beacon heard for a group: the unexpired endpoints
+     * of every sender whose datagram verified, newest sender first.
+     *
+     * @param groupId the group
+     * @return the endpoints, how many senders, and the shortest remaining life
+     */
+    public BeaconLearned beaconLearned(GroupId groupId) {
+        Map<PeerId, LearnedEndpoints> learned = beaconLearned.get(groupId);
+        if (learned == null || learned.isEmpty()) {
+            return new BeaconLearned(List.of(), 0, Duration.ZERO);
+        }
+        long now = clock.millis();
+        List<PeerAdvertisement.Endpoint> out = new ArrayList<>();
+        long shortest = Long.MAX_VALUE;
+        int peers = 0;
+        for (Map.Entry<PeerId, LearnedEndpoints> entry : learned.entrySet()) {
+            if (entry.getValue().expiresMillis() <= now) {
+                learned.remove(entry.getKey());
+                continue;
+            }
+            peers++;
+            shortest = Math.min(shortest, entry.getValue().expiresMillis() - now);
+            for (PeerAdvertisement.Endpoint endpoint : byPriority(entry.getValue().endpoints())) {
+                out.add(new PeerAdvertisement.Endpoint(endpoint.transport(), endpoint.address(), out.size()));
+            }
+        }
+        return new BeaconLearned(out, peers, peers == 0 ? Duration.ZERO : Duration.ofMillis(shortest));
+    }
+
+    /**
+     * The last hint a group's locator answered, with its evidence; empty before
+     * the first locate or for a group joined with a fixed seed list (whose
+     * hint is the list).
+     *
+     * @param groupId the group
+     * @return the hint
+     */
+    public Optional<BeaconHint> lastBeaconHint(GroupId groupId) {
+        return Optional.ofNullable(lastBeaconHints.get(groupId));
     }
 
     /**
@@ -1238,19 +2218,28 @@ public final class PeerNode implements AutoCloseable {
                                   List<PeerAdvertisement.Endpoint> seeds,
                                   Map<String, String> membershipHints,
                                   MembershipValidator validator) {
-        return join(groupAd, null, membershipConfig, seeds, membershipHints, validator);
+        Objects.requireNonNull(groupAd, "groupAd");
+        Objects.requireNonNull(seeds, "seeds");
+        SeedsLocator locator = SeedsLocator.fixed(seeds);
+        return join(groupAd, null, membershipConfig, locator,
+                locator.locate(request(groupAd.group(), groupAd.name())), membershipHints, validator, null);
     }
 
-    /** The common join: wires the runtime and introduces this node to the seeds. */
+    /** The common join: wires the runtime and introduces this node to the hint's endpoints. */
     private GroupRuntime join(GroupAdvertisement groupAd,
                               SignedGroupAdvertisement founding,
                               GroupMembership.Config membershipConfig,
-                              List<PeerAdvertisement.Endpoint> seeds,
+                              BeaconLocator locator,
+                              BeaconHint hint,
                               Map<String, String> membershipHints,
-                              MembershipValidator validator) {
+                              MembershipValidator validator,
+                              String groupName) {
         Objects.requireNonNull(groupAd, "groupAd");
         Objects.requireNonNull(membershipHints, "membershipHints");
         GroupId groupId = groupAd.group();
+        List<PeerAdvertisement.Endpoint> seeds = hint.endpoints();
+        groupLocators.put(groupId, locator);
+        groupNames.put(groupId, nameOf(groupAd, groupName));
         groupHints.put(groupId, Map.copyOf(membershipHints));
         if (validator != null) {
             groupValidators.put(groupId, validator);
@@ -1336,6 +2325,15 @@ public final class PeerNode implements AutoCloseable {
         // ASF-012: this node forwards only peer ads it can verify end-to-end,
         // so its identity and rate budget never amplify unverifiable content.
         gossip.forwardFilter(PEER_AD_STREAM, payload -> forwardsPeerAd(revocations, payload));
+        // The members admitted under a delegation before a restart, back before the first contact.
+        admissionMemory.load(groupId);
+        if (groupAd.membershipPolicy() == GroupAdvertisement.MembershipPolicy.INVITE
+                && !admissionMemory.persistent()) {
+            LOG.log(System.Logger.Level.INFO, "the admission memory of group " + groupId.value()
+                    + " is held in memory only: no state directory is configured, so a restart forgets which"
+                    + " members were admitted under an invite delegation before it expired, and refuses them"
+                    + " after it (PeerNode.Builder.stateDirectory; the starter passes agentspaces.keystore)");
+        }
         groups.put(groupId, runtime);
 
         // Introduce ourselves to the seeds directly; gossip takes it from there.
@@ -1354,8 +2352,8 @@ public final class PeerNode implements AutoCloseable {
     private void introduceTo(GroupId groupId, List<PeerAdvertisement.Endpoint> endpoints) {
         for (PeerAdvertisement.Endpoint seed : byPriority(endpoints)) {
             Transport transport = transports.get(seed.transport());
-            if (transport == null) {
-                continue;
+            if (transport == null || transport.signalled()) {
+                continue; // a signalled endpoint names no address to introduce ourselves at
             }
             try {
                 TransportConnection connection = transport.dial(seed.address());
@@ -1406,11 +2404,47 @@ public final class PeerNode implements AutoCloseable {
                 tried = true;
                 introduceTo(groupId, seeds);
             }
+            relocateIfStale(groupId, nowMillis);
         }
         if (tried) {
             lastLostRetryMillis.put(groupId, nowMillis);
             lostRetryIntervalMillis.put(groupId, Math.min(interval * 2, LOST_RETRY_MAX_INTERVAL_MILLIS));
         }
+    }
+
+    /**
+     * Re-asks a group's locator, off the tick thread, when the view is empty
+     * and the last hint has aged past its time to live: a seed that moved (a
+     * rescheduled pod, a changed SRV record) is found again without a restart.
+     * Never faster than {@link #LOCATE_MIN_INTERVAL_MILLIS}; the dial back-off
+     * of {@code retryLost} is untouched, and a stable view asks nothing.
+     */
+    private void relocateIfStale(GroupId groupId, long nowMillis) {
+        BeaconLocator locator = groupLocators.get(groupId);
+        if (locator == null || locator instanceof SeedsLocator) {
+            return; // a fixed list never changes
+        }
+        Long expiry = hintExpiryMillis.get(groupId);
+        Long last = lastLocateMillis.get(groupId);
+        long min = locator.policy().minInterval().map(Duration::toMillis).orElse(locateMinMillis);
+        if ((expiry != null && nowMillis < expiry)
+                || (last != null && nowMillis - last < min)
+                || !locating.add(groupId)) {
+            return;
+        }
+        lastLocateMillis.put(groupId, nowMillis);
+        String name = groupNames.getOrDefault(groupId, groupId.value());
+        Thread.ofVirtual().name("peer-locate-" + groupId.value()).start(() -> {
+            try {
+                BeaconHint hint = locate(groupId, name, locator, false);
+                if (!hint.endpoints().isEmpty() && groups.containsKey(groupId)) {
+                    groupSeeds.put(groupId, hint.endpoints());
+                    introduceTo(groupId, hint.endpoints());
+                }
+            } finally {
+                locating.remove(groupId);
+            }
+        });
     }
 
     /** Endpoints in ascending priority, stable for ties (spec §5.5). */
@@ -1429,6 +2463,102 @@ public final class PeerNode implements AutoCloseable {
      */
     public Optional<GroupRuntime> group(GroupId groupId) {
         return Optional.ofNullable(groups.get(groupId));
+    }
+
+    /**
+     * Leaves one group (ISSUE-PeerRobustness-2, R2-2): everything this node
+     * holds for it goes, and nothing held for another group changes. The group
+     * leaves the node's tables first, so a frame of the group arriving from
+     * now on takes the stranger path and the node sends nothing more in it;
+     * then the locate, the lost-member retry, the seeds, the hints, the beacon
+     * seal, and the relay counters of the group are dropped, the runtime is
+     * released (its periodic work and kind handlers cleared, its
+     * {@link GroupRuntime#onClose} listeners told), the admission memory of the
+     * group and its file go, and the connections to the members of the group's
+     * last view that are members of no remaining group are closed. Other
+     * members notice the departure by the membership TTL; no frame announces
+     * it. Rejoining starts the group afresh, with an empty admission memory.
+     *
+     * @param groupId the group
+     * @return whether this node was a member
+     */
+    public synchronized boolean leaveGroup(GroupId groupId) {
+        Objects.requireNonNull(groupId, "groupId");
+        GroupRuntime runtime = groups.remove(groupId);
+        if (runtime == null) {
+            return false;
+        }
+        // The members this node held in the group, from the live view and the last tick's view.
+        Set<PeerId> held = new java.util.HashSet<>();
+        for (GroupMembership.Member member : runtime.membership().allMembers()) {
+            held.add(member.id());
+        }
+        Set<PeerId> previous = lastView.remove(groupId);
+        if (previous != null) {
+            held.addAll(previous);
+        }
+        groupSeeds.remove(groupId);
+        groupLocators.remove(groupId);
+        groupNames.remove(groupId);
+        lastBeaconHints.remove(groupId);
+        lastBootstrapTraces.remove(groupId);
+        beaconLearned.remove(groupId);
+        hintExpiryMillis.remove(groupId);
+        lastLocateMillis.remove(groupId);
+        locating.remove(groupId); // a locate in flight checks the group is still joined before it acts
+        pendingFounding.remove(groupId); // never present for a joined group; cleared for completeness
+        lostMembers.remove(groupId);
+        lastLostRetryMillis.remove(groupId);
+        lostRetryIntervalMillis.remove(groupId);
+        heldAds.remove(groupId);
+        newlyAdmitted.remove(groupId);
+        lastSelfAdMillis.remove(groupId);
+        selfAdSentTo.remove(groupId);
+        lastSelfAdFingerprint.remove(groupId);
+        groupHints.remove(groupId);
+        groupValidators.remove(groupId);
+        beaconSeals.remove(groupId);
+        relayCounters.remove(groupId);
+        relayedWith.remove(groupId);
+        offloadAttempted.remove(groupId);
+        readmittedLogged.removeIf(key -> key.startsWith(groupId.value() + '|'));
+        // Frames coalesced for the group and not yet flushed are discarded, never sent.
+        for (Map.Entry<PeerId, Outbox> entry : List.copyOf(outboxes.entrySet())) {
+            Outbox outbox = entry.getValue();
+            if (groupId.equals(outbox.group)) {
+                synchronized (outbox) {
+                    outbox.frames.clear();
+                    outbox.bytes = 0;
+                }
+                outboxes.remove(entry.getKey(), outbox);
+            }
+        }
+        runtime.release();
+        admissionMemory.drop(groupId);
+        // The links are the node's: keep one to a peer still a member of another group joined here.
+        int closed = 0;
+        for (PeerId peer : held) {
+            boolean sharedElsewhere = groups.values().stream()
+                    .anyMatch(g -> g.membership().member(peer).isPresent());
+            if (sharedElsewhere) {
+                continue;
+            }
+            TransportConnection connection = connections.get(peer);
+            if (connection != null) {
+                dropConnection(peer, connection);
+                closed++;
+            }
+            lastEndpoints.remove(peer);
+            lastHints.remove(peer);
+            probePulls.remove(peer);
+            batchPeers.remove(peer);
+            treePeers.remove(peer);
+            sessionPeers.remove(peer);
+            hashPeers.remove(peer);
+        }
+        LOG.log(System.Logger.Level.INFO, "left group " + groupId.value() + ": " + held.size()
+                + " member(s) forgotten, " + closed + " connection(s) closed");
+        return true;
     }
 
     /**
@@ -1510,8 +2640,11 @@ public final class PeerNode implements AutoCloseable {
             // Layers above peering join this same clock through
             // GroupRuntime.onTick (QA3 A3-1): capability protocols advance here,
             // for the same reason membership and anti-entropy just did.
+            offloadRelayed(runtime, nowMillis); // JS-W-11, off this thread for the dial itself
             runtime.runTickWork(e -> LOG.log(System.Logger.Level.WARNING,
                     "tick work failed in group " + runtime.id().value(), e));
+            admissionMemory.flushIfDue(runtime.id(), nowMillis,
+                    runtime.advertisement().gossip().period().toMillis());
         }
         if (beacon != null) {
             Long last = lastBeaconMillis;
@@ -1644,6 +2777,9 @@ public final class PeerNode implements AutoCloseable {
      * @param body    the body object
      */
     boolean send(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+        if (!groups.containsKey(groupId)) {
+            return false; // a group this node left sends nothing more, even over a link it still holds (R2-2.2)
+        }
         if (quarantined(to)) {
             return false; // cautious: a sentenced peer is sent nothing, and no link is opened to it
         }
@@ -1794,6 +2930,7 @@ public final class PeerNode implements AutoCloseable {
             try {
                 sendOn(connection, groupId, relay, Envelope.Kind.RELAY_FRAME,
                         new Bodies.RelayFrame(to, inner));
+                noteRelayed(groupId, to); // JS-W-11: a frame the relay carried for this pair
                 return true;
             } catch (IOException e) {
                 dropConnection(relay, connection);
@@ -1852,8 +2989,17 @@ public final class PeerNode implements AutoCloseable {
                 // Best effort.
             }
         }
+        admissionMemory.flushAll(); // an admission inside the last gossip period survives the restart
         connections.values().forEach(TransportConnection::close);
         connections.clear();
+        for (AutoCloseable resource : ownedResources) {
+            try {
+                resource.close();
+            } catch (Exception ignored) {
+                // Best effort.
+            }
+        }
+        ownedResources.clear();
         bareAccepted.clear();
         helloSent.clear();
         sessions.clear();
@@ -2037,7 +3183,8 @@ public final class PeerNode implements AutoCloseable {
         // v0.1.9 CA channel mode: attestation is a condition of everything
         // below, admission included. Runs after the replay dedup so a captured
         // frame replayed over a stranger's connection is not fresh evidence.
-        if (requireAttestation && !attests(connection, envelope.from())) {
+        if (requireAttestation && !attests(connection, envelope.from())
+                && !relayedSignalToSelf(envelope, connection)) {
             onUnattestedFrame(runtime, envelope, connection);
             return;
         }
@@ -2162,6 +3309,36 @@ public final class PeerNode implements AutoCloseable {
     private static boolean attests(TransportConnection connection, PeerId peer) {
         return connection != null
                 && connection.attestedPeer().filter(peer::equals).isPresent();
+    }
+
+    /** The capability type of WebRTC signalling (SRAD srad/agentspaces-js.md §3.5). */
+    static final String RTC_SIGNAL_CAPABILITY = "aspace:cap/rtc-signal";
+
+    /** The head of a {@code PIPE_DATA} body: the capability type alone, every other key ignored. */
+    private record PipeHead(String capability) {
+    }
+
+    /**
+     * The one relayed inner frame required attestation admits (SPEC §5.6, v0.1.21; SRAD
+     * srad/agentspaces-js.md JS-N-03, decision 6): a fully signed {@code PIPE_DATA} of the
+     * {@code aspace:cap/rtc-signal} capability addressed to this node. A browser member can
+     * reach a node it cannot dial only through a relay, and the data channel its signal opens
+     * attests it by the fingerprint the signed signal carried, so the exception admits the
+     * signal to the signalling capability and nothing else. A null connection is the relayed
+     * path alone ({@link #onRelayFrame}), whose inner frame {@code wire.decode} accepted only
+     * when fully signed.
+     */
+    private boolean relayedSignalToSelf(Envelope envelope, TransportConnection connection) {
+        if (connection != null || envelope.kind() != Envelope.Kind.PIPE_DATA
+                || !peerId().equals(envelope.to())) {
+            return false;
+        }
+        try {
+            PipeHead head = codec.fromBytes(envelope.body(), PipeHead.class);
+            return head != null && RTC_SIGNAL_CAPABILITY.equals(head.capability());
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     /**
@@ -2408,12 +3585,12 @@ public final class PeerNode implements AutoCloseable {
         }
         if (ai.badmonkey.agentspaces.api.ad.CredentialRevocation.Target.JOIN_CREDENTIAL.equals(target.kind())) {
             String hash = HexFormat.of().formatHex(target.credentialHash());
-            Map<PeerId, String> admitted = admittedUnder.getOrDefault(groupId, Map.of());
-            for (Map.Entry<PeerId, String> entry : Map.copyOf(admitted).entrySet()) {
-                if (entry.getValue().equals(hash)) {
+            for (Map.Entry<PeerId, String> entry : admissionMemory.forGroup(groupId).entrySet()) {
+                if (List.of(entry.getValue().split(",")).contains(hash)) {
                     PeerId evicted = entry.getKey();
                     membership.evict(evicted);
-                    admitted.remove(evicted);
+                    admissionMemory.remove(groupId, evicted); // revocation always beats memory (R2-1.2)
+                    readmittedLogged.remove(groupId.value() + '|' + evicted.value());
                     // The link is the node's, not the group's: keep it for a peer
                     // still a member of another group joined here.
                     boolean sharedElsewhere = groups.entrySet().stream()
@@ -2778,11 +3955,35 @@ public final class PeerNode implements AutoCloseable {
             // no connection to cache (the origin is behind the relay, not here).
             wire.decode(relayed.frame())
                     .filter(inner -> inner.kind() != Envelope.Kind.RELAY_FRAME)
-                    .ifPresent(inner -> dispatch(inner, null));
+                    .ifPresent(inner -> {
+                        noteRelayed(runtime.id(), inner.from()); // JS-W-11: the other direction of the pair
+                        dispatch(inner, null);
+                    });
             return;
         }
         if (!roles.contains(PeerAdvertisement.PeerRole.RELAY)) {
             return; // only declared relays spend bandwidth forwarding
+        }
+        // A relay forwards only to a member of the group the frame names (SPEC §5.4, R2-3.1): a
+        // connection this node holds to the target through another group is no reason to carry
+        // a stranger's frame to it.
+        RelayCounters counters = relayCounters(runtime.id());
+        if (runtime.membership().member(relayed.target()).isEmpty()) {
+            counters.droppedNotMember.incrementAndGet();
+            return;
+        }
+        RelayCounters forTarget = counters.target(relayed.target()); // a verified member from here on
+        boolean allowed;
+        try {
+            allowed = relayPolicy.allow(runtime.id(), envelope.from(), relayed.target(), relayed.frame().length);
+        } catch (RuntimeException e) {
+            logPolicyFailure(e); // fail closed (R2-S3)
+            allowed = false;
+        }
+        if (!allowed) {
+            counters.droppedByPolicy.incrementAndGet();
+            forTarget.droppedByPolicy.incrementAndGet();
+            return;
         }
         TransportConnection out = connectionTo(runtime.id(), relayed.target());
         if (out == null) {
@@ -2790,9 +3991,25 @@ public final class PeerNode implements AutoCloseable {
         }
         try {
             sendOn(out, runtime.id(), relayed.target(), Envelope.Kind.RELAY_FRAME, relayed);
+            counters.framesForwarded.incrementAndGet();
+            counters.bytesForwarded.addAndGet(relayed.frame().length);
+            forTarget.framesForwarded.incrementAndGet();
+            forTarget.bytesForwarded.addAndGet(relayed.frame().length);
         } catch (IOException e) {
             dropConnection(relayed.target(), out);
         }
+    }
+
+    /** A relay policy that threw: logged at most once a minute, since it runs once per relayed frame. */
+    private void logPolicyFailure(RuntimeException e) {
+        long now = clock.millis();
+        Long last = lastPolicyFailureLogMillis;
+        if (last != null && now - last < 60_000L) {
+            return;
+        }
+        lastPolicyFailureLogMillis = now;
+        LOG.log(System.Logger.Level.WARNING, "the relay policy failed; the frame was dropped"
+                + " (further failures within a minute are not logged)", e);
     }
 
     private void sendOn(TransportConnection connection, GroupId groupId, PeerId to,
@@ -2847,40 +4064,53 @@ public final class PeerNode implements AutoCloseable {
         if (runtime == null) {
             return null;
         }
-        // Spec §5.5: try endpoints in ascending priority (stable for ties),
-        // skipping schemes this node has no transport for.
+        // Spec §5.5: try endpoints in ascending priority (stable for ties), skipping schemes
+        // this node has no transport for. A signalled endpoint (webrtc's "sig") is skipped
+        // here too: its dial may take the binding's whole timeout and its signals route
+        // through this very method, so a send takes the relay and the tick dials it once the
+        // relayed traffic warrants (offloadRelayed, JS-W-11).
         return runtime.membership().member(to).map(member -> {
             for (PeerAdvertisement.Endpoint endpoint : byPriority(member.endpoints())) {
                 Transport transport = transports.get(endpoint.transport());
-                if (transport == null) {
+                if (transport == null || transport.signalled()) {
                     continue;
                 }
                 try {
-                    TransportConnection dialed = transport.dial(endpoint.address());
-                    attach(dialed);
-                    TransportConnection raced = connections.putIfAbsent(to, dialed);
-                    if (raced != null) {
-                        dialed.close();
-                        return raced;
-                    }
-                    maybeAnnounceChannel(groupId, dialed, null); // a session opens once the peer answers
-                    // Introduce ourselves on the new channel, as to a seed: a peer that forgot
-                    // this node (its view expired, or it was quarantined) re-admits it from its
-                    // own advertisement and from nothing else.
-                    try {
-                        Bodies.Rumor selfAd = selfAdRumor(groupId);
-                        sendOn(dialed, groupId, to, Envelope.Kind.RUMOR,
-                                new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload()));
-                    } catch (IOException e) {
-                        // The channel is dead already; the caller's send will notice and drop it.
-                    }
-                    return dialed;
+                    return dialEndpoint(groupId, to, transport, endpoint);
                 } catch (IOException e) {
                     // Try the next endpoint.
                 }
             }
             return null;
         }).orElse(null);
+    }
+
+    /**
+     * Dials one advertised endpoint of a member, attaches the connection, and introduces this
+     * node on it; the connection another thread raced in first wins and the new one closes.
+     */
+    private TransportConnection dialEndpoint(GroupId groupId, PeerId to, Transport transport,
+                                             PeerAdvertisement.Endpoint endpoint) throws IOException {
+        TransportConnection dialed = transport.dial(endpoint.address(), to);
+        connectionSchemes.put(dialed, transport.scheme());
+        attach(dialed);
+        TransportConnection raced = connections.putIfAbsent(to, dialed);
+        if (raced != null) {
+            dialed.close();
+            return raced;
+        }
+        maybeAnnounceChannel(groupId, dialed, null); // a session opens once the peer answers
+        // Introduce ourselves on the new channel, as to a seed: a peer that forgot
+        // this node (its view expired, or it was quarantined) re-admits it from its
+        // own advertisement and from nothing else.
+        try {
+            Bodies.Rumor selfAd = selfAdRumor(groupId);
+            sendOn(dialed, groupId, to, Envelope.Kind.RUMOR,
+                    new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload()));
+        } catch (IOException e) {
+            // The channel is dead already; the caller's send will notice and drop it.
+        }
+        return dialed;
     }
 
     private void onPeerAdItem(GroupRuntime runtime, PeerId from, byte[] payload) {
@@ -3071,9 +4301,26 @@ public final class PeerNode implements AutoCloseable {
     private List<byte[]> beaconAnnouncements() {
         List<byte[]> announcements = new ArrayList<>();
         for (GroupId groupId : groups.keySet()) {
-            announcements.add(selfAdRumor(groupId).payload());
+            byte[] signedAd = selfAdRumor(groupId).payload();
+            ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal seal = beaconSeals.get(groupId);
+            announcements.add(seal == null ? signedAd : seal.seal(signedAd, clock.instant()));
         }
         return announcements;
+    }
+
+    /**
+     * Seals this group's bootstrap-beacon datagrams under its content key
+     * (SPEC §10.1 v0.1.19 addendum, SRAD dtls-support group M), and opens
+     * sealed datagrams that carry its tag. Members holding the same key find
+     * each other; a bystander learns nothing but a rotating tag. A group with
+     * no beacon key keeps the plain datagram.
+     *
+     * @param groupId    the group
+     * @param contentKey the group's content key
+     */
+    public void beaconKey(GroupId groupId, byte[] contentKey) {
+        beaconSeals.put(Objects.requireNonNull(groupId, "groupId"),
+                new ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal(contentKey));
     }
 
     /**
@@ -3093,6 +4340,21 @@ public final class PeerNode implements AutoCloseable {
                 || !bootstrapBucket.tryAcquire()) {
             return;
         }
+        if (ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal.isSealed(datagram)) {
+            // A sealed beacon (SPEC §10.1 v0.1.19): open it with a held group key, or drop
+            // it unread; the opened bytes take the plain path below, verification and all.
+            byte[] opened = null;
+            for (ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal seal : beaconSeals.values()) {
+                opened = seal.open(datagram, clock.instant()).orElse(null);
+                if (opened != null) {
+                    break;
+                }
+            }
+            if (opened == null) {
+                return;
+            }
+            datagram = opened;
+        }
         PeerAdvertisement ad = verifiedPeerAd(datagram).orElse(null);
         if (ad == null || ad.issuer().equals(peerId())) {
             return;
@@ -3100,6 +4362,10 @@ public final class PeerNode implements AutoCloseable {
         GroupRuntime runtime = groups.get(ad.group());
         if (runtime == null || !admits(runtime.advertisement(), ad)) {
             return;
+        }
+        if (!ad.endpoints().isEmpty()) {
+            beaconLearned.computeIfAbsent(ad.group(), g -> new ConcurrentHashMap<>()).put(ad.issuer(),
+                    new LearnedEndpoints(List.copyOf(ad.endpoints()), ad.issued().plus(ad.ttl()).toEpochMilli()));
         }
         if (!requireAttestation) {
             admitAdvertisement(runtime, ad);
@@ -3160,6 +4426,9 @@ public final class PeerNode implements AutoCloseable {
         if (ad.issuer().equals(groupAd.issuer())) {
             return true; // the founder created the group
         }
+        if (ad.issuer().equals(peerId())) {
+            return true; // our own advertisement, flooded back: membership ignores it, and it is never recorded
+        }
         return switch (groupAd.membershipPolicy()) {
             case OPEN -> true;
             case INVITE -> admitsInvite(groupAd, ad);
@@ -3175,10 +4444,17 @@ public final class PeerNode implements AutoCloseable {
      * INVITE admission: a founder-signed credential for this candidate that no
      * {@code JOIN_CREDENTIAL} revocation names (SPEC §6.1, v0.1.13). Records
      * which credential admitted the member, so revoking it evicts the member.
+     * A delegated credential whose only fault is its delegation's expiry admits
+     * a member the admission memory holds under the identical credential
+     * (SPEC §5.1 v0.1.20, ISSUE-PeerRobustness-2 R2-1): the invite window
+     * bounds first admission; a peer the memory does not hold is judged against
+     * the clock as before, and revocation always beats the memory.
      */
     private boolean admitsInvite(GroupAdvertisement groupAd, PeerAdvertisement ad) {
         String credential = ad.resourceHints().get(JoinCredentials.HINT_KEY);
-        if (!JoinCredentials.verify(credential, ad.issuer(), groupAd, codec)) {
+        JoinCredentials.Verdict verdict = JoinCredentials.judge(credential, ad.issuer(), groupAd, codec,
+                clock.instant());
+        if (verdict == JoinCredentials.Verdict.INVALID) {
             return false;
         }
         byte[] hash = JoinCredentials.hash(credential);
@@ -3186,9 +4462,44 @@ public final class PeerNode implements AutoCloseable {
         if (runtime != null && runtime.credentialRevocations().joinCredentialRevoked(hash)) {
             return false;
         }
-        admittedUnder.computeIfAbsent(groupAd.group(), g -> new ConcurrentHashMap<>())
-                .put(ad.issuer(), HexFormat.of().formatHex(hash));
+        // A delegated credential also dies with its delegation: the founder revokes an invite key
+        // by its delegation's hash and every credential issued under it is refused at once.
+        byte[] delegationHash = JoinCredentials.delegationHash(credential);
+        if (delegationHash != null && runtime != null
+                && runtime.credentialRevocations().joinCredentialRevoked(delegationHash)) {
+            return false;
+        }
+        GroupId groupId = groupAd.group();
+        String record = HexFormat.of().formatHex(hash)
+                + (delegationHash == null ? "" : "," + HexFormat.of().formatHex(delegationHash));
+        if (verdict == JoinCredentials.Verdict.EXPIRED) {
+            if (!admissionMemory.holds(groupId, ad.issuer(), record)) {
+                // A first admission, or another credential: the window has closed (R2-1.3, R2-S1).
+                LOG.log(System.Logger.Level.DEBUG, "refused " + ad.issuer().display() + " in group "
+                        + groupId.value() + ": its invite delegation has expired and this node holds no"
+                        + " admission of it under that credential");
+                return false;
+            }
+            admissionMemory.touch(groupId, ad.issuer());
+            if (readmittedLogged.add(groupId.value() + '|' + ad.issuer().value())) {
+                LOG.log(System.Logger.Level.INFO, "member " + ad.issuer().display() + " of group "
+                        + groupId.value() + " is admitted from memory: its invite delegation has expired,"
+                        + " and it was admitted under the same credential while the delegation was valid");
+            }
+            return true;
+        }
+        admissionMemory.record(groupId, ad.issuer(), record);
         return true;
+    }
+
+    /** The admission memory, for tests. */
+    AdmissionMemory admissionMemory() {
+        return admissionMemory;
+    }
+
+    /** How many members' signed advertisements this node holds for a group's view anti-entropy, for tests. */
+    int heldAdCount(GroupId groupId) {
+        return heldAds.getOrDefault(groupId, Map.of()).size();
     }
 
     /** This node's self-ad hints for a group: node-wide hints under the group's own. */

@@ -22,24 +22,20 @@ import ai.badmonkey.agentspaces.identity.ChannelCertificate;
 import ai.badmonkey.agentspaces.identity.ChannelTrust;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.identity.ServingCredential;
+import ai.badmonkey.agentspaces.identity.tls.AttestLaterTrustManager;
+import ai.badmonkey.agentspaces.identity.tls.ChannelAttestation;
+import ai.badmonkey.agentspaces.identity.tls.SingleKeyManager;
 
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
-import javax.net.ssl.X509ExtendedKeyManager;
-import javax.net.ssl.X509ExtendedTrustManager;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.security.GeneralSecurityException;
-import java.security.Principal;
-import java.security.PrivateKey;
-import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.util.Objects;
 import java.util.Optional;
@@ -64,7 +60,6 @@ import java.util.function.Consumer;
 public final class TlsTcpTransport implements Transport {
 
     private static final int MAX_FRAME = 8 * 1024 * 1024;
-    private static final String ALIAS = "channel";
 
     private final SSLContext context;
     /** CA trust for attestation (enterprise mode), read on every handshake so
@@ -159,6 +154,12 @@ public final class TlsTcpTransport implements Transport {
     }
 
     @Override
+    public java.util.Set<Capability> capabilities() {
+        return java.util.Set.of(Capability.ENCRYPTED, Capability.ATTESTING,
+                Capability.RELIABLE, Capability.ORDERED);
+    }
+
+    @Override
     public TransportConnection dial(String address) throws IOException {
         InetSocketAddress target = TcpTransport.parse(address);
         SSLSocket socket = (SSLSocket) context.getSocketFactory().createSocket();
@@ -217,116 +218,16 @@ public final class TlsTcpTransport implements Transport {
     }
 
     private Optional<PeerId> attestOf(X509Certificate[] x509) {
-        if (x509.length == 0) {
-            return Optional.empty(); // no certificate presented: unattested
-        }
         // Enterprise mode: the CA (and its revocation) vouches for the
         // PeerID binding. Default mode: the identity's own endorsement does.
-        return trust != null ? trust.get().attest(x509) : ChannelCertificate.attest(x509[0]);
+        return ChannelAttestation.attest(x509, trust);
     }
 
     /** The chain the remote end presented, leaf first; empty when none or not X.509. */
     private static X509Certificate[] remoteChainOf(SSLSocket socket) {
         try {
-            Certificate[] chain = socket.getSession().getPeerCertificates();
-            X509Certificate[] x509 = new X509Certificate[chain.length];
-            for (int i = 0; i < chain.length; i++) {
-                if (!(chain[i] instanceof X509Certificate certificate)) {
-                    return new X509Certificate[0];
-                }
-                x509[i] = certificate;
-            }
-            return x509;
+            return ChannelAttestation.x509(socket.getSession().getPeerCertificates());
         } catch (SSLPeerUnverifiedException e) {
-            return new X509Certificate[0];
-        }
-    }
-
-    /** Serves exactly the configured credential and its TLS key, for any request. */
-    private static final class SingleKeyManager extends X509ExtendedKeyManager {
-        private final ServingCredential credential;
-
-        private SingleKeyManager(ServingCredential credential) {
-            this.credential = credential;
-        }
-
-        @Override
-        public String[] getClientAliases(String keyType, Principal[] issuers) {
-            return new String[]{ALIAS};
-        }
-
-        @Override
-        public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
-            return ALIAS;
-        }
-
-        @Override
-        public String chooseEngineClientAlias(String[] keyType, Principal[] issuers,
-                                              SSLEngine engine) {
-            return ALIAS;
-        }
-
-        @Override
-        public String[] getServerAliases(String keyType, Principal[] issuers) {
-            return new String[]{ALIAS};
-        }
-
-        @Override
-        public String chooseServerAlias(String keyType, Principal[] issuers, Socket socket) {
-            return ALIAS;
-        }
-
-        @Override
-        public String chooseEngineServerAlias(String keyType, Principal[] issuers,
-                                              SSLEngine engine) {
-            return ALIAS;
-        }
-
-        @Override
-        public X509Certificate[] getCertificateChain(String alias) {
-            return credential.chain();
-        }
-
-        @Override
-        public PrivateKey getPrivateKey(String alias) {
-            return credential.key();
-        }
-    }
-
-    /**
-     * Accepts any certificate at the TLS layer: the trust decision is the
-     * PeerID pin {@link ChannelCertificate#attest} makes after the handshake,
-     * and an unattested connection simply keeps requiring signed frames.
-     */
-    private static final class AttestLaterTrustManager extends X509ExtendedTrustManager {
-        @Override
-        public void checkClientTrusted(X509Certificate[] chain, String authType) {
-        }
-
-        @Override
-        public void checkClientTrusted(X509Certificate[] chain, String authType, Socket socket) {
-        }
-
-        @Override
-        public void checkClientTrusted(X509Certificate[] chain, String authType,
-                                       SSLEngine engine) {
-        }
-
-        @Override
-        public void checkServerTrusted(X509Certificate[] chain, String authType) {
-        }
-
-        @Override
-        public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket) {
-        }
-
-        @Override
-        public void checkServerTrusted(X509Certificate[] chain, String authType,
-                                       SSLEngine engine) {
-        }
-
-        @Override
-        public X509Certificate[] getAcceptedIssuers() {
             return new X509Certificate[0];
         }
     }

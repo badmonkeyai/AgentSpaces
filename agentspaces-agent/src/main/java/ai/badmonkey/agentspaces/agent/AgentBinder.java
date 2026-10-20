@@ -1604,22 +1604,17 @@ public final class AgentBinder implements AutoCloseable {
             template = at < 0 ? template.hasTag(key)
                     : template.whereTag(key, Matchers.eq(filter.substring(at + 1)));
         }
-        // Field filters (ISSUE-WorkflowVerbs): the field's string form against the
-        // literal, the rule a join key uses, so numbers and enums read as written.
+        // Field filters (ISSUE-WorkflowVerbs; the portable grammar of SPEC §7.2, JS-V-03):
+        // the field's value against the literal, numerically when both are numbers, so
+        // numbers and enums read as written and the three clients judge alike.
         for (String filter : where) {
-            int at = filter.indexOf("!=");
-            boolean negated = at >= 0;
-            if (!negated) {
-                at = filter.indexOf('=');
+            ai.badmonkey.agentspaces.api.space.FieldFilter parsed;
+            try {
+                parsed = ai.badmonkey.agentspaces.api.space.FieldFilter.parse(filter);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(e.getMessage() + " at " + site, e);
             }
-            String field = at < 0 ? "" : filter.substring(0, at);
-            if (at < 0 || field.isBlank()) {
-                throw new IllegalArgumentException("malformed field filter '" + filter + "' at " + site
-                        + "; use \"field=value\" or \"field!=value\"");
-            }
-            String value = filter.substring(at + (negated ? 2 : 1));
-            template = template.where(field, Matchers.predicate(v ->
-                    negated != value.equals(String.valueOf(v))));
+            template = template.where(parsed.field(), parsed.matcher());
         }
         return template;
     }

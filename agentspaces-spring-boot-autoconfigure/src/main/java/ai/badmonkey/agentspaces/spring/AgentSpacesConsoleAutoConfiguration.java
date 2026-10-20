@@ -64,6 +64,7 @@ public class AgentSpacesConsoleAutoConfiguration {
                                               List<ConsoleViewCustomizer> customizers) {
         ConsoleView.Builder builder = ConsoleView.builder();
         builder.channelModes(node::channelModes);
+        builder.connectionSchemes(node::connectionSchemes);
         boolean first = true;
         for (String groupName : spaces.groupNames()) {
             AgentSpaces.GroupContext group = spaces.group(groupName);

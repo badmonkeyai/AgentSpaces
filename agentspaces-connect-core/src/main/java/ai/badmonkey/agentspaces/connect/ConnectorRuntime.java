@@ -23,19 +23,26 @@ import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.Authorizer;
 import ai.badmonkey.agentspaces.common.id.GroupId;
+import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.connect.AssetInvocations.AssetInvocation;
+import ai.badmonkey.agentspaces.connect.AssetInvocations.AssetInvocationResult;
 import ai.badmonkey.agentspaces.connect.DataQueryEntries.AssetChange;
 import ai.badmonkey.agentspaces.connect.DataQueryEntries.DataQuery;
 import ai.badmonkey.agentspaces.connect.DataQueryEntries.DataResult;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.AdvertisementSigner;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.time.InstantSource;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
@@ -55,6 +62,18 @@ import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
  * emits into the change space as an {@link AssetChange} under the same
  * per-asset freshness lease, so the lease is the retention policy and
  * subscribers see the source's events through {@code Space.notify}.
+ *
+ * <p>The runtime also serves {@code aspace:cap/asset-invoke}
+ * (srad/agentspaces-js.md JS-C-03, appendix F) from the invocation space
+ * (the data space unless {@link #invocationSpace(Space)} names another): an
+ * {@link AssetInvocation} for an advertised asset is taken under the claim
+ * lattice with a lease, run through {@link AssetProvider#invoke} only when
+ * the asset's card lists the operation in {@code invoke-ops} (JS-C-07) and,
+ * under an authorizer, only when the requesting peer is permitted
+ * {@code CONNECTOR_INVOKE} in {@code <asset>:<operation>} (JS-C-02); the
+ * {@link AssetInvocationResult} is written and the take completed. An
+ * invocation answered once is remembered for {@link #invocationRetention}
+ * so a retry under the same id never runs the target here a second time.
  */
 public final class ConnectorRuntime implements AutoCloseable {
 
@@ -75,12 +94,27 @@ public final class ConnectorRuntime implements AutoCloseable {
     private final AtomicInteger executed = new AtomicInteger();
     private final AtomicInteger servedFromSpace = new AtomicInteger();
     private final AtomicInteger materialized = new AtomicInteger();
+    private final AtomicInteger invoked = new AtomicInteger();
+    private final AtomicInteger refused = new AtomicInteger();
+    private final AtomicInteger repeated = new AtomicInteger();
+    /** The operations each advertised asset's card allows (appendix F {@code invoke-ops}). */
+    private final Map<String, Set<String>> invokeOpsByAsset = new ConcurrentHashMap<>();
+    /** Answered invocations by id, kept for {@link #invocationRetention} so a retry never re-runs the target. */
+    private final Map<String, Answered> answered = new ConcurrentHashMap<>();
     /** Optional (TODO-EFG §4): when set, only assets this connector's own peer is
      * permitted {@code CONNECTOR_SERVE} for are advertised. */
     private volatile Authorizer authorizer;
+    private volatile Space invocationSpace;
+    private volatile Duration invokeLease = Duration.ofSeconds(30);
+    private volatile Duration invocationRetention = Duration.ofHours(24);
     private volatile boolean running = true;
     private Thread loop;
+    private Thread invokeLoop;
     private AutoCloseable feed;
+
+    /** One remembered answer. */
+    private record Answered(AssetInvocationResult result, Instant at) {
+    }
 
     /**
      * Creates the runtime.
@@ -133,6 +167,43 @@ public final class ConnectorRuntime implements AutoCloseable {
         this.group = Objects.requireNonNull(group, "group");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.defaultFreshness = Objects.requireNonNull(defaultFreshness, "defaultFreshness");
+        this.invocationSpace = dataSpace;
+    }
+
+    /**
+     * Names the space invocations and their results flow through (appendix
+     * F: the connector's task space); the data space unless set. Call before
+     * {@link #start()}.
+     *
+     * @param space the invocation space
+     * @return this runtime
+     */
+    public ConnectorRuntime invocationSpace(Space space) {
+        this.invocationSpace = Objects.requireNonNull(space, "space");
+        return this;
+    }
+
+    /**
+     * Sets the take lease on an invocation (appendix F: 30 s by default).
+     *
+     * @param lease the lease; the operation must finish within it
+     * @return this runtime
+     */
+    public ConnectorRuntime invokeLease(Duration lease) {
+        this.invokeLease = Objects.requireNonNull(lease, "lease");
+        return this;
+    }
+
+    /**
+     * Sets how long an answered invocation's result is remembered so a retry
+     * under the same id is answered without a second run (24 h by default).
+     *
+     * @param retention the retention
+     * @return this runtime
+     */
+    public ConnectorRuntime invocationRetention(Duration retention) {
+        this.invocationRetention = Objects.requireNonNull(retention, "retention");
+        return this;
     }
 
     /**
@@ -155,14 +226,19 @@ public final class ConnectorRuntime implements AutoCloseable {
     }
 
     /**
-     * Publishes the current AssetCards, starts serving queries, and, for a
-     * {@link MaterializingAssetProvider}, starts the change feed.
+     * Publishes the current AssetCards, starts serving queries and
+     * invocations, and, for a {@link MaterializingAssetProvider}, starts the
+     * change feed.
      */
     public synchronized void start() {
         refreshCards();
         if (loop == null) {
             loop = Thread.ofVirtual().name("connector-" + connectorName)
                     .start(this::serveLoop);
+        }
+        if (invokeLoop == null) {
+            invokeLoop = Thread.ofVirtual().name("connector-invoke-" + connectorName)
+                    .start(this::invokeLoop);
         }
         if (feed == null && provider instanceof MaterializingAssetProvider materializing) {
             feed = materializing.materialize(this::push);
@@ -185,8 +261,24 @@ public final class ConnectorRuntime implements AutoCloseable {
                 continue;
             }
             freshnessByAsset.put(card.asset(), parseFreshness(card.freshness()));
+            invokeOpsByAsset.put(card.asset(), Set.copyOf(AssetInvocations.invokeOps(card)));
             discovery.publish(signer.sign(card, identity));
         }
+    }
+
+    /** How many invocations ran against the provider. */
+    public int invoked() {
+        return invoked.get();
+    }
+
+    /** How many invocations were answered with an error result without running. */
+    public int refused() {
+        return refused.get();
+    }
+
+    /** How many retried invocations were answered from the remembered result. */
+    public int repeated() {
+        return repeated.get();
     }
 
     /** How many queries this connector executed against its source. */
@@ -218,6 +310,10 @@ public final class ConnectorRuntime implements AutoCloseable {
         if (loop != null) {
             loop.interrupt();
             loop = null;
+        }
+        if (invokeLoop != null) {
+            invokeLoop.interrupt();
+            invokeLoop = null;
         }
     }
 
@@ -331,6 +427,138 @@ public final class ConnectorRuntime implements AutoCloseable {
     private void completeQuietly(TakenEntry<DataQuery> taken) {
         try {
             dataSpace.complete(taken);
+        } catch (RuntimeException lapsed) {
+            // The take lease lapsed; nothing to do.
+        }
+    }
+
+    // ------------------------------------------------------------ asset-invoke
+
+    private void invokeLoop() {
+        while (running) {
+            Space space = invocationSpace;
+            Optional<TakenEntry<AssetInvocation>> taken;
+            Map<String, PeerId> requesters;
+            try {
+                Object[] assets = freshnessByAsset.keySet().toArray();
+                if (assets.length == 0) {
+                    Thread.sleep(Duration.ofSeconds(1));
+                    continue;
+                }
+                Template<AssetInvocation> mine = Template.of(AssetInvocation.class)
+                        .where("asset", Matchers.in(assets));
+                // The requesting peer is read before the take: a template read cannot see an
+                // entry while it is claimed (issue #16 §9.3), and the scope is judged against the
+                // requesting entry's signer (appendix F).
+                requesters = new HashMap<>();
+                for (Space.Issued<AssetInvocation> issued : space.readAllIssued(mine, 64)) {
+                    requesters.put(issued.entry().invocationId(), issued.issuer().peer());
+                }
+                taken = space.take(mine, Lease.of(invokeLease), Duration.ofSeconds(1));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RuntimeException e) {
+                if (running) {
+                    LOG.log(System.Logger.Level.WARNING, "invocation take failed", e);
+                }
+                continue;
+            }
+            if (taken.isEmpty()) {
+                continue;
+            }
+            handle(space, taken.get(), requesters);
+        }
+    }
+
+    /**
+     * One invocation under the claim lattice (JS-C-03): refused with an error
+     * result naming the rule when the operation is absent from the card's
+     * {@code invoke-ops} (JS-C-07) or the requester lacks the invoke scope
+     * (JS-C-02); otherwise run once, the result remembered so a retry under
+     * the same id is answered without a second run; the result written, then
+     * the take completed.
+     */
+    private void handle(Space space, TakenEntry<AssetInvocation> taken, Map<String, PeerId> requesters) {
+        AssetInvocation invocation = taken.entry();
+        String id = invocation.invocationId();
+        Answered remembered = answered.get(id);
+        if (remembered != null) {
+            repeated.incrementAndGet();
+            // The earlier result still serves the window: complete the retry under it. Otherwise
+            // write the remembered result again; the target never runs twice here.
+            boolean live = space.readAllIssued(Template.of(AssetInvocationResult.class)
+                            .where("invocationId", eq(id)), 16).stream()
+                    .anyMatch(r -> r.issuer().peer().equals(identity.peerId()));
+            if (live) {
+                completeQuietly(space, taken);
+            } else {
+                finish(space, taken, remembered.result());
+            }
+            return;
+        }
+        PeerId requester = requesters.get(id);
+        if (requester == null && space instanceof ReplicatedSpace replicated) {
+            requester = replicated.recordOf(taken.entryId()).map(record -> record.issuer().peer()).orElse(null);
+        }
+        Set<String> allowed = invokeOpsByAsset.getOrDefault(invocation.asset(), Set.of());
+        Authorizer gate = authorizer;
+        AssetInvocationResult result;
+        if (!allowed.contains(invocation.operation())) {
+            refused.incrementAndGet();
+            result = AssetInvocationResult.refused(invocation, "unknown-operation", AssetInvocations.INVOKE_OPS,
+                    "operation '" + invocation.operation() + "' is not in the invoke-ops of asset '"
+                            + invocation.asset() + "' (" + (allowed.isEmpty() ? "none" : String.join(",", allowed))
+                            + ")");
+        } else if (gate != null && (requester == null || !gate.permits(requester,
+                Authorizer.Operation.CONNECTOR_INVOKE, invocation.asset() + ":" + invocation.operation()))) {
+            refused.incrementAndGet();
+            result = AssetInvocationResult.refused(invocation, "refused-scope",
+                    "aspace:connector-invoke:" + invocation.asset() + ":" + invocation.operation(),
+                    "requester " + (requester == null ? "unknown" : requester.value())
+                            + " is not permitted to invoke '" + invocation.operation() + "' on '"
+                            + invocation.asset() + "'");
+        } else {
+            result = run(invocation);
+        }
+        remember(id, result);
+        finish(space, taken, result);
+    }
+
+    private AssetInvocationResult run(AssetInvocation invocation) {
+        AssetProvider.InvokeResult outcome;
+        try {
+            invoked.incrementAndGet();
+            outcome = provider.invoke(invocation.asset(), invocation.operation(), invocation.params(),
+                    invocation.invocationId());
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING, "operation " + invocation.operation() + " on asset "
+                    + invocation.asset() + " failed", e);
+            outcome = AssetProvider.InvokeResult.failed("target-error", "target", String.valueOf(e.getMessage()));
+        }
+        return AssetInvocationResult.of(invocation, outcome);
+    }
+
+    /** Writes the result (leased for the asset's freshness window, or 30 s on an error) and completes the take. */
+    private void finish(Space space, TakenEntry<AssetInvocation> taken, AssetInvocationResult result) {
+        Duration lease = result.ok()
+                ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : Duration.ofSeconds(30);
+        try {
+            space.complete(taken, result, Lease.of(lease));
+        } catch (RuntimeException lapsed) {
+            LOG.log(System.Logger.Level.WARNING, "completing invocation " + result.invocationId() + " failed", lapsed);
+        }
+    }
+
+    private void remember(String id, AssetInvocationResult result) {
+        Instant now = clock.instant();
+        answered.values().removeIf(entry -> Duration.between(entry.at(), now).compareTo(invocationRetention) > 0);
+        answered.put(id, new Answered(result, now));
+    }
+
+    private void completeQuietly(Space space, TakenEntry<?> taken) {
+        try {
+            space.complete(taken);
         } catch (RuntimeException lapsed) {
             // The take lease lapsed; nothing to do.
         }

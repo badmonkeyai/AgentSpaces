@@ -263,7 +263,7 @@ public final class DtlsTransport implements Transport, AutoCloseable {
             throw new IOException("cannot resolve " + address);
         }
         DtlsOptions opts = options;
-        DatagramSocket socket = new DatagramSocket();
+        DatagramSocket socket = BcSupport.dialSocket(remote);
         PeerDatagramTransport path = new PeerDatagramTransport(
                 (buf, off, len, to) -> socket.send(new DatagramPacket(buf, off, len, to)),
                 opts.mtu(), remote, socket::close);

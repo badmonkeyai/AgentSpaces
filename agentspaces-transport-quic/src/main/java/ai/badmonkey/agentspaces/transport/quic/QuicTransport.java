@@ -236,7 +236,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
                     .group(group)
                     .channel(NioDatagramChannel.class)
                     .handler(codec)
-                    .bind(0)
+                    .bind(dialBindAddress(target))
                     .sync()
                     .channel();
             QuicChannel quic = QuicChannel.newBootstrap(udp)
@@ -346,6 +346,19 @@ public final class QuicTransport implements Transport, AutoCloseable {
     @Override
     public void close() {
         group.shutdownGracefully(0, 500, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Where a dialer's UDP channel binds: any address, except toward a
+     * loopback peer, where it binds the loopback address. macOS gives a
+     * wildcard socket an ephemeral port that a socket bound to
+     * {@code 127.0.0.1} already holds, and the listener's replies then reach
+     * that socket instead, so the dial times out.
+     */
+    static InetSocketAddress dialBindAddress(InetSocketAddress target) {
+        return target.getAddress() != null && target.getAddress().isLoopbackAddress()
+                ? new InetSocketAddress(target.getAddress(), 0)
+                : new InetSocketAddress(0);
     }
 
     /** Parses {@code host:port}, the transport's address format. */

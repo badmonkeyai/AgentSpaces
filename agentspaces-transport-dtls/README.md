@@ -84,3 +84,5 @@ A node with `require-attestation` may run on `dtls` alone.
   peers with `dtls` listeners, watch `DtlsCounters.retransmitted()` rise and the fleet keep
   converging; `tc qdisc del dev lo root` restores the link. For NAT rebinding, `DtlsRelayTest`
   drives a relay in-process.
+- **Stress Testing** `DtlsConcurrentDialStressTest` runs with `-Ddtls.stress=true`. `-Ddtls.stress.rounds` sets the number of rounds and `-Ddtls.stress.load` the number of busy threads. Original bug fixed in #33, before it failed several rounds out of 600 against the old bind and passed 1,500 rounds (48,000 dials) with the fix.
+

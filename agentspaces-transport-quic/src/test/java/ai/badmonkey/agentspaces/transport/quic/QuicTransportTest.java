@@ -109,6 +109,60 @@ class QuicTransportTest {
                 .isInstanceOf(IOException.class);
     }
 
+    /**
+     * macOS hands a wildcard socket an ephemeral port that a socket bound to
+     * 127.0.0.1 already holds; a dialer on such a port never hears the
+     * listener, whose replies go to the other socket. Five hundred held ports
+     * catch a wildcard dialer about three dials in a hundred, so 150 dials
+     * meet one almost every run; a stolen reply shows up at the held socket.
+     */
+    @Test
+    @Timeout(120)
+    void aLoopbackDialNeverSharesAPortWithAnotherLoopbackSocket() throws Exception {
+        java.util.List<java.nio.channels.DatagramChannel> held = new java.util.ArrayList<>();
+        int port = freeUdpPort();
+        AutoCloseable listener = transport.listen("127.0.0.1:" + port, connection -> { });
+        try {
+            for (int i = 0; i < 500; i++) {
+                java.nio.channels.DatagramChannel channel = java.nio.channels.DatagramChannel.open()
+                        .bind(new java.net.InetSocketAddress("127.0.0.1", 0));
+                channel.configureBlocking(false);
+                held.add(channel);
+            }
+            java.util.List<String> failures = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            for (int batch = 0; batch < 10; batch++) {
+                java.util.List<Thread> dials = new java.util.ArrayList<>();
+                for (int i = 0; i < 15; i++) {
+                    dials.add(Thread.ofVirtual().start(() -> {
+                        try {
+                            transport.dial("127.0.0.1:" + port).close();
+                        } catch (IOException e) {
+                            failures.add(e.getMessage());
+                        }
+                    }));
+                }
+                for (Thread dial : dials) {
+                    dial.join();
+                }
+            }
+            java.util.List<Integer> stolen = new java.util.ArrayList<>();
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(65_536);
+            for (java.nio.channels.DatagramChannel channel : held) {
+                buffer.clear();
+                if (channel.receive(buffer) != null) {
+                    stolen.add(((java.net.InetSocketAddress) channel.getLocalAddress()).getPort());
+                }
+            }
+            assertThat(stolen).as("held loopback ports that received the listener's replies").isEmpty();
+            assertThat(failures).isEmpty();
+        } finally {
+            listener.close();
+            for (java.nio.channels.DatagramChannel channel : held) {
+                channel.close();
+            }
+        }
+    }
+
     private static int freeUdpPort() throws IOException {
         try (DatagramSocket socket = new DatagramSocket(0)) {
             return socket.getLocalPort();

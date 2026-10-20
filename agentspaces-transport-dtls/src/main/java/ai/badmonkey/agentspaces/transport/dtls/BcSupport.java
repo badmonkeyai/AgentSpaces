@@ -33,7 +33,9 @@ import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCrypto;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.security.PrivateKey;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -154,5 +156,19 @@ final class BcSupport {
             host = host.substring(1, host.length() - 1);
         }
         return new InetSocketAddress(host, Integer.parseInt(address.substring(colon + 1)));
+    }
+
+    /**
+     * A dialer's socket. Bound to no one address, so it outlives a change of
+     * this host's address (DT-K-05), except toward a loopback peer, where it
+     * binds the loopback address: macOS gives a wildcard socket an ephemeral
+     * port that a socket bound to {@code 127.0.0.1} already holds, and every
+     * datagram for that port then reaches the other socket. A dial to a
+     * listener holding the port talks to the listener itself and times out.
+     */
+    static DatagramSocket dialSocket(InetSocketAddress remote) throws SocketException {
+        return remote.getAddress().isLoopbackAddress()
+                ? new DatagramSocket(new InetSocketAddress(remote.getAddress(), 0))
+                : new DatagramSocket();
     }
 }

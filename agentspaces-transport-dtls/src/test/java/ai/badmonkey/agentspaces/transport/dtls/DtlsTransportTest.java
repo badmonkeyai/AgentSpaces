@@ -180,4 +180,26 @@ class DtlsTransportTest {
         pair.dialed().send("hello".getBytes());
         assertThat(pair.atListener().poll(10, TimeUnit.SECONDS)).isEqualTo("hello".getBytes());
     }
+
+    @Test
+    @Timeout(30)
+    void aLoopbackDialNeverSharesAPortWithALoopbackListener() throws Exception {
+        // macOS hands a wildcard socket ports that 127.0.0.1 sockets hold, about one in 80 here;
+        // a dialer on its listener's port handshakes with the listener's own socket and times out.
+        java.util.Set<Integer> held = new java.util.HashSet<>();
+        for (int i = 0; i < 200; i++) {
+            DatagramSocket socket = new DatagramSocket(new java.net.InetSocketAddress("127.0.0.1", 0));
+            closeables.add(socket);
+            held.add(socket.getLocalPort());
+        }
+        java.net.InetSocketAddress remote = new java.net.InetSocketAddress("127.0.0.1", 9);
+        for (int i = 0; i < 2_000; i++) {
+            try (DatagramSocket dial = BcSupport.dialSocket(remote)) {
+                assertThat(held).doesNotContain(dial.getLocalPort());
+            }
+        }
+        try (DatagramSocket dial = BcSupport.dialSocket(new java.net.InetSocketAddress("192.0.2.1", 9))) {
+            assertThat(dial.getLocalAddress().isAnyLocalAddress()).isTrue(); // DT-K-05: off-host dials stay unbound
+        }
+    }
 }

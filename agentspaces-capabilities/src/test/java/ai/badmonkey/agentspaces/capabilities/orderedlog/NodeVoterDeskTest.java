@@ -153,10 +153,6 @@ class NodeVoterDeskTest {
             }
             throw new AssertionError(name + " never printed what was awaited; output:\n" + String.join("\n", lines));
         }
-
-        long count(Predicate<String> wanted) {
-            return lines.stream().filter(wanted).count();
-        }
     }
 
     @Test
@@ -270,8 +266,18 @@ class NodeVoterDeskTest {
         }
         assertThat(survivor.space().read(Template.of(Job.class))).as("every job was completed").isEmpty();
         if (!nodeLed) {
-            assertThat(voter.count(line -> line.contains("\"event\":\"committed\""))).as("the Node voter committed both claims")
-                    .isEqualTo(2);
+            // The same rule at the Node voter, whose listener also hears a resent claim again.
+            Map<String, Set<String>> nodePerEntry = new ConcurrentHashMap<>();
+            for (String line : voter.lines) {
+                if (line.contains("\"event\":\"committed\"")) {
+                    nodePerEntry.computeIfAbsent(line.replaceAll(".*\"entryId\":\"([^\"]+)\".*", "$1"),
+                            k -> new java.util.HashSet<>()).add(line.replaceAll(".*\"holder\":\"([^\"]+)\".*", "$1")
+                            + "@" + line.replaceAll(".*\"epoch\":(\\d+).*", "$1"));
+                }
+            }
+            assertThat(nodePerEntry).as("the Node voter committed a claim for each job").hasSize(2);
+            assertThat(nodePerEntry.values()).as("one holder and epoch per job at the Node voter")
+                    .allMatch(holders -> holders.size() == 1);
             voter.process.getOutputStream().write("stop\n".getBytes(StandardCharsets.UTF_8));
             voter.process.getOutputStream().flush();
             assertThat(voter.process.waitFor(30, TimeUnit.SECONDS)).as("the Node voter drained on stop").isTrue();

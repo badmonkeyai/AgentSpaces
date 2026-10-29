@@ -42,6 +42,11 @@
     </dependency>
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-content</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-console</artifactId>
       <version>${project.version}</version>
     </dependency>

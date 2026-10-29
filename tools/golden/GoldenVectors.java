@@ -209,6 +209,120 @@ public final class GoldenVectors {
     record Frame(Share share, Extremum extremum, Histogram histogram, Roster roster) {
     }
 
+    // ---- SPEC v0.1.23 annex G: the content swarm and relay paths (srad/large-networks-bulk-data.md) ----
+
+    /** Mirrors ai.badmonkey.agentspaces.agent.content.Manifest. */
+    record Manifest(int v, String root, long size, int pieceSize, int pieces, byte[] table, String tableRef,
+                    List<String> tableRefs, String name, String mediaType, String sealing, Long keyEpoch,
+                    String hashing, PeerId origin, long created, Map<String, String> attrs) {
+    }
+
+    /** Mirrors ai.badmonkey.agentspaces.agent.content.Holding. */
+    record Holding(int v, String root, PeerId holder, boolean complete, byte[] have, int count,
+                   List<PeerId> via, Map<String, String> cost) {
+    }
+
+    record PieceWant(int t, String root, int index, int offset, int length, int req) {
+    }
+
+    record Piece(int t, String root, int index, int offset, byte[] bytes, int req) {
+    }
+
+    record Have(int t, String root, byte[] have, boolean complete) {
+    }
+
+    record Cancel(int t, String root, int index, int req) {
+    }
+
+    record Reject(int t, String root, int index, int reason) {
+    }
+
+    record ManifestWant(int t, String root) {
+    }
+
+    record ManifestReply(int t, String root, byte[] record) {
+    }
+
+    /** Mirrors PeerNode.RelaySignal and the pipe body (capability, payload). */
+    record RelaySignal(PeerId target, PeerId failedHop, String reason) {
+    }
+
+    record RelayPipeFrame(String capability, byte[] payload) {
+    }
+
+    /** A content root: CIDv1 (0x01, raw 0x55, sha2-256 0x12, 32 bytes) over the piece table, multibase base32. */
+    private static String contentRoot(byte[] table) {
+        byte[] digest = Digests.sha256(table);
+        byte[] cid = new byte[4 + digest.length];
+        cid[0] = 0x01;
+        cid[1] = 0x55;
+        cid[2] = 0x12;
+        cid[3] = 0x20;
+        System.arraycopy(digest, 0, cid, 4, digest.length);
+        return ai.badmonkey.agentspaces.common.codec.Multibase.base32(cid);
+    }
+
+    private static byte[] pieceTable(int pieces, int pieceSize, int lastLength) {
+        java.io.ByteArrayOutputStream table = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < pieces; i++) {
+            byte[] piece = new byte[i == pieces - 1 ? lastLength : pieceSize];
+            java.util.Arrays.fill(piece, (byte) (i + 1));
+            table.writeBytes(Digests.sha256(piece));
+        }
+        return table.toByteArray();
+    }
+
+    private static String contentVectors(CborCodec codec, HexFormat hex, byte[] innerFrame, PeerId self,
+                                         GroupId group, Instant issued) {
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.agent.content.Manifest", Manifest.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.agent.content.Holding", Holding.class);
+        int pieceSize = 65_536;
+        byte[] table = pieceTable(3, pieceSize, 100);
+        String root = contentRoot(table);
+        require(root.startsWith("bafkrei") && root.length() == 59, "a content root is a 59-character CIDv1");
+        StringBuilder out = new StringBuilder();
+        out.append(field("content_root_cidv1", root));
+        Manifest inline = new Manifest(1, root, 2L * pieceSize + 100, pieceSize, 3, table, null, null,
+                "golden.bin", "application/octet-stream", "none", null, "plain", self, 1735689600000L,
+                Map.of("run", "42"));
+        byte[] inlineBytes = codec.toBytes(inline);
+        out.append(field("content_manifest_inline_cbor", hex.formatHex(inlineBytes)));
+        byte[] bigTable = pieceTable(65, pieceSize, pieceSize);
+        String bigRoot = contentRoot(bigTable);
+        String tableRef = ai.badmonkey.agentspaces.common.codec.Multibase.base58btc(Digests.sha256(bigTable));
+        Manifest referenced = new Manifest(1, bigRoot, 65L * pieceSize, pieceSize, 65, null, tableRef, null,
+                null, null, "group-key", 3L, "plain", self, 1735689600000L, null);
+        out.append(field("content_manifest_tableref_cbor", hex.formatHex(codec.toBytes(referenced))));
+        // pieces 0 and 2 of 3: runs zeros 0, ones 1, zeros 1, ones 1
+        out.append(field("content_holding_partial_cbor", hex.formatHex(codec.toBytes(
+                new Holding(1, root, self, false, new byte[]{0, 1, 1, 1}, 2, List.of(PeerId.of("zB")), null)))));
+        out.append(field("content_holding_complete_cbor", hex.formatHex(codec.toBytes(
+                new Holding(1, root, self, true, null, 3, null, null)))));
+        byte[] range = new byte[16];
+        for (int i = 0; i < range.length; i++) {
+            range[i] = (byte) i;
+        }
+        out.append(field("content_piece_want_cbor", hex.formatHex(codec.toBytes(new PieceWant(1, root, 2, 65_536, 65_536, 42)))));
+        out.append(field("content_piece_cbor", hex.formatHex(codec.toBytes(new Piece(2, root, 2, 65_536, range, 42)))));
+        out.append(field("content_have_cbor", hex.formatHex(codec.toBytes(new Have(3, root, new byte[]{0, 1, 1, 1}, false)))));
+        out.append(field("content_cancel_cbor", hex.formatHex(codec.toBytes(new Cancel(4, root, 2, 42)))));
+        out.append(field("content_reject_cbor", hex.formatHex(codec.toBytes(new Reject(5, root, 2, 2)))));
+        out.append(field("content_manifest_want_cbor", hex.formatHex(codec.toBytes(new ManifestWant(6, root)))));
+        out.append(field("content_manifest_cbor", hex.formatHex(codec.toBytes(new ManifestReply(7, root, inlineBytes)))));
+        out.append(field("relay_frame_with_path_cbor", hex.formatHex(codec.toBytes(
+                new ai.badmonkey.agentspaces.peering.wire.Bodies.RelayFrame(PeerId.of("zB"), innerFrame,
+                        List.of(PeerId.of("zR1"), PeerId.of("zR2")), 0)))));
+        out.append(field("relay_signal_unreachable_cbor", hex.formatHex(codec.toBytes(new RelayPipeFrame(
+                "aspace:cap/relay-signal",
+                codec.toBytes(new RelaySignal(PeerId.of("zB"), PeerId.of("zR2"), "unreachable")))))));
+        PeerAdvertisement dialOnly = new PeerAdvertisement(
+                "aspace://" + group.value() + "/peer/" + self.value(),
+                self, group, issued, Duration.ofMinutes(10),
+                List.of(), java.util.Set.of(), Map.of("relay.via", "zR1,zR2"));
+        out.append(field("peer_ad_with_via_hint_cbor", hex.formatHex(codec.toBytes(dialOnly))));
+        return out.toString();
+    }
+
     /** Mirrors GossipLearner's private Exchange record (SPEC §8 gossip-learn, TECH-SPEC §8.5). */
     record Exchange(String modelId, long token, String kind, long round, byte[] inline, String cid) {
     }
@@ -1381,6 +1495,7 @@ public final class GoldenVectors {
         json.append(raftVectors(codec, hex));
         json.append(rtcVectors(codec, hex, wire.encode(ping, identity)));
         json.append(connectVectors(codec, hex));
+        json.append(contentVectors(codec, hex, wire.encode(ping, identity), self, group, issued));
         json.append(field("dtls_pdu_ping", "01030000"));
         json.append(field("dtls_pdu_pong", "01040000"));
         json.append(field("dtls_pdu_close_idle", "01050300"));

@@ -45,7 +45,7 @@ public @interface OnEstimate {
     /** Only epochs whose id starts with this prefix; empty means every epoch. */
     String prefix() default "";
 
-    /** Consecutive ticks the estimate must stay within {@link #tolerance()} to count as settled. */
+    /** Settle steps (gossip rounds, about one a second) the estimate must stay within {@link #tolerance()} to count as settled. */
     int settleTicks() default 8;
 
     /** The relative change (of the larger of 1 and the last value) that still counts as unchanged. */

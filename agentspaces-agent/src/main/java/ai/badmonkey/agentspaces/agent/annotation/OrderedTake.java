@@ -79,8 +79,11 @@ public @interface OrderedTake {
 
     /**
      * Field filters an entry must satisfy to be seen by this method, each
-     * {@code "field=value"} or {@code "field!=value"} compared on the field's
-     * string form, compiled onto the method's template (ISSUE-WorkflowVerbs);
+     * {@code "field=value"}, {@code "field!=value"}, {@code "field<value"},
+     * {@code "field<=value"}, {@code "field>value"}, {@code "field>=value"}, or
+     * {@code "field in a,b,c"}, compared numerically when both sides parse as
+     * decimals and in string order otherwise (a null field matches only
+     * {@code !=}), compiled onto the method's template (ISSUE-WorkflowVerbs);
      * an unknown field is refused at bind time.
      */
     String[] where() default {};

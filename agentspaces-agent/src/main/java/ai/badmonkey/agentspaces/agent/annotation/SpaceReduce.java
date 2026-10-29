@@ -81,7 +81,7 @@ public @interface SpaceReduce {
     /** Tag filters on the element, {@code "key=value"} or {@code "key"}, as on {@code @SpaceTake}. */
     String[] tags() default {};
 
-    /** Field filters on the element, {@code "field=value"} or {@code "field!=value"}, as on {@code @SpaceTake}. */
+    /** Field filters on the element, in the grammar of {@code @SpaceTake#where()}. */
     String[] where() default {};
 
     /** How the steps of one key are serialized. */

@@ -27,6 +27,9 @@ public final class Multibase {
     /** The multibase prefix for base58btc. */
     public static final char BASE58BTC_PREFIX = 'z';
 
+    /** The multibase prefix for lower-case unpadded base32 (RFC 4648), the CIDv1 default. */
+    public static final char BASE32_PREFIX = 'b';
+
     private Multibase() {
     }
 
@@ -41,7 +44,19 @@ public final class Multibase {
     }
 
     /**
-     * Decodes a multibase string. Only base58btc is supported in v0.1.
+     * Encodes bytes as a base32 multibase string ({@code 'b'} prefix, lower case,
+     * unpadded), the form a CIDv1 takes and the form a content root uses.
+     *
+     * @param bytes the bytes to encode
+     * @return the multibase string
+     */
+    public static String base32(byte[] bytes) {
+        return BASE32_PREFIX + Base32.encode(bytes);
+    }
+
+    /**
+     * Decodes a multibase string. Base58btc ({@code z}) and base32 ({@code b})
+     * are supported; every other prefix is refused.
      *
      * @param encoded a multibase string with a supported prefix
      * @return the decoded bytes
@@ -49,10 +64,13 @@ public final class Multibase {
      */
     public static byte[] decode(String encoded) {
         Objects.requireNonNull(encoded, "encoded");
-        if (encoded.isEmpty() || encoded.charAt(0) != BASE58BTC_PREFIX) {
-            throw new IllegalArgumentException(
-                    "unsupported multibase prefix in: " + (encoded.isEmpty() ? "<empty>" : encoded));
+        if (encoded.isEmpty()) {
+            throw new IllegalArgumentException("unsupported multibase prefix in: <empty>");
         }
-        return Base58.decode(encoded.substring(1));
+        return switch (encoded.charAt(0)) {
+            case BASE58BTC_PREFIX -> Base58.decode(encoded.substring(1));
+            case BASE32_PREFIX -> Base32.decode(encoded.substring(1));
+            default -> throw new IllegalArgumentException("unsupported multibase prefix in: " + encoded);
+        };
     }
 }

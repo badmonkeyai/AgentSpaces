@@ -130,10 +130,31 @@ public final class Bodies {
      * verifies the origin's signature as usual, so the relay can neither read
      * into nor tamper with what it carries beyond what the envelope exposes.
      *
+     * <p>Since srad/large-networks-bulk-data.md §3.7 a frame may carry a
+     * <em>path</em>: the RELAY-role members it traverses in order, with
+     * {@code hop} the index of the relay the outer envelope is addressed to. A
+     * relay that cannot deliver forwards once to {@code path[hop + 1]}; a frame
+     * without a path behaves as before (one hop, never re-relayed). Both fields
+     * are omitted when absent, so a 0.4.0 reader sees the old body.
+     *
      * @param target the peer the inner frame is for
      * @param frame  the origin's complete signed wire frame, verbatim
+     * @param path   the relays to traverse, origin's choice; null for the one-hop form
+     * @param hop    the index in {@code path} of the relay this envelope is addressed to; null without a path
      */
-    public record RelayFrame(PeerId target, byte[] frame) {
+    public record RelayFrame(PeerId target, byte[] frame,
+                             @JsonInclude(JsonInclude.Include.NON_NULL) List<PeerId> path,
+                             @JsonInclude(JsonInclude.Include.NON_NULL) Integer hop) {
+
+        /** The one-hop form, as 0.4.0 sends it. */
+        public RelayFrame(PeerId target, byte[] frame) {
+            this(target, frame, null, null);
+        }
+
+        /** The same frame addressed to the next relay on its path. */
+        public RelayFrame nextHop() {
+            return new RelayFrame(target, frame, path, hop == null ? null : hop + 1);
+        }
     }
 
     /**

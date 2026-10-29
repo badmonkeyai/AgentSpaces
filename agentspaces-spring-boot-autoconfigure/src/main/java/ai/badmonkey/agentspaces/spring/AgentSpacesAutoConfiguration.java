@@ -352,6 +352,14 @@ public class AgentSpacesAutoConfiguration {
         } catch (IllegalArgumentException | NullPointerException e) {
             throw new IllegalStateException("agentspaces.transport.webrtc.offload: " + e.getMessage(), e);
         }
+        // srad/large-networks-bulk-data.md group R: relay paths are node settings.
+        try {
+            builder.maxPathHops(properties.getRelay().getMaxPathHops())
+                    .pathTtl(properties.getRelay().getPathTtl())
+                    .unreachableSignal(properties.getRelay().isUnreachableSignal());
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new IllegalStateException("agentspaces.relay: " + e.getMessage(), e);
+        }
         // SPEC §5.6 v0.1.13 (item 9): the CA trust is built before the node, so
         // the node judges presented chains by the same refreshable trust the
         // transport attests with, and may accept CA-rooted revocations.
@@ -852,7 +860,7 @@ public class AgentSpacesAutoConfiguration {
                     identity.peerId(), clock, roles);
             AgentSpaces.GroupContext context = spaces.register(
                     groupConfig.getName(), runtime.id(), runtime, discovery);
-            BlockExchange blocks = new BlockExchange(runtime, codec);
+            BlockExchange blocks = buildBlocks(properties.getBlocks(), runtime, codec, clock, groupConfig.getName());
             GroupKey contentKey = contentKeyOf(groupConfig);
             if (properties.getMulticast().isSeal() && contentKey != null) {
                 // SPEC §10.1 v0.1.19: this group's beacon datagrams travel sealed under its content key.
@@ -861,16 +869,36 @@ public class AgentSpacesAutoConfiguration {
             // SPEC §11a.3 v0.1.13: one ring per group, shared by its spaces, so a
             // rotation reaches every space at once; persisted with the keystore.
             GroupKeyRing ring = contentKeyRing(properties, groupConfig, runtime, contentKey, codec);
+            // srad/large-networks-bulk-data.md §7.2: the content swarm before the application
+            // spaces, so each of them can escalate a large payload to it (LB-E-02).
+            ai.badmonkey.agentspaces.content.Content content = null;
+            ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk = null;
+            long escalateAbove = 0;
+            if (properties.getContent().isEnabled()) {
+                if (!properties.getCapabilities().isEnabled()) {
+                    throw new IllegalStateException("agentspaces.content.enabled=true needs"
+                            + " agentspaces.capabilities.enabled=true: the swarm is a capability");
+                }
+                AgentSpacesProperties.SpaceDef contentDef = new AgentSpacesProperties.SpaceDef();
+                contentDef.setName(properties.getContent().getSpace());
+                ReplicatedSpace contentSpace = buildSpace(runtime, identity, contentDef, blocks, discovery,
+                        ring, authorizer, clock, schemaRegistry, null, 0, 0);
+                content = buildContent(properties.getContent(), groupConfig.getName(), context.pipes(), runtime,
+                        contentSpace, identity, codec, clock, blocks, ring, authorizer);
+                bulk = new ai.badmonkey.agentspaces.content.SpacePayloads(content);
+                escalateAbove = properties.getContent().getEscalateAbove();
+            }
             for (AgentSpacesProperties.SpaceDef spaceDef : groupConfig.getSpaces()) {
                 context.space(spaceDef.getName(),
                         buildSpace(runtime, identity, spaceDef, blocks, discovery, ring,
-                                authorizer, clock, schemaRegistry),
+                                authorizer, clock, schemaRegistry, bulk, escalateAbove,
+                                properties.getBlocks().getMaxPayload()),
                         writer);
             }
             if (properties.getCapabilities().isEnabled()) {
                 registerCapabilities(properties.getCapabilities(), context, runtime,
                         discovery, identity, codec, clock, blocks, ring, groupConfig,
-                        authorizer, embedder, peerEncryptionKeys(properties), schemaRegistry);
+                        authorizer, embedder, peerEncryptionKeys(properties), schemaRegistry, content);
             }
             if (properties.getTransport().getWebrtc().isEnabled()
                     && TransportBlocks.present(TransportBlocks.WEBRTC_CLASS)) {
@@ -931,7 +959,8 @@ public class AgentSpacesAutoConfiguration {
                                              Authorizer authorizer,
                                              Embedder embedder,
                                              java.security.KeyPair encryptionKeys,
-                                             SchemaRegistry schemas) {
+                                             SchemaRegistry schemas,
+                                             ai.badmonkey.agentspaces.content.Content content) {
         if (config.isOrderedLog()) {
             throw new IllegalStateException("agentspaces.capabilities.ordered-log=true: the"
                     + " ordered log runs over a fixed member set the starter cannot infer;"
@@ -941,6 +970,9 @@ public class AgentSpacesAutoConfiguration {
         AgentSpaces.GroupContext group = context.capabilities(
                 new CapabilityRuntime(runtime, discovery, identity));
         CapabilityPipes pipes = group.pipes();
+        if (content != null) {
+            group.provide(content); // aspace:cap/content-swarm (srad/large-networks-bulk-data.md)
+        }
         if (config.isAggregate()) {
             group.provide(new PushSumAggregate(pipes, runtime.sampler(), identity.peerId(),
                     codec, clock));
@@ -957,7 +989,7 @@ public class AgentSpacesAutoConfiguration {
                 AgentSpacesProperties.SpaceDef def = new AgentSpacesProperties.SpaceDef();
                 def.setName(votesName);
                 votes = buildSpace(runtime, identity, def, blocks, discovery, contentKey,
-                        authorizer, clock, schemas);
+                        authorizer, clock, schemas, null, 0, 0);
             }
             // gate2-review G2-3: the profile's authorizer narrows the electorate,
             // so an identity provider names QUORUM voters as it names Raft voters.
@@ -1114,6 +1146,113 @@ public class AgentSpacesAutoConfiguration {
      * {@code <keystore>/content-keys/<group>.ring} when a keystore is set, so
      * rotated epochs survive restarts. Null when the group is unencrypted.
      */
+    /**
+     * Builds a group's block exchange over the configured store (LB-B-05): memory as in
+     * 0.4.0, or a file store under {@code agentspaces.blocks.path/<group>} that a restart
+     * reads back.
+     */
+    static BlockExchange buildBlocks(AgentSpacesProperties.Blocks config, GroupRuntime runtime,
+                                     CborCodec codec, InstantSource clock, String groupName) {
+        ai.badmonkey.agentspaces.peering.blocks.BlockStore store;
+        switch (config.getStore()) {
+            case "memory" -> store = new ai.badmonkey.agentspaces.peering.blocks.MemoryBlockStore();
+            case "file" -> {
+                java.nio.file.Path path = java.nio.file.Path.of(config.getPath())
+                        .resolve(groupName.replaceAll("[^A-Za-z0-9._-]", "_"));
+                try {
+                    store = new ai.badmonkey.agentspaces.peering.blocks.FileBlockStore(path);
+                } catch (java.io.IOException e) {
+                    throw new IllegalStateException("agentspaces.blocks.path: cannot use " + path + ": " + e.getMessage(), e);
+                }
+            }
+            default -> throw new IllegalStateException("agentspaces.blocks.store: unknown kind '" + config.getStore()
+                    + "' (memory or file)");
+        }
+        return new BlockExchange(runtime, codec, clock, config.getQuota(), BlockExchange.DEFAULT_MAX_BLOCK_BYTES, store);
+    }
+
+    /**
+     * Builds the content swarm of a group from {@code agentspaces.content.*}
+     * (srad/large-networks-bulk-data.md §7.2): the store composed from the listed
+     * backends (a per-group directory for {@code file}), the policy from the
+     * property values, the group's key ring and authorizer.
+     */
+    private static ai.badmonkey.agentspaces.content.Content buildContent(
+            AgentSpacesProperties.ContentSwarm config, String groupName, CapabilityPipes pipes,
+            GroupRuntime runtime, ReplicatedSpace contentSpace, PeerIdentity identity, CborCodec codec,
+            InstantSource clock, BlockExchange blocks, GroupKeyRing ring, Authorizer authorizer) {
+        java.util.List<ai.badmonkey.agentspaces.content.PieceStore> backends = new java.util.ArrayList<>();
+        for (String kind : config.getStore().getBackends()) {
+            switch (kind.trim().toLowerCase(java.util.Locale.ROOT)) {
+                case "file" -> {
+                    java.nio.file.Path path = java.nio.file.Path.of(config.getStore().getPath())
+                            .resolve(groupName.replaceAll("[^A-Za-z0-9._-]", "_"));
+                    try {
+                        ai.badmonkey.agentspaces.content.PieceStore file = new ai.badmonkey.agentspaces.content.FilePieceStore(
+                                path, codec, clock, config.getStore().getQuota());
+                        // LB-T-11: pieces on disk under a local key kept in the store directory
+                        backends.add(config.getStore().isEncryptAtRest()
+                                ? new ai.badmonkey.agentspaces.content.EncryptedPieceStore(file,
+                                        ai.badmonkey.agentspaces.content.EncryptedPieceStore.keyIn(path))
+                                : file);
+                    } catch (java.io.IOException e) {
+                        throw new IllegalStateException("agentspaces.content.store.path: cannot use " + path
+                                + ": " + e.getMessage(), e);
+                    }
+                }
+                case "memory" -> backends.add(new ai.badmonkey.agentspaces.content.MemoryPieceStore(
+                        clock, config.getStore().getQuota()));
+                case "in-place" -> backends.add(new ai.badmonkey.agentspaces.content.InPlaceStore());
+                default -> throw new IllegalStateException("agentspaces.content.store.backends: unknown kind '"
+                        + kind + "' (file, memory, in-place)");
+            }
+        }
+        if (backends.isEmpty()) {
+            throw new IllegalStateException("agentspaces.content.store.backends lists no backend");
+        }
+        ai.badmonkey.agentspaces.content.PieceStore store = backends.size() == 1 ? backends.get(0)
+                : new ai.badmonkey.agentspaces.content.CompositeStore(backends, config.getStore().isCacheExternal());
+        ai.badmonkey.agentspaces.content.ContentPolicy.SeedMode seedMode;
+        try {
+            seedMode = ai.badmonkey.agentspaces.content.ContentPolicy.SeedMode.valueOf(
+                    config.getSeedMode().trim().toUpperCase(java.util.Locale.ROOT).replace('-', '_'));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException("agentspaces.content.seed-mode: '" + config.getSeedMode()
+                    + "' is not auto, complete-only, or never");
+        }
+        ai.badmonkey.agentspaces.content.ContentPolicy policy = new ai.badmonkey.agentspaces.content.ContentPolicy() {
+            @Override
+            public ai.badmonkey.agentspaces.content.ContentPolicy.SeedMode seedMode() {
+                return seedMode;
+            }
+
+            @Override
+            public long uploadBytesPerDay() {
+                return config.getUploadBytesPerDay();
+            }
+
+            @Override
+            public int maxSessions() {
+                return config.getMaxSessions();
+            }
+
+            @Override
+            public int maxWindow() {
+                return config.getMaxWindow();
+            }
+
+            @Override
+            public int maxFetches() {
+                return config.getMaxFetches();
+            }
+        };
+        return ai.badmonkey.agentspaces.content.Content.builder(pipes, runtime, contentSpace, identity.peerId())
+                .codec(codec).clock(clock).store(store).blocks(blocks).keyRing(ring).authorizer(authorizer)
+                .policy(policy).pieceSize(config.getPieceSize())
+                .holdingLease(ai.badmonkey.agentspaces.api.space.Lease.of(config.getHoldingLease()))
+                .build();
+    }
+
     private static GroupKeyRing contentKeyRing(AgentSpacesProperties properties,
                                                AgentSpacesProperties.Group config,
                                                GroupRuntime runtime, GroupKey contentKey,
@@ -1298,7 +1437,9 @@ public class AgentSpacesAutoConfiguration {
                                               AgentSpacesProperties.SpaceDef spaceDef,
                                               BlockExchange blocks, DiscoveryService discovery,
                                               GroupKeyRing contentKey, Authorizer authorizer,
-                                              InstantSource clock, SchemaRegistry schemas) {
+                                              InstantSource clock, SchemaRegistry schemas,
+                                              ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk,
+                                              long escalateAbove, long maxPayload) {
         ConflictStrategyType strategy =
                 ConflictStrategyType.valueOf(spaceDef.getStrategy().trim().toUpperCase());
         ReplicatedSpace.Builder builder =
@@ -1308,6 +1449,11 @@ public class AgentSpacesAutoConfiguration {
                         .clock(clock) // the fabric's clock (review M-8)
                         .blocks(blocks)
                         .advertise(discovery::publish);
+        if (bulk != null && escalateAbove > 0) {
+            builder.bulk(bulk, escalateAbove); // LB-E-02
+        } else if (maxPayload > 0) {
+            builder.maxPayload(maxPayload); // LB-E-06: refuse what no swarm carries, naming the property
+        }
         if (schemas != null) {
             builder.schemaRegistry(schemas);
         }

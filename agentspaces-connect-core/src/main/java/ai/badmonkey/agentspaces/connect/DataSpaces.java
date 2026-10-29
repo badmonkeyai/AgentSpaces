@@ -75,4 +75,30 @@ public final class DataSpaces {
         return ReplicatedSpace.builder(runtime, name, identity, agentName)
                 .blocks(Objects.requireNonNull(blocks, "blocks"));
     }
+
+    /**
+     * Starts building a data space whose bulk results become artifacts of the content
+     * swarm (srad/large-networks-bulk-data.md LB-E-05): a result above {@code escalateAbove}
+     * is published through {@code bulk} and the completion carries its root, so a
+     * {@link DataQueryClient} on any replica with the same seam reads the rows once the
+     * artifact is complete there; a result between the inline limit and the bound still
+     * travels as one block.
+     *
+     * @param runtime       the group runtime
+     * @param name          the space name within the group
+     * @param identity      the local peer identity
+     * @param agentName     the local agent name writes are attributed to
+     * @param blocks        the group runtime's block exchange
+     * @param bulk          the content swarm's seam ({@code SpacePayloads} in {@code agentspaces-content})
+     * @param escalateAbove payload bytes above which a result escalates; 0 disables
+     * @return the builder, with content addressing and escalation wired
+     */
+    public static ReplicatedSpace.Builder builder(GroupRuntime runtime, String name,
+                                                  PeerIdentity identity, String agentName,
+                                                  BlockExchange blocks,
+                                                  ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk,
+                                                  long escalateAbove) {
+        return builder(runtime, name, identity, agentName, blocks)
+                .bulk(Objects.requireNonNull(bulk, "bulk"), escalateAbove);
+    }
 }

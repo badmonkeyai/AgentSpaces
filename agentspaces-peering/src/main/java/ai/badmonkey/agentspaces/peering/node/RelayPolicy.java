@@ -56,6 +56,43 @@ public interface RelayPolicy {
     boolean allow(GroupId group, PeerId from, PeerId target, int bytes);
 
     /**
+     * Whether to forward a frame of this kind (LB-R-11): the inner envelope's kind, a pipe frame as
+     * {@code PIPE_DATA:<capability>} (so the content swarm's pieces are
+     * {@code PIPE_DATA:aspace:cap/content-swarm}), as {@link PeerNode#relayBytesByKind} counts them.
+     * Consulted before {@link #allow}; the default forwards every kind.
+     *
+     * @param group the group the frame names
+     * @param kind  the frame's kind
+     * @return {@code true} to forward, {@code false} to drop
+     */
+    default boolean allowKind(GroupId group, String kind) {
+        return true;
+    }
+
+    /**
+     * This policy, refusing the given kinds as well (LB-R-11): {@code refusingKinds("PIPE_DATA:aspace:cap/content-swarm")}
+     * keeps the content swarm's pieces off a metered relay while every other frame still passes this policy.
+     *
+     * @param kinds the kinds to refuse, as {@link #allowKind} names them
+     * @return the composed policy
+     */
+    default RelayPolicy refusingKinds(String... kinds) {
+        java.util.Set<String> refused = java.util.Set.of(kinds);
+        RelayPolicy self = this;
+        return new RelayPolicy() {
+            @Override
+            public boolean allow(GroupId group, PeerId from, PeerId target, int bytes) {
+                return self.allow(group, from, target, bytes);
+            }
+
+            @Override
+            public boolean allowKind(GroupId group, String kind) {
+                return !refused.contains(kind) && self.allowKind(group, kind);
+            }
+        };
+    }
+
+    /**
      * A per-group daily byte budget (ISSUE-BootstrapCore FR-2, the relay budget; SRAD
      * discovery-bootstrap DB-S-06): the inner bytes forwarded in each group are summed per UTC
      * day on the system clock, and a frame that would take the day's total past the budget is

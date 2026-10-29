@@ -86,7 +86,13 @@ public interface Authorizer {
          * {@code <asset>:<operation>}, so the OIDC scope reads
          * {@code aspace:connector-invoke:<asset>:<operation>}.
          */
-        CONNECTOR_INVOKE
+        CONNECTOR_INVOKE,
+        /**
+         * Fetch pieces of a content root through {@code aspace:cap/content-swarm}
+         * (srad/large-networks-bulk-data.md LB-P-02); the scope is the root. A
+         * holder consults it before serving. Defaults to every member.
+         */
+        CONTENT_FETCH
     }
 
     /**

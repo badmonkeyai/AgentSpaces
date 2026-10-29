@@ -131,11 +131,12 @@ public final class Settlement {
 
     /**
      * Stage 8: reacts once when the epoch's estimate has settled (unchanged
-     * within a tolerance for a number of protocol ticks). The capability
-     * evaluates the rule on its own tick; nothing here polls. The peers tick
-     * every 250 ms, so twenty ticks is five quiet seconds: longer than the
-     * spread between the first and the last priced claim, so the one report
-     * carries the average of all of them.
+     * within a tolerance for a number of settle steps). The capability
+     * evaluates the rule on its own tick; nothing here polls. A step is a
+     * gossip round, and rounds run about once a second, so forty steps is
+     * about forty quiet seconds: longer than the spread between the first
+     * and the last priced claim, so the one report carries the average of
+     * all of them.
      */
     @AgentSpec(name = "supervisor", description = "Reports the fleet's average reserve once it settles",
             goals = {"report reserves"})

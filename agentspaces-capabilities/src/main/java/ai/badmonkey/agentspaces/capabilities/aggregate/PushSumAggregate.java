@@ -364,7 +364,9 @@ public final class PushSumAggregate implements CapabilityProvider {
     /**
      * When an estimate counts as settled: unchanged, within a relative
      * tolerance of the larger of one and the last value, for a number of
-     * consecutive ticks. {@link #FIRST} fires on the first estimate present.
+     * settle steps. A step is a gossip round this node took part in after it
+     * first heard the epoch, or the epoch going quiet; rounds run about once a
+     * second. {@link #FIRST} fires on the first estimate present.
      */
     public record Settle(int ticks, double tolerance) {
         public static final Settle FIRST = new Settle(0, 0);

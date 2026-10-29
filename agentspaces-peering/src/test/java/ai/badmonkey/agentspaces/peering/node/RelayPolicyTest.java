@@ -186,6 +186,32 @@ class RelayPolicyTest {
                 .isGreaterThanOrEqualTo(1);
     }
 
+    /** LB-R-11, LB-R-09: a relay keeps the content swarm's pieces off itself by kind and passes everything else, counted by kind. */
+    @Test
+    void aPolicyRefusesOneKindAndCountsTheRestByKind() throws Exception {
+        Fleet fleet = fleet(RelayPolicy.ALLOW.refusingKinds("PIPE_DATA:aspace:cap/content-swarm"));
+        ai.badmonkey.agentspaces.common.codec.CborCodec codec = ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+        java.util.function.Function<String, byte[]> pipe = capability -> {
+            Map<String, Object> frame = new java.util.LinkedHashMap<>();
+            frame.put("capability", capability);
+            frame.put("payload", "x".getBytes(StandardCharsets.UTF_8));
+            return codec.toBytes(frame);
+        };
+        PeerNode.RelayStats before = stats(fleet.relay(), groupA.group());
+
+        fleet.aliceRuntime().send(fleet.nat().peerId(), Envelope.Kind.PIPE_DATA, pipe.apply("aspace:cap/content-swarm"));
+        fleet.aliceRuntime().send(fleet.nat().peerId(), Envelope.Kind.PIPE_DATA, pipe.apply("aspace:cap/aggregate"));
+        fleet.aliceRuntime().send(fleet.nat().peerId(), Envelope.Kind.PIPE_DATA, "hello".getBytes(StandardCharsets.UTF_8));
+
+        PeerNode.RelayStats after = stats(fleet.relay(), groupA.group());
+        assertThat(after.droppedByPolicy()).isEqualTo(before.droppedByPolicy() + 1);
+        assertThat(fleet.natSaw()).hasSize(2);
+        Map<String, Long> byKind = fleet.relay().relayBytesByKind(groupA.group());
+        assertThat(byKind).containsKeys("PIPE_DATA:aspace:cap/aggregate", "PIPE_DATA")
+                .doesNotContainKey("PIPE_DATA:aspace:cap/content-swarm");
+        assertThat(RelayPolicy.ALLOW.allowKind(groupA.group(), "PIPE_DATA:aspace:cap/content-swarm")).isTrue();
+    }
+
     /** R2-S3: a policy that throws fails closed; the frame is dropped and counted, and the relay goes on. */
     @Test
     void policyThrows() throws Exception {

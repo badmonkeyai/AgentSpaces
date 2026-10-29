@@ -82,7 +82,7 @@ public @interface Propose {
     /** Tag filters on the cue, {@code "key=value"} or {@code "key"}, judged before decode. */
     String[] tags() default {};
 
-    /** Field filters on the cue, {@code "field=value"} or {@code "field!=value"}. */
+    /** Field filters on the cue, in the grammar of {@code @SpaceTake#where()}. */
     String[] where() default {};
 
     /**

@@ -165,6 +165,7 @@ public final class Authorizers {
         put(grants, agents, Authorizer.Operation.SPACE_TAKE, config.getSpaceTake(), "space-take");
         put(grants, agents, Authorizer.Operation.VOTE, config.getVote(), "vote");
         put(grants, agents, Authorizer.Operation.MODEL_SERVE, config.getModelServe(), "model-serve");
+        put(grants, agents, Authorizer.Operation.CONTENT_FETCH, config.getContentFetch(), "content-fetch");
         if (properties.getConsole().isEnabled() && properties.getConsole().getCommand().isEnabled()) {
             Set<PeerId> issuers = new LinkedHashSet<>(
                     grants.getOrDefault(Authorizer.Operation.DIRECTIVE_ISSUER, Set.of()));

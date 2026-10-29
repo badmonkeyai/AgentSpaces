@@ -326,6 +326,9 @@ public final class PeerNode implements AutoCloseable {
     private final Map<GroupId, RelayCounters> relayCounters = new ConcurrentHashMap<>();
     /** Bound on per-target relay counters per group; least-recently-relayed-to evict (PR-2, ASF-019). */
     static final int RELAY_TARGETS_CAPACITY = 4_096;
+
+    /** Kinds a group's relay counters keep apart before the rest count as {@code other} (LB-R-09). */
+    static final int RELAY_KINDS_CAPACITY = 64;
     /** JS-W-11: when this node dials a member it is otherwise relayed to, and how soon it retries. */
     private final RelayOffload relayOffload;
     /**
@@ -339,14 +342,70 @@ public final class PeerNode implements AutoCloseable {
     /** Members an offload dial is in flight to, so one dial at a time reaches for each. */
     private final Set<PeerId> offloadInFlight = ConcurrentHashMap.newKeySet();
 
+    // ---- relay paths (srad/large-networks-bulk-data.md §3.7, group R) ----
+
+    /** Per group, per member, the relays it declares attachment to (hint {@code relay.via}). */
+    private final Map<GroupId, Map<PeerId, Set<PeerId>>> relayVia = new ConcurrentHashMap<>();
+    /** Per group, per relay, the relays it declares links to (hint {@code relay.links}). */
+    private final Map<GroupId, Map<PeerId, Set<PeerId>>> relayLinks = new ConcurrentHashMap<>();
+    /** Per group, per target, the pinned relay path (LB-R-05). */
+    private final Map<GroupId, Map<PeerId, PinnedPath>> pinnedPaths = new ConcurrentHashMap<>();
+    /** Relays a mesh dial is in flight to, and when each was last attempted (LB-R-02). */
+    private final Set<PeerId> meshInFlight = ConcurrentHashMap.newKeySet();
+    private final Map<PeerId, Long> meshAttempted = new ConcurrentHashMap<>();
+    /** Per origin and target, when the last unreachable signal went out (LB-R-07). */
+    private final Map<String, Long> signalSentAt = new ConcurrentHashMap<>();
+    /** Relays whose dial as a first hop failed, and when: excluded from path starts for a minute. */
+    private final Map<PeerId, Long> firstHopFailedAt = new ConcurrentHashMap<>();
+    private final AtomicLong unreachableSignalsReceived = new AtomicLong();
+    private final int maxPathHops;
+    private final Duration pathTtl;
+    private final boolean unreachableSignal;
+
+    private record PinnedPath(List<PeerId> path, long lastUsedMillis) {
+    }
+
+    /** The capability type of the unreachable signal a relay sends toward an origin (LB-R-07). */
+    public static final String RELAY_SIGNAL_CAPABILITY = "aspace:cap/relay-signal";
+
+    /** Interval between mesh dial attempts to one relay. */
+    static final long MESH_RETRY_MILLIS = 60_000;
+
+    /** Interval between unreachable signals for one origin and target. */
+    static final long SIGNAL_INTERVAL_MILLIS = 10_000;
+
+    /** The body of a {@code PIPE_DATA} frame, the shape the capability runtime uses. */
+    private record RelayPipeFrame(String capability, byte[] payload) {
+    }
+
+    /**
+     * What a relay tells an origin when it dropped a path frame: the target the
+     * frame was for and the hop that could not be reached. No endpoint travels.
+     *
+     * @param target    the unreachable target
+     * @param failedHop the relay or target the dropping relay could not reach
+     * @param reason    a short word for the counters
+     */
+    public record RelaySignal(PeerId target, PeerId failedHop, String reason) {
+    }
+
     private static final class RelayCounters {
         final AtomicLong framesForwarded = new AtomicLong();
         final AtomicLong bytesForwarded = new AtomicLong();
         final AtomicLong droppedNotMember = new AtomicLong();
         final AtomicLong droppedByPolicy = new AtomicLong();
+        final AtomicLong forwardedToRelay = new AtomicLong();
+        final AtomicLong droppedUnreachable = new AtomicLong();
+        final AtomicLong droppedBadPath = new AtomicLong();
         final AtomicLong offloadAttempts = new AtomicLong();
         final AtomicLong offloadOpened = new AtomicLong();
         final AtomicLong offloadFailed = new AtomicLong();
+        /**
+         * LB-R-09: bytes forwarded per inner frame kind, a pipe frame keyed by its capability
+         * ({@code PIPE_DATA:aspace:cap/content-swarm}), so an operator sees how much of a relay's
+         * traffic is pieces; bounded at {@link #RELAY_KINDS_CAPACITY} keys, the rest under {@code other}.
+         */
+        final Map<String, AtomicLong> bytesByKind = new ConcurrentHashMap<>();
         /**
          * Per target that passed the membership check, so the key is always a verified member's
          * PeerId (SR-2): a flood naming fake targets reaches neither this map nor the policy.
@@ -363,13 +422,19 @@ public final class PeerNode implements AutoCloseable {
                     });
         }
 
+        void countKind(String kind, long bytes) {
+            String key = bytesByKind.containsKey(kind) || bytesByKind.size() < RELAY_KINDS_CAPACITY ? kind : "other";
+            bytesByKind.computeIfAbsent(key, k -> new AtomicLong()).addAndGet(bytes);
+        }
+
         RelayCounters target(PeerId target) {
             return targets.computeIfAbsent(target, t -> new RelayCounters(false));
         }
 
         RelayStats snapshot() {
             return new RelayStats(framesForwarded.get(), bytesForwarded.get(),
-                    droppedNotMember.get(), droppedByPolicy.get());
+                    droppedNotMember.get(), droppedByPolicy.get(),
+                    forwardedToRelay.get(), droppedUnreachable.get(), droppedBadPath.get());
         }
     }
     /** v0.1.9 CA channel mode: admit and serve peers only over connections the
@@ -530,7 +595,13 @@ public final class PeerNode implements AutoCloseable {
      * in this node's view, and frames dropped by the {@link RelayPolicy}.
      */
     public record RelayStats(long framesForwarded, long bytesForwarded, long droppedNotMember,
-                             long droppedByPolicy) {
+                             long droppedByPolicy, long forwardedToRelay, long droppedUnreachable,
+                             long droppedBadPath) {
+
+        /** The 0.4.0 form, with no path counters. */
+        public RelayStats(long framesForwarded, long bytesForwarded, long droppedNotMember, long droppedByPolicy) {
+            this(framesForwarded, bytesForwarded, droppedNotMember, droppedByPolicy, 0, 0, 0);
+        }
     }
 
     /**
@@ -556,6 +627,52 @@ public final class PeerNode implements AutoCloseable {
      * @param groupId the group
      * @return target to counters; empty for a group this node never relayed in
      */
+    /**
+     * The bytes this node forwarded as a relay in a group, per inner frame kind (LB-R-09): a pipe
+     * frame under {@code PIPE_DATA:<capability>}, so the content swarm's pieces show as
+     * {@code PIPE_DATA:aspace:cap/content-swarm}; empty for a group this node never relayed in.
+     *
+     * @param groupId the group
+     * @return kind to bytes, a snapshot
+     */
+    public Map<String, Long> relayBytesByKind(GroupId groupId) {
+        RelayCounters counters = relayCounters.get(Objects.requireNonNull(groupId, "groupId"));
+        if (counters == null) {
+            return Map.of();
+        }
+        Map<String, Long> out = new java.util.TreeMap<>();
+        counters.bytesByKind.forEach((kind, bytes) -> out.put(kind, bytes.get()));
+        return out;
+    }
+
+    /**
+     * The kind of a relayed frame, read without verifying it (the target verifies): the envelope's
+     * kind, and for a pipe frame its capability. A frame that does not parse is {@code unknown}.
+     */
+    private String relayedKind(byte[] frame) {
+        try {
+            ai.badmonkey.agentspaces.peering.wire.WireCodec.Signed signed =
+                    codec.fromBytes(frame, ai.badmonkey.agentspaces.peering.wire.WireCodec.Signed.class);
+            if (signed == null || signed.envelope() == null || signed.envelope().kind() == null) {
+                return "unknown";
+            }
+            Envelope.Kind kind = signed.envelope().kind();
+            if (kind == Envelope.Kind.PIPE_DATA && signed.envelope().body() != null) {
+                try {
+                    RelayPipeFrame pipe = codec.fromBytes(signed.envelope().body(), RelayPipeFrame.class);
+                    if (pipe != null && pipe.capability() != null) {
+                        return kind.name() + ":" + pipe.capability();
+                    }
+                } catch (RuntimeException e) {
+                    // a pipe body that is not a capability frame counts as plain PIPE_DATA
+                }
+            }
+            return kind.name();
+        } catch (RuntimeException e) {
+            return "unknown";
+        }
+    }
+
     public Map<PeerId, RelayStats> relayStats(GroupId groupId) {
         RelayCounters counters = relayCounters.get(Objects.requireNonNull(groupId, "groupId"));
         if (counters == null) {
@@ -858,6 +975,9 @@ public final class PeerNode implements AutoCloseable {
         this.admissionMemory = new AdmissionMemory(builder.stateDirectory, builder.admissionMemoryBound, clock);
         this.relayPolicy = builder.relayPolicy;
         this.relayOffload = builder.relayOffload;
+        this.maxPathHops = builder.maxPathHops;
+        this.pathTtl = builder.pathTtl;
+        this.unreachableSignal = builder.unreachableSignal;
         this.locateMinMillis = builder.locateMinMillis;
         this.locateMaxMillis = builder.locateMaxMillis;
     }
@@ -902,6 +1022,9 @@ public final class PeerNode implements AutoCloseable {
         private int admissionMemoryBound = AdmissionMemory.DEFAULT_BOUND;
         private RelayPolicy relayPolicy = RelayPolicy.ALLOW;
         private RelayOffload relayOffload = RelayOffload.defaults();
+        private int maxPathHops = 4;
+        private Duration pathTtl = Duration.ofMinutes(10);
+        private boolean unreachableSignal = true;
 
         private Builder(PeerIdentity identity) {
             this.identity = Objects.requireNonNull(identity, "identity");
@@ -958,6 +1081,27 @@ public final class PeerNode implements AutoCloseable {
          * @param offload the settings
          * @return this builder
          */
+        /** The longest relay path this node computes or forwards (LB-R-03, decision 10); default 4. */
+        public Builder maxPathHops(int hops) {
+            if (hops < 1) {
+                throw new IllegalArgumentException("max-path-hops must be positive: " + hops);
+            }
+            this.maxPathHops = hops;
+            return this;
+        }
+
+        /** Idle time after which a pinned relay path is recomputed (LB-R-05); default 10 minutes. */
+        public Builder pathTtl(Duration ttl) {
+            this.pathTtl = Objects.requireNonNull(ttl, "ttl");
+            return this;
+        }
+
+        /** Whether a relay that drops a path frame signals the origin (LB-R-07, decision 11); default on. */
+        public Builder unreachableSignal(boolean enabled) {
+            this.unreachableSignal = enabled;
+            return this;
+        }
+
         public Builder relayOffload(RelayOffload offload) {
             this.relayOffload = Objects.requireNonNull(offload, "offload");
             return this;
@@ -1054,7 +1198,7 @@ public final class PeerNode implements AutoCloseable {
          * signed BATCH frame per window (PERF2 §3.3): one signature and one verification where
          * there were many. Only toward peers that advertise {@code wire.batch=1}; other peers get
          * single frames. Off by default (hand-driven tests expect immediate delivery); the starter
-         * turns it on with {@code agentspaces.wire.coalesce-millis}. Adds up to one window of
+         * turns it on with {@code agentspaces.coalesce-millis}. Adds up to one window of
          * latency per hop, which must stay well under a space's settle window.
          *
          * @param window the flush period, or null to send every frame at once
@@ -2619,6 +2763,9 @@ public final class PeerNode implements AutoCloseable {
                 }
             }
             retryLost(runtime, nowMillis);
+            publishReachHints(runtime);
+            meshRelays(runtime, nowMillis);
+            expirePins(runtime, nowMillis);
             gossip.tick(nowMillis); // lazy push: grafts and announcements (PERF2 §3.4)
             PeerId periodicPartner = null;
             if (runtime.claimAntiEntropyRound(nowMillis, active)) {
@@ -2903,9 +3050,13 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * Wraps the frame in a RELAY_FRAME and hands it to the first reachable
-     * RELAY-role member. One relay hop only: the relay dials the target
-     * directly, and relay frames themselves are never re-relayed.
+     * Wraps the frame in a RELAY_FRAME and hands it to the first relay of the
+     * path to the target (srad/large-networks-bulk-data.md §3.7): the pinned path
+     * when one is held, else the shortest path over the relay graph the view
+     * carries, pinned for later sends. A one-relay path travels in the 0.4.0
+     * form; a longer one carries {@code path} and {@code hop}. With no path
+     * known, the first reachable RELAY-role member carries the frame one hop,
+     * as before.
      */
     private boolean sendViaRelay(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
         if (kind == Envelope.Kind.RELAY_FRAME) {
@@ -2918,6 +3069,26 @@ public final class PeerNode implements AutoCloseable {
         // The inner frame is addressed to the ultimate target; the outer
         // RELAY_FRAME is addressed to the relay that carries it.
         byte[] inner = encodeFrame(groupId, to, kind, body);
+        List<PeerId> path = pathTo(groupId, runtime, to);
+        if (path != null) {
+            PeerId first = path.get(0);
+            TransportConnection connection = connectionTo(groupId, first);
+            if (connection == null) {
+                firstHopFailedAt.put(first, clock.millis()); // not a start for a while (LB-R-04)
+            } else {
+                try {
+                    Bodies.RelayFrame frame = path.size() == 1
+                            ? new Bodies.RelayFrame(to, inner)
+                            : new Bodies.RelayFrame(to, inner, path, 0);
+                    sendOn(connection, groupId, first, Envelope.Kind.RELAY_FRAME, frame);
+                    noteRelayed(groupId, to); // JS-W-11: a frame the relay carried for this pair
+                    return true;
+                } catch (IOException e) {
+                    dropConnection(first, connection);
+                }
+            }
+            unpin(groupId, to);
+        }
         for (PeerId relay : runtime.membership()
                 .withRole(PeerAdvertisement.PeerRole.RELAY)) {
             if (relay.equals(to) || relay.equals(peerId())) {
@@ -2930,13 +3101,332 @@ public final class PeerNode implements AutoCloseable {
             try {
                 sendOn(connection, groupId, relay, Envelope.Kind.RELAY_FRAME,
                         new Bodies.RelayFrame(to, inner));
-                noteRelayed(groupId, to); // JS-W-11: a frame the relay carried for this pair
+                noteRelayed(groupId, to);
                 return true;
             } catch (IOException e) {
                 dropConnection(relay, connection);
             }
         }
         return false;
+    }
+
+    // ------------------------------------------------------------ relay paths (group R)
+
+    /** The pinned path to a target, or a freshly computed and pinned one; null when none exists. */
+    private List<PeerId> pathTo(GroupId groupId, GroupRuntime runtime, PeerId to) {
+        Map<PeerId, PinnedPath> pins = pinnedPaths.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>());
+        long now = clock.millis();
+        PinnedPath pinned = pins.get(to);
+        if (pinned != null && now - pinned.lastUsedMillis() <= pathTtl.toMillis()
+                && pinned.path().stream().allMatch(hop -> runtime.membership().member(hop).isPresent())) {
+            pins.put(to, new PinnedPath(pinned.path(), now));
+            return pinned.path();
+        }
+        List<PeerId> computed = computePath(runtime, to).orElse(null);
+        if (computed == null) {
+            pins.remove(to);
+            return null;
+        }
+        pins.put(to, new PinnedPath(computed, now));
+        return computed;
+    }
+
+    private void unpin(GroupId groupId, PeerId to) {
+        Map<PeerId, PinnedPath> pins = pinnedPaths.get(groupId);
+        if (pins != null) {
+            pins.remove(to);
+        }
+    }
+
+    /** The relay graph of a group as this node's view carries it (LB-R-04). */
+    private RelayPaths.Graph relayGraph(GroupRuntime runtime) {
+        Set<PeerId> relays = new java.util.HashSet<>(runtime.membership().withRole(PeerAdvertisement.PeerRole.RELAY));
+        if (roles.contains(PeerAdvertisement.PeerRole.RELAY)) {
+            relays.add(peerId());
+        }
+        Map<PeerId, Set<PeerId>> links = new java.util.HashMap<>(relayLinks.getOrDefault(runtime.id(), Map.of()));
+        if (roles.contains(PeerAdvertisement.PeerRole.RELAY)) {
+            links.put(peerId(), attachedRelays(runtime));
+        }
+        return new RelayPaths.Graph(relays, links, relayVia.getOrDefault(runtime.id(), Map.of()));
+    }
+
+    /** The RELAY-role members this node holds a link to. */
+    private Set<PeerId> attachedRelays(GroupRuntime runtime) {
+        Set<PeerId> attached = new java.util.TreeSet<>(java.util.Comparator.comparing(PeerId::value));
+        for (PeerId relay : runtime.membership().withRole(PeerAdvertisement.PeerRole.RELAY)) {
+            if (!relay.equals(peerId()) && connections.containsKey(relay)) {
+                attached.add(relay);
+            }
+        }
+        return attached;
+    }
+
+    /** Whether this node could open a link to a member on its own: it has endpoints on a transport this node runs. */
+    private boolean dialable(GroupMembership.Member member) {
+        for (PeerAdvertisement.Endpoint endpoint : member.endpoints()) {
+            Transport transport = transports.get(endpoint.transport());
+            if (transport != null && !transport.signalled()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Optional<List<PeerId>> computePath(GroupRuntime runtime, PeerId to) {
+        RelayPaths.Graph graph = relayGraph(runtime);
+        if (graph.relays().isEmpty()) {
+            return Optional.empty();
+        }
+        // Where this node can start: first the relays it holds links to; only when those
+        // reach nothing, the relays it could dial, less any whose dial failed lately. A
+        // site relay behind the far NAT has an address and no reachability (LB-R-04).
+        Set<PeerId> attached = new java.util.HashSet<>(attachedRelays(runtime));
+        attached.remove(to);
+        Set<PeerId> dialable = new java.util.HashSet<>();
+        long now = clock.millis();
+        for (PeerId relay : graph.relays()) {
+            Long failed = firstHopFailedAt.get(relay);
+            if (!relay.equals(peerId()) && !relay.equals(to) && !attached.contains(relay)
+                    && (failed == null || now - failed > MESH_RETRY_MILLIS)
+                    && runtime.membership().member(relay).map(this::dialable).orElse(false)) {
+                dialable.add(relay);
+            }
+        }
+        Set<PeerId> start = attached;
+        // Where the target can be reached from: its declared attachments, any relay when it
+        // listens, or its relay neighbours when it is itself a relay.
+        Set<PeerId> goal = new java.util.HashSet<>(graph.via().getOrDefault(to, Set.of()));
+        GroupMembership.Member target = runtime.membership().member(to).orElse(null);
+        if (goal.isEmpty() && target != null && !target.endpoints().isEmpty()) {
+            goal.addAll(graph.relays());
+        }
+        if (goal.isEmpty() && graph.relays().contains(to)) {
+            goal.addAll(graph.neighbours(to));
+        }
+        goal.remove(to);
+        goal.remove(peerId());
+        start.remove(peerId());
+        RelayPaths.Graph without = new RelayPaths.Graph(
+                graph.relays().stream().filter(r -> !r.equals(to) && !r.equals(peerId())).collect(java.util.stream.Collectors.toSet()),
+                graph.links(), graph.via());
+        Optional<List<PeerId>> fromAttached = RelayPaths.shortest(without, start, goal, maxPathHops);
+        if (fromAttached.isPresent() || dialable.isEmpty()) {
+            return fromAttached;
+        }
+        return RelayPaths.shortest(without, dialable, goal, maxPathHops);
+    }
+
+    /** How many relays a frame to a member crosses from here: 0 direct, else the path length, -1 when none. */
+    int hopsTo(GroupId groupId, PeerId to) {
+        if (connections.containsKey(to)) {
+            return 0;
+        }
+        GroupRuntime runtime = groups.get(groupId);
+        if (runtime == null) {
+            return -1;
+        }
+        Map<PeerId, PinnedPath> pins = pinnedPaths.get(groupId);
+        PinnedPath pinned = pins == null ? null : pins.get(to);
+        if (pinned != null) {
+            return pinned.path().size();
+        }
+        if (runtime.membership().member(to).map(this::dialable).orElse(false)) {
+            return 0; // a listener this node has not dialed yet counts as direct
+        }
+        return computePath(runtime, to).map(List::size).orElse(-1);
+    }
+
+    /** The RELAY-role members this node holds links to in a group, sorted by id. */
+    List<PeerId> viaRelays(GroupId groupId) {
+        GroupRuntime runtime = groups.get(groupId);
+        return runtime == null ? List.of() : List.copyOf(attachedRelays(runtime));
+    }
+
+    /** The relays a member declared attachment to, as this node last heard (console and tests). */
+    Set<PeerId> viaOf(GroupId groupId, PeerId member) {
+        return relayVia.getOrDefault(groupId, Map.of()).getOrDefault(member, Set.of());
+    }
+
+    /** The relays a relay declared links to, as this node last heard (console and tests). */
+    Set<PeerId> relayLinksOf(GroupId groupId, PeerId relay) {
+        return relayLinks.getOrDefault(groupId, Map.of()).getOrDefault(relay, Set.of());
+    }
+
+    /** Closes and forgets the link this node holds to a peer (tests: a cut wire). */
+    void dropLinksTo(PeerId peer) {
+        TransportConnection connection = connections.get(peer);
+        if (connection != null) {
+            dropConnection(peer, connection);
+            connection.close();
+        }
+    }
+
+    /** The pinned path to a target, for the console and tests. */
+    public Optional<List<PeerId>> pinnedPath(GroupId groupId, PeerId to) {
+        Map<PeerId, PinnedPath> pins = pinnedPaths.get(groupId);
+        PinnedPath pinned = pins == null ? null : pins.get(to);
+        return pinned == null ? Optional.empty() : Optional.of(pinned.path());
+    }
+
+    /** How many unreachable signals this node received as an origin. */
+    public long unreachableSignalsReceived() {
+        return unreachableSignalsReceived.get();
+    }
+
+    /** Puts this node's reach hints in its advertisement for a group (LB-R-01, LB-R-02). */
+    private void publishReachHints(GroupRuntime runtime) {
+        Set<PeerId> attached = attachedRelays(runtime);
+        String via = advertisedEndpoints.isEmpty() && !attached.isEmpty() ? RelayPaths.encode(attached) : null;
+        String links = roles.contains(PeerAdvertisement.PeerRole.RELAY) && !attached.isEmpty()
+                ? RelayPaths.encode(attached) : null;
+        setGroupHintIfChanged(runtime.id(), RelayPaths.VIA_HINT, via);
+        setGroupHintIfChanged(runtime.id(), RelayPaths.LINKS_HINT, links);
+    }
+
+    private void setGroupHintIfChanged(GroupId groupId, String key, String value) {
+        String current = groupHints.getOrDefault(groupId, Map.of()).get(key);
+        if (!Objects.equals(current, value)) {
+            groupHint(groupId, key, value);
+        }
+    }
+
+    /** Reads a member's reach hints into the relay graph (LB-R-01, LB-R-02). */
+    private void rememberReach(GroupId groupId, PeerAdvertisement ad) {
+        Set<PeerId> via = RelayPaths.decode(ad.resourceHints().get(RelayPaths.VIA_HINT));
+        Map<PeerId, Set<PeerId>> vias = relayVia.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>());
+        if (via.isEmpty()) {
+            vias.remove(ad.issuer());
+        } else {
+            vias.put(ad.issuer(), via);
+        }
+        Set<PeerId> links = RelayPaths.decode(ad.resourceHints().get(RelayPaths.LINKS_HINT));
+        Map<PeerId, Set<PeerId>> adjacency = relayLinks.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>());
+        if (links.isEmpty() || !ad.roles().contains(PeerAdvertisement.PeerRole.RELAY)) {
+            adjacency.remove(ad.issuer());
+        } else {
+            adjacency.put(ad.issuer(), links);
+        }
+    }
+
+    /** A relay dials every other RELAY-role member it can, off the tick thread (LB-R-02). */
+    private void meshRelays(GroupRuntime runtime, long nowMillis) {
+        if (!roles.contains(PeerAdvertisement.PeerRole.RELAY)) {
+            return;
+        }
+        GroupId groupId = runtime.id();
+        for (PeerId relay : runtime.membership().withRole(PeerAdvertisement.PeerRole.RELAY)) {
+            if (relay.equals(peerId()) || connections.containsKey(relay) || meshInFlight.contains(relay)
+                    || quarantined(relay)) {
+                continue;
+            }
+            Long attempted = meshAttempted.get(relay);
+            if (attempted != null && nowMillis - attempted < MESH_RETRY_MILLIS) {
+                continue;
+            }
+            GroupMembership.Member member = runtime.membership().member(relay).orElse(null);
+            if (member == null) {
+                continue;
+            }
+            PeerAdvertisement.Endpoint chosen = null;
+            Transport transport = null;
+            for (PeerAdvertisement.Endpoint endpoint : byPriority(member.endpoints())) {
+                Transport candidate = transports.get(endpoint.transport());
+                if (candidate != null && !candidate.signalled()) {
+                    chosen = endpoint;
+                    transport = candidate;
+                    break;
+                }
+            }
+            if (chosen == null || !meshInFlight.add(relay)) {
+                continue;
+            }
+            meshAttempted.put(relay, nowMillis);
+            PeerAdvertisement.Endpoint endpoint = chosen;
+            Transport dialer = transport;
+            Thread.ofVirtual().name("peer-mesh-" + relay.display()).start(() -> {
+                try {
+                    dialEndpoint(groupId, relay, dialer, endpoint);
+                } catch (IOException e) {
+                    LOG.log(System.Logger.Level.DEBUG, "relay mesh dial to " + relay.display() + " failed: " + e.getMessage());
+                } finally {
+                    meshInFlight.remove(relay);
+                }
+            });
+        }
+    }
+
+    /** Drops pins that idled past the TTL or whose hops left the view. */
+    private void expirePins(GroupRuntime runtime, long nowMillis) {
+        Map<PeerId, PinnedPath> pins = pinnedPaths.get(runtime.id());
+        if (pins == null || pins.isEmpty()) {
+            return;
+        }
+        pins.entrySet().removeIf(e -> nowMillis - e.getValue().lastUsedMillis() > pathTtl.toMillis()
+                || e.getValue().path().stream().anyMatch(hop -> runtime.membership().member(hop).isEmpty()));
+    }
+
+    /**
+     * Handles a {@code PIPE_DATA} that is an unreachable signal addressed to this
+     * node: forgets the pinned path to the target and every pin through the
+     * failed hop, so the next send computes afresh (LB-R-07).
+     *
+     * @return whether the frame was a signal, consumed here
+     */
+    private boolean onRelaySignal(GroupRuntime runtime, Envelope envelope) {
+        RelayPipeFrame frame;
+        try {
+            frame = codec.fromBytes(envelope.body(), RelayPipeFrame.class);
+        } catch (RuntimeException e) {
+            return false;
+        }
+        if (frame == null || !RELAY_SIGNAL_CAPABILITY.equals(frame.capability()) || frame.payload() == null) {
+            return false;
+        }
+        RelaySignal signal;
+        try {
+            signal = codec.fromBytes(frame.payload(), RelaySignal.class);
+        } catch (RuntimeException e) {
+            return true;
+        }
+        if (signal == null || signal.target() == null) {
+            return true;
+        }
+        unreachableSignalsReceived.incrementAndGet();
+        Map<PeerId, PinnedPath> pins = pinnedPaths.get(runtime.id());
+        if (pins != null) {
+            pins.remove(signal.target());
+            if (signal.failedHop() != null) {
+                pins.entrySet().removeIf(e -> e.getValue().path().contains(signal.failedHop()));
+            }
+        }
+        LOG.log(System.Logger.Level.DEBUG, "relay " + envelope.from().display() + " could not reach "
+                + signal.target().display() + " via " + (signal.failedHop() == null ? "?" : signal.failedHop().display())
+                + " in group " + runtime.id().value() + "; path forgotten");
+        return true;
+    }
+
+    /** Tells the origin of a dropped path frame which hop failed, at most once per 10 s per pair (LB-R-07). */
+    private void signalUnreachable(GroupRuntime runtime, Bodies.RelayFrame relayed, PeerId failedHop) {
+        if (!unreachableSignal) {
+            return;
+        }
+        PeerId origin = wire.decode(relayed.frame()).map(Envelope::from).orElse(null);
+        if (origin == null || origin.equals(peerId()) || runtime.membership().member(origin).isEmpty()) {
+            return;
+        }
+        String key = runtime.id().value() + "|" + origin.value() + "|" + relayed.target().value();
+        long now = clock.millis();
+        Long last = signalSentAt.get(key);
+        if (last != null && now - last < SIGNAL_INTERVAL_MILLIS) {
+            return;
+        }
+        signalSentAt.put(key, now);
+        if (signalSentAt.size() > 4_096) {
+            signalSentAt.clear(); // a bound, not a policy; the next signal starts the window afresh
+        }
+        byte[] payload = codec.toBytes(new RelaySignal(relayed.target(), failedHop, "unreachable"));
+        send(runtime.id(), origin, Envelope.Kind.PIPE_DATA, new RelayPipeFrame(RELAY_SIGNAL_CAPABILITY, payload));
     }
 
     /**
@@ -3287,6 +3777,9 @@ public final class PeerNode implements AutoCloseable {
             case PRUNE -> runtime.gossip().onPrune(envelope.from(),
                     codec.fromBytes(envelope.body(), Bodies.Prune.class));
             case QUERY, QUERY_HIT, BLOCK_WANT, BLOCK, PIPE_DATA -> {
+                if (envelope.kind() == Envelope.Kind.PIPE_DATA && onRelaySignal(runtime, envelope)) {
+                    break; // the node's own signal, consumed here (LB-R-07)
+                }
                 var handler = runtime.handlerFor(envelope.kind());
                 if (handler != null) {
                     handler.accept(envelope.from(), envelope.body());
@@ -3335,7 +3828,8 @@ public final class PeerNode implements AutoCloseable {
         }
         try {
             PipeHead head = codec.fromBytes(envelope.body(), PipeHead.class);
-            return head != null && RTC_SIGNAL_CAPABILITY.equals(head.capability());
+            return head != null && (RTC_SIGNAL_CAPABILITY.equals(head.capability())
+                    || RELAY_SIGNAL_CAPABILITY.equals(head.capability()));
         } catch (RuntimeException e) {
             return false;
         }
@@ -3964,10 +4458,21 @@ public final class PeerNode implements AutoCloseable {
         if (!roles.contains(PeerAdvertisement.PeerRole.RELAY)) {
             return; // only declared relays spend bandwidth forwarding
         }
+        RelayCounters counters = relayCounters(runtime.id());
+        List<PeerId> path = relayed.path();
+        int hop = relayed.hop() == null ? -1 : relayed.hop();
+        if (path != null) {
+            // A path frame names this relay at its hop; the previous hop sent it; no relay
+            // repeats and the target is not a hop (LB-R-03, LB-Q-SEC-09).
+            if (!RelayPaths.wellFormed(path, hop, peerId(), relayed.target(), maxPathHops)
+                    || (hop > 0 && !envelope.from().equals(path.get(hop - 1)))) {
+                counters.droppedBadPath.incrementAndGet();
+                return;
+            }
+        }
         // A relay forwards only to a member of the group the frame names (SPEC §5.4, R2-3.1): a
         // connection this node holds to the target through another group is no reason to carry
         // a stranger's frame to it.
-        RelayCounters counters = relayCounters(runtime.id());
         if (runtime.membership().member(relayed.target()).isEmpty()) {
             counters.droppedNotMember.incrementAndGet();
             return;
@@ -3975,7 +4480,8 @@ public final class PeerNode implements AutoCloseable {
         RelayCounters forTarget = counters.target(relayed.target()); // a verified member from here on
         boolean allowed;
         try {
-            allowed = relayPolicy.allow(runtime.id(), envelope.from(), relayed.target(), relayed.frame().length);
+            allowed = relayPolicy.allowKind(runtime.id(), relayedKind(relayed.frame()))
+                    && relayPolicy.allow(runtime.id(), envelope.from(), relayed.target(), relayed.frame().length);
         } catch (RuntimeException e) {
             logPolicyFailure(e); // fail closed (R2-S3)
             allowed = false;
@@ -3986,18 +4492,46 @@ public final class PeerNode implements AutoCloseable {
             return;
         }
         TransportConnection out = connectionTo(runtime.id(), relayed.target());
-        if (out == null) {
+        if (out != null) {
+            try {
+                sendOn(out, runtime.id(), relayed.target(), Envelope.Kind.RELAY_FRAME, relayed);
+                counters.framesForwarded.incrementAndGet();
+                counters.countKind(relayedKind(relayed.frame()), relayed.frame().length);
+                counters.bytesForwarded.addAndGet(relayed.frame().length);
+                forTarget.framesForwarded.incrementAndGet();
+                forTarget.bytesForwarded.addAndGet(relayed.frame().length);
+                return;
+            } catch (IOException e) {
+                dropConnection(relayed.target(), out);
+            }
+        }
+        // Not deliverable from here: the next relay on the path carries it, once (LB-R-03).
+        if (path != null && hop + 1 < path.size()) {
+            PeerId next = path.get(hop + 1);
+            boolean nextIsRelay = runtime.membership().member(next)
+                    .map(m -> m.roles().contains(PeerAdvertisement.PeerRole.RELAY)).orElse(false);
+            if (nextIsRelay && !quarantined(next)) {
+                TransportConnection link = connectionTo(runtime.id(), next);
+                if (link != null) {
+                    try {
+                        sendOn(link, runtime.id(), next, Envelope.Kind.RELAY_FRAME, relayed.nextHop());
+                        counters.forwardedToRelay.incrementAndGet();
+                        counters.countKind(relayedKind(relayed.frame()), relayed.frame().length);
+                        counters.bytesForwarded.addAndGet(relayed.frame().length);
+                        forTarget.framesForwarded.incrementAndGet();
+                        forTarget.bytesForwarded.addAndGet(relayed.frame().length);
+                        return;
+                    } catch (IOException e) {
+                        dropConnection(next, link);
+                    }
+                }
+            }
+            counters.droppedUnreachable.incrementAndGet();
+            signalUnreachable(runtime, relayed, next);
             return;
         }
-        try {
-            sendOn(out, runtime.id(), relayed.target(), Envelope.Kind.RELAY_FRAME, relayed);
-            counters.framesForwarded.incrementAndGet();
-            counters.bytesForwarded.addAndGet(relayed.frame().length);
-            forTarget.framesForwarded.incrementAndGet();
-            forTarget.bytesForwarded.addAndGet(relayed.frame().length);
-        } catch (IOException e) {
-            dropConnection(relayed.target(), out);
-        }
+        counters.droppedUnreachable.incrementAndGet();
+        signalUnreachable(runtime, relayed, relayed.target());
     }
 
     /** A relay policy that threw: logged at most once a minute, since it runs once per relayed frame. */
@@ -4285,6 +4819,7 @@ public final class PeerNode implements AutoCloseable {
         } else {
             hashPeers.remove(ad.issuer());
         }
+        rememberReach(runtime.id(), ad);
         if (credentialHintListeners.isEmpty()) {
             return;
         }

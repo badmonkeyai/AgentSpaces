@@ -155,6 +155,29 @@ public class AgentSpacesConsoleAutoConfiguration {
         return TrafficPanel.of(node);
     }
 
+    /**
+     * The Content panel (srad/large-networks-bulk-data.md LB-O-03), one section per
+     * group with a content swarm, when {@code agentspaces.content.enabled} is on.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+            prefix = "agentspaces.content", name = "enabled", havingValue = "true")
+    public ai.badmonkey.agentspaces.console.ContentPanel agentSpacesContentPanel(
+            ai.badmonkey.agentspaces.peering.node.PeerNode node,
+            ai.badmonkey.agentspaces.agent.AgentSpaces spaces) {
+        return ai.badmonkey.agentspaces.console.ContentPanel.of(node, () -> {
+            java.util.List<ai.badmonkey.agentspaces.content.Content> contents = new java.util.ArrayList<>();
+            for (String group : spaces.groupNames()) {
+                spaces.group(group).provider(ai.badmonkey.agentspaces.content.Content.TYPE)
+                        .filter(ai.badmonkey.agentspaces.content.Content.class::isInstance)
+                        .map(ai.badmonkey.agentspaces.content.Content.class::cast)
+                        .ifPresent(contents::add);
+            }
+            return contents;
+        });
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public FleetConsoleServer agentSpacesConsoleServer(AgentSpacesProperties properties,

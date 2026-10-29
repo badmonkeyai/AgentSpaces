@@ -129,6 +129,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final ai.badmonkey.agentspaces.api.space.ConflictStrategyType strategy;
     private volatile java.util.function.ToDoubleFunction<Object> bidFunction;
     private final ai.badmonkey.agentspaces.peering.blocks.BlockExchange blocks;
+    /** The bulk-payload seam (LB-E-02); null when the space escalates nothing. */
+    private final ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk;
+    /** Payload bytes above which a write escalates to {@link #bulk}; 0 disables. */
+    private final long escalateAbove;
+    /** A payload cap for a space without the content swarm (LB-E-06); 0 leaves the block cap alone. */
+    private final long maxPayload;
     /** The group's content keys by epoch (SPEC §11a.3); null for an unencrypted space. */
     private final ai.badmonkey.agentspaces.common.crypto.GroupKeyRing keyRing;
     private final java.util.function.Predicate<Map<String, String>> tagShard;
@@ -155,9 +161,6 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * own entry, since nothing is collected before its lease has lapsed.
      */
     static final long MAX_TRACKED_LEASE_MILLIS = Duration.ofHours(24).toMillis();
-
-    /** How long a background block fetch waits before a later read may retry it. */
-    static final long BLOCK_FETCH_TIMEOUT_MILLIS = 800;
 
     /** Default TTL of the published space advertisement (spec §7.5). */
     static final Duration DEFAULT_ADVERTISEMENT_TTL = Duration.ofMinutes(15);
@@ -242,6 +245,26 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** CIDs with a background fetch in flight, so a polling read does not re-send WANTs. */
     private final Set<String> fetching = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Block fetches that failed and wait for their next attempt (LB-B-02): the
+     * record, how many attempts ran, when the next may start, and the arrival
+     * callback. Driven from the group tick, so a {@code TestClock} governs it.
+     */
+    private final Map<String, BlockRetry> blockRetries = new ConcurrentHashMap<>();
+
+    /** Deregisters the block-retry tick work on close. */
+    private final AutoCloseable blockRetryTick;
+
+    private record BlockRetry(EntryRecord record, int attempts, long nextAtMillis, Runnable onArrival) {
+    }
+
+    /** Default escalation threshold, 4 MiB (srad/large-networks-bulk-data.md decision 7). */
+    public static final long DEFAULT_ESCALATE_ABOVE = 4L * 1024 * 1024;
+
+    /** Per-attempt wait for a block, then the interval before the next attempt (LB-B-02). */
+    static final long[] BLOCK_FETCH_TIMEOUTS_MILLIS = {800, 2_000, 5_000, 15_000};
+    static final long[] BLOCK_RETRY_DELAYS_MILLIS = {2_000, 5_000, 15_000, 60_000};
+
     // ---- lifecycle: advertisement, admission, read-only (spec §7.5)
     private final DiscoveryPublisher publisher;
     private final Duration advertisementTtl;
@@ -277,6 +300,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         this.strategy = builder.strategy;
         this.bidFunction = builder.bidFunction;
         this.blocks = builder.blocks;
+        this.bulk = builder.bulk;
+        this.escalateAbove = builder.bulk == null ? 0 : builder.escalateAbove;
+        this.maxPayload = builder.maxPayload;
         this.keyRing = builder.keyRing;
         this.tagShard = builder.tagShard;
         this.maxLeaseOverride = builder.maxLease;
@@ -293,6 +319,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         this.hlc = new HybridLogicalClock(builder.clock, issuer.encoded());
         this.id = SpaceId.local(runtime.id().value() + "/" + builder.name);
         this.streamId = "space:" + builder.name;
+        this.blockRetryTick = blocks == null ? () -> { } : runtime.onTick(this::retryBlockFetches);
         for (Class<?> hint : builder.schemaHints) {
             registerSchema(hint);
         }
@@ -351,6 +378,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 ai.badmonkey.agentspaces.api.space.ConflictStrategyType.LEASE_RACE;
         private java.util.function.ToDoubleFunction<Object> bidFunction;
         private ai.badmonkey.agentspaces.peering.blocks.BlockExchange blocks;
+        private ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk;
+        private long escalateAbove = DEFAULT_ESCALATE_ABOVE;
+        private long maxPayload;
         private ai.badmonkey.agentspaces.common.crypto.GroupKeyRing keyRing;
         private java.util.function.Predicate<Map<String, String>> tagShard;
         private Duration maxLease;
@@ -407,7 +437,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
 
         /**
-         * Sets the LEASE_RACE settle window (default 2x a typical gossip period;
+         * Sets the LEASE_RACE settle window (default 200 ms, under one 250 ms tick;
          * {@code Duration.ZERO} for deterministic single-threaded tests).
          *
          * @param settleWindow the window
@@ -461,6 +491,37 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
          * @param blocks the group's block exchange
          * @return this builder
          */
+        /**
+         * Escalates payloads above a threshold to a bulk-payload seam (the content
+         * swarm), so an entry of any size travels as a reference (LB-E-02). Between
+         * the inline limit and the threshold the block exchange carries the payload
+         * as before.
+         *
+         * @param bulk          the seam
+         * @param escalateAbove payload bytes above which a write escalates; 0 disables
+         * @return this builder
+         */
+        /**
+         * Refuses a payload above {@code bytes} at write time when no content swarm is attached
+         * (srad/large-networks-bulk-data.md LB-E-06), naming the property that would carry it, as
+         * a payload above the block cap is refused without a block exchange. 0, the default, keeps
+         * 0.4.0's behaviour: a payload travels as one block up to the block cap. Ignored once
+         * {@link #bulk} is set, since the swarm carries any size.
+         *
+         * @param bytes the cap in bytes; 0 disables
+         * @return this builder
+         */
+        public Builder maxPayload(long bytes) {
+            this.maxPayload = bytes;
+            return this;
+        }
+
+        public Builder bulk(ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk, long escalateAbove) {
+            this.bulk = Objects.requireNonNull(bulk, "bulk");
+            this.escalateAbove = escalateAbove;
+            return this;
+        }
+
         public Builder blocks(ai.badmonkey.agentspaces.peering.blocks.BlockExchange blocks) {
             this.blocks = Objects.requireNonNull(blocks, "blocks");
             return this;
@@ -963,6 +1024,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         events.forEach(Runnable::run);
     }
 
+    /** How many block fetches wait for their next attempt (LB-B-02); for tests and the console. */
+    public int pendingBlockRetries() {
+        return blockRetries.size();
+    }
+
     /** The maximum lease the tombstone collector reckons with right now, in milliseconds. */
     public long maxLeaseMillis() {
         return maxLeaseOverride != null ? maxLeaseOverride.toMillis() : maxLeaseObservedMillis;
@@ -1102,12 +1168,23 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             keyEpoch = epoch == 0 ? null : epoch;
         }
         String payloadRef = null;
-        if (payload.length > EntryRecord.INLINE_PAYLOAD_LIMIT) {
+        if (bulk == null && maxPayload > 0 && payload.length > maxPayload) {
+            throw new IllegalArgumentException("payload of " + payload.length + " bytes exceeds " + maxPayload
+                    + " bytes and this space has no content swarm to carry it; turn on agentspaces.content.enabled"
+                    + " (escalate-above) or write it through Content.publish");
+        }
+        if (bulk != null && escalateAbove > 0 && payload.length > escalateAbove) {
+            // LB-E-02: above the threshold the payload becomes an artifact of the content
+            // swarm and the record carries its root; the space replicates the reference only.
+            payloadRef = bulk.publish(payload, lease);
+            payload = null;
+        } else if (payload.length > EntryRecord.INLINE_PAYLOAD_LIMIT) {
             if (blocks == null) {
                 throw new IllegalStateException("payload of " + payload.length
                         + " bytes exceeds the inline limit; configure builder.blocks(...)");
             }
             payloadRef = blocks.put(payload);
+            blocks.retain(payloadRef); // LB-B-04: a live entry pins its block
             payload = null;
         }
         EntryRecord unsigned = new EntryRecord(entryId, id,
@@ -1365,9 +1442,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         try {
             streamRegistration.close();
             reconcileRegistration.close();
+            blockRetryTick.close();
         } catch (Exception e) {
             throw new IllegalStateException("failed deregistering space '" + name + "'", e);
         }
+        blockRetries.clear();
     }
 
     /**
@@ -1810,6 +1889,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             recordSignedState(entryId, dto);
             indexCredential(entryId);
             isNew = !wasKnown;
+            if (isNew && blocks != null && dto.record().payloadRef() != null && !isBulkRef(dto.record())) {
+                blocks.retain(dto.record().payloadRef()); // LB-B-04
+            }
             EntryState merged = crdt.state(entryId).orElseThrow();
             nowCompleted = !wasCompleted && merged.completed();
             // WRITTEN is for an entry a reader could see: present and unexpired.
@@ -1821,6 +1903,14 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (value.isPresent()) {
                 fire(SpaceEvent.Kind.WRITTEN, entryId, value.get(), dto.record().issuer(),
                         dto.record().issuer(), dto.record());
+            } else if (dto.record().payload() == null && isBulkRef(dto.record())) {
+                // LB-E-03: a bulk entry fires its WRITTEN once the artifact is complete here.
+                EntryRecord record = dto.record();
+                if (bulk != null) {
+                    ensureBulk(record, () -> decodeValue(record).ifPresent(v ->
+                            fire(SpaceEvent.Kind.WRITTEN, entryId, v, record.issuer(),
+                                    record.issuer(), record)));
+                }
             } else if (dto.record().payload() == null && dto.record().payloadRef() != null
                     && blocks != null) {
                 // A content-addressed entry whose block has not landed: fetch it now
@@ -2384,7 +2474,14 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Object value = valueCache.get(record.entryId());
         if (value == null) {
             byte[] payload = record.payload();
-            if (payload == null && record.payloadRef() != null && blocks != null) {
+            if (payload == null && isBulkRef(record)) {
+                // LB-E-03: a bulk reference is served when the artifact is complete here and
+                // acquired in the background otherwise, with the same never-block rule.
+                payload = bulk == null ? null : bulk.local(record.payloadRef()).orElse(null);
+                if (payload == null && bulk != null) {
+                    ensureBulk(record, () -> { });
+                }
+            } else if (payload == null && record.payloadRef() != null && blocks != null) {
                 // Spec §7.2 / P7: reads never block on the network. Serve the
                 // block when it is already here; otherwise start one background
                 // fetch and report the entry as not yet visible. A blocking read
@@ -2429,7 +2526,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return Optional.of(cached);
         }
         byte[] payload = record.payload();
-        if (payload == null && record.payloadRef() != null && blocks != null) {
+        if (payload == null && isBulkRef(record)) {
+            payload = bulk == null ? null : bulk.local(record.payloadRef()).orElse(null);
+        } else if (payload == null && record.payloadRef() != null && blocks != null) {
             // A block-stored entry: fire its event once the block is available
             // locally. Consulting the local store only (no network) keeps this
             // event path non-blocking; the block usually arrives moments after
@@ -2467,6 +2566,27 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * per CID at a time. The block exchange stores a verified delivery locally
      * before completing, so the next poll finds it through {@code local()}.
      */
+    /** Whether a record references a bulk artifact (multibase {@code b}) rather than one block. */
+    private static boolean isBulkRef(EntryRecord record) {
+        return ai.badmonkey.agentspaces.api.spi.BulkPayloads.isBulk(record.payloadRef());
+    }
+
+    /** Starts acquiring a bulk artifact once; the arrival callback runs when it is complete here. */
+    private void ensureBulk(EntryRecord record, Runnable onArrival) {
+        String ref = record.payloadRef();
+        if (!fetching.add(ref)) {
+            return;
+        }
+        try {
+            bulk.ensure(ref, record.issuer().peer(), () -> {
+                fetching.remove(ref);
+                onArrival.run();
+            });
+        } catch (RuntimeException e) {
+            fetching.remove(ref);
+        }
+    }
+
     private void fetchInBackground(EntryRecord record) {
         fetchInBackground(record, () -> { });
     }
@@ -2477,6 +2597,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * fire the WRITTEN event a merge had to defer.
      */
     private void fetchInBackground(EntryRecord record, Runnable onArrival) {
+        fetchInBackground(record, onArrival, 0);
+    }
+
+    /**
+     * Starts attempt {@code attempt} (zero-based) of a block fetch on a virtual
+     * thread. A failed attempt schedules the next one on the group tick with the
+     * back-off of {@link #BLOCK_RETRY_DELAYS_MILLIS} while the entry lives
+     * (LB-B-02); the first attempt waits 800 ms and later ones longer, so a slow
+     * holder on a thin link is given the time its block needs.
+     */
+    private void fetchInBackground(EntryRecord record, Runnable onArrival, int attempt) {
         String cid = record.payloadRef();
         if (!fetching.add(cid)) {
             return; // a fetch for this block is already in flight
@@ -2484,19 +2615,51 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         List<PeerId> candidates = new ArrayList<>();
         candidates.add(record.issuer().peer());
         candidates.addAll(runtime.sampler().randomMembers(2));
+        long timeout = BLOCK_FETCH_TIMEOUTS_MILLIS[Math.min(attempt, BLOCK_FETCH_TIMEOUTS_MILLIS.length - 1)];
         Thread.ofVirtual().name("space-block-fetch-" + name).start(() -> {
             boolean landed = false;
             try {
-                landed = blocks.fetch(cid, candidates, BLOCK_FETCH_TIMEOUT_MILLIS).isPresent();
+                landed = blocks.fetch(cid, candidates, timeout).isPresent();
             } catch (RuntimeException e) {
-                // A failed fetch is retried by the next read that misses the block.
+                // fall through to the retry schedule
             } finally {
                 fetching.remove(cid);
             }
             if (landed) {
+                blockRetries.remove(cid);
                 onArrival.run();
+            } else {
+                long delay = BLOCK_RETRY_DELAYS_MILLIS[Math.min(attempt, BLOCK_RETRY_DELAYS_MILLIS.length - 1)];
+                blockRetries.put(cid, new BlockRetry(record, attempt + 1, nowMillis() + delay, onArrival));
             }
         });
+    }
+
+    /**
+     * Tick work (LB-B-02): starts the next attempt of every due block fetch whose
+     * entry is still present here and whose block is still missing; forgets the
+     * rest. A present entry keeps retrying once a minute for as long as it lives.
+     */
+    private void retryBlockFetches() {
+        if (blockRetries.isEmpty()) {
+            return;
+        }
+        long now = nowMillis();
+        for (Map.Entry<String, BlockRetry> entry : blockRetries.entrySet()) {
+            BlockRetry retry = entry.getValue();
+            if (retry.nextAtMillis() > now) {
+                continue;
+            }
+            String cid = entry.getKey();
+            if (blocks.local(cid).isPresent()
+                    || recordOf(retry.record().entryId(), true).isEmpty()) {
+                blockRetries.remove(cid, retry);
+                continue;
+            }
+            if (blockRetries.remove(cid, retry)) {
+                fetchInBackground(retry.record(), retry.onArrival(), retry.attempts());
+            }
+        }
     }
 
     /**
@@ -2549,6 +2712,21 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         Set<EntryId> collected = crdt.collectable(now, maxLeaseMillis());
         if (!collected.isEmpty()) {
+            if (blocks != null || bulk != null) {
+                for (EntryId entryId : collected) {
+                    crdt.state(entryId).map(EntryState::record).map(EntryRecord::payloadRef)
+                            .ifPresent(ref -> {
+                                if (ai.badmonkey.agentspaces.api.spi.BulkPayloads.isBulk(ref)) {
+                                    if (bulk != null) {
+                                        bulk.release(ref); // LB-E-04: a collected entry unpins its artifact
+                                    }
+                                } else if (blocks != null) {
+                                    blocks.release(ref); // LB-B-04: a collected entry unpins its block
+                                    blockRetries.remove(ref);
+                                }
+                            });
+                }
+            }
             crdt = crdt.without(collected);
             generation++;
             for (EntryId entryId : collected) {

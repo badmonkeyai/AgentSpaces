@@ -66,6 +66,12 @@
       <artifactId>agentspaces-identity</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- The Content panel (srad/large-networks-bulk-data.md LB-O-03) reads the content swarm's counters. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-content</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-space</artifactId>

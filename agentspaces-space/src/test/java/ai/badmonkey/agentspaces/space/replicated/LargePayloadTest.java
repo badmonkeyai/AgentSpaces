@@ -170,7 +170,7 @@ class LargePayloadTest {
         assertThat(visible).as("an entry whose block has not arrived is skipped").isEmpty();
         assertThat(elapsedMillis)
                 .as("readAll returned without waiting on the network")
-                .isLessThan(ReplicatedSpace.BLOCK_FETCH_TIMEOUT_MILLIS / 2);
+                .isLessThan(ReplicatedSpace.BLOCK_FETCH_TIMEOUTS_MILLIS[0] / 2);
         assertThat(b.space().read(Template.of(BigEntry.class))).isEmpty();
 
         // The block becomes reachable; a blocking read sees the entry once it lands.
@@ -191,5 +191,93 @@ class LargePayloadTest {
                 new BigEntry("too-big", new byte[100_000]), Lease.of(Duration.ofMinutes(1))))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("inline limit");
+    }
+
+    // ---- srad/large-networks-bulk-data.md group B (LB-B-08) ----
+
+    /** LB-B-02: a failed background fetch is retried from the group tick with back-off, not only by the next read. */
+    @Test
+    void blockFetchRetriesOnTheTickUntilTheHolderAnswers() throws Exception {
+        Peer a = newPeer("a", 1, true);
+        Peer b = newPeer("b", 2, true, "a");
+        for (int i = 0; i < 4; i++) {
+            nodes.forEach(PeerNode::tick);
+        }
+        byte[] data = new byte[120_000];
+        new Random(31).nextBytes(data);
+        ai.badmonkey.agentspaces.api.space.EntryHandle written =
+                a.space().write(new BigEntry("retried", data), Lease.of(Duration.ofMinutes(30)));
+        for (int i = 0; i < 4; i++) {
+            nodes.forEach(PeerNode::tick); // the record replicates; the block waits for a read
+        }
+        assertThat(b.space().recordOf(written.entryId(), true)).as("the record replicated").isPresent();
+
+        network.partition("a", "b");
+        assertThat(b.space().read(Template.of(BigEntry.class))).isEmpty(); // starts attempt 0
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (b.space().pendingBlockRetries() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(b.space().pendingBlockRetries()).as("attempt 0 failed and queued a retry").isEqualTo(1);
+
+        network.heal();
+        nodes.forEach(PeerNode::tick);
+        assertThat(b.space().pendingBlockRetries()).as("not due yet: 2 s of back-off").isEqualTo(1);
+        clock.advance(Duration.ofMillis(2_100));
+        nodes.forEach(PeerNode::tick); // the retry runs here, from the tick
+        assertThat(b.space().read(Template.of(BigEntry.class), Duration.ofSeconds(5)))
+                .hasValueSatisfying(entry -> assertThat(entry.data()).isEqualTo(data));
+        deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (b.space().pendingBlockRetries() != 0 && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(b.space().pendingBlockRetries()).isZero();
+    }
+
+    /** LB-B-06: a payload no frame could carry fails at the writer, with the way out named. */
+    @Test
+    void payloadAboveTheFrameCapIsRefusedAtWrite() throws Exception {
+        Peer a = newPeer("a", 1, true);
+        assertThatThrownBy(() -> a.space().write(
+                new BigEntry("nine", new byte[9 * 1024 * 1024]), Lease.of(Duration.ofMinutes(1))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("content swarm");
+        assertThat(a.space().readAll(Template.of(BigEntry.class), 10)).isEmpty();
+    }
+
+    /** A 7 MiB payload still crosses: one block, one frame, under the cap. */
+    @Test
+    void sevenMebibytesTravelAsOneBlock() throws Exception {
+        Peer a = newPeer("a", 1, true);
+        Peer b = newPeer("b", 2, true, "a");
+        for (int i = 0; i < 4; i++) {
+            nodes.forEach(PeerNode::tick);
+        }
+        byte[] data = new byte[7 * 1024 * 1024];
+        new Random(41).nextBytes(data);
+        a.space().write(new BigEntry("seven", data), Lease.of(Duration.ofMinutes(30)));
+        for (int i = 0; i < 4; i++) {
+            nodes.forEach(PeerNode::tick);
+        }
+        assertThat(b.space().read(Template.of(BigEntry.class), Duration.ofSeconds(15)))
+                .hasValueSatisfying(entry -> assertThat(entry.data()).isEqualTo(data));
+    }
+
+    /** LB-B-04: a live entry pins its block; collecting the entry unpins it. */
+    @Test
+    void collectedEntriesReleaseTheirBlocks() throws Exception {
+        Peer a = newPeer("a", 1, true);
+        ai.badmonkey.agentspaces.api.space.EntryHandle written =
+                a.space().write(new BigEntry("short", new byte[100_000]), Lease.of(Duration.ofMinutes(1)));
+        String cid = a.space().recordOf(written.entryId()).orElseThrow().payloadRef();
+        assertThat(cid).isNotNull();
+        assertThat(a.blocks().references(cid)).isEqualTo(1);
+
+        clock.advance(Duration.ofMinutes(1).plusSeconds(1));
+        a.space().sweepNow(); // expired, kept as a tombstone
+        assertThat(a.blocks().references(cid)).isEqualTo(1);
+        clock.advance(Duration.ofHours(3)); // past twice the maximum lease the collector reckons with
+        a.space().sweepNow();
+        assertThat(a.blocks().references(cid)).as("collected, so released").isZero();
     }
 }

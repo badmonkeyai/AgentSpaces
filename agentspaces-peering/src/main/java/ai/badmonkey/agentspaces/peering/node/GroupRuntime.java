@@ -28,6 +28,7 @@ import java.util.Optional;
 import ai.badmonkey.agentspaces.peering.wire.Envelope;
 
 import java.util.Map;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
@@ -422,6 +423,29 @@ public final class GroupRuntime implements AutoCloseable {
      */
     public void send(PeerId to, Envelope.Kind kind, Object body) {
         node.send(groupId, to, kind, body);
+    }
+
+    /**
+     * How many relays an addressed frame to a member crosses (LB-R-10): 0 for a
+     * member this node holds a link to or can dial, the length of the pinned or
+     * computable relay path otherwise, and -1 when no path is known.
+     *
+     * @param to the member
+     * @return the hop count
+     */
+    public int hopsTo(PeerId to) {
+        return node.hopsTo(groupId, Objects.requireNonNull(to, "to"));
+    }
+
+    /**
+     * The RELAY-role members this node holds links to in this group: the reach
+     * hint its advertisement carries when it is dial-only (LB-R-01), and what a
+     * holding copies as {@code via} (LB-H-04).
+     *
+     * @return the relays, sorted by id; empty when none
+     */
+    public List<PeerId> viaRelays() {
+        return node.viaRelays(groupId);
     }
 
     BiConsumer<PeerId, byte[]> handlerFor(Envelope.Kind kind) {

@@ -225,12 +225,13 @@ Every replica sees the lapse, and a `Motion` opens once per proposal id, so
 the escalation is once per claim however many peers host an escalator.
 
 **Settled estimate.** `@OnEstimate` fires once per epoch, when the push-sum
-estimate has stayed within a tolerance for a number of protocol ticks. The
-peers tick every 250 ms, so twenty ticks is five quiet seconds, longer than
-the spread between the first and the last priced claim:
+estimate has stayed within a tolerance for a number of settle steps. A step
+is a gossip round and rounds run about once a second, so forty steps is about
+forty quiet seconds, longer than the spread between the first and the last
+priced claim:
 
 ```java
-@OnEstimate(prefix = "reserve:", settleTicks = 20, tolerance = 0.01, resultSpace = LEDGER,
+@OnEstimate(prefix = "reserve:", settleTicks = 40, tolerance = 0.01, resultSpace = LEDGER,
         resultLease = "24h")
 public ReserveReport report(PushSumAggregate.Estimate reserve) {
     return new ReserveReport(reserve.epochId(), reserve.value(), name);

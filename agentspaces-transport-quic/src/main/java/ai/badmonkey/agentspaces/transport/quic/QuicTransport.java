@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.transport.quic;
 
 import ai.badmonkey.agentspaces.api.spi.Transport;
 import ai.badmonkey.agentspaces.api.spi.TransportConnection;
+import ai.badmonkey.agentspaces.common.io.FramePump;
 import ai.badmonkey.agentspaces.identity.ChannelCertificate;
 import ai.badmonkey.agentspaces.identity.ChannelTrust;
 import ai.badmonkey.agentspaces.identity.ServingCredential;
@@ -257,7 +258,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
                     .sync()
                     .getNow();
             connection.stream = stream;
-            stream.closeFuture().addListener(f -> connection.notifyClosed());
+            stream.closeFuture().addListener(f -> connection.streamClosed());
             return connection;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -309,7 +310,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
                             QuicConnection connection = new QuicConnection(
                                     remoteOf(stream), null);
                             connection.stream = stream;
-            stream.closeFuture().addListener(f -> connection.notifyClosed());
+            stream.closeFuture().addListener(f -> connection.streamClosed());
                             // Attested lazily, on first ask: a stream can be
                             // initialized before the handshake's last flight is
                             // processed, and attesting then would read an honest
@@ -464,6 +465,12 @@ public final class QuicTransport implements Transport, AutoCloseable {
         private final Queue<byte[]> pending = new ConcurrentLinkedQueue<>();
         private volatile QuicStreamChannel stream;
         private volatile Consumer<byte[]> receiver;
+        /**
+         * Guards {@code pump} and {@code pending}. Not {@code this}: {@link #attestedPeer()} holds
+         * {@code this} while it waits on the event loop, which delivers here.
+         */
+        private final Object deliveryLock = new Object();
+        private FramePump pump; // made when the receiver arrives
         private volatile java.util.Optional<ai.badmonkey.agentspaces.common.id.PeerId>
                 attested = java.util.Optional.empty();
         private volatile boolean attestationDone;
@@ -518,6 +525,37 @@ public final class QuicTransport implements Transport, AutoCloseable {
             }
         }
 
+        /**
+         * The stream ended: the pump delivers what it holds and then tells the node, as the TCP
+         * reader does; with no pump yet the node is told at once.
+         */
+        void streamClosed() {
+            FramePump current;
+            synchronized (deliveryLock) {
+                current = pump;
+            }
+            if (current == null) {
+                notifyClosed();
+            } else {
+                current.end();
+            }
+        }
+
+        /** Stops reading the stream while the pump holds its bound; QUIC flow control slows the sender. */
+        private void pauseReading() {
+            QuicStreamChannel current = stream;
+            if (current != null) {
+                current.config().setAutoRead(false);
+            }
+        }
+
+        private void resumeReading() {
+            QuicStreamChannel current = stream;
+            if (current != null && current.isActive()) {
+                current.config().setAutoRead(true);
+            }
+        }
+
         @Override
         public String remoteAddress() {
             return remoteAddress;
@@ -567,28 +605,42 @@ public final class QuicTransport implements Transport, AutoCloseable {
         @Override
         public void onReceive(Consumer<byte[]> receiver) {
             this.receiver = Objects.requireNonNull(receiver, "receiver");
-            byte[] queued;
-            while ((queued = pending.poll()) != null) {
-                receiver.accept(queued);
+            synchronized (deliveryLock) {
+                if (pump == null) {
+                    pump = new FramePump("quic-deliver-" + remoteAddress, () -> this.receiver, this::close,
+                            this::notifyClosed, FramePump.DEFAULT_CAP_BYTES);
+                    pump.onRelief(this::resumeReading);
+                }
+                drainPending();
             }
         }
 
-        /** Delivers inbound frames, queueing any that arrive before the receiver. */
+        /**
+         * Hands an inbound frame to the pump, off the event loop (srad/large-networks-bulk-data.md
+         * 10.4): the node answers some frames by sending, and a send that waits on a backed-up stream
+         * cannot run on the event loop that would drain it. Frames that arrive before the receiver
+         * wait in order and go first.
+         */
         void deliver(byte[] frame) {
-            Consumer<byte[]> current = receiver;
-            if (current == null) {
-                pending.add(frame);
-                // A receiver registered while we queued drains the queue itself;
-                // re-check so no frame is stranded between the races.
-                current = receiver;
-                if (current != null) {
-                    byte[] queued;
-                    while ((queued = pending.poll()) != null) {
-                        current.accept(queued);
-                    }
+            synchronized (deliveryLock) {
+                if (pump == null) {
+                    pending.add(frame);
+                    return;
                 }
-            } else {
-                current.accept(frame);
+                drainPending();
+                if (!pump.offerNow(frame) && !pump.stopped()) {
+                    pauseReading();
+                }
+            }
+        }
+
+        /** Moves frames that arrived before the receiver into the pump, in order. Holds the delivery lock. */
+        private void drainPending() {
+            byte[] queued;
+            while ((queued = pending.poll()) != null) {
+                if (!pump.offerNow(queued) && !pump.stopped()) {
+                    pauseReading();
+                }
             }
         }
 

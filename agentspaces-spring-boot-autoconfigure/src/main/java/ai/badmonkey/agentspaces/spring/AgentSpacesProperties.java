@@ -106,6 +106,11 @@ public class AgentSpacesProperties {
 
     /** Relay settings ({@code agentspaces.relay.*}). */
     private Relay relay = new Relay();
+    /** The content swarm ({@code agentspaces.content.*}, srad/large-networks-bulk-data.md §7.2). */
+    private ContentSwarm content = new ContentSwarm();
+
+    /** The block exchange's store (SPEC §7.1, srad/large-networks-bulk-data.md LB-B-05). */
+    private Blocks blocks = new Blocks();
 
     /**
      * What this peer forwards as a {@code RELAY} (SPEC §5.4; ISSUE-BootstrapCore FR-2):
@@ -113,7 +118,206 @@ public class AgentSpacesProperties {
      * when no {@code RelayPolicy} bean is defined. Unset: every forward the membership
      * check allows.
      */
+    /** {@code agentspaces.content.*}: the content swarm (srad/large-networks-bulk-data.md appendix D). */
+    public static class ContentSwarm {
+        /** Attach the capability and the escalation path; off until a host turns it on (decision 7). */
+        private boolean enabled;
+        /** The space manifests and holdings live in, per group. */
+        private String space = "content";
+        /** Payload bytes above which a space write becomes an artifact; 0 disables. */
+        private long escalateAbove = 4L * 1024 * 1024;
+        /** Publisher's default piece size, a power of two from 64 KiB to 4 MiB. */
+        private int pieceSize = 1024 * 1024;
+        /** {@code auto}, {@code complete-only}, or {@code never}. */
+        private String seedMode = "auto";
+        private java.time.Duration holdingLease = java.time.Duration.ofMinutes(5);
+        private int maxSessions = 16;
+        private int maxWindow = 32;
+        private int maxFetches = 4;
+        private long uploadBytesPerDay;
+        private boolean replicateManifests = true;
+        private Store store = new Store();
+
+        /** {@code agentspaces.content.store.*}. */
+        public static class Store {
+            /** Backend kinds in read order: {@code file}, {@code memory}, {@code in-place}, or a bean's kind. */
+            private java.util.List<String> backends = new java.util.ArrayList<>(java.util.List.of("file"));
+            private String path = System.getProperty("user.home") + "/.agentspaces/content";
+            private long quota = 10L * 1024 * 1024 * 1024;
+            private boolean cacheExternal;
+            /** Encrypt pieces on disk under a local key in the store directory (LB-T-11); off by default. */
+            private boolean encryptAtRest;
+
+            public boolean isEncryptAtRest() {
+                return encryptAtRest;
+            }
+
+            public void setEncryptAtRest(boolean encryptAtRest) {
+                this.encryptAtRest = encryptAtRest;
+            }
+
+            public java.util.List<String> getBackends() {
+                return backends;
+            }
+
+            public void setBackends(java.util.List<String> backends) {
+                this.backends = backends;
+            }
+
+            public String getPath() {
+                return path;
+            }
+
+            public void setPath(String path) {
+                this.path = path;
+            }
+
+            public long getQuota() {
+                return quota;
+            }
+
+            public void setQuota(long quota) {
+                this.quota = quota;
+            }
+
+            public boolean isCacheExternal() {
+                return cacheExternal;
+            }
+
+            public void setCacheExternal(boolean cacheExternal) {
+                this.cacheExternal = cacheExternal;
+            }
+        }
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getSpace() {
+            return space;
+        }
+
+        public void setSpace(String space) {
+            this.space = space;
+        }
+
+        public long getEscalateAbove() {
+            return escalateAbove;
+        }
+
+        public void setEscalateAbove(long escalateAbove) {
+            this.escalateAbove = escalateAbove;
+        }
+
+        public int getPieceSize() {
+            return pieceSize;
+        }
+
+        public void setPieceSize(int pieceSize) {
+            this.pieceSize = pieceSize;
+        }
+
+        public String getSeedMode() {
+            return seedMode;
+        }
+
+        public void setSeedMode(String seedMode) {
+            this.seedMode = seedMode;
+        }
+
+        public java.time.Duration getHoldingLease() {
+            return holdingLease;
+        }
+
+        public void setHoldingLease(java.time.Duration holdingLease) {
+            this.holdingLease = holdingLease;
+        }
+
+        public int getMaxSessions() {
+            return maxSessions;
+        }
+
+        public void setMaxSessions(int maxSessions) {
+            this.maxSessions = maxSessions;
+        }
+
+        public int getMaxWindow() {
+            return maxWindow;
+        }
+
+        public void setMaxWindow(int maxWindow) {
+            this.maxWindow = maxWindow;
+        }
+
+        public int getMaxFetches() {
+            return maxFetches;
+        }
+
+        public void setMaxFetches(int maxFetches) {
+            this.maxFetches = maxFetches;
+        }
+
+        public long getUploadBytesPerDay() {
+            return uploadBytesPerDay;
+        }
+
+        public void setUploadBytesPerDay(long uploadBytesPerDay) {
+            this.uploadBytesPerDay = uploadBytesPerDay;
+        }
+
+        public boolean isReplicateManifests() {
+            return replicateManifests;
+        }
+
+        public void setReplicateManifests(boolean replicateManifests) {
+            this.replicateManifests = replicateManifests;
+        }
+
+        public Store getStore() {
+            return store;
+        }
+
+        public void setStore(Store store) {
+            this.store = store;
+        }
+    }
+
     public static class Relay {
+        /** Longest relay path this node computes or forwards (LB-R-03); default 4. */
+        private int maxPathHops = 4;
+        /** Idle time after which a pinned relay path is recomputed (LB-R-05); default 10 minutes. */
+        private java.time.Duration pathTtl = java.time.Duration.ofMinutes(10);
+        /** Whether a relay that drops a path frame signals the origin (LB-R-07); default on. */
+        private boolean unreachableSignal = true;
+
+        public int getMaxPathHops() {
+            return maxPathHops;
+        }
+
+        public void setMaxPathHops(int maxPathHops) {
+            this.maxPathHops = maxPathHops;
+        }
+
+        public java.time.Duration getPathTtl() {
+            return pathTtl;
+        }
+
+        public void setPathTtl(java.time.Duration pathTtl) {
+            this.pathTtl = pathTtl;
+        }
+
+        public boolean isUnreachableSignal() {
+            return unreachableSignal;
+        }
+
+        public void setUnreachableSignal(boolean unreachableSignal) {
+            this.unreachableSignal = unreachableSignal;
+        }
+
         private Long budgetBytesPerDay;
 
         public Long getBudgetBytesPerDay() {
@@ -123,6 +327,73 @@ public class AgentSpacesProperties {
         public void setBudgetBytesPerDay(Long budgetBytesPerDay) {
             this.budgetBytesPerDay = budgetBytesPerDay;
         }
+    }
+
+    public ContentSwarm getContent() {
+        return content;
+    }
+
+    public Blocks getBlocks() {
+        return blocks;
+    }
+
+    public void setBlocks(Blocks blocks) {
+        this.blocks = blocks;
+    }
+
+    /**
+     * Where a group's blocks (payloads between 64 KiB and the content swarm's bound) live:
+     * {@code memory} as in 0.4.0, or {@code file} under {@code path/<group>} so a live
+     * entry's block survives a restart (LB-B-05).
+     */
+    public static class Blocks {
+        /** {@code memory} or {@code file}. */
+        private String store = "memory";
+        /** The directory of the file store; one subdirectory per group. */
+        private String path = System.getProperty("user.home") + "/.agentspaces/blocks";
+        /** The byte quota per group; zero or less means unbounded. */
+        private long quota = 512L * 1024 * 1024;
+        /**
+         * Refuse a payload above this many bytes in a space without the content swarm (LB-E-06),
+         * naming {@code agentspaces.content.enabled}; 0, the default, keeps 0.4.0's behaviour.
+         */
+        private long maxPayload;
+
+        public long getMaxPayload() {
+            return maxPayload;
+        }
+
+        public void setMaxPayload(long maxPayload) {
+            this.maxPayload = maxPayload;
+        }
+
+        public String getStore() {
+            return store;
+        }
+
+        public void setStore(String store) {
+            this.store = store;
+        }
+
+        public String getPath() {
+            return path;
+        }
+
+        public void setPath(String path) {
+            this.path = path;
+        }
+
+        public long getQuota() {
+            return quota;
+        }
+
+        public void setQuota(long quota) {
+            this.quota = quota;
+        }
+    }
+
+    public void setContent(ContentSwarm content) {
+        this.content = content;
     }
 
     public Relay getRelay() {
@@ -888,6 +1159,7 @@ public class AgentSpacesProperties {
             private List<String> spaceTake = new ArrayList<>();
             private List<String> vote = new ArrayList<>();
             private List<String> modelServe = new ArrayList<>();
+            private List<String> contentFetch = new ArrayList<>();
 
             public List<String> getRaftVoter() {
                 return raftVoter;
@@ -969,6 +1241,14 @@ public class AgentSpacesProperties {
 
             public void setModelServe(List<String> modelServe) {
                 this.modelServe = modelServe;
+            }
+
+            public List<String> getContentFetch() {
+                return contentFetch;
+            }
+
+            public void setContentFetch(List<String> contentFetch) {
+                this.contentFetch = contentFetch;
             }
 
             public List<String> getSpaceWrite() {

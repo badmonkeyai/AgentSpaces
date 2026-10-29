@@ -99,6 +99,7 @@
     <module>agentspaces-agent</module>
     <module>agentspaces-a2a</module>
     <module>agentspaces-connect-core</module>
+    <module>agentspaces-content</module>
     <module>agentspaces-console</module>
     <module>agentspaces-spring-stubs</module>
     <module>agentspaces-spring-boot-autoconfigure</module>

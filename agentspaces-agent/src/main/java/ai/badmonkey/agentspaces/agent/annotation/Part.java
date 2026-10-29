@@ -46,7 +46,7 @@ public @interface Part {
     /** Tag filters, {@code "key=value"} or {@code "key"}, all of which an entry must satisfy. */
     String[] tags() default {};
 
-    /** Field filters, {@code "field=value"} or {@code "field!=value"}, all of which an entry must satisfy. */
+    /** Field filters in the grammar of {@code @SpaceTake#where()}, all of which an entry must satisfy. */
     String[] where() default {};
 
     /**

@@ -30,3 +30,9 @@ authentication stays the signed-envelope layer, exactly as over TCP.
   accepts any number of connections per listener. `QuicCaModeTransportTest`,
   `QuicCaModeFabricTest`, and `QuicListenerTest` pin it.
 - Pipe-per-stream refinement is future work; today every capability frame shares the one stream.
+- Inbound frames go from the event loop to one delivery thread per connection, in order, through
+  the common `FramePump` (2026-10-27). The node answers some frames by sending, and a send that
+  waits on a stream backed up by flow control is refused on the event loop
+  (`BlockingOperationException`). Past 64 MiB of queued frames the stream stops reading until the
+  queue drains to half, so flow control slows the sender. `QuicDeliveryTest` pins it: a receiver
+  that answers each of 64 one-MiB frames from inside its callback, which failed before the change.

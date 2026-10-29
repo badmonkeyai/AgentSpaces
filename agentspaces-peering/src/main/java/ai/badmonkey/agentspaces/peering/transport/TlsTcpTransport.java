@@ -18,6 +18,7 @@ package ai.badmonkey.agentspaces.peering.transport;
 import ai.badmonkey.agentspaces.api.spi.Transport;
 import ai.badmonkey.agentspaces.api.spi.TransportConnection;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.common.io.FramePump;
 import ai.badmonkey.agentspaces.identity.ChannelCertificate;
 import ai.badmonkey.agentspaces.identity.ChannelTrust;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
@@ -280,11 +281,14 @@ public final class TlsTcpTransport implements Transport {
             this.receiver = Objects.requireNonNull(receiver, "receiver");
             if (!readerStarted) {
                 readerStarted = true;
-                Thread.ofVirtual().name("tls-read-" + remoteAddress()).start(this::readLoop);
+                FramePump pump = new FramePump("tls-deliver-" + remoteAddress(), () -> this.receiver,
+                        this::close, this::notifyClosed, FramePump.DEFAULT_CAP_BYTES);
+                Thread.ofVirtual().name("tls-read-" + remoteAddress()).start(() -> readLoop(pump));
             }
         }
 
-        private void readLoop() {
+        /** Reads frames into the pump, which delivers them in order on its own thread. */
+        private void readLoop(FramePump pump) {
             try (DataInputStream in = new DataInputStream(socket.getInputStream())) {
                 while (!socket.isClosed()) {
                     int length = in.readInt();
@@ -293,14 +297,18 @@ public final class TlsTcpTransport implements Transport {
                     }
                     byte[] frame = new byte[length];
                     in.readFully(frame);
-                    receiver.accept(frame);
+                    if (!pump.offer(frame)) {
+                        return; // the receiver failed and the connection is closing
+                    }
                 }
             } catch (EOFException | java.net.SocketException e) {
-                // Peer closed (spec P2: absence is the signal); the node is told below.
+                // Peer closed (spec P2: absence is the signal); the node is told once the pump drains.
             } catch (IOException e) {
-                // Connection failed; the node is told below and membership confirms by probe.
+                // Connection failed; the node is told once the pump drains and membership confirms by probe.
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } finally {
-                notifyClosed();
+                pump.end();
             }
         }
 

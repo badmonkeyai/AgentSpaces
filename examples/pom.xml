@@ -59,5 +59,6 @@
     <module>example-14-gossip-learning</module>
     <module>example-18-agentic-workflow</module>
     <module>example-20-enterprise-bootstrap</module>
+    <module>example-29-content-swarm</module>
   </modules>
 </project>

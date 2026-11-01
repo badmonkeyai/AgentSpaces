@@ -103,10 +103,46 @@ public final class ContentSpaces {
             if (!root.equals(h.root()) || h.v() != Holding.VERSION || h.holder() == null) {
                 continue;
             }
-            best.merge(h.holder(), h, (a, b) -> b.complete() && !a.complete() || (b.complete() == a.complete()
-                    && b.count() > a.count()) ? b : a);
+            best.merge(h.holder(), h, ContentSpaces::better);
         }
         return List.copyOf(best.values());
+    }
+
+    /** Of two holdings by one holder, the complete one, else the one holding more pieces. */
+    private static Holding better(Holding a, Holding b) {
+        return b.complete() && !a.complete() || (b.complete() == a.complete() && b.count() > a.count()) ? b : a;
+    }
+
+    /**
+     * The number of distinct holders with a complete holding, for each of many roots, from one read of
+     * the replica (a collection page asks for a hundred roots at once; reading {@link #holdings} per
+     * root would scan the replica once per row). A root with no complete holder is absent.
+     *
+     * @param roots the roots
+     * @return complete holders per root
+     */
+    public java.util.Map<String, Integer> completeHolders(java.util.Collection<String> roots) {
+        if (roots.isEmpty()) {
+            return java.util.Map.of();
+        }
+        java.util.Set<String> wanted = new java.util.HashSet<>(roots);
+        java.util.Map<String, java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, Holding>> best = new java.util.HashMap<>();
+        int limit = (int) Math.min(Integer.MAX_VALUE, (long) MAX_HOLDINGS_READ * wanted.size());
+        for (Holding h : space.readAll(Template.of(Holding.class).whereTag(Holding.ROOT_TAG, Matchers.in(wanted.toArray())),
+                limit)) {
+            if (!wanted.contains(h.root()) || h.v() != Holding.VERSION || h.holder() == null) {
+                continue;
+            }
+            best.computeIfAbsent(h.root(), r -> new java.util.LinkedHashMap<>()).merge(h.holder(), h, ContentSpaces::better);
+        }
+        java.util.Map<String, Integer> counts = new java.util.HashMap<>();
+        best.forEach((root, byHolder) -> {
+            int complete = (int) byHolder.values().stream().filter(Holding::complete).count();
+            if (complete > 0) {
+                counts.put(root, complete);
+            }
+        });
+        return counts;
     }
 
     /** Writes a holding with its tags. */

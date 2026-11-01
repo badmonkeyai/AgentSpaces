@@ -24,7 +24,6 @@ import ai.badmonkey.agentspaces.connect.AssetProvider;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -194,43 +193,64 @@ public final class CollectionAssetProvider implements AssetProvider {
         String origin = params.get(PARAM_ORIGIN);
         String after = params.get(PARAM_AFTER);
         long now = System.currentTimeMillis();
-        List<Manifest> matching = rootsOf(collection.get())
-                .filter(m -> tag == null || (m.attrs() != null && m.attrs().containsValue(tag)))
-                .filter(m -> mediaType == null || mediaType.equals(m.mediaType()))
-                .filter(m -> prefix == null || (m.name() != null && m.name().startsWith(prefix)))
-                .filter(m -> origin == null || origin.equals(m.origin().value()))
-                .sorted(Comparator.comparing(Manifest::root))
-                .toList();
-        final long maxAgeFinal = maxAge;
-        List<Map<String, String>> rows = new ArrayList<>();
-        for (Manifest m : matching) {
-            if (maxAgeFinal >= 0 && now - m.created() > maxAgeFinal) {
-                continue;
-            }
-            if (after != null && m.root().compareTo(after) <= 0) {
-                continue;
-            }
-            if (rows.size() >= limit) {
+        // A page reads only the manifests it needs (LB-Q-PRF-08): the roots are ordered and the
+        // cursor applied by name alone, and manifests load one by one until the page is full, so a
+        // page of 100 over 40,000 roots touches about 100 manifests rather than all of them.
+        List<Manifest> page = new ArrayList<>();
+        for (String root : servedRoots(after)) {
+            if (page.size() >= limit) {
                 break;
             }
-            rows.add(row(m));
+            Optional<Manifest> listed = listable(collection.get(), root);
+            if (listed.isEmpty()) {
+                continue;
+            }
+            Manifest m = listed.get();
+            if ((tag == null || (m.attrs() != null && m.attrs().containsValue(tag)))
+                    && (mediaType == null || mediaType.equals(m.mediaType()))
+                    && (prefix == null || (m.name() != null && m.name().startsWith(prefix)))
+                    && (origin == null || origin.equals(m.origin().value()))
+                    && (maxAge < 0 || now - m.created() <= maxAge)) {
+                page.add(m);
+            }
+        }
+        // one replica read for the whole page's holder counts
+        Map<String, Integer> holders = content.spaces().completeHolders(page.stream().map(Manifest::root).toList());
+        List<Map<String, String>> rows = new ArrayList<>(page.size());
+        for (Manifest m : page) {
+            rows.add(row(m, holders.getOrDefault(m.root(), 0)));
         }
         return QueryResult.of(rows);
     }
 
-    private java.util.stream.Stream<Manifest> rootsOf(Collection c) {
-        // LB-K-06: only roots this group's swarm serves; a store shared with another group holds more
+    /**
+     * The roots this group's swarm serves, in root order, after {@code after} when it is given.
+     * LB-K-06: only roots this group's swarm serves; a store shared with another group holds more.
+     */
+    private List<String> servedRoots(String after) {
         java.util.Set<String> held = content.store().roots();
         java.util.Set<String> here = content.rootsServedHere(held);
         return held.stream()
                 .filter(here::contains)
-                .map(root -> content.store().manifest(root))
-                .flatMap(Optional::stream)
+                .filter(root -> after == null || root.compareTo(after) > 0)
+                .sorted()
+                .toList();
+    }
+
+    /** A root's manifest when the root is complete here and the collection includes it. */
+    private Optional<Manifest> listable(Collection c, String root) {
+        return content.store().manifest(root)
                 .filter(m -> content.store().have(m.root()).cardinality() >= m.pieces())
                 .filter(c.includes());
     }
 
-    private Map<String, String> row(Manifest m) {
+    private java.util.stream.Stream<Manifest> rootsOf(Collection c) {
+        return servedRoots(null).stream()
+                .map(root -> listable(c, root))
+                .flatMap(Optional::stream);
+    }
+
+    private Map<String, String> row(Manifest m, int completeHolders) {
         Map<String, String> row = new LinkedHashMap<>();
         row.put("root", m.root());
         row.put("name", m.name() == null ? "" : m.name());
@@ -240,13 +260,7 @@ public final class CollectionAssetProvider implements AssetProvider {
         row.put("created", String.valueOf(m.created()));
         row.put("origin", m.origin().value());
         row.put("attrs", m.attrs() == null ? "" : attrsOf(m.attrs()));
-        int holders = 0;
-        for (var h : content.spaces().holdings(m.root())) {
-            if (h.complete()) {
-                holders++;
-            }
-        }
-        row.put("holders", String.valueOf(Math.max(1, holders)));
+        row.put("holders", String.valueOf(Math.max(1, completeHolders)));
         return row;
     }
 

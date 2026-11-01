@@ -377,14 +377,32 @@ class ContentQualityTest {
         }
         CollectionAssetProvider provider = new CollectionAssetProvider(a.content(),
                 List.of(CollectionAssetProvider.Collection.all("tiles", "Map tiles.")));
-        provider.query(CollectionAssetProvider.assetName("tiles"), Map.of(CollectionAssetProvider.PARAM_LIMIT, "100")); // warm
-        long start = System.nanoTime();
-        var page = provider.query(CollectionAssetProvider.assetName("tiles"), Map.of(CollectionAssetProvider.PARAM_LIMIT, "100"));
-        long millis = (System.nanoTime() - start) / 1_000_000;
-        System.out.printf("LB-Q-PRF-08: a page of %d rows over %d roots in %d ms%n", page.rows().size(),
-                a.content().store().roots().size(), millis);
+        String tiles = CollectionAssetProvider.assetName("tiles");
+        provider.query(tiles, Map.of(CollectionAssetProvider.PARAM_LIMIT, "100")); // warm
+        // the median of five warm queries, so one collector pause on a loaded machine does not decide the row
+        long[] millis = new long[5];
+        var page = provider.query(tiles, Map.of(CollectionAssetProvider.PARAM_LIMIT, "100"));
+        for (int i = 0; i < millis.length; i++) {
+            long start = System.nanoTime();
+            page = provider.query(tiles, Map.of(CollectionAssetProvider.PARAM_LIMIT, "100"));
+            millis[i] = (System.nanoTime() - start) / 1_000_000;
+        }
+        long[] sorted = millis.clone();
+        java.util.Arrays.sort(sorted);
+        long median = sorted[sorted.length / 2];
+        System.out.printf("LB-Q-PRF-08: a page of %d rows over %d roots in %d ms (median of %s)%n", page.rows().size(),
+                a.content().store().roots().size(), median, java.util.Arrays.toString(millis));
         assertThat(page.rows()).hasSize(100);
-        assertThat(millis).as("LB-Q-PRF-08 query").isLessThan(200);
+        assertThat(median).as("LB-Q-PRF-08 query").isLessThan(200);
+
+        // the next page starts after the first page's last root, in root order, with no overlap
+        List<String> first = page.rows().stream().map(r -> r.get("root")).toList();
+        assertThat(first).isSorted();
+        var next = provider.query(tiles, Map.of(CollectionAssetProvider.PARAM_LIMIT, "100",
+                CollectionAssetProvider.PARAM_AFTER, first.get(first.size() - 1)));
+        List<String> second = next.rows().stream().map(r -> r.get("root")).toList();
+        assertThat(second).hasSize(100).isSorted().doesNotContainAnyElementsOf(first);
+        assertThat(second.get(0)).isGreaterThan(first.get(first.size() - 1));
     }
 
     private static long usedHeap() {

@@ -179,5 +179,19 @@ class CollectionTest {
                         + " failure=" + fetch.failure()).isTrue();
         assertThat(member.content().store().have(tiles.root()).cardinality()).isEqualTo(4);
         assertThat(member.content().describe(other.root())).as("a root never asked for stays unknown here").isEmpty();
+
+        // a page counts complete holders for all its rows from one replica read: the member now holds tiles too
+        CollectionAssetProvider all = new CollectionAssetProvider(registry.content(), List.of(
+                CollectionAssetProvider.Collection.all("everything", "every artifact the registry holds")));
+        assertThat(runUntil(Duration.ofSeconds(10), () -> "2".equals(holdersOf(all, "everything", tiles.root()))))
+                .as("tiles: the registry and the member").isTrue();
+        assertThat(holdersOf(all, "everything", roads.root())).as("roads: the registry alone").isEqualTo("1");
+        assertThat(holdersOf(all, "everything", other.root())).as("the sector 9 tiles: the registry alone").isEqualTo("1");
+    }
+
+    private static String holdersOf(CollectionAssetProvider provider, String collection, String root) {
+        return provider.query(CollectionAssetProvider.assetName(collection), Map.of(CollectionAssetProvider.PARAM_LIMIT, "100"))
+                .rows().stream().filter(r -> root.equals(r.get("root"))).findFirst()
+                .map(r -> r.get("holders")).orElse("absent");
     }
 }

@@ -108,4 +108,16 @@ public interface PieceStore {
     /** Forces unpersisted state to durable storage; a no-op for a memory backend. */
     default void flush() {
     }
+
+    /**
+     * Whether this backend serves bytes the swarm did not write and verify itself, such as files
+     * in place or objects behind a remote service. The swarm hashes each piece of an external
+     * backend whole at its first serve and forgets the root on a mismatch (LB-T-10); it skips
+     * external roots in its sampled check on start, since reading them may cost a remote call.
+     *
+     * @return true for an external backend; false by default
+     */
+    default boolean external() {
+        return false;
+    }
 }

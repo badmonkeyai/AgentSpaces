@@ -65,7 +65,7 @@ class BootstrapSeamsAutoConfigurationTest {
     }
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }
@@ -356,5 +356,79 @@ class BootstrapSeamsAutoConfigurationTest {
         joiner.lifecycle.start();
         awaitMember(seed, joiner.node, "weekend");
         assertThat(recording.askedFor).containsExactly("weekend");
+    }
+
+    /** ISSUE-BootstrapRobustness FR-1: the pre-join check reads the composed chain, member by member. */
+    @Test
+    void canLocateReadsTheComposedChain() {
+        ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator none =
+                ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator.of(List.of());
+        ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator one =
+                ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator.of(List.of("127.0.0.1:1"));
+        Recording bean = new Recording("fleet", 0);
+        assertThat(AgentSpacesAutoConfiguration.canLocate(none)).as("no seeds").isFalse();
+        assertThat(AgentSpacesAutoConfiguration.canLocate(one)).as("one seed, dead or not").isTrue();
+        assertThat(AgentSpacesAutoConfiguration.canLocate(bean)).as("a bean the starter cannot see into").isTrue();
+        assertThat(AgentSpacesAutoConfiguration.canLocate(
+                ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain.builder().build()))
+                .as("an empty chain").isFalse();
+        assertThat(AgentSpacesAutoConfiguration.canLocate(
+                ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain.builder().add(none).build()))
+                .as("a chain over empty seeds alone").isFalse();
+        assertThat(AgentSpacesAutoConfiguration.canLocate(
+                ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain.builder().add(none).add(bean).build()))
+                .as("a chain where one member can").isTrue();
+        BeaconLocator plain = new BeaconLocator() {
+            @Override
+            public String name() {
+                return "custom";
+            }
+
+            @Override
+            public BeaconHint locate(BeaconRequest request) {
+                return BeaconHint.none();
+            }
+        };
+        assertThat(AgentSpacesAutoConfiguration.canLocate(plain)).as("a custom factory's own locator").isTrue();
+        assertThat(AgentSpacesAutoConfiguration.describe(
+                ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain.builder().add(none).add(bean).build()))
+                .isEqualTo("seeds (nothing configured), recording");
+    }
+
+    /** FR-2: a join by id with nothing to ask refuses at once and names the group, the chain, and the remedies. */
+    @Test
+    void aJoinByIdWithNothingToAskRefusesStartupAndNamesTheRemedies() throws Exception {
+        AgentSpacesProperties props = properties(freePort(), "fleet", List.of());
+        props.getGroups().get(0).setFounding(null);
+        props.getGroups().get(0).setJoin("aspace://zNobodyServesThis");
+        assertThatThrownBy(() -> wire(props, List.of(), List.of(), List.of(), List.of(), BootstrapChainFactory.defaults()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("group 'fleet' joins by GroupId URI but its bootstrap chain has nothing to ask")
+                .hasMessageContaining("seeds (nothing configured)")
+                .hasMessageContaining("agentspaces.groups[].seeds")
+                .hasMessageContaining("agentspaces.bootstrap.order")
+                .hasMessageContaining("BeaconLocator bean");
+    }
+
+    /** FR-6 and FR-7: a reached seed that was founded from text sends nothing, and the message says why. */
+    @Test
+    void aTextFoundedSeedCannotBeJoinedByIdAndTheMessageSaysSo() throws Exception {
+        int seedPort = freePort();
+        Wired seed = wire(properties(seedPort, "fleet", List.of()), List.of(), List.of(), List.of(), List.of(),
+                BootstrapChainFactory.defaults());
+        seed.lifecycle.start();
+        String id = seed.spaces.group("fleet").runtime().id().value();
+        AgentSpacesProperties joinerProps = properties(freePort(), "fleet", List.of("127.0.0.1:" + seedPort));
+        joinerProps.getGroups().get(0).setFounding(null);
+        joinerProps.getGroups().get(0).setJoin("aspace://" + id);
+        joinerProps.getGroups().get(0).setJoinTimeoutMillis(1_500);
+        assertThatThrownBy(() -> wire(joinerProps, List.of(), List.of(), List.of(), List.of(),
+                BootstrapChainFactory.defaults()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("group 'fleet': no verified founding for " + id)
+                .hasMessageContaining("1 of 1 endpoint(s) connected")
+                .hasMessageContaining("sent no founding")
+                .hasMessageContaining("founding-document")
+                .hasMessageContaining("seeds[1]");
     }
 }

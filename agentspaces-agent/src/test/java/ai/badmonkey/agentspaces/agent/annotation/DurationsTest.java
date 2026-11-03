@@ -45,4 +45,28 @@ class DurationsTest {
                 .hasMessageContaining("10m")
                 .hasMessageContaining("ISO-8601");
     }
+
+    @Test
+    void aBareNumberHasNoUnitAndIsRefused() {
+        // The annotations never take a number as milliseconds: "500" on a lease is a mistake.
+        assertThatThrownBy(() -> Durations.parse("500"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("500ms");
+    }
+
+    @Test
+    void blankAndUnknownUnitsAreRefused() {
+        assertThatThrownBy(() -> Durations.parse("")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Durations.parse("   ")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Durations.parse("10w")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Durations.parse("ms")).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void itParsesExactlyAsTheSharedParserWithBareMillisOff() {
+        for (String value : new String[]{"10m", "500ms", "+30s", "2H", " 1d ", "10 m", "PT10M", "pt0.5s", "P1DT2H"}) {
+            assertThat(Durations.parse(value)).as(value)
+                    .isEqualTo(ai.badmonkey.agentspaces.common.time.Durations.parse(value, false));
+        }
+    }
 }

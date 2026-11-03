@@ -49,7 +49,7 @@ class WebRtcBlockAutoConfigurationTest {
     }
 
     private static int freeTcp() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }
@@ -66,7 +66,7 @@ class WebRtcBlockAutoConfigurationTest {
 
     private PeerNode node(AgentSpacesProperties properties) {
         PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
-        PeerNode node = autoConfig.agentSpacesNode(properties, identity, List.of(), List.of(), List.of());
+        PeerNode node = autoConfig.buildNode(properties, identity, List.of(), List.of(), List.of(), null);
         closeables.add(node);
         return node;
     }

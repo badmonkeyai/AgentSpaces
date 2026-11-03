@@ -42,7 +42,7 @@ class A2aFleetFlowTest {
     private final HttpClient http = HttpClient.newHttpClient();
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }

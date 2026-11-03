@@ -153,6 +153,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     private final java.util.List<CollectionAssetProvider> collections = new java.util.concurrent.CopyOnWriteArrayList<>();
     /** In-place pieces verified at their first serve (LB-T-10), as {@code root#index}. */
     private final java.util.Set<String> externalVerified = ConcurrentHashMap.newKeySet();
+    /** One lock per piece under first-serve verification, so concurrent wants read it once. */
+    private final Map<String, Object> verifying = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong rootsDroppedOnSample = new java.util.concurrent.atomic.AtomicLong();
     private long downloadDay = NEVER;
     private long downloadedToday;
@@ -460,6 +462,57 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             }
         }
         return published(manifest, options);
+    }
+
+    /**
+     * Publishes an artifact that lies in an external backend, such as an object a remote service
+     * serves by range (CC-L-02). The caller hashed the bytes at {@code options.pieceSize()}; this
+     * builds and signs the manifest, registers it with the backend under {@code key}, and writes
+     * the manifest and a complete holding, as {@link #publish(Path, PublishOptions)} does for a file
+     * served in place. The swarm never copies the bytes; each piece is hashed whole at its first
+     * serve.
+     *
+     * @param backend an external backend this swarm's store composes
+     * @param key     where the artifact lies, in the backend's terms
+     * @param hashed  the artifact's piece table, size, and root at the options' piece size
+     * @param options the publish options; sealed hashing is refused
+     * @return the manifest
+     */
+    public Manifest publishExternal(ExternalStore backend, String key, ContentRoots.Hashed hashed, PublishOptions options) {
+        Objects.requireNonNull(backend, "backend");
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(hashed, "hashed");
+        Objects.requireNonNull(options, "options");
+        if (options.sealedHashing()) {
+            throw new IllegalArgumentException("a sealed-hashing publish stores sealed pieces; it cannot serve an external artifact");
+        }
+        if (!composes(backend)) {
+            throw new IllegalStateException("the " + backend.kind() + " backend is not part of this swarm's store;"
+                    + " add it to the composition before the swarm starts");
+        }
+        if (hashed.table().length != hashed.pieces(options.pieceSize()) * Manifest.HASH_BYTES) {
+            throw new IllegalArgumentException("the table was hashed at another piece size than " + options.pieceSize());
+        }
+        Manifest manifest = manifestOf(hashed, options, true);
+        backend.register(manifest, key);
+        return published(manifest, options);
+    }
+
+    /**
+     * Hashes a stream at the options' piece size and publishes it as an external artifact; see
+     * {@link #publishExternal(ExternalStore, String, ContentRoots.Hashed, PublishOptions)}.
+     *
+     * @param backend an external backend this swarm's store composes
+     * @param key     where the artifact lies, in the backend's terms
+     * @param in      the artifact's bytes, read once and not kept
+     * @param options the publish options
+     * @return the manifest
+     * @throws IOException when the stream fails
+     */
+    public Manifest publishExternal(ExternalStore backend, String key, java.io.InputStream in, PublishOptions options)
+            throws IOException {
+        Objects.requireNonNull(in, "in");
+        return publishExternal(backend, key, ContentRoots.hash(in, options.pieceSize()), options);
     }
 
     /** The publish options of this host: its configured piece size, the other defaults. */
@@ -880,9 +933,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
      * serving rather than serving damage; roots served in place are checked at their first serve.
      */
     private void verifySamples() {
-        InPlaceStore inPlace = inPlaceBackend();
         for (String root : store.roots()) {
-            if (inPlace != null && inPlace.roots().contains(root)) {
+            if (externalBackendFor(root) != null) {
                 continue;
             }
             Manifest m = store.manifest(root).orElse(null);
@@ -912,26 +964,80 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     }
 
-    /** LB-T-10: an in-place piece is hashed whole at its first serve; a mismatch forgets the root. */
+    /**
+     * LB-T-10: a piece of an external backend (files in place, objects behind a remote service) is
+     * hashed whole at its first serve; a mismatch forgets the root in every backend, so a piece a
+     * read-through cache took from the external backend is dropped with it.
+     */
     private boolean verifiedExternally(Manifest m, int index) {
-        InPlaceStore inPlace = inPlaceBackend();
-        if (inPlace == null || !inPlace.roots().contains(m.root()) || externalVerified.contains(m.root() + "#" + index)) {
+        PieceStore external = externalBackendFor(m.root());
+        String piece = m.root() + "#" + index;
+        if (external == null || externalVerified.contains(piece)) {
             return true;
         }
+        // The sub-range wants of one piece arrive together; the first reads and hashes it, the
+        // others wait and find it verified (a remote backend then serves each piece once).
+        Object lock = verifying.computeIfAbsent(piece, k -> new Object());
+        try {
+            synchronized (lock) {
+                if (externalVerified.contains(piece)) {
+                    return true;
+                }
+                return verifyExternalPiece(m, index, external);
+            }
+        } finally {
+            verifying.remove(piece, lock);
+        }
+    }
+
+    private boolean verifyExternalPiece(Manifest m, int index, PieceStore external) {
         byte[] table = tableHere(m).orElse(null);
         if (table == null || index < 0 || index >= m.pieces()) {
             return true; // nothing to check against; the fetcher verifies regardless
         }
-        byte[] piece = store.read(m.root(), index, 0, m.pieceLength(index)).orElse(null);
+        byte[] piece;
+        try {
+            piece = store.read(m.root(), index, 0, m.pieceLength(index)).orElse(null);
+        } catch (RuntimeException e) {
+            LOG.warning("content store: " + external.kind() + " root " + m.root() + " piece " + index
+                    + " could not be read: " + e.getMessage());
+            return false;
+        }
         if (piece != null && pieceMatches(table, index, piece)) {
             externalVerified.add(m.root() + "#" + index);
             return true;
         }
-        LOG.warning("content store: in-place root " + m.root() + " piece " + index
-                + " no longer matches its manifest; the root is forgotten (LB-T-10)");
-        rootsDroppedOnSample.incrementAndGet();
-        inPlace.forget(m.root());
+        synchronized (externalVerified) {
+            if (external.roots().contains(m.root())) { // two wants in flight count one drop
+                LOG.warning("content store: " + external.kind() + " root " + m.root() + " piece " + index
+                        + " no longer matches its manifest; the root is forgotten (LB-T-10)");
+                rootsDroppedOnSample.incrementAndGet();
+                externalVerified.removeIf(k -> k.startsWith(m.root() + "#"));
+                store.forget(m.root());
+            }
+        }
         return false;
+    }
+
+    /** The external backend that holds a root, or null when none does. */
+    private PieceStore externalBackendFor(String root) {
+        if (store instanceof CompositeStore composite) {
+            for (PieceStore b : composite.backends()) {
+                if (b.external() && b.roots().contains(root)) {
+                    return b;
+                }
+            }
+            return null;
+        }
+        return store.external() && store.roots().contains(root) ? store : null;
+    }
+
+    /** Whether a backend is this swarm's store or one of its composed backends. */
+    private boolean composes(PieceStore backend) {
+        if (store == backend) {
+            return true;
+        }
+        return store instanceof CompositeStore composite && composite.backends().contains(backend);
     }
 
     /** Roots forgotten because a sample or a first serve did not match (LB-T-10). */

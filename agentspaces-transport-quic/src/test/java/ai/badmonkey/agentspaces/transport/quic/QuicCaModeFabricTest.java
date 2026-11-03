@@ -66,7 +66,7 @@ class QuicCaModeFabricTest {
 
     private static int freePort() throws Exception {
         // A free TCP port is a good guess for a free UDP port on loopback.
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }

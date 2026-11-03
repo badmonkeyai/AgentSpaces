@@ -89,6 +89,22 @@ public final class SeedsLocator implements BeaconLocator {
         return endpoints;
     }
 
+    /**
+     * Whether this locator has no endpoint to give: no seed strings, only
+     * blank ones, or an empty fixed list. The starter's pre-join check reads
+     * this (ISSUE-BootstrapRobustness FR-1).
+     *
+     * @return true when {@link #locate} can only answer nothing
+     */
+    public boolean isEmpty() {
+        return fixed != null ? fixed.isEmpty() : seeds.stream().allMatch(String::isBlank);
+    }
+
+    @Override
+    public boolean canLocate() {
+        return !isEmpty();
+    }
+
     @Override
     public String name() {
         return NAME;

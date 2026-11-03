@@ -16,20 +16,17 @@
 package ai.badmonkey.agentspaces.agent.annotation;
 
 import java.time.Duration;
-import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Parses the duration strings the annotations accept: the Spring-style simple
  * form ({@code 10m}, {@code 500ms}, {@code 2h}, {@code 30s}, {@code 1d}) and
  * ISO-8601 ({@code PT10M}), so annotation values read the way Spring Boot
- * properties do while older ISO values keep working.
+ * properties do while older ISO values keep working. A bare number has no unit
+ * and is refused. The parsing is the shared
+ * {@link ai.badmonkey.agentspaces.common.time.Durations} with bare milliseconds
+ * off; this class is the annotations' name for it.
  */
 public final class Durations {
-
-    private static final Pattern SIMPLE =
-            Pattern.compile("([+]?\\d+)(ms|s|m|h|d)", Pattern.CASE_INSENSITIVE);
 
     private Durations() {
     }
@@ -42,23 +39,6 @@ public final class Durations {
      * @throws IllegalArgumentException when the value parses as neither form
      */
     public static Duration parse(String value) {
-        String trimmed = value.trim();
-        Matcher simple = SIMPLE.matcher(trimmed);
-        if (simple.matches()) {
-            long amount = Long.parseLong(simple.group(1));
-            return switch (simple.group(2).toLowerCase(Locale.ROOT)) {
-                case "ms" -> Duration.ofMillis(amount);
-                case "s" -> Duration.ofSeconds(amount);
-                case "m" -> Duration.ofMinutes(amount);
-                case "h" -> Duration.ofHours(amount);
-                default -> Duration.ofDays(amount);
-            };
-        }
-        try {
-            return Duration.parse(trimmed);
-        } catch (java.time.format.DateTimeParseException e) {
-            throw new IllegalArgumentException("not a duration (try \"10m\", \"500ms\", "
-                    + "\"30s\", or ISO-8601 \"PT10M\"): '" + value + "'", e);
-        }
+        return ai.badmonkey.agentspaces.common.time.Durations.parse(value, false);
     }
 }

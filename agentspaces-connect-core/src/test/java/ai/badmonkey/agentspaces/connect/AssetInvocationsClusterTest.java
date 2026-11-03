@@ -86,10 +86,20 @@ class AssetInvocationsClusterTest {
     /** An inventory with one allowlisted operation, {@code reserve}, recording every run by invocation id. */
     private static final class InventoryProvider implements AssetProvider {
         final List<String> reserved = new CopyOnWriteArrayList<>();
+        /** Appended to the card id: replicas need distinct ids, since the ad cache keys cards by id. */
+        final String idSuffix;
+
+        InventoryProvider() {
+            this("");
+        }
+
+        InventoryProvider(String idSuffix) {
+            this.idSuffix = idSuffix;
+        }
 
         @Override
         public List<AssetCard> describeAssets(GroupId group, PeerId issuer, Instant now) {
-            return List.of(new AssetCard("aspace://" + group.value() + "/asset/inventory", issuer, group, now,
+            return List.of(new AssetCard("aspace://" + group.value() + "/asset/inventory" + idSuffix, issuer, group, now,
                     Duration.ofMinutes(15), "inventory", "workers://shop/do/Inventory", "Stock by SKU",
                     "com.example.Stock#v1", "PT5M", Map.of("objects", "1"),
                     Map.of("mode", "read-only,invoke", "query", "aspace:cap/data-query",
@@ -275,6 +285,191 @@ class AssetInvocationsClusterTest {
     }
 
     /** JS-F-06: the entries carry {@code v} and a reader ignores fields it does not know. */
+    /** A provider whose operation takes a while, so the claim must outlive the invoke lease. */
+    private static final class SlowProvider implements AssetProvider {
+        final InventoryProvider inner = new InventoryProvider();
+        final long millis;
+
+        SlowProvider(long millis) {
+            this.millis = millis;
+        }
+
+        @Override
+        public List<AssetCard> describeAssets(GroupId group, PeerId issuer, Instant now) {
+            return inner.describeAssets(group, issuer, now);
+        }
+
+        @Override
+        public QueryResult query(String asset, Map<String, String> parameters) {
+            return inner.query(asset, parameters);
+        }
+
+        @Override
+        public InvokeResult invoke(String asset, String operation, Map<String, String> params, String invocationId) {
+            try {
+                Thread.sleep(millis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return inner.invoke(asset, operation, params, invocationId);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void aLongOperationKeepsItsClaimRenewedUntilItsResultIsWritten() throws Exception {
+        Wired connectorPeer = newPeer("conn", 1);
+        Wired agent = newPeer("agent", 2, "conn");
+        tickAll(4);
+        SlowProvider provider = new SlowProvider(900);
+        connector = new ConnectorRuntime(connectorPeer.data(), connectorPeer.discovery(), connectorPeer.identity(),
+                "cell-connector", provider, groupId, clock, Duration.ofMinutes(1))
+                .invokeLease(Duration.ofMillis(200));
+        connector.start();
+        tickAll(2);
+        AssetCard card = agent.discovery().find(AssetCard.class, c -> c.asset().equals("inventory")).getFirst();
+        AssetInvocationResult result = AssetInvocations.invoke(agent.data(), card, "reserve",
+                Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        assertThat(result.ok()).isTrue();
+        assertThat(provider.inner.reserved).hasSize(1);
+        assertThat(connector.renewals()).as("renewed every half lease while the operation ran").isGreaterThanOrEqualTo(3);
+    }
+
+    @Test
+    @Timeout(90)
+    void replicasRunEachInvocationOnceAndMirrorEachOthersResults() throws Exception {
+        Wired peerA = newPeer("conn-a", 1);
+        Wired peerB = newPeer("conn-b", 2, "conn-a");
+        Wired agent = newPeer("agent", 3, "conn-a");
+        tickAll(6);
+        InventoryProvider providerA = new InventoryProvider("@inv-a");
+        InventoryProvider providerB = new InventoryProvider("@inv-b");
+        PeerId a = peerA.identity().peerId();
+        PeerId b = peerB.identity().peerId();
+        connector = new ConnectorRuntime(peerA.data(), peerA.discovery(), peerA.identity(),
+                "inv-a", providerA, groupId, clock, Duration.ofMinutes(1)).replicas(b::equals);
+        ConnectorRuntime replica = new ConnectorRuntime(peerB.data(), peerB.discovery(), peerB.identity(),
+                "inv-b", providerB, groupId, clock, Duration.ofMinutes(1)).replicas(a::equals);
+        try {
+            connector.start();
+            replica.start();
+            tickAll(4);
+            AssetCard cardA = agent.discovery().find(AssetCard.class,
+                    c -> c.asset().equals("inventory") && c.issuer().equals(a)).getFirst();
+            AssetCard cardB = agent.discovery().find(AssetCard.class,
+                    c -> c.asset().equals("inventory") && c.issuer().equals(b)).getFirst();
+            List<String> ids = new ArrayList<>();
+            for (int i = 0; i < 6; i++) {
+                AssetCard through = i % 2 == 0 ? cardA : cardB;
+                AssetInvocationResult result = AssetInvocations.invoke(agent.data(), through, "reserve",
+                        Map.of("sku", "A-" + i, "qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+                assertThat(result.ok()).as("answered through either card, whichever replica ran it").isTrue();
+                ids.add(result.invocationId());
+                tickAll(2);
+            }
+            // Two replicas can both take one invocation inside the space's settle window; the target's
+            // own deduplication on the invocation id (the Worker's once) absorbs that race. Every
+            // invocation ran, and the mirrors answered every requester.
+            java.util.Set<String> ran = new java.util.HashSet<>(providerA.reserved);
+            ran.addAll(providerB.reserved);
+            assertThat(ran).containsExactlyInAnyOrderElementsOf(ids);
+            int runs = providerA.reserved.size() + providerB.reserved.size();
+            assertThat(connector.mirrored() + replica.mirrored()).isPositive();
+            // A retry through the other card is answered from the mirrored result, never run again.
+            for (String id : ids) {
+                AssetInvocationResult again = AssetInvocations.retry(agent.data(), cardB, new AssetInvocation(
+                        AssetInvocations.VERSION, "inventory", "reserve", Map.of("sku", "x", "qty", "1"), id),
+                        Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+                assertThat(again.ok()).isTrue();
+            }
+            assertThat(providerA.reserved.size() + providerB.reserved.size()).as("a retry never runs again")
+                    .isEqualTo(runs);
+        } finally {
+            replica.close();
+        }
+    }
+
+    @Test
+    @Timeout(90)
+    void aLateReplicaAnswersARetryFromTheResultItsPeerAlreadyWrote() throws Exception {
+        Wired peerA = newPeer("conn-a", 1);
+        Wired peerB = newPeer("conn-b", 2, "conn-a");
+        Wired agent = newPeer("agent", 3, "conn-a");
+        tickAll(6);
+        InventoryProvider providerA = new InventoryProvider("@inv-a");
+        InventoryProvider providerB = new InventoryProvider("@inv-b");
+        PeerId a = peerA.identity().peerId();
+        PeerId b = peerB.identity().peerId();
+        connector = new ConnectorRuntime(peerA.data(), peerA.discovery(), peerA.identity(),
+                "inv-a", providerA, groupId, clock, Duration.ofMinutes(1)).replicas(b::equals);
+        connector.start();
+        tickAll(2);
+        AssetCard cardA = agent.discovery().find(AssetCard.class,
+                c -> c.asset().equals("inventory") && c.issuer().equals(a)).getFirst();
+        AssetInvocationResult first = AssetInvocations.invoke(agent.data(), cardA, "reserve",
+                Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        tickAll(4);
+        // Replica B starts after the result exists: no mirror event reaches it, so its check before
+        // running must find A's result.
+        ConnectorRuntime replica = new ConnectorRuntime(peerB.data(), peerB.discovery(), peerB.identity(),
+                "inv-b", providerB, groupId, clock, Duration.ofMinutes(1)).replicas(a::equals);
+        connector.close();
+        connector = null;
+        try {
+            replica.start();
+            tickAll(4);
+            AssetCard cardB = agent.discovery().find(AssetCard.class,
+                    c -> c.asset().equals("inventory") && c.issuer().equals(b)).getFirst();
+            AssetInvocationResult again = AssetInvocations.retry(agent.data(), cardB, new AssetInvocation(
+                    AssetInvocations.VERSION, "inventory", "reserve", Map.of("sku", "A-1", "qty", "1"),
+                    first.invocationId()), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+            assertThat(again.ok()).isTrue();
+            assertThat(again.result()).containsEntry("invocationId", first.invocationId());
+            assertThat(providerB.reserved).as("the replica never ran it").isEmpty();
+            assertThat(replica.repeated()).isEqualTo(1);
+        } finally {
+            replica.close();
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void withdrawingAnAssetsResultsSendsTheNextQueryToTheSource() throws Exception {
+        Wired connectorPeer = newPeer("conn", 1);
+        Wired agent = newPeer("agent", 2, "conn");
+        tickAll(4);
+        connector = new ConnectorRuntime(connectorPeer.data(), connectorPeer.discovery(), connectorPeer.identity(),
+                "cell-connector", new InventoryProvider(), groupId, clock, Duration.ofMinutes(1));
+        connector.start();
+        tickAll(2);
+        DataQueryClient client = new DataQueryClient(agent.data(), "analyst");
+        assertThat(client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(10))).isPresent();
+        assertThat(connector.executed()).isEqualTo(1);
+        tickAll(2);
+        assertThat(client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(10)).orElseThrow().fromCache())
+                .as("the live result serves the window").isTrue();
+        assertThat(connector.withdrawResults("inventory")).isEqualTo(1);
+        assertThat(connector.withdrawResults("inventory")).as("nothing left to withdraw").isZero();
+        tickAll(4);
+        DataQueryClient.Fetched fresh = client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(10)).orElseThrow();
+        assertThat(fresh.fromCache()).isFalse();
+        assertThat(connector.executed()).as("the next query reached the source").isEqualTo(2);
+        assertThat(connector.withdrawn()).isEqualTo(1);
+    }
+
+    @Test
+    void artifactRowsRoundTripAndRejectOrdinaryRows() {
+        ArtifactRows.Artifact artifact = new ArtifactRows.Artifact(
+                "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy", 3, 2_500_000L,
+                "application/x-ndjson", "inventory/exports/nightly", "2026-11-02T06:00:00Z");
+        assertThat(ArtifactRows.parse(artifact.toRow())).contains(artifact);
+        assertThat(ArtifactRows.isArtifact(Map.of("root", "bafy", "pieces", "1"))).isTrue();
+        assertThat(ArtifactRows.isArtifact(Map.of("sku", "A-1", "stock", "7"))).isFalse();
+        assertThat(ArtifactRows.isArtifact(Map.of("root", "zQm", "pieces", "1"))).as("a block CID is not a root").isFalse();
+        assertThat(ArtifactRows.isArtifact(Map.of("root", "bafy", "pieces", "many"))).isFalse();
+        assertThat(ArtifactRows.parse(Map.of("root", "bafy", "pieces", "2")).orElseThrow().size()).isEqualTo(-1);
+    }
+
     @Test
     void readersIgnoreUnknownFields() {
         byte[] future = codec.toBytes(Map.of("v", 2, "asset", "inventory", "operation", "reserve",

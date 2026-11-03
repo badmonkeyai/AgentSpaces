@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TlsTcpTransportTest {
 
     private static int freePort() throws Exception {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }

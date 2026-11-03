@@ -47,6 +47,7 @@ import java.util.Random;
 import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The content swarm over the in-memory fabric (srad/large-networks-bulk-data.md
@@ -837,6 +838,117 @@ class ContentSwarmTest {
         assertThat(fetch.complete()).isFalse();
         assertThat(a.content().rootsDroppedOnSample()).isEqualTo(1);
         assertThat(inPlace.roots()).isEmpty();
+    }
+
+    /** An external backend over bytes held "remotely" by key, counting every range read (CC-L-01, CC-L-02). */
+    private static final class RemoteStore implements ExternalStore {
+        final java.util.Map<String, byte[]> objects = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.Map<String, Manifest> manifests = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.Map<String, String> keys = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override public void register(Manifest manifest, String key) {
+            manifests.put(manifest.root(), manifest);
+            keys.put(manifest.root(), key);
+        }
+        @Override public String kind() { return "remote"; }
+        @Override public boolean writable() { return false; }
+        @Override public java.util.Set<String> roots() { return java.util.Set.copyOf(manifests.keySet()); }
+        @Override public java.util.Optional<Manifest> manifest(String root) { return java.util.Optional.ofNullable(manifests.get(root)); }
+        @Override public void open(Manifest manifest) { }
+        @Override public java.util.BitSet have(String root) {
+            java.util.BitSet bits = new java.util.BitSet();
+            Manifest m = manifests.get(root);
+            if (m != null) {
+                bits.set(0, m.pieces());
+            }
+            return bits;
+        }
+        @Override public java.util.Optional<byte[]> read(String root, int index, int offset, int length) {
+            Manifest m = manifests.get(root);
+            if (m == null) {
+                return java.util.Optional.empty();
+            }
+            reads.incrementAndGet();
+            byte[] object = objects.get(keys.get(root));
+            long at = (long) index * m.pieceSize() + offset;
+            int n = (int) Math.min(Math.min(length, m.pieceLength(index) - offset), object.length - at);
+            return java.util.Optional.of(java.util.Arrays.copyOfRange(object, (int) at, (int) at + n));
+        }
+        @Override public void write(String root, int index, byte[] piece) { throw new IllegalStateException("read-only"); }
+        @Override public SeekableByteChannel openArtifact(String root) throws IOException {
+            return new ByteArrayChannel(objects.get(keys.get(root)));
+        }
+        @Override public void pin(String root) { }
+        @Override public void unpin(String root) { }
+        @Override public boolean pinned(String root) { return manifests.containsKey(root); }
+        @Override public long bytesUsed() { return 0; }
+        @Override public long quota() { return 0; }
+        @Override public void evict() { }
+        @Override public void forget(String root) { manifests.remove(root); keys.remove(root); }
+    }
+
+    @Test
+    void anExternalStoreServesWhereItLiesAndTheCacheTakesEachPieceOnce() throws Exception {
+        RemoteStore remote = new RemoteStore();
+        MemoryPieceStore cache = new MemoryPieceStore(clock, 0);
+        Peer a = newPeer("a", 1, new CompositeStore(List.of(cache, remote), true));
+        Peer b = newPeer("b", 2, null, "a");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        byte[] artifact = randomBytes(6 * PIECE + 17, 61);
+        remote.objects.put("models/ckpt-7", artifact);
+        Manifest manifest = a.content().publishExternal(remote, "models/ckpt-7",
+                new java.io.ByteArrayInputStream(artifact), options());
+        assertThat(manifest.root()).isEqualTo(ContentRoots.hash(artifact, PIECE).root());
+        assertThat(remote.roots()).containsExactly(manifest.root());
+        assertThat(a.content().describe(manifest.root())).isPresent();
+
+        Fetch fetch = b.content().fetch(manifest.root());
+        assertThat(runUntil(Duration.ofSeconds(20), fetch::complete)).as(fetch.trace().toString()).isTrue();
+        assertThat(readAll(fetch)).isEqualTo(artifact);
+        assertThat(remote.reads.get()).as("one whole-piece read per piece, sub-ranges from the cache")
+                .isEqualTo(manifest.pieces());
+    }
+
+    @Test
+    void anExternalObjectChangedUnderneathIsForgottenInEveryBackend() throws Exception {
+        RemoteStore remote = new RemoteStore();
+        MemoryPieceStore cache = new MemoryPieceStore(clock, 0);
+        Peer a = newPeer("a", 1, new CompositeStore(List.of(cache, remote), true));
+        Peer b = newPeer("b", 2, null, "a");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        byte[] artifact = randomBytes(3 * PIECE + 5, 62);
+        remote.objects.put("tiles/7", artifact);
+        Manifest manifest = a.content().publishExternal(remote, "tiles/7",
+                ContentRoots.hash(artifact, PIECE), options());
+        remote.objects.put("tiles/7", randomBytes(artifact.length, 63)); // replaced after publication
+        Fetch fetch = b.content().fetch(manifest.root());
+        assertThat(runUntil(Duration.ofSeconds(20), () -> a.content().rootsDroppedOnSample() > 0))
+                .as("the first serve catches the change").isTrue();
+        assertThat(fetch.complete()).isFalse();
+        assertThat(a.content().rootsDroppedOnSample()).isEqualTo(1);
+        assertThat(remote.roots()).isEmpty();
+        assertThat(cache.roots()).as("the read-through copy of the bad piece goes too").doesNotContain(manifest.root());
+    }
+
+    @Test
+    void publishExternalRefusesABackendTheStoreDoesNotComposeAndAMismatchedPieceSize() throws Exception {
+        Peer a = newPeer("a", 1, null);
+        RemoteStore stray = new RemoteStore();
+        byte[] artifact = randomBytes(PIECE + 1, 64);
+        stray.objects.put("k", artifact);
+        assertThatThrownBy(() -> a.content().publishExternal(stray, "k", ContentRoots.hash(artifact, PIECE), options()))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("not part of this swarm's store");
+        RemoteStore remote = new RemoteStore();
+        Peer c = newPeer("c", 3, new CompositeStore(List.of(new MemoryPieceStore(clock, 0), remote), false));
+        assertThatThrownBy(() -> c.content().publishExternal(remote, "k", ContentRoots.hash(artifact, PIECE / 2), options()))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("another piece size");
+        assertThat(new InPlaceStore().external()).isTrue();
+        assertThat(new MemoryPieceStore(clock, 0).external()).isFalse();
     }
 
     @Test

@@ -52,7 +52,7 @@ final class Wire implements AutoCloseable {
     }
 
     static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }

@@ -52,6 +52,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -451,6 +453,11 @@ public final class PeerNode implements AutoCloseable {
     /** Frames the wire codec refused (bad signature, unknown version, garbage). */
     private final AtomicLong framesDropped = new AtomicLong();
     /** Join-by-GroupID fetches awaiting a verified founding advertisement. */
+    /** The first wait of a join by id before it asks again (ISSUE-BootstrapRobustness FR-4). */
+    static final long JOIN_SLICE_FIRST_MILLIS = 1_000;
+    /** The longest wait between two asks of a join by id; the slices double up to it. */
+    static final long JOIN_SLICE_MAX_MILLIS = 5_000;
+
     private final Map<GroupId, CompletableFuture<SignedGroupAdvertisement>> pendingFounding =
             new ConcurrentHashMap<>();
     private final Set<PeerAdvertisement.PeerRole> roles;
@@ -473,7 +480,7 @@ public final class PeerNode implements AutoCloseable {
      * a group's own hints win on a key clash. */
     private final Map<String, String> nodeHints = new ConcurrentHashMap<>();
     /** Listeners told about a member's resource hints on admission and on
-     * every refresh that changes them (TODO-EFG §4, token ingestion). */
+     * every refresh that changes them (plan EFG §4, token ingestion). */
     private final List<BiConsumer<PeerId, Map<String, String>>> credentialHintListeners =
             new CopyOnWriteArrayList<>();
     /** Bound on remembered hint maps; least-recently-refreshed evict. */
@@ -617,17 +624,6 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * The relay counters of one group per target (ISSUE-BootstrapCore FR-2, SR-2), a snapshot:
-     * keyed by the target's verified PeerId, held only for targets that were members of the group
-     * in this node's view when the frame arrived, and bounded per group at
-     * {@link #RELAY_TARGETS_CAPACITY} with the least recently relayed-to evicted first. A frame
-     * dropped because its target was no member counts in the group's total alone, since such a
-     * target is whatever id the sender named.
-     *
-     * @param groupId the group
-     * @return target to counters; empty for a group this node never relayed in
-     */
-    /**
      * The bytes this node forwarded as a relay in a group, per inner frame kind (LB-R-09): a pipe
      * frame under {@code PIPE_DATA:<capability>}, so the content swarm's pieces show as
      * {@code PIPE_DATA:aspace:cap/content-swarm}; empty for a group this node never relayed in.
@@ -673,6 +669,17 @@ public final class PeerNode implements AutoCloseable {
         }
     }
 
+    /**
+     * The relay counters of one group per target (ISSUE-BootstrapCore FR-2, SR-2), a snapshot:
+     * keyed by the target's verified PeerId, held only for targets that were members of the group
+     * in this node's view when the frame arrived, and bounded per group at
+     * {@link #RELAY_TARGETS_CAPACITY} with the least recently relayed-to evicted first. A frame
+     * dropped because its target was no member counts in the group's total alone, since such a
+     * target is whatever id the sender named.
+     *
+     * @param groupId the group
+     * @return target to counters; empty for a group this node never relayed in
+     */
     public Map<PeerId, RelayStats> relayStats(GroupId groupId) {
         RelayCounters counters = relayCounters.get(Objects.requireNonNull(groupId, "groupId"));
         if (counters == null) {
@@ -1073,14 +1080,6 @@ public final class PeerNode implements AutoCloseable {
             return this;
         }
 
-        /**
-         * Sets the relay offload of SRAD srad/agentspaces-js.md JS-W-11 ({@link RelayOffload}):
-         * the relayed frames a minute above which this node dials a member's signalled
-         * endpoint, and the wait after a failed dial. Defaults: 30 and 5 minutes.
-         *
-         * @param offload the settings
-         * @return this builder
-         */
         /** The longest relay path this node computes or forwards (LB-R-03, decision 10); default 4. */
         public Builder maxPathHops(int hops) {
             if (hops < 1) {
@@ -1102,6 +1101,14 @@ public final class PeerNode implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Sets the relay offload of SRAD srad/agentspaces-js.md JS-W-11 ({@link RelayOffload}):
+         * the relayed frames a minute above which this node dials a member's signalled
+         * endpoint, and the wait after a failed dial. Defaults: 30 and 5 minutes.
+         *
+         * @param offload the settings
+         * @return this builder
+         */
         public Builder relayOffload(RelayOffload offload) {
             this.relayOffload = Objects.requireNonNull(offload, "offload");
             return this;
@@ -1131,7 +1138,7 @@ public final class PeerNode implements AutoCloseable {
         private long locateMaxMillis = LOCATE_MAX_INTERVAL_MILLIS;
 
         /**
-         * Registers a listener for members' credential hints (TODO-EFG §4):
+         * Registers a listener for members' credential hints (plan EFG §4):
          * the resource hints of a peer's verified, admitted self-advertisement
          * are delivered when the peer is admitted and again whenever a refreshed
          * advertisement changes them (an unchanged refresh is not re-delivered).
@@ -1183,17 +1190,6 @@ public final class PeerNode implements AutoCloseable {
         }
 
         /**
-         * How often this node re-floods its self-advertisement through each group (default 30 s,
-         * capped at half the advertisement TTL). The advertisement used to go out on every tick,
-         * which at a 250 ms tick with fanout 3 and six hops had every member re-verifying every
-         * other member's signature several times a second, growing with the fleet. Between
-         * refreshes a member this node has not yet introduced itself to receives the advertisement
-         * directly, once, so discovery of a newcomer is not slowed by the interval.
-         *
-         * @param interval the refresh interval
-         * @return this builder
-         */
-        /**
          * Coalesces rumors, digests, pull responses and pipe frames to one destination into one
          * signed BATCH frame per window (PERF2 §3.3): one signature and one verification where
          * there were many. Only toward peers that advertise {@code wire.batch=1}; other peers get
@@ -1226,6 +1222,17 @@ public final class PeerNode implements AutoCloseable {
             return this;
         }
 
+        /**
+         * How often this node re-floods its self-advertisement through each group (default 30 s,
+         * capped at half the advertisement TTL). The advertisement used to go out on every tick,
+         * which at a 250 ms tick with fanout 3 and six hops had every member re-verifying every
+         * other member's signature several times a second, growing with the fleet. Between
+         * refreshes a member this node has not yet introduced itself to receives the advertisement
+         * directly, once, so discovery of a newcomer is not slowed by the interval.
+         *
+         * @param interval the refresh interval
+         * @return this builder
+         */
         public Builder peerAdInterval(Duration interval) {
             Objects.requireNonNull(interval, "interval");
             if (interval.isZero() || interval.isNegative()) {
@@ -1427,7 +1434,7 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * Sets one of this node's own credential hints (TODO-EFG §4): the value is
+     * Sets one of this node's own credential hints (plan EFG §4): the value is
      * carried under {@code key} in every group's next signed self-advertisement,
      * so every member's {@linkplain Builder#onCredentialHints hint listener}
      * sees it within one gossip period. Refreshing a token is calling this
@@ -1531,12 +1538,6 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * Returns how many inbound frames the wire codec refused outright (spec
-     * §9): failed signature, half-signed, unknown wire version, or garbage.
-     * Such frames name no verified sender, so they count here and strike
-     * nobody.
-     */
-    /**
      * How many verified frames this node dropped as stale, older than five minutes by its own
      * clock (ROBUSTNESS.md §3.3). Not a strike and not in {@link #framesDropped()}: a late frame
      * is the network's doing, not its signer's.
@@ -1554,6 +1555,12 @@ public final class PeerNode implements AutoCloseable {
         return framesReplayed.get();
     }
 
+    /**
+     * Returns how many inbound frames the wire codec refused outright (spec
+     * §9): failed signature, half-signed, unknown wire version, or garbage.
+     * Such frames name no verified sender, so they count here and strike
+     * nobody.
+     */
     public long framesDropped() {
         return framesDropped.get();
     }
@@ -1563,13 +1570,6 @@ public final class PeerNode implements AutoCloseable {
         return strikes.getOrDefault(peer, 0);
     }
 
-    /**
-     * Returns the channel-authentication mode per connected peer, for the
-     * console and diagnostics: {@code "attested"} when frames to that peer ride
-     * an authenticated channel unsigned, {@code "signed"} otherwise.
-     *
-     * @return peer to mode, a snapshot
-     */
     /**
      * Returns the transport scheme of each connected peer's connection ({@code tcp}, {@code tls},
      * {@code ws}, {@code webrtc}, ...), for the console (srad/agentspaces-js.md JS-N-07): a
@@ -1584,6 +1584,13 @@ public final class PeerNode implements AutoCloseable {
         return schemes;
     }
 
+    /**
+     * Returns the channel-authentication mode per connected peer, for the
+     * console and diagnostics: {@code "attested"} when frames to that peer ride
+     * an authenticated channel unsigned, {@code "signed"} otherwise.
+     *
+     * @return peer to mode, a snapshot
+     */
     public Map<PeerId, String> channelModes() {
         Map<PeerId, String> modes = new java.util.HashMap<>();
         connections.forEach((peer, connection) -> {
@@ -1751,7 +1758,7 @@ public final class PeerNode implements AutoCloseable {
 
     /**
      * The capabilities of the binding registered for a scheme (spec §5.5),
-     * for hosts' startup checks and the console.
+     * for diagnostics and tests; no host or console reads it today.
      *
      * @param scheme the transport scheme
      * @return the registered binding's capabilities, or empty when none is registered
@@ -2088,7 +2095,13 @@ public final class PeerNode implements AutoCloseable {
 
     /**
      * Joins a group knowing only its GroupID, through a locator asked by the
-     * configured group name.
+     * configured group name. The join keeps asking while it waits
+     * (ISSUE-BootstrapRobustness FR-4): after the first locate it waits in
+     * slices of 1 s, 2 s, 4 s, then 5 s each up to the timeout; at each slice
+     * it dials again every endpoint that is not connected, sends
+     * {@code GROUP_AD_WANT} again on every connection it holds, and asks the
+     * locator again when nothing is connected. A first answer that is empty
+     * under {@code bootstrap.require} refuses at once, with no slices.
      *
      * @param groupId          the GroupID
      * @param membershipConfig membership tuning
@@ -2098,8 +2111,10 @@ public final class PeerNode implements AutoCloseable {
      * @param validator        POLICY admission validator, or {@code null}
      * @param groupName        the configured group name, or null for the id
      * @return the group runtime
-     * @throws TimeoutException      when no seed served a verified founding advertisement within the timeout
-     * @throws IllegalStateException when the group is already joined or a fetch for it is already in progress
+     * @throws FoundingTimeoutException when no seed served a verified founding advertisement within the
+     *                                  timeout; the message reports the locates, the endpoints dialed and
+     *                                  connected, and the last hint
+     * @throws IllegalStateException    when the group is already joined or a fetch for it is already in progress
      */
     public GroupRuntime joinGroup(GroupId groupId,
                                   GroupMembership.Config membershipConfig,
@@ -2113,6 +2128,8 @@ public final class PeerNode implements AutoCloseable {
         Objects.requireNonNull(timeout, "timeout");
         Objects.requireNonNull(membershipHints, "membershipHints");
         String name = groupName == null || groupName.isBlank() ? groupId.value() : groupName;
+        // The timeout bounds the whole join, the first locate included (CR-3).
+        long deadline = System.nanoTime() + timeout.toNanos();
         BeaconHint hint = locate(groupId, name, locator);
         if (hint.founding().isPresent()) {
             SignedGroupAdvertisement carried = decodeFounding(hint.founding().get());
@@ -2124,7 +2141,6 @@ public final class PeerNode implements AutoCloseable {
             LOG.log(System.Logger.Level.WARNING, "the locator's founding advertisement for " + groupId
                     + " did not verify as that group's; asking the seeds instead");
         }
-        List<PeerAdvertisement.Endpoint> seeds = hint.endpoints();
         if (groups.containsKey(groupId)) {
             throw new IllegalStateException("already a member of " + groupId);
         }
@@ -2132,39 +2148,135 @@ public final class PeerNode implements AutoCloseable {
         if (pendingFounding.putIfAbsent(groupId, pending) != null) {
             throw new IllegalStateException("a join of " + groupId + " is already in progress");
         }
-        List<TransportConnection> asked = new ArrayList<>();
+        // ISSUE-BootstrapRobustness FR-4: the join keeps asking while it waits.
+        // Slices of 1 s, 2 s, 4 s, then 5 s each up to the timeout; at the start
+        // of each slice every endpoint that is not connected is dialed again,
+        // GROUP_AD_WANT goes out again on every connection held, and when nothing
+        // is connected the locator is asked again on a virtual thread, so a slow
+        // locator never extends the timeout. The first locate above stays
+        // synchronous because require (FR-5) decides on it.
+        Map<String, TransportConnection> connected = new LinkedHashMap<>();
+        Set<String> dialed = new HashSet<>();
+        int locates = 1;
+        long slice = JOIN_SLICE_FIRST_MILLIS;
+        BeaconHint current = hint;
+        CompletableFuture<BeaconHint> reask = null;
         try {
-            for (PeerAdvertisement.Endpoint seed : seeds) {
-                Transport transport = transports.get(seed.transport());
-                if (transport == null) {
-                    continue;
+            dialAndAsk(groupId, current, dialed, connected);
+            while (true) {
+                long sliceEnd = Math.min(System.nanoTime() + slice * 1_000_000L, deadline);
+                while (true) {
+                    long wait = sliceEnd - System.nanoTime();
+                    if (wait <= 0) {
+                        break;
+                    }
+                    CompletableFuture<?> wake = reask == null ? pending : CompletableFuture.anyOf(pending, reask);
+                    try {
+                        wake.get(wait, java.util.concurrent.TimeUnit.NANOSECONDS);
+                    } catch (TimeoutException e) {
+                        break;
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new TimeoutException("interrupted while fetching the founding advertisement of "
+                                + groupId);
+                    } catch (java.util.concurrent.ExecutionException e) {
+                        throw new IllegalStateException(e.getCause());
+                    }
+                    if (pending.isDone()) {
+                        break;
+                    }
+                    if (reask != null && reask.isDone()) {
+                        BeaconHint answer = reask.join();
+                        reask = null;
+                        if (!answer.isEmpty()) {
+                            current = answer;
+                        }
+                        dialAndAsk(groupId, current, dialed, connected);
+                    }
                 }
-                try {
-                    TransportConnection connection = transport.dial(seed.address());
-                    asked.add(connection);
-                    attach(connection);
-                    // Unaddressed: the seed's PeerID is not known until it answers.
-                    sendOn(connection, groupId, null, Envelope.Kind.GROUP_AD_WANT, new byte[0]);
-                } catch (IOException e) {
-                    // Seed unreachable; another may answer.
+                if (pending.isDone()) {
+                    SignedGroupAdvertisement founding;
+                    try {
+                        founding = pending.get();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new TimeoutException("interrupted while fetching the founding advertisement of "
+                                + groupId);
+                    } catch (java.util.concurrent.ExecutionException e) {
+                        throw new IllegalStateException(e.getCause());
+                    }
+                    return join(founding.advertisement(), founding, membershipConfig, locator, current,
+                            membershipHints, validator, name);
                 }
+                if (System.nanoTime() >= deadline) {
+                    throw joinTimeout(groupId, timeout, locates, dialed.size(), connected.size(), current);
+                }
+                dialAndAsk(groupId, current, dialed, connected);
+                if (connected.isEmpty() && reask == null) {
+                    locates++;
+                    String askedAs = name;
+                    reask = CompletableFuture.supplyAsync(() -> locate(groupId, askedAs, locator, true),
+                            Thread::startVirtualThread);
+                }
+                slice = Math.min(slice * 2, JOIN_SLICE_MAX_MILLIS);
             }
-            SignedGroupAdvertisement founding;
-            try {
-                founding = pending.get(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new TimeoutException("interrupted while fetching the founding advertisement of "
-                        + groupId);
-            } catch (java.util.concurrent.ExecutionException e) {
-                throw new IllegalStateException(e.getCause());
-            }
-            return join(founding.advertisement(), founding, membershipConfig, locator, hint,
-                    membershipHints, validator, name);
         } finally {
             pendingFounding.remove(groupId, pending);
-            asked.forEach(TransportConnection::close);
+            connected.values().forEach(TransportConnection::close);
         }
+    }
+
+    /**
+     * Dials every endpoint of the hint that is not connected and sends
+     * {@code GROUP_AD_WANT} on every connection held. An endpoint that
+     * refused once is dialed again next time, so a seed that starts late at
+     * the same address is reached (ISSUE-BootstrapRobustness FR-4).
+     */
+    private void dialAndAsk(GroupId groupId, BeaconHint hint, Set<String> dialed,
+                            Map<String, TransportConnection> connected) {
+        for (PeerAdvertisement.Endpoint seed : hint.endpoints()) {
+            String key = seed.transport() + "://" + seed.address();
+            if (connected.containsKey(key)) {
+                continue;
+            }
+            Transport transport = transports.get(seed.transport());
+            if (transport == null) {
+                continue;
+            }
+            dialed.add(key);
+            try {
+                TransportConnection connection = transport.dial(seed.address());
+                connected.put(key, connection);
+                attach(connection);
+            } catch (IOException e) {
+                // Seed unreachable now; it is dialed again at the next slice.
+            }
+        }
+        for (java.util.Iterator<TransportConnection> it = connected.values().iterator(); it.hasNext();) {
+            TransportConnection connection = it.next();
+            try {
+                // Unaddressed: the seed's PeerID is not known until it answers.
+                sendOn(connection, groupId, null, Envelope.Kind.GROUP_AD_WANT, new byte[0]);
+            } catch (IOException e) {
+                // The connection went away; drop it so the endpoint is dialed again.
+                it.remove();
+                connection.close();
+            }
+        }
+    }
+
+    /** The report of a join by id that ran out of time (ISSUE-BootstrapRobustness FR-6). */
+    private FoundingTimeoutException joinTimeout(GroupId groupId, Duration timeout, int locates, int dialed,
+                                                 int connected, BeaconHint hint) {
+        StringBuilder message = new StringBuilder("no verified founding for ").append(groupId)
+                .append(" within ").append(timeout.toMillis()).append(" ms: ")
+                .append(locates).append(" locate(s), ")
+                .append(connected).append(" of ").append(dialed).append(" endpoint(s) connected");
+        if (connected > 0) {
+            message.append(", the connected peers sent no founding for this id");
+        }
+        message.append("; last hint: ").append(traceText(groupId, hint));
+        return new FoundingTimeoutException(message.toString(), locates, dialed, connected);
     }
 
     /** Decodes a hint's founding bytes, or null when they are not a signed founding advertisement. */
@@ -4648,6 +4760,13 @@ public final class PeerNode implements AutoCloseable {
     }
 
     private void onPeerAdItem(GroupRuntime runtime, PeerId from, byte[] payload) {
+        /**
+         * Decodes and verifies one peers-stream payload end-to-end: the embedded
+         * key must hash to the ad's issuer, the signature must verify, and the ad
+         * must be unexpired and not future-issued beyond clock skew (ASF-027 — a
+         * far-future {@code issued} would otherwise make an ad un-evictable and
+         * permanently newest in last-writer-wins).
+         */
         PeerAdvertisement ad = verifiedPeerAd(payload).orElse(null);
         if (ad == null) {
             return;
@@ -4777,7 +4896,7 @@ public final class PeerNode implements AutoCloseable {
     /**
      * Feeds an admitted, verified self-advertisement into the group's view and
      * tells the credential-hint listeners when it introduces a member or
-     * changes the hints a member last presented (TODO-EFG §4).
+     * changes the hints a member last presented (plan EFG §4).
      */
     private void admitAdvertisement(GroupRuntime runtime, PeerAdvertisement ad) {
         if (ad.issuer().equals(peerId())) {
@@ -4910,13 +5029,6 @@ public final class PeerNode implements AutoCloseable {
         }
     }
 
-    /**
-     * Decodes and verifies one peers-stream payload end-to-end: the embedded
-     * key must hash to the ad's issuer, the signature must verify, and the ad
-     * must be unexpired and not future-issued beyond clock skew (ASF-027 — a
-     * far-future {@code issued} would otherwise make an ad un-evictable and
-     * permanently newest in last-writer-wins).
-     */
     /** Whether this node forwards a peers-stream payload: verifiable end-to-end, and not a revoked peer's. */
     boolean forwardsPeerAd(RevocationRegistry revocations, byte[] payload) {
         return verifiedPeerAd(payload).filter(ad -> !revocations.revoked(ad.issuer())).isPresent();

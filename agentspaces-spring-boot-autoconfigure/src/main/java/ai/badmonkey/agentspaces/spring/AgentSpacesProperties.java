@@ -112,12 +112,6 @@ public class AgentSpacesProperties {
     /** The block exchange's store (SPEC §7.1, srad/large-networks-bulk-data.md LB-B-05). */
     private Blocks blocks = new Blocks();
 
-    /**
-     * What this peer forwards as a {@code RELAY} (SPEC §5.4; ISSUE-BootstrapCore FR-2):
-     * a byte budget per group per day, enforced through {@code RelayPolicy.dailyBudget}
-     * when no {@code RelayPolicy} bean is defined. Unset: every forward the membership
-     * check allows.
-     */
     /** {@code agentspaces.content.*}: the content swarm (srad/large-networks-bulk-data.md appendix D). */
     public static class ContentSwarm {
         /** Attach the capability and the escalation path; off until a host turns it on (decision 7). */
@@ -135,6 +129,8 @@ public class AgentSpacesProperties {
         private int maxWindow = 32;
         private int maxFetches = 4;
         private long uploadBytesPerDay;
+        /** Bytes this peer may request from holders per UTC day (LB-P-06); 0 is unbounded. */
+        private long downloadBytesPerDay;
         private boolean replicateManifests = true;
         private Store store = new Store();
 
@@ -269,6 +265,19 @@ public class AgentSpacesProperties {
             this.uploadBytesPerDay = uploadBytesPerDay;
         }
 
+        public long getDownloadBytesPerDay() {
+            return downloadBytesPerDay;
+        }
+
+        public void setDownloadBytesPerDay(long downloadBytesPerDay) {
+            this.downloadBytesPerDay = downloadBytesPerDay;
+        }
+
+        /**
+         * @deprecated since 0.5.0: nothing reads this key; manifests are replicated per publish
+         * through {@code PublishOptions.replicate}. The key binds and is ignored; it goes in 0.6.0.
+         */
+        @Deprecated(since = "0.5.0", forRemoval = true)
         public boolean isReplicateManifests() {
             return replicateManifests;
         }
@@ -286,6 +295,12 @@ public class AgentSpacesProperties {
         }
     }
 
+    /**
+     * What this peer forwards as a {@code RELAY} (SPEC §5.4; ISSUE-BootstrapCore FR-2):
+     * a byte budget per group per day, enforced through {@code RelayPolicy.dailyBudget}
+     * when no {@code RelayPolicy} bean is defined. Unset: every forward the membership
+     * check allows.
+     */
     public static class Relay {
         /** Longest relay path this node computes or forwards (LB-R-03); default 4. */
         private int maxPathHops = 4;
@@ -980,14 +995,6 @@ public class AgentSpacesProperties {
     }
 
     /**
-     * The security posture ({@code agentspaces.security.profile}): one named
-     * profile — {@code dev-local}, {@code mtls} (the default),
-     * {@code mtls-oidc}, or {@code zero-trust} — sets transport and channel
-     * authentication coherently (remediation plan §4). Explicit
-     * {@code agentspaces.transport.*} settings override the profile's choices
-     * for deployments that need to deviate deliberately.
-     */
-    /**
      * How bound agents sign (QA4 A4-7 phase 3). {@code agent-keys=peer} (default)
      * signs every agent's records with the peer key, attributing them on the
      * peer's word; {@code subordinate} gives each bound agent an Ed25519 key of
@@ -1027,6 +1034,14 @@ public class AgentSpacesProperties {
         }
     }
 
+    /**
+     * The security posture ({@code agentspaces.security.profile}): one named
+     * profile — {@code dev-local}, {@code mtls} (the default),
+     * {@code mtls-oidc}, or {@code zero-trust} — sets transport and channel
+     * authentication coherently (remediation plan §4). Explicit
+     * {@code agentspaces.transport.*} settings override the profile's choices
+     * for deployments that need to deviate deliberately.
+     */
     public static class Security {
 
         private String profile = "mtls";
@@ -1369,12 +1384,6 @@ public class AgentSpacesProperties {
         }
 
         /**
-         * An HTTP binding's block (SRAD agentspaces-js §3.3, JS-H-10): the
-         * listener keys plus the path, the browser-origin allowlist, and the
-         * binding's tunables. {@code ws} and {@code http} may share a
-         * {@code bind}, as may {@code wss} and {@code https}.
-         */
-        /**
          * The {@code webrtc} block (SRAD agentspaces-js §3.4, §4.3, JS-N-04): {@code enabled}
          * registers the binding and accepts offers, advertising {@code Endpoint("webrtc", "sig",
          * priority)} with the priority defaulting after every stream endpoint (JS-W-08); the
@@ -1505,6 +1514,12 @@ public class AgentSpacesProperties {
             }
         }
 
+        /**
+         * An HTTP binding's block (SRAD agentspaces-js §3.3, JS-H-10): the
+         * listener keys plus the path, the browser-origin allowlist, and the
+         * binding's tunables. {@code ws} and {@code http} may share a
+         * {@code bind}, as may {@code wss} and {@code https}.
+         */
         public static class Http extends Listener {
 
             private String path;

@@ -49,6 +49,32 @@ public record GroupId(String value) {
         return new GroupId(Multibase.base58btc(Digests.sha256(foundingAdvertisementBytes)));
     }
 
+    /** The URI scheme prefix of a group id ({@code aspace://}), shared by every parser of it. */
+    public static final String URI_PREFIX = "aspace://";
+
+    /**
+     * Parses {@code aspace://<id>}, {@code aspace://<id>/<space>}, or a bare id:
+     * the one parser for the join URI (review-110226-deadcode-parity D9).
+     *
+     * @param uri the URI or bare id
+     * @return the group id
+     * @throws IllegalArgumentException when no id is present or it is malformed
+     */
+    public static GroupId ofUri(String uri) {
+        String value = java.util.Objects.requireNonNull(uri, "uri").trim();
+        if (value.regionMatches(true, 0, URI_PREFIX, 0, URI_PREFIX.length())) {
+            value = value.substring(URI_PREFIX.length());
+        }
+        int slash = value.indexOf('/');
+        if (slash >= 0) {
+            value = value.substring(0, slash);
+        }
+        if (value.isEmpty()) {
+            throw new IllegalArgumentException("URI carries no GroupId: '" + uri + "'");
+        }
+        return of(value);
+    }
+
     /**
      * Wraps an existing encoded GroupID value.
      *

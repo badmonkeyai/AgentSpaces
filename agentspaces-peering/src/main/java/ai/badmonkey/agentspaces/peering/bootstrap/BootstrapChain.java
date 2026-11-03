@@ -101,6 +101,30 @@ public final class BootstrapChain implements BeaconLocator {
         return lastTrace;
     }
 
+    /** A chain asks every member, so one member that can locate is enough. */
+    @Override
+    public boolean canLocate() {
+        return locators.stream().anyMatch(BeaconLocator::canLocate);
+    }
+
+    /**
+     * The locators of a chain with the state of each, for a host's refusal
+     * message: a member that cannot locate is marked "(nothing configured)".
+     *
+     * @param locator a chain or a single locator
+     * @return the description
+     */
+    public static String describe(BeaconLocator locator) {
+        if (locator instanceof BootstrapChain chain) {
+            if (chain.locators().isEmpty()) {
+                return "an empty chain";
+            }
+            return chain.locators().stream().map(BootstrapChain::describe)
+                    .collect(java.util.stream.Collectors.joining(", "));
+        }
+        return locator.canLocate() ? locator.name() : locator.name() + " (nothing configured)";
+    }
+
     @Override
     public String name() {
         return NAME;

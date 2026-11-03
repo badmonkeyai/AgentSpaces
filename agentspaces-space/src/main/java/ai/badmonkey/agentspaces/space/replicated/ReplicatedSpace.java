@@ -485,13 +485,6 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
 
         /**
-         * Attaches a block exchange so payloads above the inline limit are
-         * content-addressed and fetched out of band (spec §7.1).
-         *
-         * @param blocks the group's block exchange
-         * @return this builder
-         */
-        /**
          * Escalates payloads above a threshold to a bulk-payload seam (the content
          * swarm), so an entry of any size travels as a reference (LB-E-02). Between
          * the inline limit and the threshold the block exchange carries the payload
@@ -522,6 +515,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return this;
         }
 
+        /**
+         * Attaches a block exchange so payloads above the inline limit are
+         * content-addressed and fetched out of band (spec §7.1).
+         *
+         * @param blocks the group's block exchange
+         * @return this builder
+         */
         public Builder blocks(ai.badmonkey.agentspaces.peering.blocks.BlockExchange blocks) {
             this.blocks = Objects.requireNonNull(blocks, "blocks");
             return this;
@@ -1211,6 +1211,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             valueCache.put(prepared.entryId(), prepared.value());
             indexCredential(prepared.entryId());
+            /**
+             * Builds a signed state DTO for the entry: {@link SpaceWire.EntryStateDto}
+             * plus a signature by this node over the mutable state. The local node is
+             * the authorized actor for every state it publishes (the issuer for its own
+             * writes/renewals/cancels, the take-claim holder for its completions), so it
+             * always signs with its own key.
+             */
             dto = signedDto(prepared.entryId(), identity.rawPublicKey(), prepared.actor());
         }
         publishDelta(new SpaceWire.Delta(dto, null, null), "w:" + prepared.entryId());
@@ -2893,13 +2900,6 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                             Long keyEpoch) {
     }
 
-    /**
-     * Builds a signed state DTO for the entry: {@link SpaceWire.EntryStateDto}
-     * plus a signature by this node over the mutable state. The local node is
-     * the authorized actor for every state it publishes (the issuer for its own
-     * writes/renewals/cancels, the take-claim holder for its completions), so it
-     * always signs with its own key.
-     */
     /**
      * Signs the entry's current state as {@code actor} (SPEC §11a.4, v0.1.13).
      * A subordinate actor signs with its own key: the DTO names it as signer,

@@ -21,28 +21,52 @@ import ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain;
 import java.util.List;
 
 /**
- * Builds the locator a group is joined with from the locators the properties
- * produced (the configured seeds) and the {@link BeaconLocator} beans that
- * apply to the group, in that order. The starter's default is a
- * {@link BootstrapChain} over all of them; define a bean of this type to
- * change the composition policy for every group (first-wins, a different
- * order, a different per-locator deadline) while the locators themselves
- * stay as they are.
+ * The Spring form of {@link ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChainFactory}:
+ * composes the locator a group is joined with from the locators the starter
+ * collected for it (the configured seeds, the multicast locator when it is on,
+ * and the {@link BeaconLocator} beans that apply to the group, in that order),
+ * with the group's configuration in hand. The starter's default is a
+ * {@link BootstrapChain} over all of them; define a bean of this type, or of
+ * the peering form, to change the composition policy for every group
+ * (first-wins, a different order, a different per-locator deadline) while the
+ * locators themselves stay as they are.
  */
 @FunctionalInterface
-public interface BootstrapChainFactory {
+public interface BootstrapChainFactory extends ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChainFactory {
 
     /**
      * Composes the locator for one group.
      *
      * @param group    the group's configuration
-     * @param locators the property-built locators followed by the applicable beans, in order
+     * @param locators the seeds locator, the multicast locator when enabled, then the applicable beans
      * @return the locator the node joins with
      */
     BeaconLocator chainFor(AgentSpacesProperties.Group group, List<BeaconLocator> locators);
 
+    /** The peering form, satisfied by name: a group object carrying the name is passed to {@link #chainFor(AgentSpacesProperties.Group, List)}. */
+    @Override
+    default BeaconLocator chainFor(String groupName, List<BeaconLocator> locators) {
+        AgentSpacesProperties.Group group = new AgentSpacesProperties.Group();
+        group.setName(groupName);
+        return chainFor(group, locators);
+    }
+
     /** The starter's default: a chain over the locators in the given order. */
     static BootstrapChainFactory defaults() {
         return (group, locators) -> BootstrapChain.builder().addAll(locators).build();
+    }
+
+    /**
+     * Adapts the peering form, so a host that composes by name alone (the
+     * bootstrap project's composer, a plain-Java host) plugs into the starter.
+     *
+     * @param factory the peering form
+     * @return the Spring form
+     */
+    static BootstrapChainFactory of(ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChainFactory factory) {
+        if (factory instanceof BootstrapChainFactory spring) {
+            return spring;
+        }
+        return (group, locators) -> factory.chainFor(group.getName(), locators);
     }
 }

@@ -79,6 +79,24 @@ public interface AssetProvider {
     }
 
     /**
+     * {@link #invoke(String, String, Map, String)} with the requesting peer, for a provider that
+     * must judge the requester itself, such as one that fetches an artifact the requester names
+     * and must check the requester may fetch it. The {@link ConnectorRuntime} calls this form; the
+     * default ignores the requester.
+     *
+     * @param asset        the asset name from the card
+     * @param operation    the operation, one of the card's {@code invoke-ops}
+     * @param params       the operation's parameters, by declared name
+     * @param invocationId the invocation's id, constant across retries
+     * @param requester    the peer that signed the invocation, or {@code null} when unknown
+     * @return the result, or an error naming the rule that refused it
+     */
+    default InvokeResult invoke(String asset, String operation, Map<String, String> params,
+                                String invocationId, ai.badmonkey.agentspaces.common.id.PeerId requester) {
+        return invoke(asset, operation, params, invocationId);
+    }
+
+    /**
      * One operation's answer.
      *
      * @param ok     whether the operation ran and succeeded

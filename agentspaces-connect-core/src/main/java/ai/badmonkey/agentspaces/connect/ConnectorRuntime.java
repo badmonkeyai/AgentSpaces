@@ -18,7 +18,10 @@ package ai.badmonkey.agentspaces.connect;
 import ai.badmonkey.agentspaces.api.ad.AssetCard;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Matchers;
+import ai.badmonkey.agentspaces.api.space.EntryHandle;
 import ai.badmonkey.agentspaces.api.space.Space;
+import ai.badmonkey.agentspaces.api.space.SpaceEvent;
+import ai.badmonkey.agentspaces.api.space.Subscription;
 import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.Authorizer;
@@ -37,13 +40,16 @@ import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.InstantSource;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 
 import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
 
@@ -97,6 +103,14 @@ public final class ConnectorRuntime implements AutoCloseable {
     private final AtomicInteger invoked = new AtomicInteger();
     private final AtomicInteger refused = new AtomicInteger();
     private final AtomicInteger repeated = new AtomicInteger();
+    private final AtomicInteger mirrored = new AtomicInteger();
+    private final AtomicInteger renewals = new AtomicInteger();
+    private final AtomicInteger withdrawn = new AtomicInteger();
+    /** This connector's live query results by asset, so a source change can withdraw them (CC-L-09). */
+    private final Map<String, List<Issued>> resultsByAsset = new ConcurrentHashMap<>();
+    /** When set, the peers that serve the same assets as replicas of this connector (CC-L-08). */
+    private volatile Predicate<PeerId> replicas;
+    private Subscription mirror;
     /** The operations each advertised asset's card allows (appendix F {@code invoke-ops}). */
     private final Map<String, Set<String>> invokeOpsByAsset = new ConcurrentHashMap<>();
     /** Answered invocations by id, kept for {@link #invocationRetention} so a retry never re-runs the target. */
@@ -114,6 +128,10 @@ public final class ConnectorRuntime implements AutoCloseable {
 
     /** One remembered answer. */
     private record Answered(AssetInvocationResult result, Instant at) {
+    }
+
+    /** One query result this connector wrote, with the instant its lease lapses. */
+    private record Issued(EntryHandle handle, Instant until) {
     }
 
     /**
@@ -207,6 +225,22 @@ public final class ConnectorRuntime implements AutoCloseable {
     }
 
     /**
+     * Names the peers that run as replicas of this connector: they serve the same assets from the
+     * same source under their own identities (CC-L-08). Before running an invocation, the runtime
+     * looks for a result a replica already wrote for the same id and answers with it; and it
+     * mirrors each replica's result under its own identity, because a requester accepts a result
+     * only from the issuer of the card it invoked through. Call before {@link #start()}; without
+     * replicas a result from any other peer never counts, as before.
+     *
+     * @param replicas decides whether a peer is a replica of this connector
+     * @return this runtime
+     */
+    public ConnectorRuntime replicas(Predicate<PeerId> replicas) {
+        this.replicas = Objects.requireNonNull(replicas, "replicas");
+        return this;
+    }
+
+    /**
      * Gives the runtime the fleet's {@link Authorizer} (TODO-EFG §4, TODO
      * item 6). From then on {@link #start()} and every {@link #refreshCards()}
      * publish a card only for an asset the connector's own peer is permitted
@@ -243,6 +277,40 @@ public final class ConnectorRuntime implements AutoCloseable {
         if (feed == null && provider instanceof MaterializingAssetProvider materializing) {
             feed = materializing.materialize(this::push);
         }
+        if (mirror == null && replicas != null) {
+            mirror = invocationSpace.notify(Template.of(AssetInvocationResult.class), this::mirror,
+                    Lease.of(Duration.ofDays(3650)));
+        }
+    }
+
+    /**
+     * Withdraws this connector's live query results for an asset, so the next query for it
+     * reaches the source instead of a result that predates a source change (CC-L-09).
+     *
+     * @param asset the asset
+     * @return how many results were withdrawn
+     */
+    public int withdrawResults(String asset) {
+        List<Issued> held = resultsByAsset.remove(asset);
+        if (held == null) {
+            return 0;
+        }
+        Instant now = clock.instant();
+        int n = 0;
+        synchronized (held) {
+            for (Issued issued : held) {
+                if (issued.until().isAfter(now)) {
+                    try {
+                        issued.handle().cancel();
+                        n++;
+                    } catch (RuntimeException lapsed) {
+                        // The lease lapsed meanwhile; nothing to withdraw.
+                    }
+                }
+            }
+        }
+        withdrawn.addAndGet(n);
+        return n;
     }
 
     /**
@@ -291,6 +359,21 @@ public final class ConnectorRuntime implements AutoCloseable {
         return servedFromSpace.get();
     }
 
+    /** How many replica results this connector wrote again under its own identity. */
+    public int mirrored() {
+        return mirrored.get();
+    }
+
+    /** How many times a running invocation's claim was renewed. */
+    public int renewals() {
+        return renewals.get();
+    }
+
+    /** How many live query results {@link #withdrawResults(String)} took back. */
+    public int withdrawn() {
+        return withdrawn.get();
+    }
+
     /** How many source changes this connector materialized into the change space. */
     public int materialized() {
         return materialized.get();
@@ -299,6 +382,10 @@ public final class ConnectorRuntime implements AutoCloseable {
     @Override
     public synchronized void close() {
         running = false;
+        if (mirror != null) {
+            mirror.close();
+            mirror = null;
+        }
         if (feed != null) {
             try {
                 feed.close();
@@ -387,9 +474,10 @@ public final class ConnectorRuntime implements AutoCloseable {
             AssetProvider.QueryResult result = provider.query(
                     query.asset(), query.parameters());
             executed.incrementAndGet();
-            dataSpace.complete(taken, new DataResult(hash, query.asset(),
+            EntryHandle handle = dataSpace.complete(taken, new DataResult(hash, query.asset(),
                     result.rows(), result.error(), connectorName),
                     Lease.of(freshness));
+            track(query.asset(), handle, freshness);
         } catch (RuntimeException e) {
             LOG.log(System.Logger.Level.WARNING,
                     "query failed for asset " + query.asset(), e);
@@ -421,6 +509,18 @@ public final class ConnectorRuntime implements AutoCloseable {
             LOG.log(System.Logger.Level.WARNING,
                     "materializing change " + change.key() + " of asset "
                             + change.asset() + " failed", e);
+        }
+    }
+
+    private void track(String asset, EntryHandle handle, Duration lease) {
+        if (handle == null) {
+            return;
+        }
+        Instant now = clock.instant();
+        List<Issued> held = resultsByAsset.computeIfAbsent(asset, a -> new ArrayList<>());
+        synchronized (held) {
+            held.removeIf(issued -> !issued.until().isAfter(now));
+            held.add(new Issued(handle, now.plus(lease)));
         }
     }
 
@@ -519,18 +619,96 @@ public final class ConnectorRuntime implements AutoCloseable {
                             + " is not permitted to invoke '" + invocation.operation() + "' on '"
                             + invocation.asset() + "'");
         } else {
-            result = run(invocation);
+            AssetInvocationResult fromReplica = replicaResult(space, id);
+            if (fromReplica != null) {
+                repeated.incrementAndGet();
+                result = fromReplica;
+            } else {
+                result = runHeld(taken, invocation, requester);
+            }
         }
         remember(id, result);
         finish(space, taken, result);
     }
 
-    private AssetInvocationResult run(AssetInvocation invocation) {
+    /** A result a replica already wrote for this invocation id, or null (CC-L-08). */
+    private AssetInvocationResult replicaResult(Space space, String id) {
+        Predicate<PeerId> peers = replicas;
+        if (peers == null) {
+            return null;
+        }
+        return space.readAllIssued(Template.of(AssetInvocationResult.class).where("invocationId", eq(id)), 16)
+                .stream()
+                .filter(r -> !r.issuer().peer().equals(identity.peerId()) && peers.test(r.issuer().peer()))
+                .map(Space.Issued::entry)
+                .findFirst().orElse(null);
+    }
+
+    /**
+     * Writes a replica's result again under this connector's identity, so a requester that invoked
+     * through this connector's card reads it (CC-L-08); remembered so a retry here never runs.
+     */
+    private void mirror(SpaceEvent<AssetInvocationResult> event) {
+        Predicate<PeerId> peers = replicas;
+        if (!running || peers == null || event.kind() != SpaceEvent.Kind.WRITTEN) {
+            return;
+        }
+        PeerId from = event.issuer().peer();
+        AssetInvocationResult result = event.entry();
+        if (from.equals(identity.peerId()) || !peers.test(from) || !freshnessByAsset.containsKey(result.asset())
+                || answered.containsKey(result.invocationId())) {
+            return;
+        }
+        remember(result.invocationId(), result);
+        Duration lease = result.ok()
+                ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : Duration.ofSeconds(30);
+        try {
+            invocationSpace.write(result, Lease.of(lease));
+            mirrored.incrementAndGet();
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING, "mirroring result " + result.invocationId() + " failed", e);
+        }
+    }
+
+    /**
+     * Runs an invocation while renewing its claim every half {@link #invokeLease}, so an operation
+     * that outlasts the lease (a large upload) keeps the invocation claimed and a retry under the
+     * same id waits for this run instead of starting another (CC-L-03).
+     */
+    private AssetInvocationResult runHeld(TakenEntry<AssetInvocation> taken, AssetInvocation invocation,
+                                          PeerId requester) {
+        Duration lease = invokeLease;
+        Duration every = lease.dividedBy(2).isZero() ? lease : lease.dividedBy(2);
+        Thread renewer = Thread.ofVirtual().name("connector-renew-" + invocation.invocationId()).start(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(every);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                try {
+                    taken.renew(lease);
+                    renewals.incrementAndGet();
+                } catch (RuntimeException e) {
+                    LOG.log(System.Logger.Level.WARNING, "renewing the claim on invocation "
+                            + invocation.invocationId() + " failed", e);
+                    return;
+                }
+            }
+        });
+        try {
+            return run(invocation, requester);
+        } finally {
+            renewer.interrupt();
+        }
+    }
+
+    private AssetInvocationResult run(AssetInvocation invocation, PeerId requester) {
         AssetProvider.InvokeResult outcome;
         try {
             invoked.incrementAndGet();
             outcome = provider.invoke(invocation.asset(), invocation.operation(), invocation.params(),
-                    invocation.invocationId());
+                    invocation.invocationId(), requester);
         } catch (RuntimeException e) {
             LOG.log(System.Logger.Level.WARNING, "operation " + invocation.operation() + " on asset "
                     + invocation.asset() + " failed", e);

@@ -84,15 +84,6 @@ public class AgentSpacesConsoleAutoConfiguration {
     }
 
     /**
-     * The console server, its fleet name defaulting to the first configured
-     * group's name.
-     *
-     * @param properties the starter configuration
-     * @param view       the console view
-     * @param panels     every panel bean in the context, possibly empty
-     * @return the server, not yet started
-     */
-    /**
      * The C2 executor, present only when {@code agentspaces.console.command.enabled=true}.
      * It resolves spaces on the first configured group (so the control and
      * audit spaces must be declared among that group's spaces), collects every
@@ -124,22 +115,6 @@ public class AgentSpacesConsoleAutoConfiguration {
                 .build();
     }
 
-    /**
-     * The console server, its fleet name defaulting to the first configured
-     * group's name. Command-and-control is attached when a {@link FleetCommander}
-     * bean is present and the command routes have a gate: the static
-     * {@code agentspaces.console.command.token} when set, otherwise — under a
-     * configured {@code agentspaces.security.oidc.*} — a
-     * {@link BearerJwtValidator} over the identity provider's keys requiring
-     * {@code agentspaces.console.command.required-scope} (TODO-EFG §5). A
-     * static token always wins when both are present.
-     *
-     * @param properties the starter configuration
-     * @param view       the console view
-     * @param panels     every panel bean in the context, possibly empty
-     * @param commanders the commander bean when C2 is enabled, else empty
-     * @return the server, not yet started
-     */
     /**
      * The wire-traffic panel (PERF2 §4): the node's frame and byte counters as rates by kind,
      * the signed, session and bare split, the stale, replayed and unverifiable drops, and each

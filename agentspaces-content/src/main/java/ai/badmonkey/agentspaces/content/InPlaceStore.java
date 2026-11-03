@@ -36,7 +36,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * eviction never touches it. A registry with two hundred checkpoints on disk
  * becomes a seeder of all of them by registering each file.
  */
-public final class InPlaceStore implements PieceStore {
+public final class InPlaceStore implements ExternalStore {
 
     private record Held(Manifest manifest, Path file) {
     }
@@ -62,6 +62,17 @@ public final class InPlaceStore implements PieceStore {
      */
     public void register(Manifest manifest, Path file) {
         held.put(manifest.root(), new Held(manifest, file));
+    }
+
+    /**
+     * Registers the file named by a path string; see {@link #register(Manifest, Path)}.
+     *
+     * @param manifest the manifest
+     * @param key      the file's path
+     */
+    @Override
+    public void register(Manifest manifest, String key) {
+        register(manifest, Path.of(key));
     }
 
     @Override

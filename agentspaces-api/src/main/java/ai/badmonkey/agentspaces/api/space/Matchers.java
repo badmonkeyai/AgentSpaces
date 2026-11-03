@@ -39,7 +39,7 @@ public final class Matchers {
      * @return the matcher
      */
     public static Matcher eq(Object expected) {
-        return actual -> Objects.equals(actual, expected);
+        return actual -> sameValue(actual, expected);
     }
 
     /**
@@ -49,7 +49,7 @@ public final class Matchers {
      * @return the matcher
      */
     public static Matcher ne(Object unexpected) {
-        return actual -> !Objects.equals(actual, unexpected);
+        return actual -> !sameValue(actual, unexpected);
     }
 
     /**
@@ -104,7 +104,8 @@ public final class Matchers {
         // work as a caller naturally expects.
         Set<Object> accepted = new java.util.HashSet<>(
                 java.util.Arrays.asList(alternatives));
-        return accepted::contains;
+        return actual -> accepted.contains(actual)
+                || (actual instanceof Number && accepted.stream().anyMatch(a -> sameValue(actual, a)));
     }
 
     /**
@@ -144,11 +145,43 @@ public final class Matchers {
     private static Matcher comparing(Comparable<?> bound, java.util.function.IntPredicate accept) {
         Objects.requireNonNull(bound, "bound");
         return actual -> {
+            if (actual instanceof Number a && bound instanceof Number b) {
+                // Numbers compare by value whatever their boxed class, so a filter
+                // written with an int matches a long or a double field
+                // (review-110226-deadcode-parity C6).
+                return accept.test(decimal(a).compareTo(decimal(b)));
+            }
             if (!(actual instanceof Comparable comparable)
                     || !bound.getClass().isInstance(actual)) {
                 return false;
             }
             return accept.test(comparable.compareTo(bound));
         };
+    }
+
+    /** Whether two values are equal, with numbers compared by value across boxed classes. */
+    static boolean sameValue(Object actual, Object expected) {
+        if (actual instanceof Number a && expected instanceof Number b) {
+            return decimal(a).compareTo(decimal(b)) == 0;
+        }
+        return Objects.equals(actual, expected);
+    }
+
+    private static java.math.BigDecimal decimal(Number n) {
+        if (n instanceof java.math.BigDecimal d) {
+            return d;
+        }
+        if (n instanceof java.math.BigInteger i) {
+            return new java.math.BigDecimal(i);
+        }
+        if (n instanceof Double || n instanceof Float) {
+            double v = n.doubleValue();
+            if (Double.isNaN(v) || Double.isInfinite(v)) {
+                return java.math.BigDecimal.valueOf(Double.MAX_VALUE).multiply(
+                        java.math.BigDecimal.valueOf(Double.isNaN(v) ? 0 : Math.signum(v) * 2));
+            }
+            return java.math.BigDecimal.valueOf(v);
+        }
+        return java.math.BigDecimal.valueOf(n.longValue());
     }
 }

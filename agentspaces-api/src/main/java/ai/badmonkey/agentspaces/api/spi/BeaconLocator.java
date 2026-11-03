@@ -58,6 +58,18 @@ public interface BeaconLocator {
     }
 
     /**
+     * Whether this locator can ever name an endpoint, read before a join so a
+     * group with nothing to ask is refused at once instead of waiting out its
+     * timeout (review-110226-deadcode-parity B2). A locator built with no
+     * domain, no URL, or no seed answers false; the default is true.
+     *
+     * @return true when a locate may answer
+     */
+    default boolean canLocate() {
+        return true;
+    }
+
+    /**
      * How the node should pace, require, and trace this locator's answers.
      * The default leaves everything to the node's own settings.
      *

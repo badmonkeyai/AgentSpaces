@@ -56,7 +56,7 @@ class TransportBlocksAutoConfigurationTest {
     }
 
     private static int freeTcp() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }
@@ -279,8 +279,8 @@ class TransportBlocksAutoConfigurationTest {
         properties.getGroups().get(0).setContentKey(java.util.Base64.getEncoder().encodeToString(new byte[32]));
         properties.getMulticast().setSeal(true);
         PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
-        PeerNode node = autoConfig.agentSpacesNode(properties, identity, List.of(),
-                List.of(builder -> builder.beacon(carrier, Duration.ofMillis(100))), List.of());
+        PeerNode node = autoConfig.buildNode(properties, identity, List.of(),
+                List.of(builder -> builder.beacon(carrier, Duration.ofMillis(100))), List.of(), null);
         Authorizers authorizers = autoConfig.agentSpacesAuthorizers(properties, identity);
         AgentSpaces spaces = autoConfig.agentSpaces(properties, node, identity, authorizers,
                 autoConfig.agentSpacesEmbedder());
@@ -326,7 +326,7 @@ class TransportBlocksAutoConfigurationTest {
 
     private Wired wire(AgentSpacesProperties properties) {
         PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
-        PeerNode node = autoConfig.agentSpacesNode(properties, identity, List.of(), List.of(), List.of());
+        PeerNode node = autoConfig.buildNode(properties, identity, List.of(), List.of(), List.of(), null);
         Authorizers authorizers = autoConfig.agentSpacesAuthorizers(properties, identity);
         AgentSpaces spaces = autoConfig.agentSpaces(properties, node, identity, authorizers,
                 autoConfig.agentSpacesEmbedder());

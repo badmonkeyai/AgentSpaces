@@ -38,6 +38,7 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.peering.transport.TcpTransport;
+import ai.badmonkey.agentspaces.peering.transport.TlsTcpTransport;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 
 import java.time.Duration;
@@ -111,9 +112,21 @@ public final class CouncilFleet {
 
     /** The coordinator on TCP: the research group, the task and vote spaces, discovery, and the capabilities. */
     public static Council start(int port) throws Exception {
+        return start(port, false);
+    }
+
+    /**
+     * The coordinator on TCP or, with {@code tls}, on TLS 1.3 requiring attestation: every member
+     * must present a channel certificate (SPEC §5.6), and the node runs in ATTESTED channel mode,
+     * so a member that announces CHANNEL_HELLO receives bare frames on its attested connection.
+     */
+    public static Council start(int port, boolean tls) throws Exception {
         PeerIdentity identity = PeerIdentity.generate();
-        PeerNode node = PeerNode.builder(identity).build();
-        node.listen(new TcpTransport(), HOST + ":" + port);
+        PeerNode node = tls
+                ? PeerNode.builder(identity).requireAttestation(true)
+                        .channelAuth(PeerNode.ChannelAuth.ATTESTED).build()
+                : PeerNode.builder(identity).build();
+        node.listen(tls ? new TlsTcpTransport(identity) : new TcpTransport(), HOST + ":" + port);
         GroupRuntime runtime = node.joinGroup(ResearchFleet.fleetGroup(),
                 new GroupMembership.Config(Duration.ofSeconds(30), Duration.ofSeconds(2), 2),
                 List.<PeerAdvertisement.Endpoint>of());
@@ -157,7 +170,28 @@ public final class CouncilFleet {
      */
     public static Outcome act(Council council, int workers, double localValue, Duration timeout)
             throws InterruptedException {
-        int taskCount = 2 * workers;
+        return act(council, workers, 2 * workers, localValue, timeout);
+    }
+
+    /**
+     * As {@link #act(Council, int, double, Duration)} with {@code taskCount} research tasks. The
+     * workers race for them under LEASE_RACE, so a worker whose first take comes a little after
+     * the others' can find a short queue drained; more tasks per worker keep every worker in it.
+     *
+     * @param council    the coordinator
+     * @param workers    how many workers are expected (the quorum is workers plus this peer)
+     * @param taskCount  how many research tasks to publish
+     * @param localValue this peer's contribution to the epoch
+     * @param timeout    how long each wait may take
+     */
+    public static Outcome act(Council council, int workers, int taskCount, double localValue, Duration timeout)
+            throws InterruptedException {
+        // Every worker in the view before the first task, so the slowest runtime to boot
+        // is not left with an empty queue (the cross-language test asserts every worker
+        // takes tasks).
+        await(timeout, () -> council.runtime().membership().allMembers().stream()
+                .filter(m -> !m.id().equals(council.node().peerId())).count() >= workers);
+        System.out.println("coordinator: " + workers + " workers in view");
         for (int i = 1; i <= taskCount; i++) {
             council.tasks().write(new ResearchTask("council-topic-" + i, i), Lease.of(Duration.ofMinutes(30)));
         }
@@ -224,13 +258,24 @@ public final class CouncilFleet {
         }
     }
 
-    public static void main(String[] args) throws Exception {
+    /**
+     * {@code [port] [workers] [value] [--tls]}: with {@code --tls} the coordinator listens on the
+     * tls binding with attestation required, and prints each worker's link after the act.
+     */
+    public static void main(String[] argv) throws Exception {
+        boolean tls = List.of(argv).contains("--tls");
+        String[] args = List.of(argv).stream().filter(a -> !a.equals("--tls")).toArray(String[]::new);
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 7470;
         int workers = args.length > 1 ? Integer.parseInt(args[1]) : 2;
         double value = args.length > 2 ? Double.parseDouble(args[2]) : 20.0;
-        try (Council council = start(port)) {
-            System.out.println("council coordinator listening on " + port + " as " + council.identity().peerId().value());
+        try (Council council = start(port, tls)) {
+            System.out.println("council coordinator listening on " + port + " as " + council.identity().peerId().value()
+                    + (tls ? " (tls, attestation required, channel mode ATTESTED)" : ""));
             Outcome outcome = act(council, workers, value, Duration.ofSeconds(90));
+            if (tls) {
+                ResearchFleet.printLinks(council.node(), workers, Duration.ofSeconds(10));
+                ResearchFleet.printFrames(council.node());
+            }
             boolean ok = outcome.findings().size() >= 2 * workers && outcome.decision().isPresent()
                     && outcome.estimate().isPresent();
             System.out.println(ok ? "council act complete" : "council act INCOMPLETE");

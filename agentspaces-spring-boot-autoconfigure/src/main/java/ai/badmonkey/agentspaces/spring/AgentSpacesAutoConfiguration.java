@@ -26,6 +26,7 @@ import ai.badmonkey.agentspaces.api.spi.BeaconHint;
 import ai.badmonkey.agentspaces.api.spi.BeaconLocator;
 import ai.badmonkey.agentspaces.api.spi.BeaconRequest;
 import ai.badmonkey.agentspaces.api.spi.Transport;
+import ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain;
 import ai.badmonkey.agentspaces.peering.bootstrap.SeedsLocator;
 import ai.badmonkey.agentspaces.peering.node.JoinCredentials;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
@@ -111,6 +112,25 @@ public class AgentSpacesAutoConfiguration {
 
     private static final System.Logger LOG =
             System.getLogger(AgentSpacesAutoConfiguration.class.getName());
+
+    /** Host-provided content-store backends by group name (LB-T-07). */
+    private volatile java.util.function.Function<String, List<ai.badmonkey.agentspaces.content.PieceStore>>
+            hostPieceStores = group -> List.of();
+
+    /**
+     * Gives each group's content swarm backends the host provides, such as a store over a remote
+     * service's objects (LB-T-07). A backend whose {@code kind()} appears in
+     * {@code agentspaces.content.store.backends} takes that place in the read order; the others
+     * follow the listed ones. Call before the facade is built.
+     *
+     * @param perGroup the backends for a group name; an empty list for none
+     * @return this configuration
+     */
+    public AgentSpacesAutoConfiguration pieceStores(
+            java.util.function.Function<String, List<ai.badmonkey.agentspaces.content.PieceStore>> perGroup) {
+        this.hostPieceStores = java.util.Objects.requireNonNull(perGroup, "perGroup");
+        return this;
+    }
 
     /**
      * The profile's authorizer selection (TODO-EFG §4): membership-rooted per
@@ -210,24 +230,9 @@ public class AgentSpacesAutoConfiguration {
     }
 
     /**
-     * Builds the node (SRAD DB-C-04, DB-C-05, DB-C-06): the starter's settings
-     * on the builder, then every {@link PeerNodeCustomizer} in order; the
-     * default TCP (and TLS) transport unless an application {@link Transport}
-     * bean has the same scheme, every other application transport registered
-     * for dialing; the bind and advertised addresses; then every
-     * {@link PeerNodeConfigurer} in order, before any group is joined.
-     *
-     * @param properties   the properties
-     * @param identity     the peer identity
-     * @param transports   application transports, in order
-     * @param customizers  builder hooks, in order
-     * @param configurers  node hooks, in order
-     * @return the node
-     */
-    /**
      * @deprecated since 0.4.0: the list form is {@link #buildNode}, a name of its own so a
      * host without Spring on its classpath resolves it without seeing the bean method's
-     * {@code ObjectProvider} parameters (ISSUE-BootstrapCore FR-7). Removed in 0.5.0.
+     * {@code ObjectProvider} parameters (ISSUE-BootstrapCore FR-7). Removed in a later release.
      */
     @Deprecated(since = "0.4.0", forRemoval = true)
     public PeerNode agentSpacesNode(AgentSpacesProperties properties, PeerIdentity identity,
@@ -775,7 +780,13 @@ public class AgentSpacesAutoConfiguration {
                                    ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
                                    ObjectProvider<SchemaRegistry> schemaRegistry,
                                    ObjectProvider<BeaconLocator> locators,
-                                   ObjectProvider<BootstrapChainFactory> chains) {
+                                   ObjectProvider<BootstrapChainFactory> chains,
+                                   ObjectProvider<ai.badmonkey.agentspaces.content.PieceStore> pieceStores) {
+        List<ai.badmonkey.agentspaces.content.PieceStore> hosted = pieceStores.orderedStream().toList();
+        if (!hosted.isEmpty()) {
+            // LB-T-07: PieceStore beans join every group's swarm by kind.
+            pieceStores(group -> hosted);
+        }
         return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
                 agents, schemaRegistry.getIfAvailable(), locators.orderedStream().toList(),
                 chains.getIfAvailable(BootstrapChainFactory::defaults));
@@ -851,9 +862,10 @@ public class AgentSpacesAutoConfiguration {
             if (properties.getMulticast().isEnabled()) {
                 forGroup.add(new ai.badmonkey.agentspaces.peering.bootstrap.MulticastLocator(node));
             }
-            boolean hasLocators = !groupConfig.getSeeds().isEmpty() || forGroup.size() > 1;
-            GroupRuntime runtime = join(node, groupConfig, chains.chainFor(groupConfig, forGroup),
-                    hasLocators, identity);
+            // ISSUE-BootstrapRobustness FR-1: the composed chain is what the node
+            // asks, so the pre-join check reads it, not the list it was built from.
+            BeaconLocator composed = chains.chainFor(groupConfig, forGroup);
+            GroupRuntime runtime = join(node, groupConfig, composed, canLocate(composed), identity);
             authorizers.register(groupConfig.getName(), runtime);
             Authorizer authorizer = authorizers.forGroup(groupConfig.getName());
             DiscoveryService discovery = DiscoveryService.create(runtime, codec,
@@ -868,6 +880,12 @@ public class AgentSpacesAutoConfiguration {
             }
             // SPEC §11a.3 v0.1.13: one ring per group, shared by its spaces, so a
             // rotation reaches every space at once; persisted with the keystore.
+            /**
+             * The group's content-key ring (SPEC §11a.3, v0.1.13), epoch 0 being the
+             * configured key: restored from and saved to
+             * {@code <keystore>/content-keys/<group>.ring} when a keystore is set, so
+             * rotated epochs survive restarts. Null when the group is unencrypted.
+             */
             GroupKeyRing ring = contentKeyRing(properties, groupConfig, runtime, contentKey, codec);
             // srad/large-networks-bulk-data.md §7.2: the content swarm before the application
             // spaces, so each of them can escalate a large payload to it (LB-E-02).
@@ -884,7 +902,8 @@ public class AgentSpacesAutoConfiguration {
                 ReplicatedSpace contentSpace = buildSpace(runtime, identity, contentDef, blocks, discovery,
                         ring, authorizer, clock, schemaRegistry, null, 0, 0);
                 content = buildContent(properties.getContent(), groupConfig.getName(), context.pipes(), runtime,
-                        contentSpace, identity, codec, clock, blocks, ring, authorizer);
+                        contentSpace, identity, codec, clock, blocks, ring, authorizer,
+                        hostPieceStores.apply(groupConfig.getName()));
                 bulk = new ai.badmonkey.agentspaces.content.SpacePayloads(content);
                 escalateAbove = properties.getContent().getEscalateAbove();
             }
@@ -1073,20 +1092,37 @@ public class AgentSpacesAutoConfiguration {
                     locator, hints, null, config.getName());
         }
         if (!hasLocators) {
-            throw new IllegalStateException("group '" + config.getName() + "' joins by"
-                    + " GroupId URI but configures no seeds and no locator to fetch the founding"
-                    + " advertisement from");
+            throw new IllegalStateException("group '" + config.getName() + "' joins by GroupId URI but its"
+                    + " bootstrap chain has nothing to ask: " + describe(locator) + ". Set"
+                    + " agentspaces.groups[].seeds, add a locator to agentspaces.bootstrap.order and configure"
+                    + " it (dns-srv, dns-sd, url, k8s), or define a BeaconLocator bean");
         }
         GroupId groupId = groupIdOf(config.getJoin());
         try {
             return node.joinGroup(groupId, GroupMembership.Config.defaults(), locator,
                     Duration.ofMillis(config.getJoinTimeoutMillis()), hints, null, config.getName());
         } catch (TimeoutException e) {
-            throw new IllegalStateException("group '" + config.getName() + "': no seed"
-                    + " served a verified founding advertisement for " + groupId
-                    + " within " + config.getJoinTimeoutMillis() + " ms; last hint: "
-                    + node.lastBeaconHint(groupId).map(h -> h.evidence()).orElse("none"), e);
+            String advice = e instanceof ai.badmonkey.agentspaces.peering.node.FoundingTimeoutException report
+                    && report.connected() > 0
+                    ? ". A group started from a 'founding:' text has no signed founding and cannot be joined"
+                            + " by id; the seed must hold the group's founding-document or have joined by id itself"
+                    : "";
+            throw new IllegalStateException("group '" + config.getName() + "': " + e.getMessage() + advice, e);
         }
+    }
+
+    /**
+     * Whether a locator can ever name an endpoint (ISSUE-BootstrapRobustness
+     * FR-1): the locator's own answer, which a chain takes from its members
+     * and a seeds locator from its list.
+     */
+    static boolean canLocate(BeaconLocator locator) {
+        return locator.canLocate();
+    }
+
+    /** The locators of a chain with the state of each, for the refusal of FR-2. */
+    static String describe(BeaconLocator locator) {
+        return BootstrapChain.describe(locator);
     }
 
     /** The {@code aspace:join} hint from {@code join-credential}, or none. */
@@ -1098,18 +1134,11 @@ public class AgentSpacesAutoConfiguration {
 
     /** Parses {@code aspace://<groupId>} or a bare GroupId (spec §10.1). */
     static GroupId groupIdOf(String join) {
-        String value = join.trim();
-        if (value.startsWith(GroupFounding.URI_PREFIX)) {
-            value = value.substring(GroupFounding.URI_PREFIX.length());
+        try {
+            return GroupId.ofUri(join);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("join URI carries no GroupId: '" + join + "'", e);
         }
-        int slash = value.indexOf('/');
-        if (slash >= 0) {
-            value = value.substring(0, slash);
-        }
-        if (value.isEmpty()) {
-            throw new IllegalArgumentException("join URI carries no GroupId: '" + join + "'");
-        }
-        return GroupId.of(value);
     }
 
     /** Parses the multicast beacon group ({@code host:port}). */
@@ -1140,12 +1169,6 @@ public class AgentSpacesAutoConfiguration {
         return roles;
     }
 
-    /**
-     * The group's content-key ring (SPEC §11a.3, v0.1.13), epoch 0 being the
-     * configured key: restored from and saved to
-     * {@code <keystore>/content-keys/<group>.ring} when a keystore is set, so
-     * rotated epochs survive restarts. Null when the group is unencrypted.
-     */
     /**
      * Builds a group's block exchange over the configured store (LB-B-05): memory as in
      * 0.4.0, or a file store under {@code agentspaces.blocks.path/<group>} that a restart
@@ -1180,10 +1203,21 @@ public class AgentSpacesAutoConfiguration {
     private static ai.badmonkey.agentspaces.content.Content buildContent(
             AgentSpacesProperties.ContentSwarm config, String groupName, CapabilityPipes pipes,
             GroupRuntime runtime, ReplicatedSpace contentSpace, PeerIdentity identity, CborCodec codec,
-            InstantSource clock, BlockExchange blocks, GroupKeyRing ring, Authorizer authorizer) {
+            InstantSource clock, BlockExchange blocks, GroupKeyRing ring, Authorizer authorizer,
+            List<ai.badmonkey.agentspaces.content.PieceStore> hosted) {
         java.util.List<ai.badmonkey.agentspaces.content.PieceStore> backends = new java.util.ArrayList<>();
+        java.util.List<ai.badmonkey.agentspaces.content.PieceStore> unplaced = new java.util.ArrayList<>(
+                hosted == null ? List.of() : hosted);
         for (String kind : config.getStore().getBackends()) {
-            switch (kind.trim().toLowerCase(java.util.Locale.ROOT)) {
+            String wanted = kind.trim().toLowerCase(java.util.Locale.ROOT);
+            java.util.Optional<ai.badmonkey.agentspaces.content.PieceStore> host = unplaced.stream()
+                    .filter(b -> b.kind().toLowerCase(java.util.Locale.ROOT).equals(wanted)).findFirst();
+            if (host.isPresent()) {
+                backends.add(host.get());
+                unplaced.remove(host.get());
+                continue;
+            }
+            switch (wanted) {
                 case "file" -> {
                     java.nio.file.Path path = java.nio.file.Path.of(config.getStore().getPath())
                             .resolve(groupName.replaceAll("[^A-Za-z0-9._-]", "_"));
@@ -1204,9 +1238,12 @@ public class AgentSpacesAutoConfiguration {
                         clock, config.getStore().getQuota()));
                 case "in-place" -> backends.add(new ai.badmonkey.agentspaces.content.InPlaceStore());
                 default -> throw new IllegalStateException("agentspaces.content.store.backends: unknown kind '"
-                        + kind + "' (file, memory, in-place)");
+                        + kind + "' (file, memory, in-place" + (hosted == null || hosted.isEmpty() ? ""
+                        : ", or a host backend: " + hosted.stream().map(ai.badmonkey.agentspaces.content.PieceStore::kind)
+                        .collect(java.util.stream.Collectors.joining(", "))) + ")");
             }
         }
+        backends.addAll(unplaced);
         if (backends.isEmpty()) {
             throw new IllegalStateException("agentspaces.content.store.backends lists no backend");
         }
@@ -1229,6 +1266,11 @@ public class AgentSpacesAutoConfiguration {
             @Override
             public long uploadBytesPerDay() {
                 return config.getUploadBytesPerDay();
+            }
+
+            @Override
+            public long downloadBytesPerDay() {
+                return config.getDownloadBytesPerDay();
             }
 
             @Override
@@ -1412,17 +1454,6 @@ public class AgentSpacesAutoConfiguration {
                 Duration.ofDays(365), config.getName(),
                 policy, ConflictStrategyType.LEASE_RACE,
                 GroupAdvertisement.GossipParameters.defaults());
-    }
-
-    /**
-     * Parses seed strings into endpoints. A seed may carry an explicit scheme
-     * ({@code tls://host:port}, {@code tcp://host:port}); a bare
-     * {@code host:port} takes {@code defaultScheme}, which follows the node's
-     * own transport configuration.
-     */
-    static List<PeerAdvertisement.Endpoint> seedEndpoints(List<String> seeds,
-                                                          String defaultScheme) {
-        return SeedsLocator.parse(seeds, defaultScheme);
     }
 
     /**

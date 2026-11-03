@@ -94,7 +94,7 @@ class AgentSpacesAutoConfigurationTest {
     }
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
         }
     }
@@ -1500,10 +1500,21 @@ class AgentSpacesAutoConfigurationTest {
     void multicastCanBeEnabledFromProperties() throws Exception {
         AgentSpacesProperties properties = fleetProperties(freePort(), 0);
         properties.getMulticast().setEnabled(true);
-        properties.getMulticast().setGroup("239.255.42.99:" + freePort());
         properties.getMulticast().setIntervalMillis(500);
         PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
-        PeerNode node = autoConfig.agentSpacesNode(properties, identity);
+        PeerNode node = null;
+        // A TCP-free port can be held by a UDP socket on macOS (the port-collision gotcha
+        // of 2026-10-20), so try a few before calling the beacon unopenable.
+        for (int attempt = 0; node == null; attempt++) {
+            properties.getMulticast().setGroup("239.255.42.99:" + freePort());
+            try {
+                node = autoConfig.agentSpacesNode(properties, identity);
+            } catch (java.io.UncheckedIOException e) {
+                if (attempt == 4 || !(e.getCause() instanceof java.net.BindException)) {
+                    throw e;
+                }
+            }
+        }
         closeables.add(node);
         assertThat(node).isNotNull();
         node.tick(); // the beacon announces on the tick without error

@@ -656,7 +656,8 @@ public final class LocalSpace implements Space, AutoCloseable {
      * Callers hold the lock.
      */
     private static boolean matchesLocked(Template<?> template, Stored stored) {
-        return template.matchesTags(stored.record.tags()) && template.matches(stored.entry);
+        return template.matchesTags(stored.record.tags()) && template.matchesType(stored.record.type())
+                && template.matches(stored.entry);
     }
 
     /** The metadata view over a stored entry (issue #16 §9.2). Callers hold the lock. */
@@ -679,7 +680,7 @@ public final class LocalSpace implements Space, AutoCloseable {
         EntryView<Object> details = viewOf(stored, entry);
         return () -> {
             for (Sub sub : subscriptions) {
-                if (!sub.closedFlag && sub.template.matchesTags(record.tags())
+                if (!sub.closedFlag && sub.template.matchesTags(record.tags()) && sub.template.matchesType(record.type())
                         && sub.template.matches(entry)) {
                     sub.listener.onEvent(new SpaceEvent(kind, entryId, entry, record.issuer(),
                             record.issuer(), details));

@@ -173,7 +173,11 @@ class ReplicatedSpaceLifecycleTest {
                 .as("the entry reappeared for other takers").isPresent();
     }
 
-    /** Spec §7.2 notify: each transition is delivered once per replica despite rumor plus anti-entropy re-delivery. */
+    /**
+     * Spec §7.2 notify: each transition is delivered once per replica despite rumor plus anti-entropy re-delivery.
+     * Since v0.1.24 a replica that merges another peer's claim fires TAKEN once (the holder as the actor), so a watcher
+     * of a foreign lane sees the take as well as the completion.
+     */
     @Test
     void subscriptionsSeeEachTransitionOnceAcrossRumorAndAntiEntropy() throws Exception {
         Peer a = newPeer("a", 1);
@@ -192,7 +196,7 @@ class ReplicatedSpaceLifecycleTest {
         tickAll(8);
 
         assertThat(onB).extracting(SpaceEvent::kind)
-                .containsExactly(SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.COMPLETED);
+                .containsExactly(SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.TAKEN, SpaceEvent.Kind.COMPLETED);
         assertThat(onB).extracting(SpaceEvent::entry)
                 .containsOnly(new TaskEntry("observed", 1));
     }
@@ -210,13 +214,14 @@ class ReplicatedSpaceLifecycleTest {
         TakenEntry<TaskEntry> taken = a.space().take(Template.of(TaskEntry.class),
                 Lease.of(Duration.ofMinutes(1)), Duration.ZERO).orElseThrow();
         tickAll(2);
-        assertThat(onB).extracting(SpaceEvent::kind).containsExactly(SpaceEvent.Kind.WRITTEN);
+        assertThat(onB).extracting(SpaceEvent::kind).as("the merged claim fires TAKEN once (v0.1.24)")
+                .containsExactly(SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.TAKEN);
 
         // The taker never completes; its claim lapses and the entry reappears.
         clock.advance(Duration.ofMinutes(2));
         tickAll(4); // the anti-entropy tick runs the lease sweep on every replica
         assertThat(onB).extracting(SpaceEvent::kind)
-                .containsExactly(SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.REAPPEARED);
+                .containsExactly(SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.TAKEN, SpaceEvent.Kind.REAPPEARED);
         assertThat(b.space().read(Template.of(TaskEntry.class))).isPresent();
         assertThatThrownBy(() -> a.space().complete(taken))
                 .isInstanceOf(LeaseExpiredException.class);
@@ -225,13 +230,13 @@ class ReplicatedSpaceLifecycleTest {
         clock.advance(Duration.ofMinutes(5));
         tickAll(8);
         assertThat(onB).extracting(SpaceEvent::kind).containsExactly(
-                SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.REAPPEARED, SpaceEvent.Kind.EXPIRED);
+                SpaceEvent.Kind.WRITTEN, SpaceEvent.Kind.TAKEN, SpaceEvent.Kind.REAPPEARED, SpaceEvent.Kind.EXPIRED);
         assertThat(onB).extracting(SpaceEvent::entry).containsOnly(new TaskEntry("watched", 1));
         assertThat(b.space().read(Template.of(TaskEntry.class))).isEmpty();
 
         // An explicit sweep without traffic adds nothing further.
         b.space().sweepNow();
-        assertThat(onB).hasSize(3);
+        assertThat(onB).hasSize(4);
     }
 
     /** Spec §7.2 notify: a closed or lapsed subscription receives nothing further. */

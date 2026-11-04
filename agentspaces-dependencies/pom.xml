@@ -137,6 +137,16 @@
       </dependency>
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-constraints</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-guardrail</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-agent</artifactId>
         <version>${project.version}</version>
       </dependency>

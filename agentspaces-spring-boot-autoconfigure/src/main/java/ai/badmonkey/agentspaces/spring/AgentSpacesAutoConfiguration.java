@@ -963,6 +963,32 @@ public class AgentSpacesAutoConfiguration {
     }
 
     /**
+     * The constraint gate per group (ISSUE-Constraints FR-10): created only when {@code agentspaces.rules.gate}
+     * is true; installs the gate in each group's binder, watches the group's spaces, and sets the
+     * {@code rules.gate=true} hint.
+     */
+    @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "agentspaces.rules", name = "gate",
+            havingValue = "true")
+    public ConstraintGates agentSpacesConstraintGates(AgentSpaces spaces, AgentSpacesProperties properties,
+                                                      Authorizers authorizers, PeerNode node, PeerIdentity identity,
+                                                      InstantSource clock) {
+        return new ConstraintGates(spaces, properties, authorizers, node, identity, clock);
+    }
+
+    /** The flow reconciler per group (ISSUE-FlowManifest FR-2): created only when {@code agentspaces.flows.reconcile} is true. */
+    @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "agentspaces.flows", name = "reconcile",
+            havingValue = "true")
+    public FlowReconcilers agentSpacesFlowReconcilers(AgentSpaces spaces, AgentSpacesProperties properties,
+                                                      Authorizers authorizers, PeerNode node, PeerIdentity identity,
+                                                      InstantSource clock) {
+        return new FlowReconcilers(spaces, properties, authorizers, node, identity, clock);
+    }
+
+    /**
      * Wires the shipped capability providers into one group (spec §10.5):
      * an explicit {@link CapabilityRuntime} registered through
      * {@link AgentSpaces#register(String, CapabilityRuntime)}, then each

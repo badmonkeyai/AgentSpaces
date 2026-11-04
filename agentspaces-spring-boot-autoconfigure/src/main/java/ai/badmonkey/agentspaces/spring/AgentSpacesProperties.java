@@ -97,6 +97,8 @@ public class AgentSpacesProperties {
 
     /** The Embabel bridge settings; active only with Embabel on the classpath. */
     private Embabel embabel = new Embabel();
+    private Rules rules = new Rules();
+    private Flows flows = new Flows();
 
     /** The shipped capability providers ({@code agentspaces.capabilities.*}, spec §10.5). */
     private Capabilities capabilities = new Capabilities();
@@ -800,6 +802,22 @@ public class AgentSpacesProperties {
 
     public Embabel getEmbabel() {
         return embabel;
+    }
+
+    public Rules getRules() {
+        return rules;
+    }
+
+    public Flows getFlows() {
+        return flows;
+    }
+
+    public void setFlows(Flows flows) {
+        this.flows = flows;
+    }
+
+    public void setRules(Rules rules) {
+        this.rules = rules;
     }
 
     public void setEmbabel(Embabel embabel) {
@@ -1933,6 +1951,69 @@ public class AgentSpacesProperties {
      * whose typed {@code @Action} methods the GOAP planner plans over; each
      * invocation is a leased space round-trip.
      */
+    /**
+     * {@code agentspaces.rules.*} (ISSUE-Constraints §11): the constraint gate in the binder. Off by default; when
+     * on, the gate reads the group's {@code constraints} space (opened on demand) and the node advertises
+     * {@code rules.gate=true} so a console reads enforcement from membership.
+     */
+    public static class Rules {
+
+        private boolean gate = false;
+        private String space = "constraints";
+        private int cacheKeys = 4096;
+
+        public boolean isGate() {
+            return gate;
+        }
+
+        public void setGate(boolean gate) {
+            this.gate = gate;
+        }
+
+        public String getSpace() {
+            return space;
+        }
+
+        public void setSpace(String space) {
+            this.space = space;
+        }
+
+        public int getCacheKeys() {
+            return cacheKeys;
+        }
+
+        public void setCacheKeys(int cacheKeys) {
+            this.cacheKeys = cacheKeys;
+        }
+    }
+
+    /**
+     * {@code agentspaces.flows.*} (ISSUE-FlowManifest §11): the flow reconciler in the binder. Off by default; when
+     * on, the reconciler reads the group's {@code flow-control} space (opened on demand), rebinds the stages a
+     * manifest names on this peer, and sets the {@code flowVersion} and {@code flowConformance} hints.
+     */
+    public static class Flows {
+
+        private boolean reconcile = false;
+        private String space = "flow-control";
+
+        public boolean isReconcile() {
+            return reconcile;
+        }
+
+        public void setReconcile(boolean reconcile) {
+            this.reconcile = reconcile;
+        }
+
+        public String getSpace() {
+            return space;
+        }
+
+        public void setSpace(String space) {
+            this.space = space;
+        }
+    }
+
     public static class Embabel {
 
         private boolean remoteActionsEnabled = true;

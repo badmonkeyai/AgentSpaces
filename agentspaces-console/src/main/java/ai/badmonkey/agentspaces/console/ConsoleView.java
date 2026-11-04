@@ -275,6 +275,10 @@ public final class ConsoleView implements AutoCloseable {
                             + ")");
             case AssetCard card -> new AdRow("asset", card.asset(),
                     card.issuer().display(), card.description() + " (" + card.uri() + ")" + operationsOf(card));
+            case ai.badmonkey.agentspaces.api.ad.ModelCard model -> new AdRow("model", model.name() + "@" + model.version(),
+                    model.issuer().display(), String.join(",", model.tasks()) + " on " + model.engine()
+                            + (model.residency().containsKey("sites") ? ", at " + model.residency().get("sites") : "")
+                            + ", " + model.servers().size() + " server(s)");
             case CapabilityAdvertisement cap -> new AdRow("capability",
                     cap.capabilityType(), cap.issuer().display(),
                     "v" + cap.version() + " via " + cap.binding()

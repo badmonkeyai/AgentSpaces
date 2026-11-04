@@ -236,9 +236,25 @@ public final class AgentSpaces implements AutoCloseable {
      * @throws IllegalArgumentException when the bean names a group that is not
      *                                  registered, or no group satisfies it
      */
+    /** The objects bound through this facade by their card names: the flow reconciler's catalogue. */
+    private final Map<String, Object> bindables = new ConcurrentHashMap<>();
+
+    /** A manifest binds only what this facade bound or was told about (ISSUE-FlowManifest §9.2). */
+    public ai.badmonkey.agentspaces.agent.flow.Catalogue catalogue() {
+        return name -> Optional.ofNullable(bindables.get(name));
+    }
+
+    /** Registers an object a manifest may bind by name without binding it now. */
+    public void register(String name, Object bindable) {
+        bindables.put(Objects.requireNonNull(name, "name"), Objects.requireNonNull(bindable, "bindable"));
+    }
+
     public List<AgentBinder.Bound> bind(Object bean) {
         Objects.requireNonNull(bean, "bean");
         Class<?> type = bean.getClass();
+        if (AgentBinder.isAgentType(type) || AgentBinder.hasBindings(type)) {
+            bindables.put(AgentBinder.cardNameOf(type), bean);
+        }
         ProvidesCapability provides = type.getAnnotation(ProvidesCapability.class);
         if (provides != null) {
             // QA4 A4-1: the annotation promises a provider. Without the interface

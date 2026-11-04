@@ -33,7 +33,7 @@ import java.time.Instant;
  */
 public sealed interface Advertisement
         permits PeerAdvertisement, GroupAdvertisement, SpaceAdvertisement,
-        CapabilityAdvertisement, AgentCard, AssetCard, RevocationAdvertisement,
+        CapabilityAdvertisement, AgentCard, AssetCard, ModelCard, RevocationAdvertisement,
         CredentialRevocation {
 
     /** Returns the advertisement's URI-style identifier. */

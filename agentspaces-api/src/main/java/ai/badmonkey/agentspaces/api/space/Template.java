@@ -57,6 +57,8 @@ public final class Template<T> {
     private final Class<T> type;
     private final List<Condition> conditions;
     private final List<TagCondition> tagConditions;
+    /** A schema-name condition judged on the record before decoding (v0.1.24): a wire name or a simple name. */
+    private final String typeName;
 
     private record Condition(String field, Matcher matcher, Method accessor) {
     }
@@ -76,9 +78,47 @@ public final class Template<T> {
     }
 
     private Template(Class<T> type, List<Condition> conditions, List<TagCondition> tagConditions) {
+        this(type, conditions, tagConditions, null);
+    }
+
+    private Template(Class<T> type, List<Condition> conditions, List<TagCondition> tagConditions, String typeName) {
         this.type = type;
         this.conditions = conditions;
         this.tagConditions = tagConditions;
+        this.typeName = typeName;
+    }
+
+    /**
+     * Narrows to records whose schema name is {@code name}: the wire name as written
+     * ({@code a.b.Claim#v1}) or its simple name ({@code Claim}). Judged on the record
+     * before decoding, so a reader without the type still selects by it (v0.1.24).
+     */
+    public Template<T> whereType(String name) {
+        Objects.requireNonNull(name, "name");
+        return new Template<>(type, conditions, tagConditions, name);
+    }
+
+    /** The type-name condition, or null. */
+    public String typeName() {
+        return typeName;
+    }
+
+    /** Whether a record's schema name passes the type-name condition (always when none is set). */
+    public boolean matchesType(String recordType) {
+        if (typeName == null) {
+            return true;
+        }
+        if (recordType == null) {
+            return false;
+        }
+        return recordType.equals(typeName) || simpleName(recordType).equals(typeName)
+                || simpleName(recordType).equals(simpleName(typeName));
+    }
+
+    private static String simpleName(String wire) {
+        String s = wire.contains("#") ? wire.substring(0, wire.indexOf('#')) : wire;
+        int i = Math.max(s.lastIndexOf('.'), s.lastIndexOf('$'));
+        return i < 0 ? s : s.substring(i + 1);
     }
 
     /**
@@ -107,7 +147,7 @@ public final class Template<T> {
         Method accessor = accessorFor(type, field);
         List<Condition> extended = new ArrayList<>(conditions);
         extended.add(new Condition(field, matcher, accessor));
-        return new Template<>(type, List.copyOf(extended), tagConditions);
+        return new Template<>(type, List.copyOf(extended), tagConditions, typeName);
     }
 
     /**
@@ -125,7 +165,7 @@ public final class Template<T> {
         TagCondition condition = new TagCondition(key, matcher);
         List<TagCondition> extended = new ArrayList<>(tagConditions);
         extended.add(condition);
-        return new Template<>(type, conditions, List.copyOf(extended));
+        return new Template<>(type, conditions, List.copyOf(extended), typeName);
     }
 
     /**
@@ -202,7 +242,7 @@ public final class Template<T> {
     @Override
     public String toString() {
         return "Template[" + type.getSimpleName() + ", conditions=" + conditions.size()
-                + ", tagConditions=" + tagConditions.size() + "]";
+                + ", tagConditions=" + tagConditions.size() + (typeName == null ? "" : ", type=" + typeName) + "]";
     }
 
     private static Method accessorFor(Class<?> type, String field) {

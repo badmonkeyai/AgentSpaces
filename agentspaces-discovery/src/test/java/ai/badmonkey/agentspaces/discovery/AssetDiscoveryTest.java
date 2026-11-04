@@ -132,4 +132,28 @@ class AssetDiscoveryTest {
         clock.advance(Duration.ofSeconds(31));
         assertThat(agent.discovery().find(AssetCard.class, card -> true)).isEmpty();
     }
+
+    /** ISSUE-ModelCard FR-2: model cards are found by task, engine, and residency site through the same discovery. */
+    @Test
+    void findsModelCardsByTaskEngineAndSite() throws Exception {
+        Wired server = newPeer("srv", 11);
+        Wired agent = newPeer("agt", 12, "srv");
+        tickAll(4);
+        ai.badmonkey.agentspaces.api.ad.ModelCard classify = new ai.badmonkey.agentspaces.api.ad.ModelCard(
+                "aspace://" + groupId.value() + "/model/bm-classify-1b@1", server.identity().peerId(), groupId, clock.instant(), Duration.ofMinutes(15),
+                "bm-classify-1b", "1", List.of("classify", "embed"), "text", Map.of(), "Apache-2.0", Map.of(), Map.of(), Map.of(),
+                Map.of("sites", "on-premises"), "onnx", List.of(server.identity().peerId()));
+        ai.badmonkey.agentspaces.api.ad.ModelCard chat = new ai.badmonkey.agentspaces.api.ad.ModelCard(
+                "aspace://" + groupId.value() + "/model/frontier@1", server.identity().peerId(), groupId, clock.instant(), Duration.ofMinutes(15),
+                "frontier", "1", List.of("chat"), "text", Map.of(), "proprietary", Map.of("upstream", "provider"), Map.of(), Map.of(),
+                Map.of("sites", "cloud"), "provider", List.of());
+        server.discovery().publish(signer.sign(classify, server.identity()));
+        server.discovery().publish(signer.sign(chat, server.identity()));
+        assertThat(agent.discovery().find(ai.badmonkey.agentspaces.api.ad.ModelCard.class, c -> c.serves("classify"))).singleElement()
+                .satisfies(c -> assertThat(c.name()).isEqualTo("bm-classify-1b"));
+        assertThat(agent.discovery().find(ai.badmonkey.agentspaces.api.ad.ModelCard.class, c -> "provider".equals(c.engine()))).singleElement()
+                .satisfies(c -> assertThat(c.name()).isEqualTo("frontier"));
+        assertThat(agent.discovery().find(ai.badmonkey.agentspaces.api.ad.ModelCard.class, c -> c.residentAt("on-premises"))).hasSize(1);
+        assertThat(agent.discovery().find(ai.badmonkey.agentspaces.api.ad.ModelCard.class, c -> c.serves("chat") && c.residentAt("on-premises"))).isEmpty();
+    }
 }

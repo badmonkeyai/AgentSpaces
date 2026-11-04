@@ -1,0 +1,24 @@
+# condition | expected (true/false/refused) over the fixture events of ConditionGrammarTest
+exists(Claim) | true
+exists(Claim where amount > 50000) | true
+exists(Claim where amount > 90000) | false
+exists(Payment) | false
+count(Claim) >= 2 | true
+count(Claim where status=open) = 1 | true
+count(Claim) > 5 | false
+newest(Claim).status = closed | true
+newest(Claim).amount < 100 | false
+age(Claim) > PT1H | true
+age(Claim) > P30D | false
+exists(Claim) and not exists(Payment) | true
+exists(Payment) or count(Claim) = 2 | true
+not (exists(Claim) and exists(Payment)) | true
+(exists(Claim) or exists(Payment)) and count(Claim where amount>50000) = 2 | true
+exists(Claim where amount > 50000, status = closed) | true
+exists(Claim where amount > 65000, status = open) | false
+exists( | refused
+count(Claim) ~ 2 | refused
+newest(Claim) = x | refused
+age(Claim) > soon | refused
+exists(Claim) and | refused
+banana(Claim) | refused

@@ -211,6 +211,76 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     /**
+     * Installs the constraint gate (ISSUE-Constraints FR-8, FR-10): consulted before a take claim of each verb
+     * binding and before the binder writes a bound method's result. Null (the default) gates nothing.
+     */
+    public AgentBinder constraintGate(ai.badmonkey.agentspaces.constraints.ConstraintGate gate) {
+        this.constraintGate = gate;
+        return this;
+    }
+
+    public ai.badmonkey.agentspaces.constraints.ConstraintGate constraintGate() {
+        return constraintGate;
+    }
+
+    private volatile ai.badmonkey.agentspaces.constraints.ConstraintGate constraintGate;
+
+    /**
+     * The gate's look before a claim (§9.4): the entries the template matches are read, the first the gate admits
+     * narrows the take to its key, and when every candidate is refused the loop waits one poll. Returns the
+     * template to take with, or empty when nothing may be taken now.
+     */
+    private Optional<Template<?>> gated(Space space, Template<?> template, Duration pollTimeout) {
+        ai.badmonkey.agentspaces.constraints.ConstraintGate gate = constraintGate;
+        if (gate == null || gate.loaded().isEmpty()) {
+            return Optional.of(template);
+        }
+        List<? extends Space.Entry<?>> candidates;
+        try {
+            candidates = space.readAllEntries(template, 16);
+        } catch (RuntimeException e) {
+            return Optional.of(template);
+        }
+        for (Space.Entry<?> candidate : candidates) {
+            if (gate.beforeClaim(candidate).admitted()) {
+                return Optional.of(gate.narrow(template, candidate));
+            }
+        }
+        // nothing admitted now (nothing there, or every candidate refused): wait one poll and look again,
+        // rather than a blocking take that would claim an entry the gate never saw
+        try {
+            Thread.sleep(Math.max(20, Math.min(pollTimeout.toMillis(), 250)));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return Optional.empty();
+    }
+
+    /** A short poll when the gate is on: the look already found an admitted entry, so the take should not wait long. */
+    private Duration gatedPoll(Duration pollTimeout) {
+        ai.badmonkey.agentspaces.constraints.ConstraintGate gate = constraintGate;
+        return gate == null || gate.loaded().isEmpty() ? pollTimeout : Duration.ofMillis(Math.min(200, pollTimeout.toMillis()));
+    }
+
+    /** The gate's look before a result write (§9.6): a refusal throws to the bound method's caller. */
+    private void gateResult(Object entry, Map<String, String> tags) {
+        ai.badmonkey.agentspaces.constraints.ConstraintGate gate = constraintGate;
+        if (gate == null || entry == null) {
+            return;
+        }
+        String wire;
+        try {
+            wire = schemas.schemaNameOf(entry.getClass());
+        } catch (RuntimeException e) {
+            wire = entry.getClass().getName();
+        }
+        ai.badmonkey.agentspaces.constraints.ConstraintGate.Decision d = gate.beforeResult(entry, wire, tags);
+        if (!d.admitted()) {
+            throw new ai.badmonkey.agentspaces.constraints.ConstraintRefusedException(d.unit(), d.key(), d.reason());
+        }
+    }
+
+    /**
      * Replaces the agent identity factory for agents bound from now on.
      *
      * @param identities the factory
@@ -375,6 +445,30 @@ public final class AgentBinder implements AutoCloseable {
      * @param name  the agent's local name, or null for the declared name
      * @return the binding
      */
+    /**
+     * Binds with attribute overrides and record tags (ISSUE-FlowManifest FR-4, FR-8): an override is keyed
+     * {@code <method>.<attribute>} or {@code <attribute>} for every method and may name any attribute the bound
+     * methods' verb annotations declare; an override of an attribute no method declares is refused by name. The
+     * tags (the manifest's {@code flow} and {@code flowVersion}) are added to every record the binding writes.
+     */
+    public Bound bind(Object agent, String name, Map<String, String> overrides, Map<String, String> recordTags) {
+        Objects.requireNonNull(agent, "agent");
+        Map<String, String> effective = overrides == null ? Map.of() : Map.copyOf(overrides);
+        if (!effective.isEmpty()) {
+            Overrides.check(agent.getClass(), effective);
+        }
+        OVERRIDES.set(effective);
+        try {
+            Bound handle = bind(agent, name);
+            if (recordTags != null && !recordTags.isEmpty()) {
+                handle.recordTags.putAll(recordTags);
+            }
+            return handle;
+        } finally {
+            OVERRIDES.remove();
+        }
+    }
+
     public Bound bind(Object agent, String name) {
         Objects.requireNonNull(agent, "agent");
         everBound = true;
@@ -693,6 +787,12 @@ public final class AgentBinder implements AutoCloseable {
         private final List<AutoCloseable> closeables = new ArrayList<>();
         private volatile boolean running = true;
         private volatile AgentCard card;
+        /** Tags every record this binding writes carries (a manifest's flow and version). */
+        final Map<String, String> recordTags = new java.util.concurrent.ConcurrentHashMap<>();
+
+        public Map<String, String> recordTags() {
+            return Map.copyOf(recordTags);
+        }
 
         private Bound(ai.badmonkey.agentspaces.api.spi.AgentIdentity identity) {
             this.identity = identity;
@@ -761,7 +861,11 @@ public final class AgentBinder implements AutoCloseable {
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
-                    taken = space.take(template, takeLease, pollTimeout);
+                    Optional<Template<?>> admitted = gated(space, template, pollTimeout);
+                    if (admitted.isEmpty()) {
+                        continue;
+                    }
+                    taken = space.take(admitted.get(), takeLease, gatedPoll(pollTimeout));
                 } catch (RuntimeException e) {
                     if (!handle.running) {
                         return;
@@ -1103,6 +1207,12 @@ public final class AgentBinder implements AutoCloseable {
      * @param type the candidate class
      * @return whether the class declares an agent identity
      */
+    /** The card name a class binds under by default: its spec's name, else the decapitalised simple name. */
+    public static String cardNameOf(Class<?> type) {
+        Spec spec = findSpec(type);
+        return spec != null && !spec.name().isEmpty() ? spec.name() : decapitalize(type.getSimpleName());
+    }
+
     public static boolean isAgentType(Class<?> type) {
         return findSpec(type) != null;
     }
@@ -1150,7 +1260,22 @@ public final class AgentBinder implements AutoCloseable {
      * @param <A>        the annotation type
      * @return the annotation, or null
      */
+    /** The attribute overrides of the bind in progress on this thread (ISSUE-FlowManifest FR-4), or null. */
+    private static final ThreadLocal<Map<String, String>> OVERRIDES = new ThreadLocal<>();
+    /** The verb annotations whose attributes a manifest may override. */
+    private static final List<Class<? extends java.lang.annotation.Annotation>> OVERRIDABLE = List.of(SpaceTake.class,
+            SpaceNotify.class, OrderedTake.class, SpaceJoin.class);
+
     static <A extends java.lang.annotation.Annotation> A annotationOf(Method method, Class<A> annotation) {
+        A found = declaredAnnotationOf(method, annotation);
+        Map<String, String> overrides = OVERRIDES.get();
+        if (found == null || overrides == null || overrides.isEmpty() || !OVERRIDABLE.contains(annotation)) {
+            return found;
+        }
+        return Overrides.apply(found, annotation, method, overrides);
+    }
+
+    static <A extends java.lang.annotation.Annotation> A declaredAnnotationOf(Method method, Class<A> annotation) {
         A own = method.getAnnotation(annotation);
         if (own != null) {
             return own;
@@ -1415,7 +1540,11 @@ public final class AgentBinder implements AutoCloseable {
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
-                    taken = coordinator.take(template, takeLease, pollTimeout);
+                    Optional<Template<?>> admitted = gated(space, template, pollTimeout);
+                    if (admitted.isEmpty()) {
+                        continue;
+                    }
+                    taken = coordinator.take(admitted.get(), takeLease, gatedPoll(pollTimeout));
                 } catch (RuntimeException e) {
                     if (!handle.running) {
                         return;
@@ -1718,6 +1847,12 @@ public final class AgentBinder implements AutoCloseable {
                         + entry.getClass().getSimpleName() + "; it is not an entry and carries no tags");
             }
         }
+        if (handle != null && !handle.recordTags.isEmpty()) {
+            Map<String, String> merged = new LinkedHashMap<>(handle.recordTags);
+            merged.putAll(tags);
+            tags = merged;
+        }
+        gateResult(entry, tags);
         if (taken != null && resultSpace == space) {
             if (tags.isEmpty()) {
                 space.complete(taken, entry, resultLease);
@@ -1930,6 +2065,113 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     private static String decapitalize(String name) {
+        if (name.isEmpty()) {
+            return "agent"; // an anonymous class has no simple name; its binding still names a group to check
+        }
         return Character.toLowerCase(name.charAt(0)) + name.substring(1);
+    }
+
+    /** Attribute overrides as proxied annotations (ISSUE-FlowManifest §9.3). */
+    static final class Overrides {
+
+        private Overrides() {
+        }
+
+        /** Every override key must name an attribute some verb annotation of the type declares. */
+        static void check(Class<?> type, Map<String, String> overrides) {
+            Set<String> attributes = new LinkedHashSet<>();
+            Set<String> methods = new LinkedHashSet<>();
+            for (Method m : type.getMethods()) {
+                for (Class<? extends java.lang.annotation.Annotation> a : OVERRIDABLE) {
+                    if (declaredAnnotationOf(m, a) != null) {
+                        methods.add(m.getName());
+                        for (Method attr : a.getDeclaredMethods()) {
+                            attributes.add(attr.getName());
+                        }
+                    }
+                }
+            }
+            for (String key : overrides.keySet()) {
+                String attribute = key.contains(".") ? key.substring(key.lastIndexOf('.') + 1) : key;
+                String method = key.contains(".") ? key.substring(0, key.lastIndexOf('.')) : null;
+                if (attribute.equals("shape") || attribute.equals("group") || attribute.equals("description")) {
+                    continue; // asset shapes travel beside the attribute; group and description are not overridable
+                }
+                if (!attributes.contains(attribute)) {
+                    throw new IllegalArgumentException("override '" + key + "' names no attribute a verb annotation of "
+                            + type.getSimpleName() + " declares; known: " + attributes);
+                }
+                if (method != null && !methods.contains(method)) {
+                    throw new IllegalArgumentException("override '" + key + "' names no bound method of " + type.getSimpleName()
+                            + "; known: " + methods);
+                }
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        static <A extends java.lang.annotation.Annotation> A apply(A found, Class<A> type, Method method, Map<String, String> overrides) {
+            Map<String, String> mine = new LinkedHashMap<>();
+            for (Method attr : type.getDeclaredMethods()) {
+                String specific = overrides.get(method.getName() + "." + attr.getName());
+                String general = overrides.get(attr.getName());
+                String value = specific != null ? specific : general;
+                if (value != null && attr.getName().equals("group") == false && attr.getName().equals("produces") == false) {
+                    mine.put(attr.getName(), value);
+                }
+            }
+            if (mine.isEmpty()) {
+                return found;
+            }
+            return (A) java.lang.reflect.Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, (proxy, m, args) -> {
+                String name = m.getName();
+                if (name.equals("annotationType")) {
+                    return type;
+                }
+                if (name.equals("toString")) {
+                    return found.toString() + " with overrides " + mine;
+                }
+                if (name.equals("hashCode")) {
+                    return found.hashCode();
+                }
+                if (name.equals("equals")) {
+                    return proxy == args[0];
+                }
+                String value = mine.get(name);
+                if (value == null) {
+                    return m.invoke(found, args);
+                }
+                return convert(value, m.getReturnType(), name, type);
+            });
+        }
+
+        static Object convert(String value, Class<?> returnType, String attribute, Class<?> annotation) {
+            if (returnType == String.class) {
+                return value;
+            }
+            if (returnType == String[].class) {
+                return value.isBlank() ? new String[0] : java.util.Arrays.stream(value.split(",")).map(String::trim)
+                        .filter(s -> !s.isEmpty()).toArray(String[]::new);
+            }
+            if (returnType == int.class) {
+                return Integer.parseInt(value.trim());
+            }
+            if (returnType == long.class) {
+                return Long.parseLong(value.trim());
+            }
+            if (returnType == boolean.class) {
+                return Boolean.parseBoolean(value.trim());
+            }
+            if (returnType.isEnum()) {
+                for (Object constant : returnType.getEnumConstants()) {
+                    if (constant.toString().equalsIgnoreCase(value.trim())) {
+                        return constant;
+                    }
+                }
+                throw new IllegalArgumentException("override " + attribute + "=" + value + " is not one of "
+                        + java.util.Arrays.toString(returnType.getEnumConstants()));
+            }
+            throw new IllegalArgumentException("attribute " + attribute + " of @" + annotation.getSimpleName()
+                    + " cannot be overridden from text");
+        }
     }
 }

@@ -192,6 +192,15 @@ public interface Space {
 
         /** The record's issue stamp. */
         HlcTimestamp issued();
+
+        /**
+         * The record's schema name as the writer named it. A view over a record decoded into a foreign
+         * representation (a lenient registry decoding an unknown type as a map) still names the writer's type;
+         * the default is the decoded value's class name.
+         */
+        default String type() {
+            return value() == null ? "" : value().getClass().getName();
+        }
     }
 
     /**

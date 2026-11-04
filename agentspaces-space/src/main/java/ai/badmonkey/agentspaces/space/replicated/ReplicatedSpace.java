@@ -231,6 +231,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final Set<EntryId> expiredFired = new HashSet<>();
     /** Claim epoch per entry whose REAPPEARED event already fired here. Under {@link #lock}. */
     private final Map<EntryId, Long> reappearedEpochs = new HashMap<>();
+    /** Claim epoch per entry whose TAKEN event already fired here: a won local take, or a merged remote claim
+     *  (a replica that only watches a lane hears of its takes this way). Under {@link #lock}. */
+    private final Map<EntryId, Long> takenEpochs = new HashMap<>();
     /** Hashes of remote claims already rejected here, so a lagging honest replica
      * re-offering the same contested claim is not struck once per round. */
     private final Set<String> rejectedClaims = java.util.Collections.newSetFromMap(
@@ -1236,7 +1239,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // a frame carrying the block needs it on the transport reader thread.
         List<EntryRecord> candidates;
         synchronized (lock) {
-            candidates = availableRecords(schemas.schemaNameOf(template.type()));
+            candidates = availableRecords(candidateType(template));
         }
         for (EntryRecord record : candidates) {
             Optional<T> value = decodeIfMatches(template, record);
@@ -1263,7 +1266,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // arrived are skipped this time (see read()).
         List<EntryRecord> candidates;
         synchronized (lock) {
-            candidates = availableRecords(schemas.schemaNameOf(template.type()));
+            candidates = availableRecords(candidateType(template));
         }
         List<T> results = new ArrayList<>();
         for (EntryRecord record : candidates) {
@@ -1284,7 +1287,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         registerSchema(template.type());
         List<EntryRecord> candidates;
         synchronized (lock) {
-            candidates = availableRecords(schemas.schemaNameOf(template.type()));
+            candidates = availableRecords(candidateType(template));
         }
         // The issuer comes off the entry record, whose signature mergeState
         // verified against that issuer's key, so it is the authenticated writer.
@@ -1340,7 +1343,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         List<EntryRecord> candidates;
         Set<EntryId> attested = new HashSet<>();
         synchronized (lock) {
-            candidates = availableRecords(schemas.schemaNameOf(template.type()));
+            candidates = availableRecords(candidateType(template));
             for (EntryRecord record : candidates) {
                 if (issuerCertificates.containsKey(record.entryId())) {
                     attested.add(record.entryId());
@@ -1685,7 +1688,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             record Candidate<V>(EntryRecord entry, V value, double bid) {
             }
             List<Candidate<T>> candidates = new ArrayList<>();
-            for (EntryRecord record : liveRecords(schemas.schemaNameOf(template.type()))) {
+            for (EntryRecord record : liveRecords(candidateType(template))) {
                 Optional<T> value = decodeIfMatches(template, record);
                 if (value.isEmpty()) {
                     continue;
@@ -1746,6 +1749,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (!won) {
                 return Optional.empty(); // lost the race; retry elsewhere
             }
+            takenEpochs.put(claimedId, myClaim.epoch());
         }
         fire(SpaceEvent.Kind.TAKEN, claimedId, claimedValue, claimedRecord.issuer(),
                 claimedRecord.issuer(), claimedRecord);
@@ -2098,6 +2102,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         String violation = null;
         boolean firstRejection = false;
+        EntryRecord takenRecord = null;
+        AgentId takenHolder = null;
         synchronized (lock) {
             // ASF-004: bound what a remote claim may assert before it enters the
             // lattice, where higher epochs win by design. Local claims (tryTakeOnce)
@@ -2140,9 +2146,26 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 generation++;
                 hlc.update(offered.stamp()); // spec §11: bounded-drift regime
                 observeLease(offered.expiresAtMillis() - offered.stamp().physical());
+                // A watcher's TAKEN (spiral 2 S2-H-01): the claim now in force, once per epoch, so a replica
+                // that never takes still hears who took what; a race settles as a later claim at the same
+                // epoch, which fires again with the winner as the actor.
+                TakeClaim merged = claimOf(entryId);
+                if (merged != null && !merged.expired(now)
+                        && !Long.valueOf(merged.epoch()).equals(takenEpochs.get(entryId))) {
+                    takenEpochs.put(entryId, merged.epoch());
+                    takenRecord = crdt.state(entryId).filter(EntryState::present).map(EntryState::record)
+                            .orElse(null);
+                    takenHolder = merged.holder();
+                }
             } else {
                 firstRejection = rejectedClaims.add(claimHash(offered) + "@" + entryId.value());
             }
+        }
+        if (takenRecord != null) {
+            EntryRecord record = takenRecord;
+            AgentId holder = takenHolder;
+            decodeValue(record).ifPresent(value -> fire(SpaceEvent.Kind.TAKEN, entryId, value, record.issuer(),
+                    holder, record));
         }
         if (violation != null && firstRejection) {
             // The hostile claim carries its author's own verified signature
@@ -2468,8 +2491,25 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return available;
     }
 
+    /**
+     * The schema name a template's candidates are filtered by: a typed template's own name; for an Object
+     * template (v0.1.24) the wire name of its type-name condition when it is one, else every type.
+     */
+    private String candidateType(Template<?> template) {
+        if (template.type() != Object.class) {
+            return schemas.schemaNameOf(template.type());
+        }
+        String name = template.typeName();
+        return name != null && name.contains("#") ? name : null;
+    }
+
     private <T> Optional<T> decodeIfMatches(Template<T> template, EntryRecord record) {
-        if (!record.type().equals(schemas.schemaNameOf(template.type()))) {
+        // An Object template selects any type (v0.1.24): a watcher reads foreign entries through its
+        // registry's decoding; a typed template still selects its own schema name only.
+        if (template.type() != Object.class && !record.type().equals(schemas.schemaNameOf(template.type()))) {
+            return Optional.empty();
+        }
+        if (!template.matchesType(record.type())) {
             return Optional.empty();
         }
         // Issue #16 §9.2 matching order: type, tags, then decode and fields. The
@@ -2751,6 +2791,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 generation++;
                 expiredFired.remove(entryId);
                 reappearedEpochs.remove(entryId);
+                takenEpochs.remove(entryId);
             }
         }
         return events;
@@ -3065,7 +3106,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         EntryView<Object> details = null;
         for (Sub sub : subscriptions) {
-            if (!sub.closed && sub.template.matchesTags(record.tags())
+            if (!sub.closed && sub.template.matchesTags(record.tags()) && sub.template.matchesType(record.type())
                     && sub.template.matches(value)) {
                 if (details == null) {
                     boolean attested;

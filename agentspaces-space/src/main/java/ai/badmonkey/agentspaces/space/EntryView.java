@@ -39,11 +39,18 @@ import java.util.Objects;
  * @param tags        the record's tags
  * @param lease       the lease in force on the record when the view was taken
  * @param issued      the record's issue stamp
+ * @param type        the record's schema name as written
  * @param <T>         the entry type
  */
 public record EntryView<T>(T value, EntryId entryId, AgentId issuer, Space.Attestation attestation,
-                           Map<String, String> tags, LeaseInfo lease, HlcTimestamp issued)
+                           Map<String, String> tags, LeaseInfo lease, HlcTimestamp issued, String type)
         implements Space.Entry<T> {
+
+    /** A view naming the value's class as its type (the record's name is not known). */
+    public EntryView(T value, EntryId entryId, AgentId issuer, Space.Attestation attestation,
+                     Map<String, String> tags, LeaseInfo lease, HlcTimestamp issued) {
+        this(value, entryId, issuer, attestation, tags, lease, issued, value == null ? "" : value.getClass().getName());
+    }
 
     public EntryView {
         Objects.requireNonNull(value, "value");
@@ -53,6 +60,7 @@ public record EntryView<T>(T value, EntryId entryId, AgentId issuer, Space.Attes
         Objects.requireNonNull(tags, "tags");
         Objects.requireNonNull(lease, "lease");
         Objects.requireNonNull(issued, "issued");
+        type = type == null ? "" : type;
     }
 
     /**
@@ -66,6 +74,6 @@ public record EntryView<T>(T value, EntryId entryId, AgentId issuer, Space.Attes
      */
     public static <T> EntryView<T> of(EntryRecord record, T value, Space.Attestation attestation) {
         return new EntryView<>(value, record.entryId(), record.issuer(), attestation,
-                record.tags(), record.lease(), record.issued());
+                record.tags(), record.lease(), record.issued(), record.type());
     }
 }

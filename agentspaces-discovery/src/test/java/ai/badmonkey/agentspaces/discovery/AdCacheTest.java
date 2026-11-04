@@ -139,6 +139,39 @@ class AdCacheTest {
         assertThat(cache.size()).isZero();
     }
 
+    /** ISSUE-ModelCard FR-2: a ModelCard is cached, refreshed by a newer issue, and expired like an AssetCard. */
+    @Test
+    void aModelCardIsCachedRefreshedAndExpired() {
+        ai.badmonkey.agentspaces.api.ad.ModelCard first = modelCard("bm-classify-1b", clock.instant(), Duration.ofMinutes(15));
+        assertThat(cache.accept(stored(first, issuer))).isPresent();
+        assertThat(cache.size()).isEqualTo(1);
+        clock.advance(Duration.ofMinutes(5));
+        ai.badmonkey.agentspaces.api.ad.ModelCard newer = modelCard("bm-classify-1b", clock.instant(), Duration.ofMinutes(15));
+        assertThat(cache.accept(stored(newer, issuer))).isPresent();
+        assertThat(cache.size()).as("the same id refreshes in place").isEqualTo(1);
+        assertThat(cache.find(ai.badmonkey.agentspaces.api.ad.ModelCard.class, c -> c.serves("classify"))).singleElement()
+                .satisfies(c -> assertThat(c.issued()).isEqualTo(newer.issued()));
+        clock.advance(Duration.ofMinutes(16));
+        assertThat(cache.find(ai.badmonkey.agentspaces.api.ad.ModelCard.class, c -> true)).as("expired on the next read").isEmpty();
+        assertThat(cache.size()).isZero();
+    }
+
+    /** ISSUE-ModelCard CR-1: a kind this reader does not know (a future card) is refused as the 0.5.0 reader refused ModelCard. */
+    @Test
+    void anUnknownAdvertisementKindIsRefusedNotMisread() {
+        ai.badmonkey.agentspaces.api.ad.ModelCard card = modelCard("bm-vision-7b", clock.instant(), Duration.ofMinutes(15));
+        AdCache.StoredAd good = stored(card, issuer);
+        assertThat(cache.accept(new AdCache.StoredAd("FutureCard", good.adBytes(), good.publicKey(), good.signature()))).isEmpty();
+        assertThat(cache.accept(new AdCache.StoredAd("AssetCard", good.adBytes(), good.publicKey(), good.signature()))).as("mistyped").isEmpty();
+        assertThat(cache.accept(good)).isPresent();
+    }
+
+    private ai.badmonkey.agentspaces.api.ad.ModelCard modelCard(String name, java.time.Instant issued, Duration ttl) {
+        return new ai.badmonkey.agentspaces.api.ad.ModelCard("aspace://" + groupId.value() + "/model/" + name + "@1", issuer.peerId(), groupId, issued, ttl,
+                name, "1", java.util.List.of("classify"), "text", java.util.Map.of(), "Apache-2.0", java.util.Map.of(), java.util.Map.of(),
+                java.util.Map.of(), java.util.Map.of("sites", "on-premises"), "onnx", java.util.List.of());
+    }
+
     // ------------------------------------------------------------ ASF-027 skew + TTL cap
 
     /** ASF-027: an issued stamp more than 10 minutes in the future is refused; within it is honest skew. */

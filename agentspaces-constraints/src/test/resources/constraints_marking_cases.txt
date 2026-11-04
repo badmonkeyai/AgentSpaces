@@ -1,0 +1,16 @@
+# template a b n within | events (type@secondsOffset[:kind], ...) | expected enabled | expected refused | violations
+precedence HumanApproval PaymentOrder 0 - | | HumanApproval | PaymentOrder | 0
+precedence HumanApproval PaymentOrder 0 - | HumanApproval@0 | HumanApproval,PaymentOrder | | 0
+precedence HumanApproval PaymentOrder 0 - | PaymentOrder@0 | HumanApproval | PaymentOrder | 1
+precedence HumanApproval PaymentOrder 0 - | PaymentOrder@5,HumanApproval@0 | HumanApproval,PaymentOrder | | 0
+precedence HumanApproval PaymentOrder 0 - | HumanApproval@5,PaymentOrder@0 | HumanApproval,PaymentOrder | | 1
+notCoexistence Refund Chargeback 0 - | | Refund,Chargeback | | 0
+notCoexistence Refund Chargeback 0 - | Refund@0 | Refund | Chargeback | 0
+notCoexistence Refund Chargeback 0 - | Refund@0,Chargeback@1 | Refund | Chargeback | 1
+response Claim Payment 0 P2D | Claim@0 | Claim,Payment | | 0
+response Claim Payment 0 P2D | Claim@0,Payment@3600 | Claim,Payment | | 0
+response Claim Payment 0 P2D | Claim@0,Payment@259200 | Claim,Payment | | 1
+cardinality Quote Quote 2 - | | Quote | | 0
+cardinality Quote Quote 2 - | Quote@0 | Quote | | 0
+cardinality Quote Quote 2 - | Quote@0,Quote@1 | | Quote | 0
+cardinality Quote Quote 2 - | Quote@0,Quote@1,Quote@2 | | Quote | 1

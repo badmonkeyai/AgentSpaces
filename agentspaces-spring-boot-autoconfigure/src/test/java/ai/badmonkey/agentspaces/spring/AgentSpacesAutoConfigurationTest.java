@@ -99,6 +99,54 @@ class AgentSpacesAutoConfigurationTest {
         }
     }
 
+    /** ISSUE-Constraints FR-10: the gate is installed in each binder only when the property is on, with the hint. */
+    @Test
+    void theConstraintGateInstallsWithTheRulesProperty() throws Exception {
+        AgentSpacesProperties properties = fleetProperties(freePort(), 0);
+        PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
+        PeerNode node = autoConfig.agentSpacesNode(properties, identity);
+        closeables.add(node::close);
+        Authorizers authorizers = autoConfig.agentSpacesAuthorizers(properties, identity);
+        AgentSpaces spaces = autoConfig.agentSpaces(properties, node, identity, authorizers, autoConfig.agentSpacesEmbedder());
+        closeables.add(spaces::close);
+        assertThat(spaces.group("fleet").binder().constraintGate()).as("off by default").isNull();
+        properties.getRules().setGate(true);
+        ConstraintGates gates = autoConfig.agentSpacesConstraintGates(spaces, properties, authorizers, node, identity,
+                java.time.InstantSource.system());
+        closeables.add(gates::close);
+        gates.start();
+        assertThat(gates.isRunning()).isTrue();
+        assertThat(gates.gate("fleet")).isNotNull();
+        assertThat(gates.gate("fleet").loaded()).as("nothing published yet").isEmpty();
+        assertThat(spaces.group("fleet").binder().constraintGate()).isSameAs(gates.gate("fleet"));
+        assertThat(properties.getRules().getSpace()).isEqualTo("constraints");
+        gates.stop();
+        assertThat(gates.isRunning()).isFalse();
+    }
+
+    /** ISSUE-FlowManifest FR-2, FR-9: the reconciler per group only with the property, reading flow-control on demand. */
+    @Test
+    void theFlowReconcilerInstallsWithTheFlowsProperty() throws Exception {
+        AgentSpacesProperties properties = fleetProperties(freePort(), 0);
+        PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
+        PeerNode node = autoConfig.agentSpacesNode(properties, identity);
+        closeables.add(node::close);
+        Authorizers authorizers = autoConfig.agentSpacesAuthorizers(properties, identity);
+        AgentSpaces spaces = autoConfig.agentSpaces(properties, node, identity, authorizers, autoConfig.agentSpacesEmbedder());
+        closeables.add(spaces::close);
+        properties.getFlows().setReconcile(true);
+        FlowReconcilers reconcilers = autoConfig.agentSpacesFlowReconcilers(spaces, properties, authorizers, node, identity,
+                java.time.InstantSource.system());
+        closeables.add(reconcilers::close);
+        reconcilers.start();
+        assertThat(reconcilers.isRunning()).isTrue();
+        assertThat(reconcilers.reconciler("fleet")).isNotNull();
+        assertThat(reconcilers.reconciler("fleet").current()).as("no manifest yet").isEmpty();
+        assertThat(reconcilers.reconciler("fleet").conformance().failures()).isEmpty();
+        assertThat(spaces.catalogue().lookup("nobody")).isEmpty();
+        reconcilers.stop();
+    }
+
     private AgentSpacesProperties fleetProperties(int port, int seedPort) {
         AgentSpacesProperties properties = new AgentSpacesProperties();
         properties.setBind("127.0.0.1:" + port);

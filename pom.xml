@@ -96,6 +96,8 @@
     <module>agentspaces-transport-webrtc</module>
     <module>agentspaces-discovery</module>
     <module>agentspaces-capabilities</module>
+    <module>agentspaces-constraints</module>
+    <module>agentspaces-guardrail</module>
     <module>agentspaces-agent</module>
     <module>agentspaces-a2a</module>
     <module>agentspaces-connect-core</module>

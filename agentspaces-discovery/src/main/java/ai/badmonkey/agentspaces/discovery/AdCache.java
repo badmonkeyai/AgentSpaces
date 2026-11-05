@@ -75,7 +75,8 @@ public final class AdCache {
             "CapabilityAdvertisement", CapabilityAdvertisement.class,
             "AgentCard", AgentCard.class,
             "AssetCard", ai.badmonkey.agentspaces.api.ad.AssetCard.class,
-            "ModelCard", ai.badmonkey.agentspaces.api.ad.ModelCard.class);
+            "ModelCard", ai.badmonkey.agentspaces.api.ad.ModelCard.class,
+            "AppCard", ai.badmonkey.agentspaces.api.ad.AppCard.class);
 
     /**
      * The default bound on cached advertisements (ASF-019). A peer serving the

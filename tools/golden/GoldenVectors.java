@@ -1195,6 +1195,17 @@ public final class GoldenVectors {
         json.append(field("agent_card_with_actions_cbor", hex.formatHex(codec.toBytes(actionCard))));
         json.append(field("agent_card_with_actions_signature",
                 hex.formatHex(new AdvertisementSigner(codec).sign(actionCard, identity).signature())));
+        // v0.1.26 (ISSUE-UiComponents, SPEC §6.1a.3): the same card with a ui declaration appended last.
+        //   agent_card_ui_cbor  the card with ui {protocol, version, components, entries, catalogIds}
+        AgentCard uiCard = actionCard.withUi(ai.badmonkey.agentspaces.api.ad.UiDeclaration.of(List.of(
+                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component("ObjectShare", "bma-widgets", "ObjectShare",
+                        "https://badmonkey.ai/ns/apps/v1/SharedObject", List.of("research"), "panel"),
+                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component("ask", "bma-widgets", "ChatInput",
+                        "https://badmonkey.ai/ns/apps/v1/ChatMessage", List.of(), "control")),
+                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Entries(List.of("https://badmonkey.ai/ns/apps/v1/SharedObject"),
+                        List.of("https://badmonkey.ai/ns/apps/v1/ChatMessage"))));
+        require(codec.toBytes(uiCard.withUi(null)).length == codec.toBytes(actionCard).length, "a card without ui keeps its bytes");
+        json.append(field("agent_card_ui_cbor", hex.formatHex(codec.toBytes(uiCard))));
 
         // ------------------------------------------------------------------
         // v0.1.13 audit item 10: the remaining v0.1.13 transitions and their

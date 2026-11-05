@@ -1,0 +1,41 @@
+{
+  "name": "a route through a produced type",
+  "goal": "Payment",
+  "state": {
+    "types": [
+      "Claim"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "pay",
+      "card": "payer",
+      "consumes": [
+        "PaymentOrder"
+      ],
+      "produces": [
+        "Payment"
+      ]
+    },
+    {
+      "name": "order",
+      "card": "adjuster",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "PaymentOrder"
+      ]
+    }
+  ],
+  "constraints": [],
+  "expect": {
+    "enablement": [],
+    "enablementReason": "no enabled action produces Payment",
+    "search": [
+      "order",
+      "pay"
+    ]
+  }
+}

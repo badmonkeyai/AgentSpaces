@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Bad Monkey, Inc.
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+      https://www.apache.org/licenses/LICENSE-2.0
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>ai.badmonkey.agentspaces</groupId>
+    <artifactId>agentspaces</artifactId>
+    <version>0.5.0</version>
+  </parent>
+  <artifactId>agentspaces-planner</artifactId>
+  <name>AgentSpaces :: Planner</name>
+  <description>
+    The planner (ISSUE-CardContract, SPEC §6.1b; strategy B2 of the builder-planner SRAD): the Planner SPI over
+    the cards' actions and contracts, the enablement planner (the next enabled action whose post reaches the
+    goal), the bounded search planner over contracts, and the adapters from cards and from a key's marking. Pure
+    over the records of agentspaces-api and agentspaces-constraints; tested with conformance cases.
+  </description>
+  <dependencies>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-api</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-constraints</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-support</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

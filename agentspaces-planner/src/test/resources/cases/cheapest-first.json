@@ -1,0 +1,43 @@
+{
+  "name": "among routes of one length the cheaper action is chosen",
+  "goal": "Payment",
+  "state": {
+    "types": [
+      "Claim"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "payFast",
+      "card": "payer-b",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "Payment"
+      ],
+      "cost": "high"
+    },
+    {
+      "name": "payCheap",
+      "card": "payer-a",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "Payment"
+      ],
+      "cost": "low"
+    }
+  ],
+  "constraints": [],
+  "expect": {
+    "enablement": [
+      "payCheap"
+    ],
+    "search": [
+      "payCheap"
+    ]
+  }
+}

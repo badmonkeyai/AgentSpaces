@@ -1,0 +1,44 @@
+{
+  "name": "a contract's pre needs a situation another action establishes",
+  "goal": "SiteVisit",
+  "state": {
+    "types": [
+      "Claim"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "schedule",
+      "card": "scheduler",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "SiteVisit"
+      ],
+      "pre": [
+        "adjuster-assigned"
+      ]
+    },
+    {
+      "name": "assign",
+      "card": "dispatcher",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [],
+      "post": [
+        "adjuster-assigned"
+      ]
+    }
+  ],
+  "constraints": [],
+  "expect": {
+    "enablement": [],
+    "search": [
+      "assign",
+      "schedule"
+    ]
+  }
+}

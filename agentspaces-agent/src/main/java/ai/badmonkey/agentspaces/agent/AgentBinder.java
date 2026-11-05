@@ -536,7 +536,8 @@ public final class AgentBinder implements AutoCloseable {
                     produces.add(schemas.register(produced));
                 }
                 actions.add(action(method, take.produces(), take.description(), List.of(schema),
-                        resolveSpaceName(take.space(), method), CardAction.TAKE));
+                        resolveSpaceName(take.space(), method), CardAction.TAKE,
+                        CardAction.Contract.of(List.of(take.pre()), List.of(take.post()), take.cost())));
                 handle.threads.add(startTakeLoop(agent, method, take, handle));
             }
             SpaceNotify notify = annotationOf(method, SpaceNotify.class);
@@ -599,7 +600,8 @@ public final class AgentBinder implements AutoCloseable {
                 }
                 actions.add(action(method, orderedTake.produces(), orderedTake.description(), List.of(schema),
                         resolveCoordinatedSpaceName(orderedTake.space(), method),
-                        CardAction.ORDERED_TAKE));
+                        CardAction.ORDERED_TAKE,
+                        CardAction.Contract.of(List.of(orderedTake.pre()), List.of(orderedTake.post()), orderedTake.cost())));
                 handle.threads.add(startOrderedTakeLoop(agent, method, orderedTake, handle));
             }
             SpaceJoin join = annotationOf(method, SpaceJoin.class);
@@ -703,7 +705,8 @@ public final class AgentBinder implements AutoCloseable {
         }
 
         handle.card = buildCard(agentIdentity, spec, consumes, produces, spaceBindings)
-                .withActions(declared(actions));
+                .withActions(declared(actions))
+                .withUi(uiDeclaration(type));   // v0.1.26 (ISSUE-UiComponents): what the agent can show, or null
         publishCard(handle);
         bound.add(handle);
         return handle;
@@ -745,7 +748,8 @@ public final class AgentBinder implements AutoCloseable {
                     current.actions(),
                     // the identity's current certificate, renewed above when due
                     current.agentPublicKey() == null ? null
-                            : handle.identity.certificateCovering(issuedAt).orElse(null));
+                            : handle.identity.certificateCovering(issuedAt).orElse(null),
+                    current.ui());
             publishCard(handle);
         }
     }
@@ -1125,12 +1129,18 @@ public final class AgentBinder implements AutoCloseable {
      */
     private CardAction action(Method method, Class<?>[] declaredProduces, String description,
                               List<String> consumed, String space, String kind) {
+        return action(method, declaredProduces, description, consumed, space, kind, null);
+    }
+
+    /** The same, with the contract the annotation declares (ISSUE-CardContract); null when it declares none. */
+    private CardAction action(Method method, Class<?>[] declaredProduces, String description,
+                              List<String> consumed, String space, String kind, CardAction.Contract contract) {
         requireCapabilityForDeclaredReturn(method);
         List<String> produced = new ArrayList<>();
         for (Class<?> type : producedTypes(method, declaredProduces)) {
             produced.add(schemas.register(type));
         }
-        return new CardAction(method.getName(), description, consumed, produced, space, kind);
+        return new CardAction(method.getName(), description, consumed, produced, space, kind, contract);
     }
 
     /**
@@ -1149,7 +1159,7 @@ public final class AgentBinder implements AutoCloseable {
             String name = counts.get(a.name()) > 1
                     ? a.name() + "(" + String.join(",", a.consumes()) + ")" : a.name();
             named.add(new CardAction(name, a.description(), a.consumes(), a.produces(),
-                    a.space(), a.kind()));
+                    a.space(), a.kind(), a.contract()));   // the contract rides along (ISSUE-CardContract)
         }
         named.sort(java.util.Comparator.comparing(CardAction::name));
         if (named.size() > AgentCard.MAX_ACTIONS) {
@@ -1157,6 +1167,49 @@ public final class AgentBinder implements AutoCloseable {
                     + " actions; this one binds " + named.size());
         }
         return named;
+    }
+
+    /**
+     * The card's {@code ui} group from every {@code @UiComponent} on the type and its public methods
+     * (SPEC §6.1a.3, v0.1.26; ISSUE-UiComponents FR-5): one component per annotation, the entries it reads and writes
+     * from the annotations' entry types, the catalogs derived; null when the type declares none. The card refuses a
+     * control that names no action of the card.
+     */
+    static ai.badmonkey.agentspaces.api.ad.UiDeclaration uiDeclaration(Class<?> type) {
+        List<ai.badmonkey.agentspaces.agent.annotation.UiComponent> found = new ArrayList<>();
+        // the declaration may sit on the class, a superclass, or an interface the class implements (a Clojure
+        // defagent's generated interface, a Groovy trait): the same places the agent's spec is read from
+        for (Class<?> t = type; t != null && t != Object.class; t = t.getSuperclass()) {
+            found.addAll(List.of(t.getAnnotationsByType(ai.badmonkey.agentspaces.agent.annotation.UiComponent.class)));
+            for (Class<?> i : t.getInterfaces()) {
+                found.addAll(List.of(i.getAnnotationsByType(ai.badmonkey.agentspaces.agent.annotation.UiComponent.class)));
+            }
+        }
+        for (Method method : type.getMethods()) {
+            found.addAll(List.of(method.getAnnotationsByType(ai.badmonkey.agentspaces.agent.annotation.UiComponent.class)));
+        }
+        if (found.isEmpty()) {
+            return null;
+        }
+        List<ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component> components = new ArrayList<>();
+        Set<String> reads = new LinkedHashSet<>();
+        Set<String> writes = new LinkedHashSet<>();
+        for (ai.badmonkey.agentspaces.agent.annotation.UiComponent u : found) {
+            String entry = !u.entryIri().isBlank() ? u.entryIri() : (u.entry() == Void.class ? "" : u.entry().getName());
+            String id = u.id().isBlank() ? u.component() : u.id();
+            components.add(new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component(id, u.catalog(), u.component(), entry,
+                    List.of(u.controls()), u.role()));
+            if (!entry.isEmpty()) {
+                if (u.reads()) {
+                    reads.add(entry);
+                }
+                if (u.writes()) {
+                    writes.add(entry);
+                }
+            }
+        }
+        return ai.badmonkey.agentspaces.api.ad.UiDeclaration.of(components,
+                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Entries(List.copyOf(reads), List.copyOf(writes)));
     }
 
     /**

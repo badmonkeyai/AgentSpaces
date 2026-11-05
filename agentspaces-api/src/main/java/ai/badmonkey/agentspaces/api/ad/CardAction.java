@@ -43,7 +43,56 @@ public record CardAction(
         List<String> consumes,
         List<String> produces,
         @JsonInclude(JsonInclude.Include.NON_NULL) String space,
-        String kind) {
+        String kind,
+        // Appended in v0.1.25 (ISSUE-CardContract) and omitted from the wire when absent, so an action
+        // without a contract is byte-identical to the v0.1.13 action. When present it is what a planner
+        // reads: the situations or conditions the action needs, what it establishes, a cost hint, and
+        // the methods (HTN) it belongs to.
+        @JsonInclude(JsonInclude.Include.NON_NULL) Contract contract) {
+
+    /**
+     * The planner's view of an action (SPEC §6.1b, v0.1.25): {@code pre}, the situation names or
+     * conditions that must hold before the action runs (beside its consumed schemas); {@code post},
+     * the schemas it produces and the situations it establishes (beside its produced schemas);
+     * {@code cost}, a free hint a planner orders by ("1", "low", "PT2M"); {@code methods}, the HTN
+     * method names the action belongs to (reserved for strategy B4). Each list holds at most
+     * {@link #MAX_CONTRACT_TERMS} terms.
+     */
+    public record Contract(List<String> pre, List<String> post, String cost, List<String> methods) {
+        public Contract {
+            pre = pre == null ? List.of() : List.copyOf(pre);
+            post = post == null ? List.of() : List.copyOf(post);
+            cost = cost == null ? "" : cost;
+            methods = methods == null ? List.of() : List.copyOf(methods);
+            if (pre.size() > MAX_CONTRACT_TERMS || post.size() > MAX_CONTRACT_TERMS || methods.size() > MAX_CONTRACT_TERMS) {
+                throw new IllegalArgumentException("a contract carries at most " + MAX_CONTRACT_TERMS + " terms per list");
+            }
+            if (cost.length() > MAX_COST_LENGTH) {
+                throw new IllegalArgumentException("a contract's cost hint is at most " + MAX_COST_LENGTH + " characters");
+            }
+        }
+
+        /** Null when every term is empty, so an empty contract never reaches the wire. */
+        public static Contract of(List<String> pre, List<String> post, String cost) {
+            boolean empty = (pre == null || pre.isEmpty()) && (post == null || post.isEmpty()) && (cost == null || cost.isBlank());
+            return empty ? null : new Contract(pre, post, cost, List.of());
+        }
+    }
+
+    /** The most terms a contract list carries. */
+    public static final int MAX_CONTRACT_TERMS = 32;
+    /** The longest cost hint. */
+    public static final int MAX_COST_LENGTH = 64;
+
+    /** The v0.1.13 shape: an action without a contract. */
+    public CardAction(String name, String description, List<String> consumes, List<String> produces, String space, String kind) {
+        this(name, description, consumes, produces, space, kind, null);
+    }
+
+    /** This action with a contract (null removes it). */
+    public CardAction withContract(Contract contract) {
+        return new CardAction(name, description, consumes, produces, space, kind, contract);
+    }
 
     /** A {@code @SpaceTake} worker. */
     public static final String TAKE = "take";

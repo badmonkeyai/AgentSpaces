@@ -115,6 +115,41 @@ public final class EmbabelIntrospector {
                 : stringAttribute(annotation, "description").orElse("");
     }
 
+    /**
+     * The contract an Embabel {@code @Action} declares (ISSUE-CardContract, strategy B6): its {@code pre} and
+     * {@code post} condition names and its {@code cost}; null when it declares none.
+     *
+     * @param action an {@code @Action} method
+     * @return the contract, or null
+     */
+    public static ai.badmonkey.agentspaces.api.ad.CardAction.Contract actionContract(Method action) {
+        Annotation annotation = annotationNamed(action.getAnnotations(), ACTION_ANNOTATION);
+        if (annotation == null) {
+            return null;
+        }
+        java.util.List<String> pre = stringsAttribute(annotation, "pre");
+        java.util.List<String> post = stringsAttribute(annotation, "post");
+        String cost = "";
+        try {
+            Object value = annotation.annotationType().getMethod("cost").invoke(annotation);
+            if (value instanceof Double d && d != 0.0) {
+                cost = Double.toString(d);
+            }
+        } catch (ReflectiveOperationException e) {
+            // the attribute does not exist in this version
+        }
+        return ai.badmonkey.agentspaces.api.ad.CardAction.Contract.of(pre, post, cost);
+    }
+
+    private static java.util.List<String> stringsAttribute(Annotation annotation, String attribute) {
+        try {
+            Object value = annotation.annotationType().getMethod(attribute).invoke(annotation);
+            return value instanceof String[] texts ? java.util.List.of(texts) : java.util.List.of();
+        } catch (ReflectiveOperationException e) {
+            return java.util.List.of();
+        }
+    }
+
     private static Annotation annotationNamed(Annotation[] annotations, String name) {
         for (Annotation annotation : annotations) {
             if (annotation.annotationType().getName().equals(name)) {

@@ -89,6 +89,18 @@ public @interface OrderedTake {
     String[] where() default {};
 
     /**
+     * The action's contract for a planner (ISSUE-CardContract, SPEC §6.1b): the situation names or
+     * conditions that must hold before it runs, beside the entry it consumes; empty when undeclared.
+     */
+    String[] pre() default {};
+
+    /** What the action establishes beside the entry it produces: schemas or situation names. */
+    String[] post() default {};
+
+    /** A cost hint a planner orders by ("1", "low", "PT2M"); empty when undeclared. */
+    String cost() default "";
+
+    /**
      * What this method produces when its return type does not say: the entry
      * types inside an {@code Entries} fork or an {@code Object} return, declared
      * on the card (ISSUE-WorkflowVerbs). A sealed return type declares its

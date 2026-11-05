@@ -108,7 +108,7 @@ class EmbabelBinderTest {
     @Agent(name = "desk", description = "A two-action Embabel desk")
     public static class TwoActionDesk {
 
-        @Action(description = "Researches one topic")
+        @Action(description = "Researches one topic", pre = {"topic-chosen"}, post = {"findings-ready"}, cost = 2.0)
         public FindingEntry research(TaskEntry task) {
             return new FindingEntry(task.topic(), "done");
         }
@@ -284,6 +284,12 @@ class EmbabelBinderTest {
         assertThat(card.actions()).extracting(ai.badmonkey.agentspaces.api.ad.CardAction::name)
                 .containsExactly("followUp", "research");
         ai.badmonkey.agentspaces.api.ad.CardAction research = card.actions().get(1);
+        // ISSUE-CardContract FR-7: an Embabel @Action's pre, post, and cost read as the action's contract
+        assertThat(research.contract()).isNotNull();
+        assertThat(research.contract().pre()).containsExactly("topic-chosen");
+        assertThat(research.contract().post()).containsExactly("findings-ready");
+        assertThat(research.contract().cost()).isEqualTo("2.0");
+        assertThat(card.actions().get(0).contract()).as("no contract declared").isNull();
         assertThat(research.description()).isEqualTo("Researches one topic");
         assertThat(research.kind()).isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.EMBABEL_ACTION);
         assertThat(research.consumes()).containsExactly(TaskEntry.class.getName() + "#v1");

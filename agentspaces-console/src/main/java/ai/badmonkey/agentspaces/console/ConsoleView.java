@@ -268,17 +268,22 @@ public final class ConsoleView implements AutoCloseable {
     private static AdRow toRow(Advertisement ad) {
         return switch (ad) {
             case AgentCard card -> new AdRow("agent", card.agent().localName(),
-                    card.issuer().display(), card.actions() == null ? card.description()
+                    card.issuer().display(), (card.actions() == null ? card.description()
                             : card.description() + " (actions: " + String.join(", ",
                                     card.actions().stream().map(
                                             ai.badmonkey.agentspaces.api.ad.CardAction::name).toList())
-                            + ")");
+                            + ")")
+                            // v0.1.26: what the agent can show (ISSUE-UiComponents FR-8)
+                            + (card.declaresUi() ? " ui " + card.ui().components().size() + " component(s)" : ""));
             case AssetCard card -> new AdRow("asset", card.asset(),
                     card.issuer().display(), card.description() + " (" + card.uri() + ")" + operationsOf(card));
             case ai.badmonkey.agentspaces.api.ad.ModelCard model -> new AdRow("model", model.name() + "@" + model.version(),
                     model.issuer().display(), String.join(",", model.tasks()) + " on " + model.engine()
                             + (model.residency().containsKey("sites") ? ", at " + model.residency().get("sites") : "")
                             + ", " + model.servers().size() + " server(s)");
+            case ai.badmonkey.agentspaces.api.ad.AppCard app -> new AdRow("app", app.name() + "@" + app.version(),
+                    app.issuer().display(), app.kind() + "/" + app.shape() + (app.url().isBlank() ? "" : " at " + app.url())
+                            + (app.ui() == null ? "" : ", " + app.ui().surfaces().size() + " surface(s) by " + app.ui().agent()));
             case CapabilityAdvertisement cap -> new AdRow("capability",
                     cap.capabilityType(), cap.issuer().display(),
                     "v" + cap.version() + " via " + cap.binding()

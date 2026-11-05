@@ -1,0 +1,62 @@
+{
+  "name": "a chain longer than the budget is stuck",
+  "goal": "T4",
+  "state": {
+    "types": [
+      "T0"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "s1",
+      "card": "w",
+      "consumes": [
+        "T0"
+      ],
+      "produces": [
+        "T1"
+      ]
+    },
+    {
+      "name": "s2",
+      "card": "w",
+      "consumes": [
+        "T1"
+      ],
+      "produces": [
+        "T2"
+      ]
+    },
+    {
+      "name": "s3",
+      "card": "w",
+      "consumes": [
+        "T2"
+      ],
+      "produces": [
+        "T3"
+      ]
+    },
+    {
+      "name": "s4",
+      "card": "w",
+      "consumes": [
+        "T3"
+      ],
+      "produces": [
+        "T4"
+      ]
+    }
+  ],
+  "constraints": [],
+  "budget": {
+    "depth": 3,
+    "width": 100
+  },
+  "expect": {
+    "enablement": [],
+    "search": [],
+    "searchReason": "within 3 steps"
+  }
+}

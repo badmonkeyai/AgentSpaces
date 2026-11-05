@@ -1,0 +1,49 @@
+{
+  "name": "a precedence constraint orders the route",
+  "goal": "Payment",
+  "state": {
+    "types": [
+      "Claim"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "pay",
+      "card": "payer",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "Payment"
+      ],
+      "cost": "1"
+    },
+    {
+      "name": "approve",
+      "card": "approver",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "HumanApproval"
+      ],
+      "cost": "2"
+    }
+  ],
+  "constraints": [
+    {
+      "unit": "k1",
+      "template": "precedence",
+      "a": "HumanApproval",
+      "b": "Payment"
+    }
+  ],
+  "expect": {
+    "enablement": [],
+    "search": [
+      "approve",
+      "pay"
+    ]
+  }
+}

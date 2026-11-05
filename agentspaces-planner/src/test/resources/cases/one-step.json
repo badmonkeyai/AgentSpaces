@@ -1,0 +1,42 @@
+{
+  "name": "one enabled action reaches the goal",
+  "goal": "Payment",
+  "state": {
+    "types": [
+      "Claim",
+      "PaymentOrder"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "pay",
+      "card": "payer",
+      "consumes": [
+        "PaymentOrder"
+      ],
+      "produces": [
+        "Payment"
+      ]
+    },
+    {
+      "name": "register",
+      "card": "registrar",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "Registration"
+      ]
+    }
+  ],
+  "constraints": [],
+  "expect": {
+    "enablement": [
+      "pay"
+    ],
+    "search": [
+      "pay"
+    ]
+  }
+}

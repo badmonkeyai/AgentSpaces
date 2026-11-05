@@ -151,7 +151,7 @@ class AgentBinderAttributesTest {
     public static class Worker {
         final List<String> taken = new CopyOnWriteArrayList<>();
 
-        @SpaceTake(space = "tasks", pollTimeout = "50ms", resultLease = "2h")
+        @SpaceTake(space = "tasks", pollTimeout = "50ms", resultLease = "2h", pre = {"ready"}, post = {"done"}, cost = "low")
         public Finding work(Task task) {
             taken.add(task.topic());
             return task.topic().startsWith("quiet") ? null : new Finding(task.topic(), "done");
@@ -161,7 +161,13 @@ class AgentBinderAttributesTest {
     @Test
     void aTakeWritesItsResultUnderTheDeclaredResultLeaseAndANullReturnCompletesWithoutWriting() throws Exception {
         Worker worker = new Worker();
-        binder.bind(worker);
+        AgentBinder.Bound bound = binder.bind(worker);
+        // ISSUE-CardContract FR-7: the card carries the contract the annotation declares
+        CardAction.Contract contract = action(bound, "work").contract();
+        assertThat(contract).isNotNull();
+        assertThat(contract.pre()).containsExactly("ready");
+        assertThat(contract.post()).containsExactly("done");
+        assertThat(contract.cost()).isEqualTo("low");
         tasks.space.write(new Task("t1"), HOUR);
         await(() -> !tasks.space.readAll(Template.of(Finding.class), 10).isEmpty(), Duration.ofSeconds(5));
         assertThat(expiryOf(tasks.space, Finding.class)).isEqualTo(now() + Duration.ofHours(2).toMillis());

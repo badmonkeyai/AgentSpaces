@@ -142,6 +142,11 @@
       </dependency>
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-planner</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-guardrail</artifactId>
         <version>${project.version}</version>
       </dependency>

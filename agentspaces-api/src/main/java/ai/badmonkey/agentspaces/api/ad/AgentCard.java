@@ -77,7 +77,25 @@ public record AgentCard(
         // verify it under the card issuer's key at the card's issue time.
         @com.fasterxml.jackson.annotation.JsonInclude(
                 com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
-        ai.badmonkey.agentspaces.api.security.AgentCertificate agentCertificate) implements Advertisement {
+        ai.badmonkey.agentspaces.api.security.AgentCertificate agentCertificate,
+        // Appended in v0.1.26 (ISSUE-UiComponents), omitted when absent: what the
+        // agent can show, derived by the binder from @UiComponent, so a console can
+        // assemble an application from a group's cards. A card without it is
+        // byte-identical to v0.1.25.
+        @com.fasterxml.jackson.annotation.JsonInclude(
+                com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        UiDeclaration ui) implements Advertisement {
+
+    /** The v0.1.25 shape: everything but the ui declaration. */
+    public AgentCard(String id, PeerId issuer, GroupId group, Instant issued, Duration ttl,
+                     AgentId agent, String description, List<String> goals,
+                     List<String> consumes, List<String> produces, Map<String, String> costHints,
+                     Map<String, String> spaceBindings, byte[] agentPublicKey,
+                     List<CardAction> actions,
+                     ai.badmonkey.agentspaces.api.security.AgentCertificate agentCertificate) {
+        this(id, issuer, group, issued, ttl, agent, description, goals, consumes, produces,
+                costHints, spaceBindings, agentPublicKey, actions, agentCertificate, null);
+    }
 
     public AgentCard(String id, PeerId issuer, GroupId group, Instant issued, Duration ttl,
                      AgentId agent, String description, List<String> goals,
@@ -85,7 +103,7 @@ public record AgentCard(
                      Map<String, String> spaceBindings, byte[] agentPublicKey,
                      List<CardAction> actions) {
         this(id, issuer, group, issued, ttl, agent, description, goals, consumes, produces,
-                costHints, spaceBindings, agentPublicKey, actions, null);
+                costHints, spaceBindings, agentPublicKey, actions, null, null);
     }
 
     /** The most actions one card may declare, which keeps cards inside the ad frame budget. */
@@ -152,6 +170,32 @@ public record AgentCard(
                 throw new IllegalArgumentException("action names must be unique within a card");
             }
         }
+        if (ui != null) {
+            // FR-3: a control names an action the card declares (a surface action the agent answers is a card action too)
+            java.util.Set<String> names = new java.util.HashSet<>();
+            if (actions != null) {
+                actions.forEach(a -> names.add(a.name()));
+            }
+            for (UiDeclaration.Component c : ui.components()) {
+                for (String control : c.controls()) {
+                    if (!names.contains(control)) {
+                        throw new IllegalArgumentException("ui component " + c.id() + " names the control '" + control
+                                + "', which is not an action of the card");
+                    }
+                }
+            }
+        }
+    }
+
+    /** The card with its ui declaration (v0.1.26), every other field unchanged; null clears it. */
+    public AgentCard withUi(UiDeclaration declaration) {
+        return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
+                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, declaration);
+    }
+
+    /** Whether the card declares what its agent can show. */
+    public boolean declaresUi() {
+        return ui != null && !ui.components().isEmpty();
     }
 
     /** Whether the card's agent signs with a peer-certified key of its own (SPEC §4.2). */
@@ -169,14 +213,15 @@ public record AgentCard(
                 && costHints.equals(that.costHints) && spaceBindings.equals(that.spaceBindings)
                 && java.util.Arrays.equals(agentPublicKey, that.agentPublicKey)
                 && Objects.equals(actions, that.actions)
-                && Objects.equals(agentCertificate, that.agentCertificate);
+                && Objects.equals(agentCertificate, that.agentCertificate)
+                && Objects.equals(ui, that.ui);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(id, issuer, group, issued, ttl, agent, description, goals, consumes,
                 produces, costHints, spaceBindings, java.util.Arrays.hashCode(agentPublicKey),
-                actions, agentCertificate);
+                actions, agentCertificate, ui);
     }
 
     /**
@@ -200,7 +245,7 @@ public record AgentCard(
      */
     public AgentCard withActions(List<CardAction> declared) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, declared, agentCertificate);
+                produces, costHints, spaceBindings, agentPublicKey, declared, agentCertificate, ui);
     }
 
     /**
@@ -212,7 +257,7 @@ public record AgentCard(
      */
     public AgentCard withAgentCertificate(ai.badmonkey.agentspaces.api.security.AgentCertificate certificate) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, actions, certificate);
+                produces, costHints, spaceBindings, agentPublicKey, actions, certificate, ui);
     }
 
 }

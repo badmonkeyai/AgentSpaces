@@ -1,0 +1,27 @@
+{
+  "name": "stuck names the missing input",
+  "goal": "Payment",
+  "state": {
+    "types": [],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "pay",
+      "card": "payer",
+      "consumes": [
+        "PaymentOrder"
+      ],
+      "produces": [
+        "Payment"
+      ]
+    }
+  ],
+  "constraints": [],
+  "expect": {
+    "enablement": [],
+    "enablementReason": "pay needs PaymentOrder",
+    "search": [],
+    "searchReason": "pay needs PaymentOrder"
+  }
+}

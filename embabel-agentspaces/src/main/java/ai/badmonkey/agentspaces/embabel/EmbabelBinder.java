@@ -179,7 +179,7 @@ public final class EmbabelBinder {
                 description = description.substring(0, CardAction.MAX_DESCRIPTION_LENGTH);
             }
             actions.add(new CardAction(action.getName(), description, consumed, produced,
-                    boundSpace.orElse(null), CardAction.EMBABEL_ACTION));
+                    boundSpace.orElse(null), CardAction.EMBABEL_ACTION, EmbabelIntrospector.actionContract(action)));
         }
         AgentId agentId = identity.agent(agent.name());
         return new AgentCard(
@@ -203,7 +203,7 @@ public final class EmbabelBinder {
             String name = counts.get(a.name()) > 1
                     ? a.name() + "(" + String.join(",", a.consumes()) + ")" : a.name();
             named.add(new CardAction(name, a.description(), a.consumes(), a.produces(),
-                    a.space(), a.kind()));
+                    a.space(), a.kind(), a.contract()));   // the contract rides along (ISSUE-CardContract)
         }
         named.sort(java.util.Comparator.comparing(CardAction::name));
         return named.size() > AgentCard.MAX_ACTIONS ? named.subList(0, AgentCard.MAX_ACTIONS) : named;

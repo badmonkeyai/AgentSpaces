@@ -1,0 +1,36 @@
+{
+  "name": "never both for one key leaves no route",
+  "goal": "Refund",
+  "state": {
+    "types": [
+      "Claim",
+      "Payment"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "refund",
+      "card": "payer",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "Refund"
+      ]
+    }
+  ],
+  "constraints": [
+    {
+      "unit": "k2",
+      "template": "notCoexistence",
+      "a": "Payment",
+      "b": "Refund"
+    }
+  ],
+  "expect": {
+    "enablement": [],
+    "search": [],
+    "searchReason": "violates constraint k2", "enablementReason": "constraint k2 forbids refund"
+  }
+}

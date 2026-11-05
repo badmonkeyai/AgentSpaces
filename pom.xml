@@ -97,6 +97,7 @@
     <module>agentspaces-discovery</module>
     <module>agentspaces-capabilities</module>
     <module>agentspaces-constraints</module>
+    <module>agentspaces-planner</module>
     <module>agentspaces-guardrail</module>
     <module>agentspaces-agent</module>
     <module>agentspaces-a2a</module>

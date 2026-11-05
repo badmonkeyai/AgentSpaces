@@ -1,0 +1,37 @@
+{
+  "name": "at most one of a type",
+  "goal": "Payment",
+  "state": {
+    "types": [
+      "Claim",
+      "Payment"
+    ],
+    "situations": []
+  },
+  "actions": [
+    {
+      "name": "pay",
+      "card": "payer",
+      "consumes": [
+        "Claim"
+      ],
+      "produces": [
+        "Payment"
+      ]
+    }
+  ],
+  "constraints": [
+    {
+      "unit": "k3",
+      "template": "cardinality",
+      "a": "Payment",
+      "n": 1
+    }
+  ],
+  "expect": {
+    "enablement": [],
+    "enablementReason": "already holds",
+    "search": [],
+    "searchReason": "already holds"
+  }
+}

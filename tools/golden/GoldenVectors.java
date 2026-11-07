@@ -1206,6 +1206,16 @@ public final class GoldenVectors {
                         List.of("https://badmonkey.ai/ns/apps/v1/ChatMessage"))));
         require(codec.toBytes(uiCard.withUi(null)).length == codec.toBytes(actionCard).length, "a card without ui keeps its bytes");
         json.append(field("agent_card_ui_cbor", hex.formatHex(codec.toBytes(uiCard))));
+        // v0.1.28 (ISSUE-AppHost, SPEC §6.1a.4): an AppCard with a host group appended last; the same bytes the api
+        // module pins in src/test/resources/vectors/app_card_host_cbor.hex (AppCardHostTest).
+        //   app_card_host_cbor  the card with host {url, port, hostAgent, path, signOn, publishedBy, publishedAt, status}
+        java.time.Instant hostAt = java.time.Instant.parse("2026-11-06T09:00:00Z");
+        ai.badmonkey.agentspaces.api.ad.AppCard hostCard = new ai.badmonkey.agentspaces.api.ad.AppCard("aspace://zApps/app/zPeerA/claims-chat",
+                ai.badmonkey.agentspaces.common.id.PeerId.of("zPeerA"), ai.badmonkey.agentspaces.common.id.GroupId.of("zApps"), hostAt,
+                java.time.Duration.ofMinutes(15), "Claims chat", "fed", "a2ui", "claims", List.of("zApps/conversations"), List.of("ask"), "", "", "", "1", List.of("conversations"),
+                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "v0.9.1", List.of("bma-widgets", "bma-viz"), "summariser", "views", List.of("chat-1")))
+                .withHost(new ai.badmonkey.agentspaces.api.ad.AppCard.Host("https://chat.acme.example", 7801, "zHostPeer", "/", "tenant", "summariser", hostAt, "serving"));
+        json.append(field("app_card_host_cbor", hex.formatHex(codec.toBytes(hostCard))));
 
         // ------------------------------------------------------------------
         // v0.1.13 audit item 10: the remaining v0.1.13 transitions and their

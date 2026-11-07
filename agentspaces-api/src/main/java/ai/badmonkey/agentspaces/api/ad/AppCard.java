@@ -66,7 +66,8 @@ public record AppCard(
         String pkg,
         String version,
         List<String> views,
-        @JsonInclude(JsonInclude.Include.NON_NULL) Ui ui) implements Advertisement {
+        @JsonInclude(JsonInclude.Include.NON_NULL) Ui ui,
+        @JsonInclude(JsonInclude.Include.NON_NULL) Host host) implements Advertisement {
 
     public static final List<String> KINDS = List.of("peer", "fed", "gateway", "realm", "assembled");   // assembled: v0.1.26, drafted by a console from a group's ui declarations
     public static final List<String> SHAPES = List.of("web", "desktop", "static", "a2ui");
@@ -77,6 +78,47 @@ public record AppCard(
      * The surfaces an app draws (A2UI): the protocol and its version, the catalog ids the surfaces use, the surface
      * agent's instance, the transport ({@code views} through the feed, {@code a2a} through the gateway), the surface ids.
      */
+    /**
+     * v0.1.28 (spiral 5, S5-P-01): where the application is served for its end users, appended last and omitted when
+     * absent, so a card without it is byte-identical to v0.1.27. An agent publishes its own interface; the host that
+     * serves it names the address; a console lists and links, it does not draw.
+     *
+     * @param url         the address end users open
+     * @param port        the port the host bound, or 0 when the url says it all
+     * @param hostAgent   the peer id of the app host serving it
+     * @param path        the path under the host, "/" by default
+     * @param signOn      {@code tenant} (the tenant's identity provider at the host's door) or {@code none}
+     * @param publishedBy the agent that published it
+     * @param publishedAt when
+     * @param status      {@code serving} or {@code stopped}
+     */
+    public record Host(String url, int port, String hostAgent, String path, String signOn, String publishedBy, Instant publishedAt, String status) {
+        public static final List<String> SIGN_ONS = List.of("tenant", "none");
+        public static final List<String> STATUSES = List.of("serving", "stopped");
+
+        public Host {
+            Objects.requireNonNull(url, "host.url");
+            if (url.isBlank()) {
+                throw new IllegalArgumentException("a host names the url end users open");
+            }
+            if (port < 0 || port > 65535) {
+                throw new IllegalArgumentException("host.port is a port number or 0: " + port);
+            }
+            hostAgent = hostAgent == null ? "" : hostAgent;
+            path = path == null || path.isBlank() ? "/" : path;
+            signOn = signOn == null || signOn.isBlank() ? "tenant" : signOn;
+            if (!SIGN_ONS.contains(signOn)) {
+                throw new IllegalArgumentException("host.signOn must be one of " + SIGN_ONS + ": " + signOn);
+            }
+            publishedBy = publishedBy == null ? "" : publishedBy;
+            Objects.requireNonNull(publishedAt, "host.publishedAt");
+            status = status == null || status.isBlank() ? "serving" : status;
+            if (!STATUSES.contains(status)) {
+                throw new IllegalArgumentException("host.status must be one of " + STATUSES + ": " + status);
+            }
+        }
+    }
+
     public record Ui(String protocol, String version, List<String> catalogIds, String agent, String transport, List<String> surfaces,
                      @JsonInclude(JsonInclude.Include.NON_EMPTY) List<UiDeclaration.Component> components) {
 
@@ -139,12 +181,27 @@ public record AppCard(
         }
     }
 
+    /** The v0.1.27 shape: no host. */
+    public AppCard(String id, PeerId issuer, GroupId group, Instant issued, Duration ttl, String name, String kind, String shape, String owner,
+                   List<String> reads, List<String> actions, String idpClient, String url, String pkg, String version, List<String> views, Ui ui) {
+        this(id, issuer, group, issued, ttl, name, kind, shape, owner, reads, actions, idpClient, url, pkg, version, views, ui, null);
+    }
+
     /** Whether the app draws A2UI surfaces (its own shape, or surfaces embedded in another shape). */
     public boolean drawsSurfaces() {
         return ui != null;
     }
 
+    /** True when an app host serves the application for end users at {@link Host#url()} (named without {@code is}: a bean-style helper would leak onto the wire). */
+    public boolean servesEndUsers() {
+        return host != null && "serving".equals(host.status());
+    }
+
     public AppCard withUi(Ui newUi) {
-        return new AppCard(id, issuer, group, issued, ttl, name, kind, shape, owner, reads, actions, idpClient, url, pkg, version, views, newUi);
+        return new AppCard(id, issuer, group, issued, ttl, name, kind, shape, owner, reads, actions, idpClient, url, pkg, version, views, newUi, host);
+    }
+
+    public AppCard withHost(Host newHost) {
+        return new AppCard(id, issuer, group, issued, ttl, name, kind, shape, owner, reads, actions, idpClient, url, pkg, version, views, ui, newHost);
     }
 }

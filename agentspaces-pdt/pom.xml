@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Bad Monkey, Inc.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+       https://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>ai.badmonkey.agentspaces</groupId>
+    <artifactId>agentspaces</artifactId>
+    <version>0.5.0</version>
+  </parent>
+  <artifactId>agentspaces-pdt</artifactId>
+  <name>AgentSpaces :: Persistent Data Trees (Layer 4)</name>
+  <description>
+    Persistent data trees (srad/agentspaces-pdt.md): persistent values (a map, set,
+    vector, or blob held as a wide tree of content-addressed nodes, modelled on
+    Clojure's collections), deltas (the nodes of a new version a receiver does not
+    hold), refs (a named, leased entry that points at the current root of a value),
+    and the node store over the shipped BlockStore SPI, so that a small update
+    ships only its delta over the content swarm's tree exchange.
+  </description>
+  <dependencies>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-common</artifactId>
+    </dependency>
+    <!-- The BlockStore SPI the node store keeps nodes on (PD-S-01). -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-peering</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-content</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-agent</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-space</artifactId>
+    </dependency>
+    <!-- AES-GCM-SIV (RFC 8452) for the sealed-nodes mode of §3.8 (PD-P-05); the version is pinned in the parent. -->
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk18on</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-support</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- PD-E-07: the connector SDK's data spaces ride the trees (test only). -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-connect-core</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

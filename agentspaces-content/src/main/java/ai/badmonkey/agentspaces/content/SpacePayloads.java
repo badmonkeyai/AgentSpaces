@@ -19,6 +19,7 @@ import ai.badmonkey.agentspaces.agent.content.Manifest;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.spi.BulkPayloads;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.content.tree.Cids;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -37,6 +38,14 @@ import java.util.List;
  * record carries its root, and a reader's space acquires it through a fetch
  * and decodes once complete. Attach with
  * {@code ReplicatedSpace.builder(...).bulk(new SpacePayloads(content), threshold)}.
+ *
+ * <p>This seam carries raw (0x55) artifact roots only: {@link #accepts} refuses a
+ * dag-cbor (0x71) root, which names a persistent tree of
+ * {@code ai.badmonkey.agentspaces.pdt.escalation.PdtPayloads} and has no manifest
+ * here (srad/agentspaces-pdt.md PD-E-01; SPEC §7.1 "a bulk implementation MUST
+ * refuse a reference of the other codec"), so a space that holds only this seam
+ * leaves such a record waiting for anti-entropy instead of opening a flat fetch
+ * that can never complete.
  */
 public final class SpacePayloads implements BulkPayloads {
 
@@ -60,8 +69,24 @@ public final class SpacePayloads implements BulkPayloads {
         return content.publishOpaque(payload, options).root();
     }
 
+    /** Whether a reference is a raw artifact root this seam published or can fetch. */
+    @Override
+    public boolean accepts(String ref) {
+        if (!BulkPayloads.isBulk(ref)) {
+            return false;
+        }
+        try {
+            return Cids.parse(ref).codec() == Cids.RAW;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     @Override
     public Optional<byte[]> local(String ref) {
+        if (!accepts(ref)) {
+            return Optional.empty();
+        }
         Optional<Manifest> manifest = content.store().manifest(ref);
         if (manifest.isEmpty() || content.store().have(ref).cardinality() < manifest.get().pieces()) {
             return Optional.empty();
@@ -79,6 +104,14 @@ public final class SpacePayloads implements BulkPayloads {
 
     @Override
     public void ensure(String ref, PeerId issuer, Runnable onArrival) {
+        ensure(ref, issuer, onArrival, () -> { });
+    }
+
+    @Override
+    public void ensure(String ref, PeerId issuer, Runnable onArrival, Runnable onFailure) {
+        if (!accepts(ref)) {
+            throw new IllegalArgumentException("not a raw artifact root: " + ref);
+        }
         List<Runnable> callbacks = waiting.computeIfAbsent(ref, r -> new CopyOnWriteArrayList<>());
         callbacks.add(onArrival);
         Fetch fetch = content.fetch(ref, FetchOptions.defaults().prefer(issuer));
@@ -89,8 +122,8 @@ public final class SpacePayloads implements BulkPayloads {
         content.onFetchDone(ref, () -> {
             if (fetch.complete()) {
                 fire(ref);
-            } else {
-                waiting.remove(ref);
+            } else if (waiting.remove(ref) != null) {
+                onFailure.run();
             }
         });
     }

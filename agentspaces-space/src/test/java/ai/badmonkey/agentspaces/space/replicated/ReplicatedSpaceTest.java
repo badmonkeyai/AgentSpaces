@@ -95,6 +95,35 @@ class ReplicatedSpaceTest {
     }
 
     /** Tag conditions select on read, the blocking read, readAll, readAllIssued and take. */
+    /**
+     * A stream of short-lived entries beside one long lease (2026-11-07): the lapsed entries are dropped after the
+     * short grace, not after twice the longest lease, and the digest over what remains is linear in it: twenty
+     * thousand lapsed entries beside the long one cost one pass, not a scan of the live list per known id.
+     */
+    @Test
+    void lapsedEntriesAreDroppedAfterAShortGraceAndTheDigestStaysLinear() {
+        space.write(new TaskEntry("publish", 0), Lease.of(Duration.ofDays(1)));
+        for (int i = 0; i < 20_000; i++) {
+            space.write(new TaskEntry("update-" + i, i), Lease.of(Duration.ofSeconds(1)));
+        }
+        clock.advance(Duration.ofSeconds(2));
+        space.sweepNow();
+        assertThat(space.knownEntries()).as("lapsed, kept as tombstones within the grace").isEqualTo(20_001);
+        assertThat(space.cachedValues()).as("a lapsed entry's decoded value is dropped at its lapse, not at collection").isEqualTo(1);
+        long started = System.nanoTime();
+        byte[] first = space.digest();
+        for (int i = 0; i < 5; i++) {
+            space.write(new TaskEntry("more-" + i, i), Lease.of(Duration.ofSeconds(1)));   // a change, so the digest is rebuilt
+            space.digest();
+        }
+        long millis = (System.nanoTime() - started) / 1_000_000;
+        assertThat(first.length).isGreaterThan(20_000 * 10);
+        assertThat(millis).as("six digests over twenty thousand tombstones: linear (the scan per known id took minutes)").isLessThan(10_000);
+        clock.advance(Duration.ofMillis(ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.LAPSED_GRACE_MILLIS));
+        space.sweepNow();
+        assertThat(space.knownEntries()).as("the lapsed entries are gone five minutes on; the day-long entry and the five fresh ones stay").isEqualTo(6);
+    }
+
     /** PERF2 §3.2: the anti-entropy digest is rebuilt only when the reconciled state changed. */
     @Test
     void theDigestIsCachedUntilTheStateChanges() {

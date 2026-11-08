@@ -60,8 +60,15 @@ public final class SpaceWire {
      * @param completed       the monotone completion flag
      * @param stateSig        the actor's signature over the mutable state, or
      *                        {@code null} before signing
+     * @param entryId         the entry, named only when {@code record} is absent (the
+     *                        recordless form of srad/agentspaces-pdt.md §3.9, PD-L-01)
      */
     public record EntryStateDto(
+            // Omitted when absent (PD-L-01, ISSUE-RecordlessRenew): a renew, cancel, or
+            // complete may travel without the record once the writer's replica saw it
+            // replicated; a full DTO stays byte-identical to the v0.1.28 form.
+            @com.fasterxml.jackson.annotation.JsonInclude(
+                    com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             EntryRecord record,
             byte[] issuerPublicKey,
             List<Dot> adds,
@@ -90,7 +97,25 @@ public final class SpaceWire {
             String signer,
             @com.fasterxml.jackson.annotation.JsonInclude(
                     com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
-            HlcTimestamp signedAt) {
+            HlcTimestamp signedAt,
+            // The recordless form (PD-L-01): the entry the state belongs to, present only
+            // when record is absent, so a receiver that holds the record finds it and one
+            // that does not keeps the state pending by this id. Appended and omitted when
+            // null, so every earlier vector holds.
+            @com.fasterxml.jackson.annotation.JsonInclude(
+                    com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+            EntryId entryId) {
+
+        /** The v0.1.13 shape with every appended field but the recordless entry id. */
+        public EntryStateDto(EntryRecord record, byte[] issuerPublicKey, List<Dot> adds,
+                             List<Dot> removes, HlcTimestamp leaseStamp, LeaseInfo leaseValue,
+                             boolean completed, byte[] stateSig,
+                             ai.badmonkey.agentspaces.api.security.AgentCertificate agentCertificate,
+                             ai.badmonkey.agentspaces.api.security.AgentCertificate stateCertificate,
+                             String signer, HlcTimestamp signedAt) {
+            this(record, issuerPublicKey, adds, removes, leaseStamp, leaseValue, completed, stateSig,
+                    agentCertificate, stateCertificate, signer, signedAt, null);
+        }
 
         /** The v0.1.12 shape: a peer-signed state, possibly over an agent-signed record. */
         public EntryStateDto(EntryRecord record, byte[] issuerPublicKey, List<Dot> adds,
@@ -104,6 +129,46 @@ public final class SpaceWire {
         /** Whether this state is signed by an agent's own key (v0.1.13). */
         public boolean agentSigned() {
             return signer != null;
+        }
+
+        /** Whether this state travels without its record (srad/agentspaces-pdt.md §3.9, PD-L-01). */
+        public boolean recordless() {
+            return record == null;
+        }
+
+        /** The entry this state belongs to: the record's, or the named one of a recordless state. */
+        public EntryId entryIdOf() {
+            return record != null ? record.entryId() : entryId;
+        }
+
+        /**
+         * The recordless form of this state (PD-L-01): the same mutable fields, key,
+         * certificates, and signature, the record dropped and the entry named.
+         *
+         * @return the copy
+         */
+        public EntryStateDto withoutRecord() {
+            if (record == null) {
+                return this;
+            }
+            return new EntryStateDto(null, issuerPublicKey, adds, removes, leaseStamp, leaseValue, completed,
+                    stateSig, agentCertificate, stateCertificate, signer, signedAt, record.entryId());
+        }
+
+        /**
+         * This state over the record a receiver holds for its entry (PD-L-02).
+         *
+         * @param held the record
+         * @return the full form
+         * @throws IllegalArgumentException when the record is not the named entry's
+         */
+        public EntryStateDto withRecord(EntryRecord held) {
+            java.util.Objects.requireNonNull(held, "held");
+            if (entryId != null && !entryId.equals(held.entryId())) {
+                throw new IllegalArgumentException("record " + held.entryId() + " is not entry " + entryId);
+            }
+            return new EntryStateDto(held, issuerPublicKey, adds, removes, leaseStamp, leaseValue, completed,
+                    stateSig, agentCertificate, stateCertificate, signer, signedAt, null);
         }
 
         /**
@@ -139,7 +204,7 @@ public final class SpaceWire {
         public EntryStateDto withStateSig(byte[] stateSig) {
             return new EntryStateDto(record, issuerPublicKey, adds, removes,
                     leaseStamp, leaseValue, completed, stateSig, agentCertificate,
-                    stateCertificate, signer, signedAt);
+                    stateCertificate, signer, signedAt, entryId);
         }
 
         /** Returns a copy naming its agent signer, signing time, and certificate, unsigned. */
@@ -147,7 +212,7 @@ public final class SpaceWire {
                 ai.badmonkey.agentspaces.api.security.AgentCertificate stateCertificate) {
             return new EntryStateDto(record, issuerPublicKey, adds, removes,
                     leaseStamp, leaseValue, completed, null, agentCertificate,
-                    stateCertificate, signer, signedAt);
+                    stateCertificate, signer, signedAt, entryId);
         }
 
         /** Converts wire form back to a CRDT entry state. */

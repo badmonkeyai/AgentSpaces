@@ -41,7 +41,7 @@ and `target/classes` exists:
 ```
 mvn -q -pl agentspaces-capabilities dependency:build-classpath \
     -Dmdep.outputFile=/tmp/golden-cp.txt
-CP="agentspaces-capabilities/target/classes:$(cat /tmp/golden-cp.txt)"
+CP="agentspaces-capabilities/target/classes:agentspaces-pdt/target/classes:agentspaces-content/target/classes:agentspaces-agent/target/classes:$(cat /tmp/golden-cp.txt)"
 javac -cp "$CP" -d /tmp/golden tools/golden/GoldenVectors.java
 java -cp "/tmp/golden:$CP" GoldenVectors ../agentspaces-spec/golden.json
 ../agentspaces-spec/sync-golden.sh          # refresh the vendored copies in every consumer
@@ -59,8 +59,15 @@ file exists. The generator also checks its mirrors of the private wire records
 mirror, `JoinTicket` (the issue #16 reserved type, real class in
 `agentspaces-agent`), stands in for a module outside this classpath: the
 generator checks it only when the class loads and prints a note otherwise, so
-appending `agentspaces-agent/target/classes` to `CP` turns that check on. Then
-run `mvn -q -pl agentspaces-space test -Dgolden.required=true` and the Python
+`agentspaces-agent/target/classes` on `CP` turns that check on. The `pdt_*`
+vectors (srad/agentspaces-pdt.md PD-N-07) come from
+`ai.badmonkey.agentspaces.pdt.golden.PdtVectors`, which the generator calls by
+reflection: with `agentspaces-pdt/target/classes` on `CP` (and
+`agentspaces-content/target/classes`, which it needs at run time) they are
+recomputed; without it the generator carries the previous file's `pdt_*` fields
+forward and prints a note. Then run
+`mvn -q -pl agentspaces-space test -Dgolden.required=true`,
+`mvn -q -pl agentspaces-pdt test -Dgolden.required=true`, and the Python
 and TypeScript suites.
 
 ## The Spring and Embabel modules

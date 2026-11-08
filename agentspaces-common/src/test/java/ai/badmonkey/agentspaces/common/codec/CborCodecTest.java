@@ -56,6 +56,36 @@ class CborCodecTest {
         assertThat(decoded.stamp()).isEqualTo(sample.stamp());
     }
 
+    record Stamped(HlcTimestamp stamp) {
+    }
+
+    record StampedAs(Object stamp) {
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): the codec decodes a stamp only from
+     * its canonical string form and refuses a map, an array, a number, a byte string or a
+     * non-canonical string in its place. Through
+     * the record's constructor, Jackson truncated a fractional counter in a map.
+     */
+    @Test
+    void aStampDecodesOnlyFromItsCanonicalString() {
+        CborCodec codec = CborCodec.defaultCodec();
+        assertThat(codec.fromBytes(codec.toBytes(new StampedAs("5:65536:n")), Stamped.class).stamp())
+                .isEqualTo(new HlcTimestamp(5, 65_536, "n"));
+        for (Object hostile : java.util.List.<Object>of(
+                Map.of("physical", 5, "logical", 1.5, "node", "n"),
+                Map.of("physical", 5, "logical", -1, "node", "n"),
+                java.util.List.of(5, 1, "n"), 5, 1.5,
+                // HLC canonical stamps, 2026-11-08: a CBOR byte string is no stamp either.
+                "5:0:n".getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+                "007:0:n")) {
+            byte[] bytes = codec.toBytes(new StampedAs(hostile));
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> codec.fromBytes(bytes, Stamped.class))
+                    .as(String.valueOf(hostile)).isInstanceOf(java.io.UncheckedIOException.class);
+        }
+    }
+
     @Test
     void unknownFieldsAreIgnoredOnRead() {
         CborCodec codec = CborCodec.defaultCodec();

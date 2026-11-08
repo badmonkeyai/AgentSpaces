@@ -691,9 +691,13 @@ public final class GossipBus {
             List<String> want = new ArrayList<>();
             for (Map.Entry<String, byte[]> e : digest.hashes().entrySet()) {
                 ReconcilableState state = states.get(e.getKey());
-                if (state != null && e.getValue() != null
-                        && !java.util.Arrays.equals(Digests.sha256(state.digest()), e.getValue())) {
+                if (state == null || e.getValue() == null) {
+                    continue;
+                }
+                if (!java.util.Arrays.equals(Digests.sha256(state.digest()), e.getValue())) {
                     want.add(e.getKey());
+                } else {
+                    state.matched(from); // the partner holds this stream whole (PD-L-01 evidence)
                 }
             }
             if (!want.isEmpty()) {

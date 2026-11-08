@@ -39,6 +39,12 @@ import java.util.Objects;
 public record HlcTimestamp(long physical, int logical, String node)
         implements Comparable<HlcTimestamp> {
 
+    /**
+     * The canonical constructor. Jackson decoded a map in place of the canonical string
+     * through it and truncated a fractional counter (HLC logical counter, 2026-11-08, Rust
+     * team report), so Jackson now decodes a stamp through {@link #parse(String)} alone.
+     */
+    @JsonCreator(mode = JsonCreator.Mode.DISABLED)
     public HlcTimestamp {
         Objects.requireNonNull(node, "node");
         if (physical < 0) {
@@ -47,23 +53,56 @@ public record HlcTimestamp(long physical, int logical, String node)
         if (logical < 0) {
             throw new IllegalArgumentException("logical must be >= 0: " + logical);
         }
-        if (node.isEmpty() || node.indexOf(':') >= 0) {
-            throw new IllegalArgumentException("node must be non-empty and contain no ':': " + node);
+        if (!canonicalNode(node)) {
+            throw new IllegalArgumentException(
+                    "node must be non-empty and contain no ':' and no control character: " + node);
         }
     }
 
     /**
-     * Parses the canonical {@code physical:logical:node} form.
+     * Whether a node is non-empty and holds no colon and no control character, U+0000 to U+001F
+     * or U+007F (HLC canonical stamps, 2026-11-08). The constructor demands it, so every stamp
+     * this process builds encodes to text that {@link #parse(String)} accepts.
+     */
+    private static boolean canonicalNode(String node) {
+        if (node.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < node.length(); i++) {
+            char c = node.charAt(i);
+            if (c == ':' || c < 0x20 || c == 0x7f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Parses the canonical {@code physical:logical:node} form, and refuses any other text (HLC
+     * canonical stamps, 2026-11-08). The physical and logical parts are each {@code 0} or a
+     * non-zero ASCII digit followed by ASCII digits: no leading zero, no sign, no fraction, no
+     * exponent, no whitespace, no non-ASCII digit, never empty. The physical part fits a signed
+     * 64-bit integer and the logical part an {@code int}. The node is non-empty and holds no
+     * colon and no control character. A stamp therefore has exactly one text, and the bytes a
+     * signer signed always equal {@link #encoded()}; Java once read {@code "007:00:n"} as
+     * {@code 7:0:n} and verified signatures over the re-encoding while the clients verified over
+     * the raw text, which split the claim lattice between them.
+     *
+     * <p>A counter from 65537 up to the {@code int} range parses, so the frame or state that
+     * carries it decodes, its signature verifies, and the merge point that refuses it through
+     * {@link HybridLogicalClock#isAcceptable(HlcTimestamp)} can strike its signer (HLC logical
+     * counter, 2026-11-08, Rust team report). Every Java merge and ordering point refuses such
+     * a stamp through that check.
      *
      * @param encoded the canonical string form
      * @return the parsed timestamp
      * @throws IllegalArgumentException if the input does not match the canonical form
      */
-    @JsonCreator
+    @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
     public static HlcTimestamp parse(String encoded) {
         Objects.requireNonNull(encoded, "encoded");
         String[] parts = encoded.split(":", 3);
-        if (parts.length != 3) {
+        if (parts.length != 3 || !canonicalDigits(parts[0]) || !canonicalDigits(parts[1])) {
             throw new IllegalArgumentException("expected physical:logical:node, got: " + encoded);
         }
         try {
@@ -71,6 +110,24 @@ public record HlcTimestamp(long physical, int logical, String node)
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("expected physical:logical:node, got: " + encoded, e);
         }
+    }
+
+    /**
+     * Whether a part is {@code 0} or a non-zero ASCII digit followed by ASCII digits (HLC
+     * canonical stamps, 2026-11-08). Long.parseLong also takes a sign, non-ASCII digits, and
+     * leading zeros, none of which re-encode to the text that was signed.
+     */
+    private static boolean canonicalDigits(String part) {
+        if (part.isEmpty() || (part.length() > 1 && part.charAt(0) == '0')) {
+            return false;
+        }
+        for (int i = 0; i < part.length(); i++) {
+            char c = part.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Returns the canonical {@code physical:logical:node} form. */

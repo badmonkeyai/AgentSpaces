@@ -54,6 +54,7 @@ import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import ai.badmonkey.agentspaces.space.replicated.SpaceAdmission;
 import ai.badmonkey.agentspaces.space.replicated.SpaceCredential;
 import ai.badmonkey.agentspaces.space.replicated.SpaceWire;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.lang.reflect.RecordComponent;
@@ -155,6 +156,19 @@ public final class GoldenVectors {
     }
 
     /**
+     * Mirrors ai.badmonkey.agentspaces.agent.pdt.PRef (srad/agentspaces-pdt.md §3.6, PD-R-01),
+     * the ref head record; its vectors {@code pdt_ref_cbor} and {@code pdt_ref_min_cbor}
+     * come from {@code PdtVectors} like every other {@code pdt_*} field. The three
+     * optional components are {@code NON_NULL} on the real record, so the minimal
+     * vector carries nine fields.
+     */
+    record PRef(int v, String name, String kind, String root, List<String> base, long seq, long size,
+                @JsonInclude(JsonInclude.Include.NON_NULL) List<byte[]> nodes, String mode, String sealing,
+                @JsonInclude(JsonInclude.Include.NON_NULL) Long keyEpoch,
+                @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, String> attrs) {
+    }
+
+    /**
      * Mirror of the WebRTC signalling body (srad/agentspaces-js.md appendix B, JS-W-03):
      * {@code agentspaces-transport-webrtc}'s {@code RtcSignal}, checked by shape when that
      * module's classes are on the classpath.
@@ -211,10 +225,15 @@ public final class GoldenVectors {
 
     // ---- SPEC v0.1.23 annex G: the content swarm and relay paths (srad/large-networks-bulk-data.md) ----
 
-    /** Mirrors ai.badmonkey.agentspaces.agent.content.Manifest. */
+    /**
+     * Mirrors ai.badmonkey.agentspaces.agent.content.Manifest. The trailing {@code layout}
+     * (srad/agentspaces-pdt.md PD-X-09) is omitted when null, so the two 0.5.0 manifest
+     * vectors keep their bytes.
+     */
     record Manifest(int v, String root, long size, int pieceSize, int pieces, byte[] table, String tableRef,
                     List<String> tableRefs, String name, String mediaType, String sealing, Long keyEpoch,
-                    String hashing, PeerId origin, long created, Map<String, String> attrs) {
+                    String hashing, PeerId origin, long created, Map<String, String> attrs,
+                    @JsonInclude(JsonInclude.Include.NON_NULL) String layout) {
     }
 
     /** Mirrors ai.badmonkey.agentspaces.agent.content.Holding. */
@@ -243,6 +262,19 @@ public final class GoldenVectors {
     record ManifestReply(int t, String root, byte[] record) {
     }
 
+    // The tree exchange of srad/agentspaces-pdt.md §3.5 (tags 8 to 11, PD-X-02), mirroring Messages.
+    record NodeWant(int t, int req, List<String> cids) {
+    }
+
+    record Nodes(int t, int req, List<byte[]> nodes, byte[] sealed, Long epoch, List<String> missing) {
+    }
+
+    record TreeWant(int t, int req, String root, List<String> haves, long budget, byte[] sketch) {
+    }
+
+    record TreeEnd(int t, int req, List<String> frontier, int reason) {
+    }
+
     /** Mirrors PeerNode.RelaySignal and the pipe body (capability, payload). */
     record RelaySignal(PeerId target, PeerId failedHop, String reason) {
     }
@@ -252,10 +284,15 @@ public final class GoldenVectors {
 
     /** A content root: CIDv1 (0x01, raw 0x55, sha2-256 0x12, 32 bytes) over the piece table, multibase base32. */
     private static String contentRoot(byte[] table) {
-        byte[] digest = Digests.sha256(table);
+        return cidOf(table, 0x55);
+    }
+
+    /** A CIDv1 (0x01, codec, sha2-256 0x12, 32 bytes) over bytes, multibase base32; 0x71 names a dag-cbor node. */
+    private static String cidOf(byte[] bytes, int codec) {
+        byte[] digest = Digests.sha256(bytes);
         byte[] cid = new byte[4 + digest.length];
         cid[0] = 0x01;
-        cid[1] = 0x55;
+        cid[1] = (byte) codec;
         cid[2] = 0x12;
         cid[3] = 0x20;
         System.arraycopy(digest, 0, cid, 4, digest.length);
@@ -284,15 +321,23 @@ public final class GoldenVectors {
         out.append(field("content_root_cidv1", root));
         Manifest inline = new Manifest(1, root, 2L * pieceSize + 100, pieceSize, 3, table, null, null,
                 "golden.bin", "application/octet-stream", "none", null, "plain", self, 1735689600000L,
-                Map.of("run", "42"));
+                Map.of("run", "42"), null);
         byte[] inlineBytes = codec.toBytes(inline);
         out.append(field("content_manifest_inline_cbor", hex.formatHex(inlineBytes)));
         byte[] bigTable = pieceTable(65, pieceSize, pieceSize);
         String bigRoot = contentRoot(bigTable);
         String tableRef = ai.badmonkey.agentspaces.common.codec.Multibase.base58btc(Digests.sha256(bigTable));
         Manifest referenced = new Manifest(1, bigRoot, 65L * pieceSize, pieceSize, 65, null, tableRef, null,
-                null, null, "group-key", 3L, "plain", self, 1735689600000L, null);
+                null, null, "group-key", 3L, "plain", self, 1735689600000L, null, null);
         out.append(field("content_manifest_tableref_cbor", hex.formatHex(codec.toBytes(referenced))));
+        // PD-X-09: the same inline manifest with layout "tree"; its root names a dag-cbor blob-tree node
+        // (the empty map 0xa0 stands in), and the trailing layout is the only added field.
+        String treeRoot = cidOf(new byte[]{(byte) 0xa0}, 0x71);
+        require(treeRoot.startsWith("bafyrei") && treeRoot.length() == 59, "a tree root is a 59-character dag-cbor CIDv1");
+        Manifest tree = new Manifest(1, treeRoot, 2L * pieceSize + 100, pieceSize, 3, table, null, null,
+                "golden.bin", "application/octet-stream", "none", null, "plain", self, 1735689600000L,
+                Map.of("run", "42"), "tree");
+        out.append(field("content_manifest_tree_cbor", hex.formatHex(codec.toBytes(tree))));
         // pieces 0 and 2 of 3: runs zeros 0, ones 1, zeros 1, ones 1
         out.append(field("content_holding_partial_cbor", hex.formatHex(codec.toBytes(
                 new Holding(1, root, self, false, new byte[]{0, 1, 1, 1}, 2, List.of(PeerId.of("zB")), null)))));
@@ -309,6 +354,19 @@ public final class GoldenVectors {
         out.append(field("content_reject_cbor", hex.formatHex(codec.toBytes(new Reject(5, root, 2, 2)))));
         out.append(field("content_manifest_want_cbor", hex.formatHex(codec.toBytes(new ManifestWant(6, root)))));
         out.append(field("content_manifest_cbor", hex.formatHex(codec.toBytes(new ManifestReply(7, root, inlineBytes)))));
+        // The tree exchange (srad/agentspaces-pdt.md §3.5, PD-X-02): nodes are the empty dag-cbor map (0xa0)
+        // and the empty raw chunk; cids are their CIDv1 names; the NODES vector is the plaintext form.
+        byte[] emptyMap = new byte[]{(byte) 0xa0};
+        byte[] emptyChunk = new byte[0];
+        String emptyChunkCid = cidOf(emptyChunk, 0x55);
+        out.append(field("content_node_want_cbor", hex.formatHex(codec.toBytes(
+                new NodeWant(8, 42, List.of(treeRoot, emptyChunkCid))))));
+        out.append(field("content_nodes_cbor", hex.formatHex(codec.toBytes(
+                new Nodes(9, 42, List.of(emptyMap, emptyChunk), null, null, List.of(root))))));
+        out.append(field("content_tree_want_cbor", hex.formatHex(codec.toBytes(
+                new TreeWant(10, 43, treeRoot, List.of(emptyChunkCid), 64L * 1024 * 1024, null)))));
+        out.append(field("content_tree_end_cbor", hex.formatHex(codec.toBytes(
+                new TreeEnd(11, 43, List.of(emptyChunkCid), 2)))));
         out.append(field("relay_frame_with_path_cbor", hex.formatHex(codec.toBytes(
                 new ai.badmonkey.agentspaces.peering.wire.Bodies.RelayFrame(PeerId.of("zB"), innerFrame,
                         List.of(PeerId.of("zR1"), PeerId.of("zR2")), 0)))));
@@ -350,6 +408,7 @@ public final class GoldenVectors {
         assertMirrors(ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor.class,
                 "WrapBinding", WrapBinding.class);
         assertMirrorsIfLoadable("ai.badmonkey.agentspaces.agent.join.JoinTicket", JoinTicket.class);
+        assertMirrorsIfLoadable("ai.badmonkey.agentspaces.agent.pdt.PRef", PRef.class);
         assertMirrorsIfLoadable("ai.badmonkey.agentspaces.transport.webrtc.RtcSignal", RtcSignal.class);
         assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.DataQueryEntries$DataQuery", DataQuery.class);
         assertMirrorsIfLoadable("ai.badmonkey.agentspaces.connect.DataQueryEntries$DataResult", DataResult.class);
@@ -1276,6 +1335,31 @@ public final class GoldenVectors {
                             : new SpaceWire.Delta(tDto, null, null)))));
         }
 
+        // Group L of srad/agentspaces-pdt.md (§3.9, PD-L-01, ISSUE-RecordlessRenew): the
+        // record-free renew. A renew, cancel, or complete may travel without its record once
+        // the writer's replica has evidence the record replicated and every member of its
+        // view advertises wire.recordless. EntryStateDto.record is omitted (NON_NULL) and the
+        // appended entryId names the entry; every other field, and the state signature, are
+        // those of the full form, so a receiver that holds the record verifies the state
+        // exactly as before, and one that does not keeps it pending until anti-entropy ships
+        // the whole DTO.
+        //   state_delta_recordless_cbor  Delta{state: EntryStateDto{issuerPublicKey = peer key,
+        //       adds [(peer_id,1)], removes [], leaseStamp t0+PT1M (logical 0), lease {python,
+        //       t0+PT2H, WRITE}, completed false, stateSig = the peer key over
+        //       StateSignView{space_id, entry_id, adds, removes, leaseStamp, lease, false}
+        //       (the v0.1.12 peer-signed form, no signer or signedAt), entryId = entry_id;
+        //       no record, no certificates}, claimEntry null, claim null}
+        HlcTimestamp recordlessStamp = new HlcTimestamp(t0 + 60_000L, 0, self.value());
+        LeaseInfo recordlessLease = new LeaseInfo(issuer, t0 + Duration.ofHours(2).toMillis(), LeaseKind.WRITE);
+        byte[] recordlessView = codec.toBytes(new StateSignView(spaceId, entryId, adds, removes, recordlessStamp,
+                recordlessLease, false));
+        SpaceWire.EntryStateDto recordlessDto = new SpaceWire.EntryStateDto(record, identity.rawPublicKey(), adds,
+                removes, recordlessStamp, recordlessLease, false, identity.sign(recordlessView)).withoutRecord();
+        require(recordlessDto.record() == null && entryId.equals(recordlessDto.entryId()),
+                "the recordless state names its entry and carries no record");
+        json.append(field("state_delta_recordless_cbor",
+                hex.formatHex(codec.toBytes(new SpaceWire.Delta(recordlessDto, null, null)))));
+
         // Hostile signing times (SPEC §4.2 / §11, v0.1.13): a certificate is judged
         // at the signing time of what it certifies, which must lie in its window and
         // lead the receiver's clock (certificate_verify_at) by at most the HLC drift
@@ -1517,6 +1601,7 @@ public final class GoldenVectors {
         json.append(rtcVectors(codec, hex, wire.encode(ping, identity)));
         json.append(connectVectors(codec, hex));
         json.append(contentVectors(codec, hex, wire.encode(ping, identity), self, group, issued));
+        json.append(pdtVectors(previous));
         json.append(field("dtls_pdu_ping", "01030000"));
         json.append(field("dtls_pdu_pong", "01040000"));
         json.append(field("dtls_pdu_close_idle", "01050300"));
@@ -1616,6 +1701,42 @@ public final class GoldenVectors {
      * checks the shape when the class loads and says so when it does not, so a
      * run with the agent classes added to the classpath still catches drift.
      */
+    // ---- srad/agentspaces-pdt.md PD-N-07: the persistent data tree vectors ----
+
+    /**
+     * The {@code pdt_*} vectors, computed by {@code agentspaces-pdt}'s own
+     * {@code PdtVectors.vectors()} through reflection so this generator still compiles
+     * without that module on the classpath. When the class is absent the previous
+     * file's {@code pdt_*} fields are carried forward unchanged and a note is printed,
+     * so a run from the documented short classpath never drops them.
+     */
+    @SuppressWarnings("unchecked")
+    private static String pdtVectors(Map<String, Object> previous) {
+        StringBuilder out = new StringBuilder();
+        Class<?> vectors;
+        try {
+            vectors = Class.forName("ai.badmonkey.agentspaces.pdt.golden.PdtVectors");
+        } catch (ClassNotFoundException absent) {
+            System.err.println("note: ai.badmonkey.agentspaces.pdt.golden.PdtVectors is not on the classpath; "
+                    + "the pdt_* vectors are carried forward from the previous file this run "
+                    + "(add agentspaces-pdt/target/classes to CP to regenerate them)");
+            previous.forEach((name, value) -> {
+                if (name.startsWith("pdt_") && value instanceof String s) {
+                    out.append(field(name, s));
+                }
+            });
+            return out.toString();
+        }
+        Map<String, String> computed;
+        try {
+            computed = (Map<String, String>) vectors.getMethod("vectors").invoke(null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("PdtVectors.vectors() failed", e.getCause() == null ? e : e.getCause());
+        }
+        computed.forEach((name, value) -> out.append(field(name, value)));
+        return out.toString();
+    }
+
     private static void assertMirrorsIfLoadable(String realClassName, Class<?> mirror) {
         Class<?> real;
         try {

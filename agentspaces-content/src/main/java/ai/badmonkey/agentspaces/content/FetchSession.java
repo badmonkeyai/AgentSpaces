@@ -18,6 +18,7 @@ package ai.badmonkey.agentspaces.content;
 import ai.badmonkey.agentspaces.agent.content.Holding;
 import ai.badmonkey.agentspaces.agent.content.Manifest;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.content.tree.SourceRanking;
 
 import java.io.IOException;
 import java.nio.channels.SeekableByteChannel;
@@ -46,7 +47,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * elsewhere; verified pieces land in the store as they verify and the fetcher's
  * own holding follows them. The capability drives it from the group tick and from
  * the pipe handler; both paths take the session lock, which is reentrant so a
- * synchronous fabric (the test network delivers inline) nests cleanly.
+ * synchronous fabric (the test network delivers inline) nests cleanly. The source
+ * rules (order, window, timeout, strikes, back-off) live in {@link SourceRanking},
+ * which the tree fetch shares (srad/agentspaces-pdt.md PD-X-05).
  */
 final class FetchSession implements Fetch {
 
@@ -56,13 +59,13 @@ final class FetchSession implements Fetch {
     /** The unit all ranges align to; a range is a power-of-two multiple of it, except at a piece's end. */
     static final int RANGE_UNIT = 64 * 1024;
 
-    /** First window per source, and the growth and timeout rules (LB-S-04). */
-    static final int INITIAL_WINDOW = 2;
-    static final long MIN_RANGE_TIMEOUT_MILLIS = 10_000;
-    static final int RTT_MULTIPLE_FOR_TIMEOUT = 8;
+    /** First window per source, and the growth and timeout rules (LB-S-04), as {@link SourceRanking} keeps them. */
+    static final int INITIAL_WINDOW = SourceRanking.INITIAL_WINDOW;
+    static final long MIN_RANGE_TIMEOUT_MILLIS = SourceRanking.MIN_TIMEOUT_MILLIS;
+    static final int RTT_MULTIPLE_FOR_TIMEOUT = SourceRanking.RTT_MULTIPLE_FOR_TIMEOUT;
     static final int SUCCESSES_PER_RANGE_DOUBLING = 8;
-    static final int TIMEOUTS_BEFORE_DROP = 3;
-    static final long SOURCE_DROP_MILLIS = 60_000;
+    static final int TIMEOUTS_BEFORE_DROP = SourceRanking.TIMEOUTS_BEFORE_DROP;
+    static final long SOURCE_DROP_MILLIS = SourceRanking.SOURCE_DROP_MILLIS;
     static final long HOLDINGS_REREAD_MILLIS = 5_000;
     static final int TRACE_CAPACITY = 256;
 
@@ -95,23 +98,10 @@ final class FetchSession implements Fetch {
         int hopsTo(PeerId peer);
     }
 
-    private static final class Source {
-        final PeerId id;
+    /** A holder of pieces: the shared source state plus its bitfield, range length, retries, and assignments. */
+    private static final class Source extends SourceRanking.Source {
         BitSet have;
-        int window = INITIAL_WINDOW;
-        int inFlight;
         int rangeLength = RANGE_UNIT;
-        long srttMillis = -1;
-        int successes;
-        int consecutiveTimeouts;
-        long droppedUntilMillis;
-        long bytesVerified;
-        long bytesReceived;
-        int strikes;
-        int hops;
-        /** LB-Q-PRF-04: how full this source's window was, sampled while it held pieces this fetch lacks. */
-        long fillSamples;
-        double fillSum;
         final Deque<int[]> retry = new ArrayDeque<>(); // (index, offset, length)
         /**
          * The pieces this source is filling, by index (LB-Q-PRF-04): several at once, so a window
@@ -121,12 +111,8 @@ final class FetchSession implements Fetch {
         final Map<Integer, Assignment> assignments = new LinkedHashMap<>();
 
         Source(PeerId id, BitSet have) {
-            this.id = id;
+            super(id);
             this.have = have;
-        }
-
-        boolean dropped(long now) {
-            return droppedUntilMillis > now;
         }
     }
 
@@ -161,6 +147,7 @@ final class FetchSession implements Fetch {
     private final Fabric fabric;
     private final PieceStore store;
     private final FetchOptions options;
+    private final SourceRanking ranking;
     private final int maxSessions;
     private final int maxWindow;
     private final ReentrantLock lock = new ReentrantLock();
@@ -190,6 +177,7 @@ final class FetchSession implements Fetch {
         this.fabric = fabric;
         this.store = store;
         this.options = options;
+        this.ranking = new SourceRanking(options.prefer());
         this.maxSessions = maxSessions;
         this.maxWindow = Math.max(1, maxWindow);
         this.startedAtMillis = fabric.nowMillis();
@@ -426,9 +414,7 @@ final class FetchSession implements Fetch {
         try {
             Map<PeerId, Double> fill = new LinkedHashMap<>();
             for (Source s : sources.values()) {
-                if (s.fillSamples > 0) {
-                    fill.put(s.id, s.fillSum / s.fillSamples);
-                }
+                s.fill().ifPresent(mean -> fill.put(s.id, mean));
             }
             return fill;
         } finally {
@@ -502,12 +488,7 @@ final class FetchSession implements Fetch {
                 return; // unsolicited or mismatched (LB-X-02)
             }
             Source source = out.source();
-            source.inFlight = Math.max(0, source.inFlight - 1);
-            long now = fabric.nowMillis();
-            long rtt = Math.max(0, now - out.sentAtMillis());
-            source.srttMillis = source.srttMillis < 0 ? rtt : (source.srttMillis * 7 + rtt) / 8;
-            source.consecutiveTimeouts = 0;
-            source.bytesReceived += piece.bytes().length;
+            source.answered(fabric.nowMillis() - out.sentAtMillis(), piece.bytes().length);
             Assignment a = source.assignments.get(piece.index());
             if (a == null || verified.get(piece.index())) {
                 // a cancelled or completed piece; nothing to keep
@@ -519,8 +500,7 @@ final class FetchSession implements Fetch {
                 note((opened.isEmpty() ? "unopenable" : "short or oversized") + " range from " + source.id.display()
                         + " for piece " + a.index);
                 source.retry.addFirst(new int[]{a.index, out.offset(), out.length()});
-                if (opened.isEmpty() && ++source.strikes >= 3) {
-                    source.droppedUntilMillis = Long.MAX_VALUE;
+                if (opened.isEmpty() && source.unopenable()) {
                     releaseAll(source);
                 }
                 schedule();
@@ -561,8 +541,7 @@ final class FetchSession implements Fetch {
             }
             long now = fabric.nowMillis();
             if (reject.reason() == Messages.REASON_OVER_BUDGET || reject.reason() == Messages.REASON_POLICY) {
-                source.droppedUntilMillis = now + SOURCE_DROP_MILLIS * (1L << Math.min(4, source.strikes));
-                source.strikes++;
+                source.backOff(now);
                 note("source " + source.id.display() + " rejected (" + reject.reason() + "); dropped for a while");
                 releaseAll(source);
             } else {
@@ -613,24 +592,17 @@ final class FetchSession implements Fetch {
         List<Integer> expired = new ArrayList<>();
         for (Map.Entry<Integer, Outstanding> e : outstanding.entrySet()) {
             Outstanding out = e.getValue();
-            long allowance = Math.max(MIN_RANGE_TIMEOUT_MILLIS, out.source().srttMillis < 0
-                    ? MIN_RANGE_TIMEOUT_MILLIS : RTT_MULTIPLE_FOR_TIMEOUT * out.source().srttMillis);
-            if (now - out.sentAtMillis() > allowance) {
+            if (out.source().timedOut(out.sentAtMillis(), now)) {
                 expired.add(e.getKey());
             }
         }
         for (Integer req : expired) {
             Outstanding out = outstanding.remove(req);
             Source source = out.source();
-            source.inFlight = Math.max(0, source.inFlight - 1);
-            source.window = Math.max(1, source.window / 2);
+            boolean dropped = source.timedOut(now);
             source.rangeLength = Math.max(RANGE_UNIT, source.rangeLength / 2);
-            source.successes = 0;
-            source.consecutiveTimeouts++;
             source.retry.addFirst(new int[]{out.index(), out.offset(), out.length()});
-            if (source.consecutiveTimeouts >= TIMEOUTS_BEFORE_DROP) {
-                source.droppedUntilMillis = now + SOURCE_DROP_MILLIS;
-                source.consecutiveTimeouts = 0;
+            if (dropped) {
                 note("source " + source.id.display() + " timed out " + TIMEOUTS_BEFORE_DROP + " times; dropped for 60 s");
                 releaseAll(source);
                 holdingsDirty = true;
@@ -639,10 +611,7 @@ final class FetchSession implements Fetch {
     }
 
     private void grow(Source source) {
-        source.successes++;
-        if (source.window < maxWindow) {
-            source.window++;
-        }
+        source.grow(maxWindow);
         if (source.successes % SUCCESSES_PER_RANGE_DOUBLING == 0 && source.rangeLength < manifest.pieceSize()) {
             source.rangeLength = Math.min(manifest.pieceSize(), source.rangeLength * 2);
         }
@@ -672,21 +641,8 @@ final class FetchSession implements Fetch {
         long now = fabric.nowMillis();
         int[] availability = availability();
         boolean endgame = missingUnassigned(availability) == 0;
-        List<Source> order = new ArrayList<>(sources.values());
-        order.sort((x, y) -> {
-            int px = options.prefer().contains(x.id) ? 0 : 1;
-            int py = options.prefer().contains(y.id) ? 0 : 1;
-            if (px != py) {
-                return px - py;
-            }
-            // LB-S-05, LB-R-10: direct sources first, then by relay hop count, then by throughput
-            int hx = x.hops < 0 ? Integer.MAX_VALUE : x.hops;
-            int hy = y.hops < 0 ? Integer.MAX_VALUE : y.hops;
-            if (hx != hy) {
-                return Integer.compare(hx, hy);
-            }
-            return Long.compare(throughput(y), throughput(x));
-        });
+        // LB-S-05, LB-R-10: preferred, then direct sources first, then by relay hop count, then by throughput
+        List<Source> order = ranking.order(sources.values());
         boolean anyUsable = false;
         for (Source source : order) {
             if (source.dropped(now)) {
@@ -720,16 +676,11 @@ final class FetchSession implements Fetch {
             }
             BitSet needed = (BitSet) source.have.clone();
             needed.andNot(verified);
-            if (!needed.isEmpty() && source.window > 0) {
-                source.fillSamples++;
-                source.fillSum += Math.min(1.0, (double) source.inFlight / source.window);
+            if (!needed.isEmpty()) {
+                source.sampleFill();
             }
         }
         waiting = !anyUsable && verified.cardinality() < manifest.pieces();
-    }
-
-    private long throughput(Source s) {
-        return s.srttMillis <= 0 ? s.bytesReceived : s.bytesReceived * 1000 / Math.max(1, s.srttMillis);
     }
 
     private int[] availability() {
@@ -881,11 +832,10 @@ final class FetchSession implements Fetch {
                 finish();
             }
         } else {
-            source.strikes++;
             note("piece " + a.index + " from " + source.id.display() + " failed its hash; struck");
             fabric.strike(source.id, "content piece " + a.index + " of " + root + " failed its hash");
             releaseAll(source);
-            source.droppedUntilMillis = Long.MAX_VALUE; // never again for this fetch (LB-X-03)
+            source.dropForever(); // never again for this fetch (LB-X-03)
             holdingsDirty = true;
         }
     }

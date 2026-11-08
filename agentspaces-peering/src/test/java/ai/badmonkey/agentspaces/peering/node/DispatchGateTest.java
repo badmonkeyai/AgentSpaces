@@ -195,15 +195,22 @@ class DispatchGateTest {
         assertThat(b.channelModes()).doesNotContainKey(stranger.peerId());
     }
 
-    /** Spec §11 (ASF-020): a stamp past the HLC drift ceiling is witnessed misbehavior; enough of them quarantine. */
+    /**
+     * Spec §11 (ASF-020): a stamp further past the HLC drift ceiling than the skew margin is
+     * witnessed misbehavior; enough of them quarantine. HLC canonical stamps, 2026-11-08: each
+     * such drop is counted.
+     */
     @Test
     void aFarFutureStampIsWitnessedMisbehavior() throws Exception {
-        Duration beyondCeiling = Duration.ofMillis(HybridLogicalClock.MAX_DRIFT_MILLIS + 1_000);
+        Duration beyondCeiling = Duration.ofMillis(HybridLogicalClock.MAX_DRIFT_MILLIS
+                + PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS + 1);
         for (int i = 0; i < PeerNode.STRIKE_THRESHOLD - 1; i++) {
             injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), beyondCeiling, i, news("n" + i)));
         }
         assertThat(newsAtB).as("every far-future frame was dropped").isEmpty();
         assertThat(b.quarantined(a.peerId())).as("one strike short").isFalse();
+        assertThat(b.framesFarFuture()).as("every drop is counted").isEqualTo(PeerNode.STRIKE_THRESHOLD - 1);
+        assertThat(b.framesFarFutureSkewed()).isZero();
 
         injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), beyondCeiling, 99, news("last")));
         assertThat(b.quarantined(a.peerId())).isTrue();
@@ -211,6 +218,201 @@ class DispatchGateTest {
 
         injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), Duration.ZERO, 0, news("honest")));
         assertThat(newsAtB).as("a quarantined peer's honest frames are refused too").isEmpty();
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): a member's frame stamped just under
+     * the drift ceiling with the logical counter at its maximum froze B's clock on that stamp,
+     * so every frame B sent afterwards repeated it and A dropped them as replays. The frame is
+     * now refused before the clock merge, struck and counted; a counter at exactly
+     * LOGICAL_LIMIT is honest and delivered.
+     */
+    @Test
+    void aMemberFrameWithALogicalCounterAboveTheLimitIsRefusedAndStruck() throws Exception {
+        List<String> newsAtA = new CopyOnWriteArrayList<>();
+        ra.gossip().onStream("news", (from, id, payload) ->
+                newsAtA.add(new String(payload, StandardCharsets.UTF_8)));
+        Duration nearCeiling = Duration.ofMillis(HybridLogicalClock.MAX_DRIFT_MILLIS - 1_000);
+
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), nearCeiling,
+                Integer.MAX_VALUE, news("frozen")));
+
+        assertThat(newsAtB).as("the hostile frame was refused").isEmpty();
+        assertThat(b.strikes(a.peerId())).as("struck once, not sentenced").isEqualTo(1);
+        assertThat(b.framesLogicalRefused()).isEqualTo(1);
+        for (int i = 0; i < 3; i++) {
+            rb.gossip().publish("news", "from-b-" + i, bytes("b" + i));
+        }
+        assertThat(newsAtA).as("B's clock still advances, so A drops none of its frames as replays")
+                .containsExactly("b0", "b1", "b2");
+
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), Duration.ZERO,
+                HybridLogicalClock.LOGICAL_LIMIT, news("at-limit")));
+        assertThat(newsAtB).as("a counter at the limit is honest").containsExactly("at-limit");
+        assertThat(b.strikes(a.peerId())).isEqualTo(1);
+        assertThat(b.framesLogicalRefused()).isEqualTo(1);
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): in an OPEN group a newcomer's own
+     * introduction admits it and merges its stamp, so anyone could freeze a member's clock.
+     * The introduction is now refused before admission, struck and counted; the same newcomer
+     * with an honest stamp is admitted.
+     */
+    @Test
+    void anIntroductionWithALogicalCounterAboveTheLimitIsRefusedAndStruck() throws Exception {
+        List<String> newsAtA = new CopyOnWriteArrayList<>();
+        ra.gossip().onStream("news", (from, id, payload) ->
+                newsAtA.add(new String(payload, StandardCharsets.UTF_8)));
+        PeerIdentity newcomer = PeerIdentity.generate();
+        ai.badmonkey.agentspaces.common.codec.CborCodec codec =
+                ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+        byte[] adBytes = codec.toBytes(new PeerAdvertisement(
+                "aspace://" + groupId.value() + "/peer/" + newcomer.peerId().value(),
+                newcomer.peerId(), groupId, clock.instant(), Duration.ofMinutes(10),
+                List.of(new PeerAdvertisement.Endpoint("mem", "nowhere", 0)),
+                java.util.Set.of(), Map.of()));
+        Bodies.Rumor introduction = new Bodies.Rumor("peers",
+                "peer:" + newcomer.peerId().value() + ":" + clock.millis(), 6,
+                codec.toBytes(new PeerNode.SignedPeerAd(adBytes, newcomer.rawPublicKey(),
+                        newcomer.sign(adBytes))));
+        HlcTimestamp hostile = new HlcTimestamp(
+                clock.millis() + HybridLogicalClock.MAX_DRIFT_MILLIS - 1_000, Integer.MAX_VALUE,
+                newcomer.peerId().value());
+
+        injector.send(TestFrames.signed(newcomer, groupId, Envelope.Kind.RUMOR, b.peerId(),
+                hostile, introduction));
+
+        assertThat(rb.membership().member(newcomer.peerId())).as("not admitted").isEmpty();
+        assertThat(b.strikes(newcomer.peerId())).isEqualTo(1);
+        assertThat(b.framesLogicalRefused()).isEqualTo(1);
+        for (int i = 0; i < 3; i++) {
+            rb.gossip().publish("news", "from-b-" + i, bytes("b" + i));
+        }
+        assertThat(newsAtA).as("B's clock still advances, so A drops none of its frames as replays")
+                .containsExactly("b0", "b1", "b2");
+
+        injector.send(TestFrames.signed(newcomer, groupId, Envelope.Kind.RUMOR, b.peerId(),
+                clock, HybridLogicalClock.LOGICAL_LIMIT, introduction));
+        assertThat(rb.membership().member(newcomer.peerId()))
+                .as("the same introduction with an honest stamp admits it").isPresent();
+        assertThat(b.framesLogicalRefused()).isEqualTo(1);
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report), the quarantine probe: A's frame
+     * stamped at exactly the drift ceiling with the counter at LOGICAL_LIMIT is honest, and B
+     * accepts it. B's clock merged it and carried one millisecond past the ceiling, so every
+     * frame B sent next failed the far-future check (ASF-020) at the other members, which
+     * struck the honest B until quarantine. The merge now clamps inside the ceiling, the carry
+     * lands on it, and no member strikes B.
+     */
+    @Test
+    void noMemberStrikesTheReceiverOfAFrameAtTheDriftCeilingWithTheCounterAtTheLimit() throws Exception {
+        PeerNode c = node("c", 3);
+        GroupRuntime rc = c.joinGroup(groupAd, GroupMembership.Config.defaults(),
+                List.of(new PeerAdvertisement.Endpoint("mem", "a", 0)));
+        tickAll(4);
+        assertThat(rc.membership().member(b.peerId())).isPresent();
+        List<String> newsAtC = new CopyOnWriteArrayList<>();
+        rc.gossip().onStream("news", (from, id, payload) ->
+                newsAtC.add(new String(payload, StandardCharsets.UTF_8)));
+        int strikesOfBAtA = a.strikes(b.peerId());
+        int strikesOfBAtC = c.strikes(b.peerId());
+
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(),
+                Duration.ofMillis(HybridLogicalClock.MAX_DRIFT_MILLIS), HybridLogicalClock.LOGICAL_LIMIT,
+                news("at-ceiling")));
+        assertThat(newsAtB).as("the frame at the ceiling is honest").containsExactly("at-ceiling");
+        assertThat(b.strikes(a.peerId())).isZero();
+        assertThat(b.framesLogicalRefused()).isZero();
+
+        List<String> fromB = new ArrayList<>();
+        for (int i = 0; i < PeerNode.STRIKE_THRESHOLD + 2; i++) {
+            rb.gossip().publish("news", "from-b-" + i, bytes("b" + i));
+            fromB.add("b" + i);
+        }
+        assertThat(newsAtC).as("C delivers every frame B sent after the merge").containsAll(fromB);
+        assertThat(c.strikes(b.peerId())).as("C never struck B").isEqualTo(strikesOfBAtC);
+        assertThat(a.strikes(b.peerId())).as("A never struck B").isEqualTo(strikesOfBAtA);
+        assertThat(c.quarantined(b.peerId())).isFalse();
+        assertThat(a.quarantined(b.peerId())).isFalse();
+    }
+
+    /**
+     * HLC canonical stamps, 2026-11-08 (decision B): a stamp past the drift ceiling by no more
+     * than the skew margin is what an honest peer sends when an attacker dragged its clock to
+     * its own ceiling and the receiver's wall runs a little behind. The receiver drops and counts
+     * each such frame and strikes nobody, however many arrive; one millisecond further is struck.
+     */
+    @Test
+    void aStampWithinTheSkewMarginPastTheCeilingIsDroppedAndCountedButNeverStruck() throws Exception {
+        for (int i = 0; i < PeerNode.STRIKE_THRESHOLD + 2; i++) {
+            injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(),
+                    Duration.ofMillis(HybridLogicalClock.MAX_DRIFT_MILLIS + 1 + i), 0, news("skewed" + i)));
+        }
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), Duration.ofMillis(
+                HybridLogicalClock.MAX_DRIFT_MILLIS + PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS), 0, news("edge")));
+
+        assertThat(newsAtB).as("every frame past the ceiling was dropped").isEmpty();
+        assertThat(b.framesFarFutureSkewed()).isEqualTo(PeerNode.STRIKE_THRESHOLD + 3);
+        assertThat(b.strikes(a.peerId())).as("within the margin nobody is struck").isZero();
+        assertThat(b.quarantined(a.peerId())).isFalse();
+        assertThat(b.framesFarFuture()).isZero();
+
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), Duration.ofMillis(
+                HybridLogicalClock.MAX_DRIFT_MILLIS + PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS + 1), 0, news("past")));
+        assertThat(b.strikes(a.peerId())).as("past the margin the sender is struck").isEqualTo(1);
+        assertThat(b.framesFarFuture()).isEqualTo(1);
+        assertThat(b.framesFarFutureSkewed()).isEqualTo(PeerNode.STRIKE_THRESHOLD + 3);
+
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(), Duration.ZERO, 0, news("honest")));
+        assertThat(newsAtB).containsExactly("honest");
+    }
+
+    /**
+     * HLC canonical stamps, 2026-11-08 (decision B), the skew probe: A drags B's clock to B's
+     * drift ceiling with an honest stamp at the ceiling, and C's wall runs one second behind B's.
+     * Every frame B sends next lands one second past C's ceiling. Before the skew margin C struck
+     * the honest B for each and quarantined it; now C drops and counts them and never strikes B,
+     * while a frame B signs ten seconds past C's ceiling still strikes.
+     */
+    @Test
+    void theSkewProbeAReceiverOneSecondBehindNeverStrikesAPeerDraggedToItsCeiling() throws Exception {
+        PeerNode c = PeerNode.builder(PeerIdentity.generate())
+                .clock(() -> clock.instant().minusSeconds(1)).randomSeed(3).build();
+        c.listen(network.register("c"), "c");
+        nodes.add(c);
+        GroupRuntime rc = c.joinGroup(groupAd, GroupMembership.Config.defaults(),
+                List.of(new PeerAdvertisement.Endpoint("mem", "a", 0)));
+        tickAll(6);
+        assertThat(rc.membership().member(b.peerId())).isPresent();
+        assertThat(c.strikes(b.peerId())).isZero();
+
+        injector.send(fromA(groupId, Envelope.Kind.RUMOR, b.peerId(),
+                Duration.ofMillis(HybridLogicalClock.MAX_DRIFT_MILLIS), HybridLogicalClock.LOGICAL_LIMIT,
+                news("drag")));
+        assertThat(newsAtB).as("the frame at B's ceiling is honest").containsExactly("drag");
+        long skewedBefore = c.framesFarFutureSkewed();
+        for (int i = 0; i < PeerNode.STRIKE_THRESHOLD + 2; i++) {
+            rb.gossip().publish("news", "from-b-" + i, bytes("b" + i));
+        }
+        tickAll(3);
+
+        assertThat(c.framesFarFutureSkewed()).as("C drops B's frames within the margin and counts them")
+                .isGreaterThan(skewedBefore);
+        assertThat(c.strikes(b.peerId())).as("C never strikes B").isZero();
+        assertThat(c.quarantined(b.peerId())).isFalse();
+        assertThat(c.framesFarFuture()).isZero();
+
+        TransportConnection toC = network.register("injector-c").dial("c");
+        long wallAtC = clock.millis() - 1_000;
+        HlcTimestamp tooFar = new HlcTimestamp(wallAtC + HybridLogicalClock.MAX_DRIFT_MILLIS + 10_000,
+                0, b.peerId().value());
+        toC.send(TestFrames.signed(b.identity(), groupId, Envelope.Kind.RUMOR, c.peerId(), tooFar,
+                news("ten-seconds-past")));
+        assertThat(c.strikes(b.peerId())).as("ten seconds past C's ceiling is still struck").isEqualTo(1);
+        assertThat(c.framesFarFuture()).isEqualTo(1);
     }
 
     /** WS5: a verified member sending bodies its kind cannot carry accumulates strikes into quarantine. */

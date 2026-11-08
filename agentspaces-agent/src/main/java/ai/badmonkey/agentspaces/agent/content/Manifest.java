@@ -16,6 +16,7 @@
 package ai.badmonkey.agentspaces.agent.content;
 
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.util.List;
 import java.util.Map;
@@ -46,11 +47,18 @@ import java.util.Objects;
  * @param origin    the first publisher; informative, the record signature is the proof
  * @param created   epoch millis of publication
  * @param attrs     user attributes, at most 32 entries and 4 KiB, or null
+ * @param layout    how the artifact's bytes are laid out (srad/agentspaces-pdt.md PD-X-09): null or
+ *                  {@link #LAYOUT_PIECES} for the flat piece table, {@link #LAYOUT_TREE} when {@code root}
+ *                  names a blob tree the tree exchange fetches; omitted from the wire when null, so a
+ *                  manifest without it keeps its 0.5.0 bytes
  */
 public record Manifest(int v, String root, long size, int pieceSize, int pieces, byte[] table,
                        String tableRef, List<String> tableRefs, String name, String mediaType,
                        String sealing, Long keyEpoch, String hashing, PeerId origin, long created,
-                       Map<String, String> attrs) {
+                       Map<String, String> attrs,
+                       // Appended for the tree exchange (PD-X-09) and omitted from the wire when absent, so
+                       // every manifest without a layout is byte-identical to the 0.5.0 manifest.
+                       @JsonInclude(JsonInclude.Include.NON_NULL) String layout) {
 
     /** Schema version this record carries. */
     public static final int VERSION = 1;
@@ -85,6 +93,11 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
     public static final String HASHING_PLAIN = "plain";
     public static final String HASHING_SEALED = "sealed";
 
+    /** The flat piece table of srad/large-networks-bulk-data.md §3.1, the layout a null {@code layout} means. */
+    public static final String LAYOUT_PIECES = "pieces";
+    /** A blob tree (srad/agentspaces-pdt.md §3.3) whose root the tree exchange fetches (PD-X-09). */
+    public static final String LAYOUT_TREE = "tree";
+
     public Manifest {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(sealing, "sealing");
@@ -94,12 +107,36 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
         attrs = attrs == null ? null : Map.copyOf(attrs);
     }
 
+    /** The 0.5.0 shape: a manifest without a layout, which means {@link #LAYOUT_PIECES}. */
+    public Manifest(int v, String root, long size, int pieceSize, int pieces, byte[] table,
+                    String tableRef, List<String> tableRefs, String name, String mediaType,
+                    String sealing, Long keyEpoch, String hashing, PeerId origin, long created,
+                    Map<String, String> attrs) {
+        this(v, root, size, pieceSize, pieces, table, tableRef, tableRefs, name, mediaType, sealing, keyEpoch,
+                hashing, origin, created, attrs, null);
+    }
+
+    /**
+     * Whether the root names a blob tree (PD-X-09); false means the flat piece
+     * table. Named without a {@code get}/{@code is} prefix so Jackson never
+     * treats it as a property of the wire record.
+     */
+    public boolean treeLayout() {
+        return LAYOUT_TREE.equals(layout);
+    }
+
+    /** This manifest with a layout (null removes it). */
+    public Manifest withLayout(String layout) {
+        return new Manifest(v, root, size, pieceSize, pieces, table, tableRef, tableRefs, name, mediaType, sealing,
+                keyEpoch, hashing, origin, created, attrs, layout);
+    }
+
     /**
      * Checks the invariants a validator enforces on write and on read: the
      * version, the piece-size bounds, the piece count, exactly one of the inline
-     * table and the table reference, the table length, and the size bounds on
-     * name and attributes. The root itself is checked against the table by the
-     * content module, which holds the hashing code.
+     * table and the table reference, the table length, the size bounds on
+     * name and attributes, and the layout name (PD-X-09). The root itself is
+     * checked against the table by the content module, which holds the hashing code.
      *
      * @return the first violated rule, or empty when the manifest is well formed
      */
@@ -150,6 +187,9 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
         if (!HASHING_PLAIN.equals(hashing) && !HASHING_SEALED.equals(hashing)) {
             return java.util.Optional.of("unknown hashing " + hashing);
         }
+        if (layout != null && !LAYOUT_PIECES.equals(layout) && !LAYOUT_TREE.equals(layout)) {
+            return java.util.Optional.of("unknown layout " + layout);
+        }
         return java.util.Optional.empty();
     }
 
@@ -165,7 +205,7 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
     /** A copy sharing every field, with the table array cloned; equality on records is by reference for arrays. */
     public Manifest withTableCopy() {
         return new Manifest(v, root, size, pieceSize, pieces, table == null ? null : table.clone(), tableRef,
-                tableRefs, name, mediaType, sealing, keyEpoch, hashing, origin, created, attrs);
+                tableRefs, name, mediaType, sealing, keyEpoch, hashing, origin, created, attrs, layout);
     }
 
     @Override
@@ -175,13 +215,14 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
                 && Objects.equals(tableRef, m.tableRef) && Objects.equals(tableRefs, m.tableRefs)
                 && Objects.equals(name, m.name) && Objects.equals(mediaType, m.mediaType)
                 && sealing.equals(m.sealing) && Objects.equals(keyEpoch, m.keyEpoch) && hashing.equals(m.hashing)
-                && origin.equals(m.origin) && created == m.created && Objects.equals(attrs, m.attrs);
+                && origin.equals(m.origin) && created == m.created && Objects.equals(attrs, m.attrs)
+                && Objects.equals(layout, m.layout);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(v, root, size, pieceSize, pieces, java.util.Arrays.hashCode(table), tableRef, tableRefs,
-                name, mediaType, sealing, keyEpoch, hashing, origin, created, attrs);
+                name, mediaType, sealing, keyEpoch, hashing, origin, created, attrs, layout);
     }
 
     /** The tags a manifest entry is written with. */

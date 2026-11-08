@@ -162,6 +162,11 @@
       </dependency>
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-pdt</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-a2a</artifactId>
         <version>${project.version}</version>
       </dependency>

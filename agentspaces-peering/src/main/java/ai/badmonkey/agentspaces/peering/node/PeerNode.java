@@ -177,6 +177,14 @@ public final class PeerNode implements AutoCloseable {
     public static final String HASHES_HINT = "wire.hashes";
     /** Members whose advertisement carries {@link #HASHES_HINT}. */
     private final Set<PeerId> hashPeers = ConcurrentHashMap.newKeySet();
+    /**
+     * The hint a node advertises when it accepts a recordless entry state (a renew, cancel, or
+     * complete whose {@code EntryStateDto} omits the record; srad/agentspaces-pdt.md §3.9, PD-L-03,
+     * ISSUE-RecordlessRenew). A space sends the form only when every member of its view carries it.
+     */
+    public static final String RECORDLESS_HINT = "wire.recordless";
+    /** Members whose advertisement carries {@link #RECORDLESS_HINT}. */
+    private final Set<PeerId> recordlessPeers = ConcurrentHashMap.newKeySet();
     /** Members admitted since the last tick, per group: each gets a targeted anti-entropy round on the next tick. */
     private final Map<GroupId, Set<PeerId>> newlyAdmitted = new ConcurrentHashMap<>();
     /** The seeds each group was joined with, re-dialed when the view is empty (ROBUSTNESS.md §3.3, §3.6). */
@@ -524,6 +532,17 @@ public final class PeerNode implements AutoCloseable {
      * step tripping the staleness window) without letting an attacker probe
      * freely. */
     static final int STRIKE_THRESHOLD = 16;
+
+    /**
+     * How far past the far-future ceiling, this node's wall time plus
+     * {@link HybridLogicalClock#MAX_DRIFT_MILLIS}, a frame's stamp may lie and still strike
+     * nobody (HLC canonical stamps, 2026-11-08, decision B). A hostile stamp can drag an honest
+     * peer's clock to its own ceiling, and a receiver whose wall runs behind that peer's then
+     * sees every frame the peer sends past the receiver's ceiling. Strikes never decay, so
+     * without the margin such a receiver quarantined the honest peer. Five seconds covers the
+     * wall-clock skew of hosts that keep time.
+     */
+    public static final long FAR_FUTURE_SKEW_MARGIN_MILLIS = 5_000L;
     /** How long a quarantined peer's frames are refused before local evidence
      * expires. Long enough for the enterprise revocation path to act, short
      * enough that a misjudged honest peer recovers on its own. */
@@ -561,6 +580,9 @@ public final class PeerNode implements AutoCloseable {
      */
     private final AtomicLong framesStale = new AtomicLong();
     private final AtomicLong framesReplayed = new AtomicLong();
+    private final AtomicLong framesLogicalRefused = new AtomicLong();
+    private final AtomicLong framesFarFuture = new AtomicLong();
+    private final AtomicLong framesFarFutureSkewed = new AtomicLong();
     private final Map<String, Boolean> recentFrames =
             java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(1024, 0.75f, false) {
                 @Override
@@ -943,6 +965,9 @@ public final class PeerNode implements AutoCloseable {
             nodeHints.put(SESSION_HINT, "1");
         }
         nodeHints.put(HASHES_HINT, "1");
+        if (builder.recordless) {
+            nodeHints.put(RECORDLESS_HINT, "1");
+        }
         if (coalesceWindow != null) {
             nodeHints.put(BATCH_HINT, "1");
             flusher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1007,6 +1032,7 @@ public final class PeerNode implements AutoCloseable {
         private Duration peerAdTtl = Duration.ofMinutes(10);
         private Duration peerAdInterval = Duration.ofSeconds(30);
         private boolean lazyPush = true;
+        private boolean recordless = true;
         private Duration coalesceWindow;
         private ChannelAuth channelAuth = ChannelAuth.SIGNED;
         private RevocationRegistry.RevocationValidator revocationValidator =
@@ -1223,6 +1249,20 @@ public final class PeerNode implements AutoCloseable {
         }
 
         /**
+         * Whether this node accepts recordless entry states and says so with the
+         * {@link #RECORDLESS_HINT} (srad/agentspaces-pdt.md PD-L-03): on by default. Off, the
+         * node does not advertise the hint, so every writer in its groups keeps sending it
+         * full states, as a 0.5.0 member receives them.
+         *
+         * @param enabled whether to advertise the hint
+         * @return this builder
+         */
+        public Builder recordless(boolean enabled) {
+            this.recordless = enabled;
+            return this;
+        }
+
+        /**
          * How often this node re-floods its self-advertisement through each group (default 30 s,
          * capped at half the advertisement TTL). The advertisement used to go out on every tick,
          * which at a 250 ms tick with fanout 3 and six hops had every member re-verifying every
@@ -1434,6 +1474,22 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
+     * Takes a credential-hint listener off again (the enterprise platform's FA2 audit §C.3.3: an agent that stops
+     * must deregister what it registered, or the node keeps it and everything it captured for the node's life).
+     *
+     * @param listener the listener given to {@link #onCredentialHints}
+     * @return true when the listener was registered and is now gone
+     */
+    public boolean offCredentialHints(BiConsumer<PeerId, Map<String, String>> listener) {
+        return credentialHintListeners.remove(Objects.requireNonNull(listener, "listener"));
+    }
+
+    /** The number of credential-hint listeners registered, for lifecycle tests that count what stop() leaves behind. */
+    public int credentialHintListeners() {
+        return credentialHintListeners.size();
+    }
+
+    /**
      * Sets one of this node's own credential hints (plan EFG §4): the value is
      * carried under {@code key} in every group's next signed self-advertisement,
      * so every member's {@linkplain Builder#onCredentialHints hint listener}
@@ -1553,6 +1609,35 @@ public final class PeerNode implements AutoCloseable {
      */
     public long framesReplayed() {
         return framesReplayed.get();
+    }
+
+    /**
+     * How many verified frames this node refused because their stamp's logical counter is above
+     * {@link HybridLogicalClock#LOGICAL_LIMIT} (HLC logical counter, 2026-11-08, Rust team
+     * report). Each is also a strike against its signer; none reached this node's clock.
+     */
+    public long framesLogicalRefused() {
+        return framesLogicalRefused.get();
+    }
+
+    /**
+     * How many verified frames this node dropped because their stamp lies further past its wall
+     * time plus {@link HybridLogicalClock#MAX_DRIFT_MILLIS} than {@link #FAR_FUTURE_SKEW_MARGIN_MILLIS}
+     * (ASF-020; HLC canonical stamps, 2026-11-08). Each is also a strike against its signer.
+     */
+    public long framesFarFuture() {
+        return framesFarFuture.get();
+    }
+
+    /**
+     * How many verified frames this node dropped because their stamp lies past its wall time plus
+     * {@link HybridLogicalClock#MAX_DRIFT_MILLIS} by at most {@link #FAR_FUTURE_SKEW_MARGIN_MILLIS}
+     * (HLC canonical stamps, 2026-11-08, decision B). None is a strike: an honest peer whose clock
+     * a hostile stamp dragged to its own ceiling sends such frames when this node's wall runs a
+     * little behind its own.
+     */
+    public long framesFarFutureSkewed() {
+        return framesFarFutureSkewed.get();
     }
 
     /**
@@ -1712,7 +1797,7 @@ public final class PeerNode implements AutoCloseable {
 
     /**
      * The wire hints this node advertises ({@code wire.batch}, {@code wire.tree},
-     * {@code wire.session}, {@code wire.hashes}), a copy.
+     * {@code wire.session}, {@code wire.hashes}, {@code wire.recordless}), a copy.
      *
      * @return the hints
      */
@@ -2393,6 +2478,20 @@ public final class PeerNode implements AutoCloseable {
         if ("1".equals(hint.parameters().get(HASHES_HINT))) {
             hashPeers.add(peer);
         }
+        if ("1".equals(hint.parameters().get(RECORDLESS_HINT))) {
+            recordlessPeers.add(peer);
+        }
+    }
+
+    /**
+     * Whether a member's advertisement carries {@link #RECORDLESS_HINT}, so a space may send it a
+     * recordless state (PD-L-03). A member without a known advertisement does not.
+     *
+     * @param peer the member
+     * @return true when the member accepts the recordless form
+     */
+    public boolean advertisesRecordless(PeerId peer) {
+        return peer != null && recordlessPeers.contains(peer);
     }
 
     /** Whether this node expects to open a session with the peer (a hint seeded it, or its advertisement said so). */
@@ -2811,6 +2910,7 @@ public final class PeerNode implements AutoCloseable {
             treePeers.remove(peer);
             sessionPeers.remove(peer);
             hashPeers.remove(peer);
+            recordlessPeers.remove(peer);
         }
         LOG.log(System.Logger.Level.INFO, "left group " + groupId.value() + ": " + held.size()
                 + " member(s) forgotten, " + closed + " connection(s) closed");
@@ -3804,14 +3904,10 @@ public final class PeerNode implements AutoCloseable {
             strike(envelope.from(), "rate limit breach");
             return; // spec §11: per-issuer rate limit; a flooding peer is throttled
         }
-        // ASF-020: a stamp near the HLC merge ceiling is a clock-pinning
-        // attempt (the merge would clamp it, but sustained near-ceiling
-        // traffic still drags every receiver's clock to wall+drift and wins
-        // LEASE_RACE tie-breaks). It is a fresh, signed frame — the replay
-        // dedup ran already — so it is witnessed, attributable misbehavior.
-        if (envelope.stamp().physical()
-                > clock.millis() + HybridLogicalClock.MAX_DRIFT_MILLIS) {
-            strike(envelope.from(), "far-future stamp");
+        if (refusesFarFuture(envelope)) {
+            return;
+        }
+        if (refusesLogical(envelope)) {
             return;
         }
         hlc.update(envelope.stamp());
@@ -4081,6 +4177,12 @@ public final class PeerNode implements AutoCloseable {
         if (rumor == null || !PEER_AD_STREAM.equals(rumor.streamId())) {
             return;
         }
+        // An introduction that admits its sender also merges its stamp below,
+        // so the stamp is judged before admission: in an OPEN group anyone may
+        // introduce itself.
+        if (refusesLogical(envelope)) {
+            return;
+        }
         runtime.gossip().onBootstrapRumor(envelope.from(), rumor);
         if (runtime.membership().member(envelope.from()).isPresent()) {
             // Admitted by its own introduction: adopt the side effects a member
@@ -4249,6 +4351,54 @@ public final class PeerNode implements AutoCloseable {
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    /**
+     * The far-future check (ASF-020), with the skew margin of HLC canonical stamps, 2026-11-08
+     * (decision B). A stamp past this node's wall time plus {@link HybridLogicalClock#MAX_DRIFT_MILLIS}
+     * would drag the clock toward the merge ceiling and win LEASE_RACE tie-breaks, so the frame
+     * is dropped. Within {@link #FAR_FUTURE_SKEW_MARGIN_MILLIS} past the ceiling it is what an
+     * honest peer sends when a hostile stamp dragged its clock to its own ceiling and this node's
+     * wall runs a little behind, so the drop is counted and strikes nobody. Further past it, the
+     * frame is fresh and signed (the replay dedup ran already), so it is witnessed, attributable
+     * misbehavior: counted and struck.
+     *
+     * @param envelope a verified, fresh frame from an admitted member
+     * @return true when the frame is refused and the caller must drop it
+     */
+    private boolean refusesFarFuture(Envelope envelope) {
+        long ceiling = clock.millis() + HybridLogicalClock.MAX_DRIFT_MILLIS;
+        long physical = envelope.stamp().physical();
+        if (physical <= ceiling) {
+            return false;
+        }
+        if (physical - ceiling <= FAR_FUTURE_SKEW_MARGIN_MILLIS) {
+            framesFarFutureSkewed.incrementAndGet();
+            return true;
+        }
+        framesFarFuture.incrementAndGet();
+        strike(envelope.from(), "far-future stamp");
+        return true;
+    }
+
+    /**
+     * Refuses a frame whose stamp may not merge into this node's clock, a logical
+     * counter above {@link HybridLogicalClock#LOGICAL_LIMIT} (HLC logical counter,
+     * 2026-11-08, Rust team report). Such a stamp just under the drift ceiling froze
+     * the clock for up to ten minutes, so every frame this node sent read as a
+     * replay. The frame is fresh and signed (the replay dedup ran first), so, like
+     * the ASF-020 far-future stamp, it is witnessed misbehavior: struck and counted.
+     *
+     * @param envelope a verified, fresh frame about to merge its stamp
+     * @return true when the frame is refused and the caller must drop it
+     */
+    private boolean refusesLogical(Envelope envelope) {
+        if (HybridLogicalClock.isAcceptable(envelope.stamp())) {
+            return false;
+        }
+        framesLogicalRefused.incrementAndGet();
+        strike(envelope.from(), "logical counter above " + HybridLogicalClock.LOGICAL_LIMIT);
+        return true;
     }
 
     /**
@@ -4937,6 +5087,11 @@ public final class PeerNode implements AutoCloseable {
             hashPeers.add(ad.issuer());
         } else {
             hashPeers.remove(ad.issuer());
+        }
+        if ("1".equals(ad.resourceHints().get(RECORDLESS_HINT))) {
+            recordlessPeers.add(ad.issuer());
+        } else {
+            recordlessPeers.remove(ad.issuer());
         }
         rememberReach(runtime.id(), ad);
         if (credentialHintListeners.isEmpty()) {

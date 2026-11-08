@@ -46,6 +46,13 @@ class ConstraintGateTest {
     record Quote(String claimId, String vendor) {
     }
 
+    record Approval(String claimId, String by) {
+    }
+
+    /** The platform's shape of a record written for a type the writer has no class of: the gate knows the shape only. */
+    record MappedRecord(int v, String type, String by, String key, Map<String, Object> fields) {
+    }
+
     static final PeerIdentity ID = PeerIdentity.generate();
 
     static Space space(String name) {
@@ -212,5 +219,113 @@ class ConstraintGateTest {
         ConstraintViolated cv = new ConstraintViolated(1, "rb-claims", 7, "k1", "c-1", java.time.Instant.EPOCH, "gate", ConstraintViolated.CLAIM);
         assertThat(codec.fromBytes(codec.toBytes(cv), ConstraintViolated.class)).isEqualTo(cv);
         assertThat(AgentId.class).isNotNull();
+    }
+
+    /** A flow step's result rides as a MappedRecord; the gate types it by the logical type it carries, so a rule book can name it. */
+    @Test
+    void aMappedRecordOnALaneMarksUnderItsLogicalType() throws Exception {
+        Space constraints = space("constraints");
+        Space assessments = space("assessments");
+        publish(constraints, new Constraint(1, "rb-claims", 1, "k5", Constraint.PRECEDENCE, "Assessment", List.of(), "Approval",
+                List.of(), 0, "", "field:claimId", List.of("gate", "monitor"), Map.of()));
+        try (ConstraintGate gate = ConstraintGate.attach(constraints, null, "constraints", InstantSource.system(), "g")) {
+            gate.watch("assessments", assessments);
+            assertThat(gate.beforeResult(new Approval("c-1", "alice"), null, Map.of()).admitted()).as("no assessment yet").isFalse();
+            MappedRecord assessment = new MappedRecord(1, "acme.Assessment", "assess", "c-1", Map.of("claimId", "c-1", "verdict", "approve"));
+            assessments.write(assessment, Lease.of(Duration.ofMinutes(5)), Map.of("type", "acme.Assessment", "key", "c-1", "by", "assess"));
+            Thread.sleep(100);
+            assertThat(gate.events("c-1")).singleElement().satisfies(e -> {
+                assertThat(e.type()).isEqualTo("Assessment");
+                assertThat(e.wireType()).contains("MappedRecord");
+                assertThat(e.fields()).containsEntry("verdict", "approve").containsEntry("key", "c-1");
+            });
+            assertThat(gate.beforeResult(new Approval("c-1", "alice"), null, Map.of()).admitted()).as("the assessment enables the approval").isTrue();
+            // an approval that rides as a mapped record is judged by its logical type too
+            MappedRecord approval = new MappedRecord(1, "acme.Approval", "approve", "c-2", Map.of("claimId", "c-2"));
+            assertThat(gate.beforeResult(approval, null, Map.of()).admitted()).as("no assessment for c-2").isFalse();
+            assessments.write(new MappedRecord(1, "acme.Assessment", "assess", "c-2", Map.of("claimId", "c-2")), Lease.of(Duration.ofMinutes(5)));
+            Thread.sleep(100);
+            assertThat(gate.beforeResult(approval, null, Map.of()).admitted()).isTrue();
+            Space.Entry<MappedRecord> claimed = assessments.readAllEntries(Template.of(MappedRecord.class), 10).get(0);
+            assertThat(gate.narrow(Template.of(MappedRecord.class), claimed)).as("narrowed to the key the logical type names")
+                    .isNotSameAs(Template.of(MappedRecord.class));
+        }
+    }
+
+    /** A geo view's shape: one unit's newest position and the last forty points of its track. */
+    record Tracked(String key, double lat, double lon, List<Map<String, Object>> track) {
+    }
+
+    static Tracked tracked(int unit, int sweep) {
+        List<Map<String, Object>> track = new java.util.ArrayList<>();
+        for (int i = 0; i < 40; i++) {
+            track.add(Map.of("lat", 40.0 + i / 1000.0, "lon", -75.0 - i / 1000.0, "at", "2026-11-08T14:" + sweep + ":" + i));
+        }
+        return new Tracked("truck-" + unit, 40.0 + sweep / 1000.0, -75.0, track);
+    }
+
+    /**
+     * FIT 2026-11-08 (geo watch, live heaps of the host, the feed, and the summary grew 80 to 110 MB in three minutes, each
+     * histogram holding exactly 4096 constraint Events): a gate with no book watched the views lane and kept every View
+     * the view agent wrote, a forty-point track each, in its list for a type nothing names yet, up to the 4096 it caps.
+     * Many sweeps of short-leased views of a type no book names leave the gate holding nothing.
+     */
+    @Test
+    void manySweepsOfATypeNothingNamesLeaveTheGateHoldingNothing() throws Exception {
+        Space constraints = space("constraints");
+        Space views = space("views");
+        try (ConstraintGate gate = ConstraintGate.attach(constraints, null, "constraints", InstantSource.system(), "g")) {
+            gate.watch("views", views);
+            for (int sweep = 0; sweep < 600; sweep++) {
+                for (int unit = 0; unit < 12; unit++) {
+                    views.write(tracked(unit, sweep), Lease.of(Duration.ofSeconds(30)), Map.of("kind", "view", "key", "truck-" + unit));
+                }
+                gate.reload();   // a constraints notification between sweeps replays what the gate keeps
+            }
+            assertThat(gate.heldEvents()).as("events held after 7200 views of a type nothing names").isZero();
+            assertThat(gate.keys()).isEmpty();
+        }
+    }
+
+    /**
+     * FIT 2026-11-08: the gate keeps no event of a type nothing names, so a book published after the events reads the
+     * lanes again for the types it names; a take, which the lane can no longer show, is kept and still counts.
+     */
+    @Test
+    void aBookPublishedAfterTheEventsCountsTheLanesEntriesAndTheTakesBeforeIt() throws Exception {
+        Space constraints = space("constraints");
+        Space approvals = space("approvals");
+        try (ConstraintGate gate = ConstraintGate.attach(constraints, null, "constraints", InstantSource.system(), "g")) {
+            gate.watch("approvals", approvals);
+            approvals.write(new HumanApproval("c-2", "bob"), Lease.of(Duration.ofMinutes(5)));
+            assertThat(approvals.take(Template.of(HumanApproval.class), Lease.of(Duration.ofMinutes(1)), Duration.ofSeconds(1))).isPresent();
+            approvals.write(new HumanApproval("c-1", "alice"), Lease.of(Duration.ofMinutes(5)));
+            Thread.sleep(100);
+            publish(constraints, precedence());
+            Thread.sleep(100);
+            assertThat(gate.loaded()).hasSize(1);
+            assertThat(gate.beforeResult(new PaymentOrder("c-1", 60000), null, Map.of()).admitted()).as("the approval the lane holds").isTrue();
+            assertThat(gate.beforeResult(new PaymentOrder("c-2", 60000), null, Map.of()).admitted()).as("the approval taken before the book").isTrue();
+            assertThat(gate.beforeResult(new PaymentOrder("c-3", 60000), null, Map.of()).admitted()).as("no approval").isFalse();
+            assertThat(gate.events("c-1")).hasSize(1);
+        }
+    }
+
+    /** FIT 2026-11-08: an interest named after the lane's entries were written reads them from the lane. */
+    @Test
+    void anInterestNamedAfterTheEntriesReadsThemFromTheLane() throws Exception {
+        Space constraints = space("constraints");
+        Space quotes = space("quotes");
+        try (ConstraintGate gate = ConstraintGate.attach(constraints, null, "constraints", InstantSource.system(), "g")) {
+            gate.watch("quotes", quotes);
+            quotes.write(new Quote("c-5", "a"), Lease.of(Duration.ofMinutes(5)));
+            quotes.write(new Quote("c-5", "b"), Lease.of(Duration.ofMinutes(5)));
+            Thread.sleep(100);
+            assertThat(gate.heldEvents()).as("nothing names Quote yet").isZero();
+            gate.interest("Quote", "field:claimId");
+            assertThat(gate.events("c-5")).hasSize(2);
+            gate.interest("Quote", "field:claimId");   // the same interest again reads nothing twice
+            assertThat(gate.events("c-5")).hasSize(2);
+        }
     }
 }

@@ -170,9 +170,18 @@ public final class SpaceStateCrdt {
         if (state.present() && leaseExpiry > nowMillis) {
             return false;
         }
-        long horizon = leaseExpiry + 2 * Math.max(0, maxLeaseMillis);
+        // A completion or a withdrawal is a transition every replica must learn, so its tombstone stays two
+        // maximum leases. A lapse is not: the lease stamp lapses on every replica alike, and a lagging replica's
+        // copy is judged lapsed by the same stamp when it is re-offered, so a present entry whose lease ran out is
+        // dropped after a short grace instead. Without this a space of short-lived entries beside one long lease
+        // kept days of tombstones, and every digest grew with them (found 2026-11-07).
+        long keep = state.present() ? Math.min(2 * Math.max(0, maxLeaseMillis), LAPSED_GRACE_MILLIS) : 2 * Math.max(0, maxLeaseMillis);
+        long horizon = leaseExpiry + keep;
         return horizon <= nowMillis && horizon >= leaseExpiry; // guard overflow
     }
+
+    /** How long a present entry's tombstone stays after its lease lapsed, at most (five minutes, well past any clock skew between replicas). */
+    public static final long LAPSED_GRACE_MILLIS = 5L * 60 * 1000;
 
     /**
      * Returns the ids of entries {@link #collectable} would drop now.

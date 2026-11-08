@@ -197,6 +197,33 @@ public final class GroupRuntime implements AutoCloseable {
         return membership;
     }
 
+    /**
+     * Whether a member advertises {@link PeerNode#RECORDLESS_HINT}, so a space may send it a
+     * renew, cancel, or complete without the record (srad/agentspaces-pdt.md PD-L-03).
+     *
+     * @param peer the member
+     * @return true when the member accepts the recordless form
+     */
+    public boolean advertisesRecordless(PeerId peer) {
+        return node != null && node.advertisesRecordless(peer);
+    }
+
+    /**
+     * Whether every member of this group's current view advertises
+     * {@link PeerNode#RECORDLESS_HINT} (PD-L-03). An empty view answers true: a
+     * state published then reaches nobody who could object.
+     *
+     * @return true when a recordless state may go to the group's stream
+     */
+    public boolean viewAdvertisesRecordless() {
+        for (GroupMembership.Member member : membership.allMembers()) {
+            if (!advertisesRecordless(member.id())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** This group's accepted revocations. */
     public RevocationRegistry revocations() {
         return revocations;

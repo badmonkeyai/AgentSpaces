@@ -19,6 +19,7 @@ import ai.badmonkey.agentspaces.agent.content.Holding;
 import ai.badmonkey.agentspaces.agent.content.Manifest;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.content.tree.Cids;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -128,6 +129,76 @@ class ContentVectorsConformanceTest {
         for (String name : List.of("content_piece_want_cbor", "content_piece_cbor", "content_have_cbor",
                 "content_cancel_cbor", "content_reject_cbor", "content_manifest_want_cbor", "content_manifest_cbor")) {
             assertThat(Messages.tagOf(codec, hex(name))).as(name).isPresent();
+        }
+    }
+
+    @Test
+    void theTreeManifestCarriesItsLayoutAndTheOthersDoNot() {
+        assumeTrue(golden.containsKey("content_manifest_tree_cbor"), "golden.json predates the tree vectors");
+        Manifest tree = roundTrip("content_manifest_tree_cbor", Manifest.class);
+        assertThat(tree.violation()).isEmpty();
+        assertThat(tree.layout()).isEqualTo(Manifest.LAYOUT_TREE);
+        assertThat(tree.treeLayout()).isTrue();
+        assertThat(tree.root()).startsWith("bafyrei").hasSize(59);
+        assertThat(Cids.parse(tree.root()).codec()).isEqualTo(Cids.DAG_CBOR);
+        assertThat(Cids.of(new byte[]{(byte) 0xa0}, Cids.DAG_CBOR)).isEqualTo(tree.root());
+        Manifest inline = roundTrip("content_manifest_inline_cbor", Manifest.class);
+        assertThat(inline.layout()).isNull();
+        assertThat(inline.treeLayout()).isFalse();
+        // the tree vector is the inline vector with a new root and the trailing layout; nothing else moved
+        Manifest expected = new Manifest(inline.v(), tree.root(), inline.size(), inline.pieceSize(), inline.pieces(),
+                inline.table(), inline.tableRef(), inline.tableRefs(), inline.name(), inline.mediaType(), inline.sealing(),
+                inline.keyEpoch(), inline.hashing(), inline.origin(), inline.created(), inline.attrs(), Manifest.LAYOUT_TREE);
+        assertThat(tree).isEqualTo(expected);
+        assertThat(codec.toBytes(expected)).isEqualTo(hex("content_manifest_tree_cbor"));
+        assertThat(roundTrip("content_manifest_tableref_cbor", Manifest.class).layout()).isNull();
+    }
+
+    @Test
+    void theTreeExchangeMessagesDecodeWithinTheirBounds() {
+        assumeTrue(golden.containsKey("content_node_want_cbor"), "golden.json predates the tree vectors");
+        String treeRoot = Cids.of(new byte[]{(byte) 0xa0}, Cids.DAG_CBOR);
+        String emptyChunk = Cids.of(new byte[0], Cids.RAW);
+        Messages.NodeWant want = roundTrip("content_node_want_cbor", Messages.NodeWant.class);
+        assertThat(want.t()).isEqualTo(Messages.NODE_WANT);
+        assertThat(want.req()).isEqualTo(42);
+        assertThat(want.cids()).containsExactly(treeRoot, emptyChunk);
+        assertThat(want.violation()).isEmpty();
+
+        Messages.Nodes nodes = roundTrip("content_nodes_cbor", Messages.Nodes.class);
+        assertThat(nodes.t()).isEqualTo(Messages.NODES);
+        assertThat(nodes.req()).isEqualTo(42);
+        assertThat(nodes.plaintext()).isTrue();
+        assertThat(nodes.sealed()).isNull();
+        assertThat(nodes.epoch()).isNull();
+        assertThat(nodes.nodes()).hasSize(2);
+        assertThat(Cids.of(nodes.nodes().get(0), Cids.DAG_CBOR)).as("node 0 is the asked-for root").isEqualTo(treeRoot);
+        assertThat(Cids.of(nodes.nodes().get(1), Cids.RAW)).as("node 1 is the asked-for chunk").isEqualTo(emptyChunk);
+        assertThat(nodes.missing()).containsExactly((String) golden.get("content_root_cidv1"));
+        assertThat(nodes.violation()).isEmpty();
+
+        Messages.TreeWant treeWant = roundTrip("content_tree_want_cbor", Messages.TreeWant.class);
+        assertThat(treeWant.t()).isEqualTo(Messages.TREE_WANT);
+        assertThat(treeWant.req()).isEqualTo(43);
+        assertThat(treeWant.root()).isEqualTo(treeRoot);
+        assertThat(treeWant.haves()).containsExactly(emptyChunk);
+        assertThat(treeWant.budget()).isEqualTo(Messages.MAX_TREE_BUDGET);
+        assertThat(treeWant.sketch()).isNull();
+        assertThat(treeWant.violation()).isEmpty();
+
+        Messages.TreeEnd end = roundTrip("content_tree_end_cbor", Messages.TreeEnd.class);
+        assertThat(end.t()).isEqualTo(Messages.TREE_END);
+        assertThat(end.req()).isEqualTo(43);
+        assertThat(end.frontier()).containsExactly(emptyChunk);
+        assertThat(end.reason()).isEqualTo(Messages.END_BUDGET);
+        assertThat(end.violation()).isEmpty();
+
+        for (String name : List.of("content_node_want_cbor", "content_nodes_cbor", "content_tree_want_cbor",
+                "content_tree_end_cbor")) {
+            assertThat(Messages.tagOf(codec, hex(name))).as(name).isPresent();
+            byte[] bytes = hex(name);
+            assertThat(bytes[1]).as(name + " has 't' first").isEqualTo((byte) 0x61);
+            assertThat(bytes[2]).isEqualTo((byte) 't');
         }
     }
 }

@@ -562,7 +562,9 @@ class ConnectorClusterTest {
         observer.group(groupId).orElseThrow().gossip().onStream(
                 "space:" + DataSpaces.DEFAULT_NAME, (from, itemId, payload) -> {
                     SpaceWire.Delta delta = codec.fromBytes(payload, SpaceWire.Delta.class);
-                    if (delta != null && delta.state() != null) {
+                    // a renew, cancel, or complete may travel without its record once the writer
+                    // knows it replicated (srad/agentspaces-pdt.md PD-L-01); only the records matter here
+                    if (delta != null && delta.state() != null && delta.state().record() != null) {
                         records.add(delta.state().record());
                     }
                 });

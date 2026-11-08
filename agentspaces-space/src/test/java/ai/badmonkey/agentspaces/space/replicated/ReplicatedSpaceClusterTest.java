@@ -748,6 +748,67 @@ class ReplicatedSpaceClusterTest {
         assertThat(a.space().currentClaim(entryId)).as("nothing was installed").isEmpty();
     }
 
+    /** Witnessed-violation strikes {@code node} holds against {@code peer} (PeerNode's test accessor). */
+    private static int strikes(PeerNode node, ai.badmonkey.agentspaces.common.id.PeerId peer) throws Exception {
+        java.lang.reflect.Method strikes = PeerNode.class.getDeclaredMethod("strikes",
+                ai.badmonkey.agentspaces.common.id.PeerId.class);
+        strikes.setAccessible(true);
+        return (int) strikes.invoke(node, peer);
+    }
+
+    /** The claim with its stamp's logical counter replaced. */
+    private static TakeClaim withLogical(TakeClaim claim, int logical) {
+        return new TakeClaim(claim.entryId(), claim.spaceId(), claim.epoch(),
+                new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(claim.stamp().physical(), logical,
+                        claim.stamp().node()),
+                claim.holder(), claim.bid(), claim.expiresAtMillis());
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): the ordered log installed a committed
+     * claim without the stamp check gossip applies, so a claim with a logical counter above
+     * LOGICAL_LIMIT entered the lattice. Both overloads now refuse it before the lattice and
+     * count it once per distinct claim; the attested overload strikes the holder once its
+     * signature verifies, and the space refuses a claim whose signature fails for that alone.
+     */
+    @Test
+    void anOrderedLogClaimAboveTheLogicalLimitNeverEntersTheLattice() throws Exception {
+        int limit = ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.LOGICAL_LIMIT;
+        Peer a = newPeer("a", 1);
+        Peer b = newPeer("b", 2, "a");
+        tickAll(3);
+        a.space().write(new TaskEntry("ordered", 1), MINUTES_30);
+        tickAll(2);
+        EntryId entryId = a.space().entryIdOf(new TaskEntry("ordered", 1)).orElseThrow();
+        TakeClaim honest = claimBy(b, entryId, 1);
+        TakeClaim hostile = withLogical(honest, limit + 1);
+        byte[] key = b.node().identity().rawPublicKey();
+
+        assertThatThrownBy(() -> a.space().applyAuthorizedClaim(entryId, hostile, key, signedBy(a, hostile)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("does not verify");
+        assertThat(a.space().stampsLogicalRefused()).as("an unverified claim is not counted").isZero();
+        assertThat(strikes(a.node(), b.node().peerId())).as("nor struck").isZero();
+
+        assertThat(a.space().verifiesAuthorizedClaim(entryId, hostile, key, signedBy(b, hostile), null)).isFalse();
+        for (int i = 0; i < 2; i++) {
+            assertThatThrownBy(() -> a.space().applyAuthorizedClaim(entryId, hostile, key, signedBy(b, hostile)))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("logical counter above 65536");
+        }
+        assertThat(a.space().stampsLogicalRefused()).as("counted once for the distinct claim").isEqualTo(1);
+        assertThat(strikes(a.node(), b.node().peerId())).as("and its holder struck once").isEqualTo(1);
+
+        assertThatThrownBy(() -> a.space().applyAuthorizedClaim(entryId, withLogical(honest, limit + 2)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("logical counter above 65536");
+        assertThat(a.space().stampsLogicalRefused()).as("the bare overload counts too").isEqualTo(2);
+        assertThat(strikes(a.node(), b.node().peerId()))
+                .as("a bare claim carries no holder signature, so nobody is struck").isEqualTo(1);
+        assertThat(a.space().currentClaim(entryId)).as("nothing entered the lattice").isEmpty();
+
+        TakeClaim atLimit = withLogical(honest, limit);
+        a.space().applyAuthorizedClaim(entryId, atLimit, key, signedBy(b, atLimit));
+        assertThat(a.space().currentClaim(entryId)).as("a claim at the limit is honest").contains(atLimit);
+    }
+
     /**
      * QA4 A4-5: the log's decision is authoritative for its epoch. A gossip
      * claim at the same epoch from another holder does not displace it — the

@@ -26,16 +26,27 @@ import java.util.Map;
 
 /**
  * One event of a key in issue order (FR-6): the entry's simple and wire type, its id, when it was issued, its
- * fields (a record's components or a map's entries), its tags, and whether it is a write or a claim.
+ * fields (a record's components or a map's entries), its tags, and whether it is a write or a claim. A value whose
+ * wire type is {@value #MAPPED_RECORD} and that carries the mapped shape (a {@code type} string and a {@code fields}
+ * map) is typed by that logical type, see {@link #of(String, String, Instant, Object, Map, Kind)}.
  */
 public record Event(String type, String wireType, String entryId, Instant issued, Map<String, Object> fields,
                     Map<String, String> tags, Kind kind) {
 
     public enum Kind { WRITTEN, CLAIMED }
 
+    /**
+     * The simple name of the wire type under which a writer records a type it has no class of: the value carries the
+     * logical type's name as {@code type}, the record as {@code fields}, and the correlation key as {@code key}. The
+     * core reads that shape from the value's map form and needs nothing from the writer's platform.
+     */
+    public static final String MAPPED_RECORD = "MappedRecord";
+
     public Event {
-        fields = fields == null ? Map.of() : Map.copyOf(fields);
-        tags = tags == null ? Map.of() : Map.copyOf(tags);
+        // a record's component may be null (a response with no error, a message in reply to nothing): kept as null, since
+        // Map.copyOf refuses one and the gate then died on every such write (found 2026-11-07 behind a model gateway)
+        fields = fields == null ? Map.of() : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(fields));
+        tags = tags == null ? Map.of() : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(tags));
     }
 
     /** The simple name of a wire type: {@code a.b.Outer$Claim#v1} is {@code Claim}. */
@@ -51,13 +62,32 @@ public record Event(String type, String wireType, String entryId, Instant issued
     /** An event from an entry view. */
     public static Event of(Space.Entry<?> entry, Kind kind, Instant fallback) {
         Instant issued = entry.issued() == null ? fallback : Instant.ofEpochMilli(entry.issued().physical());
-        return new Event(simpleName(entry.type()), entry.type(), entry.entryId().value(), issued, fieldsOf(entry.value()),
-                entry.tags(), kind);
+        return of(entry.type(), entry.entryId().value(), issued, entry.value(), entry.tags(), kind);
     }
 
     /** An event from a value, for a result the binder is about to write. */
     public static Event of(Object value, String wireType, Map<String, String> tags, Instant at, Kind kind) {
-        return new Event(simpleName(wireType), wireType, "", at, fieldsOf(value), tags, kind);
+        return of(wireType, "", at, value, tags, kind);
+    }
+
+    /**
+     * An event from a wire type and a value: the type is the wire type's simple name and the fields are the value's.
+     * A {@value #MAPPED_RECORD} that carries a {@code type} string and a {@code fields} map (a flow step's result, a
+     * reaction's outcome) is the event of that logical type, so a rule book can name it: its fields are the mapped
+     * fields with the record's {@code key} (a mapped field named {@code key} stands), and the wire type stays as it is.
+     */
+    public static Event of(String wireType, String entryId, Instant issued, Object value, Map<String, String> tags, Kind kind) {
+        String type = simpleName(wireType);
+        Map<String, Object> fields = fieldsOf(value);
+        if (MAPPED_RECORD.equals(type) && fields.get("type") instanceof String logical && !logical.isBlank()
+                && fields.get("fields") instanceof Map<?, ?> mapped) {
+            Map<String, Object> out = fieldsOf(mapped);
+            if (fields.get("key") instanceof String key && !key.isBlank()) {
+                out.putIfAbsent("key", key);
+            }
+            return new Event(simpleName(logical), wireType, entryId, issued, out, tags, kind);
+        }
+        return new Event(type, wireType, entryId, issued, fields, tags, kind);
     }
 
     /** The key's value as the constraint names it: {@code field:<name>} or {@code tag:<name>}. */

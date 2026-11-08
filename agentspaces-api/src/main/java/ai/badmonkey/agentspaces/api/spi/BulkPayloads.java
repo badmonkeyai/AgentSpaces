@@ -18,6 +18,8 @@ package ai.badmonkey.agentspaces.api.spi;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -59,11 +61,55 @@ public interface BulkPayloads {
     void ensure(String ref, PeerId issuer, Runnable onArrival);
 
     /**
+     * As {@link #ensure(String, PeerId, Runnable)}, and runs {@code onFailure} when the
+     * acquisition gives up (every source unreachable past the seam's deadline), so the
+     * space can retry it later with a back-off instead of waiting for good
+     * (srad/agentspaces-pdt.md PD-Q-AVL-01). The default never reports a failure,
+     * which is what a seam whose transfers never give up needs.
+     *
+     * @param ref       the reference
+     * @param issuer    the entry's issuer, a likely holder
+     * @param onArrival what to run when the bytes are complete
+     * @param onFailure what to run when this attempt gave up; the space may call {@code ensure} again
+     */
+    default void ensure(String ref, PeerId issuer, Runnable onArrival, Runnable onFailure) {
+        ensure(ref, issuer, onArrival);
+    }
+
+    /**
      * Releases a reference once its entry is collected, so the payload may be evicted.
      *
      * @param ref the reference
      */
     default void release(String ref) {
+    }
+
+    /**
+     * Whether this seam carries the reference (srad/agentspaces-pdt.md PD-E-01):
+     * a space with a primary seam and a fallback asks each in turn, so a reader
+     * reassembles a reference through the seam that published it. The default
+     * accepts every bulk reference; a seam that names its own form (the tree
+     * seam accepts dag-cbor roots only) narrows it.
+     *
+     * @param ref the reference
+     * @return true when {@link #local}, {@link #ensure}, and {@link #release} apply to it
+     */
+    default boolean accepts(String ref) {
+        return isBulk(ref);
+    }
+
+    /**
+     * The members of a group that cannot receive a payload through this seam
+     * right now (srad/agentspaces-pdt.md PD-E-06): a writer escalates through
+     * this seam only when the list is empty and falls back otherwise, and a
+     * space that requires the seam refuses the write naming them. The default
+     * names nobody, since the flat seam carries any size to any member.
+     *
+     * @param members the current members of the group, without the writer
+     * @return the members the seam cannot reach, empty when the seam is usable now
+     */
+    default List<PeerId> unable(Collection<PeerId> members) {
+        return List.of();
     }
 
     /** Whether a reference is a bulk reference rather than a single block's CID. */

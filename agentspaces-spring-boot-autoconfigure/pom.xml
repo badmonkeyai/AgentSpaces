@@ -50,6 +50,13 @@
       <artifactId>agentspaces-content</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- Persistent data trees over the content swarm (srad/agentspaces-pdt.md
+         PD-C-02): the Pdt facade per group from agentspaces.pdt.*. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-pdt</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-console</artifactId>

@@ -47,6 +47,16 @@ public interface ContentPolicy {
         return true;
     }
 
+    /**
+     * Whether this peer serves the nodes under a tree root to a requester
+     * (srad/agentspaces-pdt.md PD-P-01, PD-X-03). A tree root has no manifest, so
+     * the default asks {@link #mayServe} with a null manifest; a policy that reads
+     * the manifest overrides this method instead.
+     */
+    default boolean mayServeTree(GroupId group, PeerId requester, String root) {
+        return mayServe(group, requester, null);
+    }
+
     /** The seed mode (decision 9). */
     default SeedMode seedMode() {
         return SeedMode.AUTO;

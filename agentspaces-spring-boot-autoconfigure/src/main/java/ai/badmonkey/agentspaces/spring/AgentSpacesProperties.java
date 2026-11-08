@@ -110,6 +110,8 @@ public class AgentSpacesProperties {
     private Relay relay = new Relay();
     /** The content swarm ({@code agentspaces.content.*}, srad/large-networks-bulk-data.md §7.2). */
     private ContentSwarm content = new ContentSwarm();
+    /** Persistent data trees ({@code agentspaces.pdt.*}, srad/agentspaces-pdt.md appendix C). */
+    private PersistentTrees pdt = new PersistentTrees();
 
     /** The block exchange's store (SPEC §7.1, srad/large-networks-bulk-data.md LB-B-05). */
     private Blocks blocks = new Blocks();
@@ -348,6 +350,256 @@ public class AgentSpacesProperties {
 
     public ContentSwarm getContent() {
         return content;
+    }
+
+    public PersistentTrees getPdt() {
+        return pdt;
+    }
+
+    public void setPdt(PersistentTrees pdt) {
+        this.pdt = pdt;
+    }
+
+    /**
+     * {@code agentspaces.pdt.*}: persistent data trees over the content swarm
+     * (srad/agentspaces-pdt.md appendix C, PD-C-02). The starter builds one
+     * {@code Pdt} facade per group when {@code enabled} is true; it needs
+     * {@code agentspaces.content.enabled=true}, because the trees ride the
+     * swarm. The facades reach an application through the {@link Pdts} bean
+     * by group name, and the sole group's as the {@code Pdt} bean.
+     *
+     * <p>{@code spaces.<name>.*} (PD-E-01, PD-E-06) binds here so a
+     * configuration written for the finished feature loads, but the starter
+     * wires it in phase 4 of the SRAD: in this phase no space escalates through
+     * the trees and {@code require} refuses nothing.
+     */
+    public static class PersistentTrees {
+        /** Build the facade and advertise {@code trees=1}; off until a host turns it on (PD-C-02). */
+        private boolean enabled;
+        /** The space the ref heads ({@code PRef} entries) live in, per group. */
+        private String space = "pdt";
+        /** The largest delta carried on a head, in bytes, at most 32 KiB (PD-X-07). */
+        private int inlineDelta = 32 * 1024;
+        /** How long a lazy load or a deref waits for a node or a delta (PD-V-06). */
+        private java.time.Duration loadTimeout = java.time.Duration.ofSeconds(10);
+        /** {@code full}: a reader fetches each new head's tree as it arrives; {@code lazy}: nodes load on get (PD-X-10). */
+        private String follow = "full";
+        /** {@code group-key}, {@code sealed-nodes}, or {@code none}: the sealing every head names (PD-P-03, PD-P-05). */
+        private String sealing = "group-key";
+        private Store store = new Store();
+        private Retain retain = new Retain();
+        /** Per-ref settings by ref name ({@code agentspaces.pdt.refs.<name>.*}). */
+        private java.util.Map<String, RefDef> refs = new java.util.LinkedHashMap<>();
+        /** Per-space escalation by space name ({@code agentspaces.pdt.spaces.<name>.*}); wired in phase 4. */
+        private java.util.Map<String, SpaceEscalation> spaces = new java.util.LinkedHashMap<>();
+
+        /** {@code agentspaces.pdt.store.*}: the node store (PD-S-02, PD-S-05, PD-Q-AVL-02). */
+        public static class Store {
+            /**
+             * {@code pack}: the append-only pack store under {@code path/<group>};
+             * {@code memory}: on the heap; {@code bean}: the application's
+             * {@code NodeStore} bean, which also wins over the other two when present.
+             */
+            private String kind = "pack";
+            /** The pack directory; blank with {@code kind=pack} falls back to memory with a warning, or refuses under {@code require}. */
+            private String path = System.getProperty("user.home") + "/.agentspaces/pdt";
+            /** The store quota in bytes (PD-S-05); 0 is unbounded. */
+            private long quota;
+            /** Refuse to start without a durable store: a pack store with a path, or a bean (PD-Q-AVL-02). */
+            private boolean require;
+
+            public String getKind() {
+                return kind;
+            }
+
+            public void setKind(String kind) {
+                this.kind = kind;
+            }
+
+            public String getPath() {
+                return path;
+            }
+
+            public void setPath(String path) {
+                this.path = path;
+            }
+
+            public long getQuota() {
+                return quota;
+            }
+
+            public void setQuota(long quota) {
+                this.quota = quota;
+            }
+
+            public boolean isRequire() {
+                return require;
+            }
+
+            public void setRequire(boolean require) {
+                this.require = require;
+            }
+        }
+
+        /** {@code agentspaces.pdt.retain.*}: the delta bases kept per ref (PD-S-03). */
+        public static class Retain {
+            /** Versions kept per ref. */
+            private int versions = 64;
+            /** Age kept per ref. */
+            private java.time.Duration age = java.time.Duration.ofHours(1);
+
+            public int getVersions() {
+                return versions;
+            }
+
+            public void setVersions(int versions) {
+                this.versions = versions;
+            }
+
+            public java.time.Duration getAge() {
+                return age;
+            }
+
+            public void setAge(java.time.Duration age) {
+                this.age = age;
+            }
+        }
+
+        /** {@code agentspaces.pdt.refs.<name>.*}: one ref's settings. */
+        public static class RefDef {
+            /** {@code multi} (heads merge on read) or {@code linear} (a swap takes the head first) (PD-R-04). */
+            private String mode;
+            /**
+             * {@code full} or {@code lazy} for this ref alone (PD-X-10). The facade of this
+             * phase follows every ref in the global mode; a value here that differs from
+             * {@code agentspaces.pdt.follow} is logged and the global mode applies.
+             */
+            private String follow;
+
+            public String getMode() {
+                return mode;
+            }
+
+            public void setMode(String mode) {
+                this.mode = mode;
+            }
+
+            public String getFollow() {
+                return follow;
+            }
+
+            public void setFollow(String follow) {
+                this.follow = follow;
+            }
+        }
+
+        /**
+         * {@code agentspaces.pdt.spaces.<name>.*}: a space that escalates its payloads
+         * through the trees (PD-E-01, PD-E-06). Declared now, wired in phase 4; nothing
+         * in this phase reads it.
+         */
+        public static class SpaceEscalation {
+            /** Payload bytes above which a write of this space becomes a tree; 0 keeps the space on the block path. */
+            private long escalateAbove;
+            /** Refuse to start when a member of the space lacks the {@code trees} parameter. */
+            private boolean require;
+
+            public long getEscalateAbove() {
+                return escalateAbove;
+            }
+
+            public void setEscalateAbove(long escalateAbove) {
+                this.escalateAbove = escalateAbove;
+            }
+
+            public boolean isRequire() {
+                return require;
+            }
+
+            public void setRequire(boolean require) {
+                this.require = require;
+            }
+        }
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getSpace() {
+            return space;
+        }
+
+        public void setSpace(String space) {
+            this.space = space;
+        }
+
+        public int getInlineDelta() {
+            return inlineDelta;
+        }
+
+        public void setInlineDelta(int inlineDelta) {
+            this.inlineDelta = inlineDelta;
+        }
+
+        public java.time.Duration getLoadTimeout() {
+            return loadTimeout;
+        }
+
+        public void setLoadTimeout(java.time.Duration loadTimeout) {
+            this.loadTimeout = loadTimeout;
+        }
+
+        public String getFollow() {
+            return follow;
+        }
+
+        public void setFollow(String follow) {
+            this.follow = follow;
+        }
+
+        public String getSealing() {
+            return sealing;
+        }
+
+        public void setSealing(String sealing) {
+            this.sealing = sealing;
+        }
+
+        public Store getStore() {
+            return store;
+        }
+
+        public void setStore(Store store) {
+            this.store = store;
+        }
+
+        public Retain getRetain() {
+            return retain;
+        }
+
+        public void setRetain(Retain retain) {
+            this.retain = retain;
+        }
+
+        public java.util.Map<String, RefDef> getRefs() {
+            return refs;
+        }
+
+        public void setRefs(java.util.Map<String, RefDef> refs) {
+            this.refs = refs;
+        }
+
+        public java.util.Map<String, SpaceEscalation> getSpaces() {
+            return spaces;
+        }
+
+        public void setSpaces(java.util.Map<String, SpaceEscalation> spaces) {
+            this.spaces = spaces;
+        }
     }
 
     public Blocks getBlocks() {

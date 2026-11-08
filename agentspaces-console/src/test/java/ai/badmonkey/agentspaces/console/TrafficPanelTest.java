@@ -131,7 +131,8 @@ class TrafficPanelTest {
         Map<String, Object> doc = read(panel);
         Map<String, Object> totals = (Map<String, Object>) doc.get("totals");
         assertThat(totals).containsKeys("droppedUnverifiable", "droppedStale", "droppedReplayed",
-                "signedSent", "sessionSent", "bareSent", "bytesSentByKind");
+                "framesLogicalRefused", "framesFarFuture", "framesFarFutureSkewed", "signedSent", "sessionSent",
+                "bareSent", "bytesSentByKind");
         List<Map<String, Object>> groups = (List<Map<String, Object>>) doc.get("groups");
         assertThat(groups).hasSize(1);
         Map<String, Object> group = groups.get(0);
@@ -147,6 +148,70 @@ class TrafficPanelTest {
         assertThat((Map<String, Long>) group.get("treeFramesSent")).containsKeys("HAVE", "GRAFT", "PRUNE");
         assertThat((Map<String, Long>) group.get("rumorsSentByStream")).isNotNull();
         assertThat(group).containsKeys("antiEntropyRounds", "lazyPeers");
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): a member's frame whose stamp carries a
+     * logical counter above LOGICAL_LIMIT is refused and counted, and the panel shows the count
+     * beside the other refusal counters.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void showsFramesRefusedForTheirLogicalCounter() throws Exception {
+        TrafficPanel panel = TrafficPanel.of(b, clock);
+        assertThat(((Map<String, Object>) read(panel).get("totals")).get("framesLogicalRefused")).isEqualTo(0L);
+
+        ai.badmonkey.agentspaces.api.spi.TransportConnection injector = network.register("injector").dial("b");
+        ai.badmonkey.agentspaces.common.codec.CborCodec codec =
+                ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+        ai.badmonkey.agentspaces.common.hlc.HlcTimestamp hostile = new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(
+                clock.millis(), ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.LOGICAL_LIMIT + 1,
+                a.peerId().value());
+        ai.badmonkey.agentspaces.peering.wire.Envelope unsigned = new ai.badmonkey.agentspaces.peering.wire.Envelope(
+                ai.badmonkey.agentspaces.peering.wire.WireCodec.WIRE_VERSION, groupId,
+                ai.badmonkey.agentspaces.peering.wire.Envelope.Kind.RUMOR, a.peerId(), b.peerId(), hostile,
+                codec.toBytes(new ai.badmonkey.agentspaces.peering.wire.Bodies.Rumor("news", "news:refused", 3,
+                        "refused".getBytes(StandardCharsets.UTF_8))));
+        injector.send(new ai.badmonkey.agentspaces.peering.wire.WireCodec(codec).encode(unsigned, a.identity()));
+
+        assertThat(b.framesLogicalRefused()).isEqualTo(1);
+        assertThat(((Map<String, Object>) read(panel).get("totals")).get("framesLogicalRefused")).isEqualTo(1L);
+    }
+
+    /**
+     * HLC canonical stamps, 2026-11-08 (decision B): a member's frame stamped past the receiver's
+     * drift ceiling by no more than the skew margin is dropped and counted without a strike, one
+     * further past it is dropped, counted and struck, and the panel shows both counts.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void showsFramesDroppedAsFarFutureWithinAndPastTheSkewMargin() throws Exception {
+        TrafficPanel panel = TrafficPanel.of(b, clock);
+        Map<String, Object> before = (Map<String, Object>) read(panel).get("totals");
+        assertThat(before.get("framesFarFutureSkewed")).isEqualTo(0L);
+        assertThat(before.get("framesFarFuture")).isEqualTo(0L);
+
+        ai.badmonkey.agentspaces.api.spi.TransportConnection injector = network.register("injector").dial("b");
+        long ceiling = clock.millis() + ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.MAX_DRIFT_MILLIS;
+        injector.send(rumorFromA(ceiling + 1, "skewed"));
+        injector.send(rumorFromA(ceiling + PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS + 1, "far"));
+
+        Map<String, Object> after = (Map<String, Object>) read(panel).get("totals");
+        assertThat(after.get("framesFarFutureSkewed")).isEqualTo(1L);
+        assertThat(after.get("framesFarFuture")).isEqualTo(1L);
+    }
+
+    /** A signed RUMOR from A to B stamped at the given physical time. */
+    private byte[] rumorFromA(long physical, String text) {
+        ai.badmonkey.agentspaces.common.codec.CborCodec codec =
+                ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+        ai.badmonkey.agentspaces.peering.wire.Envelope unsigned = new ai.badmonkey.agentspaces.peering.wire.Envelope(
+                ai.badmonkey.agentspaces.peering.wire.WireCodec.WIRE_VERSION, groupId,
+                ai.badmonkey.agentspaces.peering.wire.Envelope.Kind.RUMOR, a.peerId(), b.peerId(),
+                new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(physical, 0, a.peerId().value()),
+                codec.toBytes(new ai.badmonkey.agentspaces.peering.wire.Bodies.Rumor("news", "news:" + text, 3,
+                        text.getBytes(StandardCharsets.UTF_8))));
+        return new ai.badmonkey.agentspaces.peering.wire.WireCodec(codec).encode(unsigned, a.identity());
     }
 
     @Test

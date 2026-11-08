@@ -30,6 +30,11 @@ import ai.badmonkey.agentspaces.common.crypto.GroupKey;
 import ai.badmonkey.agentspaces.common.crypto.GroupKeyRing;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.content.tree.TreeFetch;
+import ai.badmonkey.agentspaces.content.tree.TreeFetchSession;
+import ai.badmonkey.agentspaces.content.tree.TreeServer;
+import ai.badmonkey.agentspaces.content.tree.TreeStore;
+import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.peering.blocks.BlockExchange;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 
@@ -67,6 +72,16 @@ import java.util.logging.Logger;
  * holdings, in the content space) and as {@code PIPE_DATA} payloads under this
  * capability type; no frame kind is added, and no transport scheme is named
  * anywhere in this module (principle 3 of the SRAD).
+ *
+ * <p>The tree exchange of srad/agentspaces-pdt.md §3.5 rides the same capability:
+ * with a {@link Builder#treeStore} this peer serves {@code NODE_WANT} and
+ * {@code TREE_WANT} through a {@link TreeServer} under the checks a piece want
+ * passes, fetches trees with {@link #fetchTree} and node batches with
+ * {@link #fetchNodes}, and publishes holdings for tree roots with
+ * {@link #holdTree} (PD-S-06). Tags 8 to 11 go only to members whose current
+ * advertisement carries {@code trees = "1"} (PD-X-01), and one peer's tree frames
+ * are handled in the order they arrived, so a holder's breadth-first stream
+ * reaches the fetcher parents first.
  */
 public final class Content implements CapabilityProvider, AutoCloseable {
 
@@ -75,6 +90,16 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
     /** "Never happened" for a millisecond stamp: far enough in the past that {@code now - NEVER} cannot overflow. */
     static final long NEVER = Long.MIN_VALUE / 4;
+
+    /**
+     * The advertisement parameter that says this peer speaks the tree exchange
+     * (srad/agentspaces-pdt.md PD-X-01): tags 8 to 11 go only to a member whose
+     * current content-swarm advertisement carries {@code trees = "1"}.
+     */
+    public static final String TREES_PARAMETER = "trees";
+
+    /** The value of {@link #TREES_PARAMETER} this build advertises. */
+    public static final String TREES_VERSION = "1";
 
     /** Advertisement TTL, as every shipped capability uses. */
     static final Duration ADVERTISEMENT_TTL = Duration.ofMinutes(15);
@@ -85,6 +110,14 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
     /** Roots whose holdings one tick visits at most (LB-H-05). */
     static final int HOLDINGS_PER_TICK = 64;
+    /** Frames one peer may have queued for the tree exchange. */
+    static final int TREE_QUEUE_FRAMES = 256;
+    /** Bytes one peer may have queued for the tree exchange. */
+    static final long TREE_QUEUE_BYTES = 32L * 1024 * 1024;
+    /** An empty tree queue unused this long is forgotten. */
+    static final long TREE_QUEUE_IDLE_MILLIS = 60_000;
+    /** How often the group-seals signal is re-read from the advertisements. */
+    static final long GROUP_SEALS_REREAD_MILLIS = 5_000;
 
     private int holdingCursor;
     static final long MANIFEST_KEEPALIVE_INTERVAL_MILLIS = 30_000;
@@ -114,9 +147,100 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     }
 
-    /** Counters an operator reads. */
+    /**
+     * Counters an operator reads.
+     *
+     * @param fetchesActive        piece fetches in progress
+     * @param rootsHeld            roots in the piece store
+     * @param bytesServed          piece bytes served
+     * @param bytesReceived        piece bytes received by the active fetches
+     * @param wantsRefused         piece wants refused
+     * @param piecesStruck         pieces (and tree nodes) whose sender was struck
+     * @param treeFetchesActive    tree fetches and node batches in progress
+     * @param nodesServed          nodes served to {@code NODE_WANT} and {@code TREE_WANT}
+     * @param nodesReceived        nodes received and verified by tree fetches
+     * @param treeRequestsRejected tree requests refused with a {@code REJECT}
+     * @param treeMessagesDropped  tree messages dropped for a violated bound or an unknown request (PD-X-02, PD-X-04)
+     */
     public record Stats(int fetchesActive, int rootsHeld, long bytesServed, long bytesReceived,
-                        long wantsRefused, long piecesStruck) {
+                        long wantsRefused, long piecesStruck, int treeFetchesActive, long nodesServed,
+                        long nodesReceived, long treeRequestsRejected, long treeMessagesDropped) {
+
+        /** The form of 0.5.0, before the tree exchange. */
+        public Stats(int fetchesActive, int rootsHeld, long bytesServed, long bytesReceived,
+                     long wantsRefused, long piecesStruck) {
+            this(fetchesActive, rootsHeld, bytesServed, bytesReceived, wantsRefused, piecesStruck, 0, 0, 0, 0, 0);
+        }
+    }
+
+    /** The frames of one peer's tree exchange, drained in order by one task at a time. */
+    private final class TreeQueue {
+        final PeerId peer;
+        final java.util.ArrayDeque<byte[]> frames = new java.util.ArrayDeque<>();
+        long bytes;
+        boolean draining;
+        volatile long lastUsedMillis;
+
+        TreeQueue(PeerId peer) {
+            this.peer = peer;
+        }
+
+        /** Queues a frame and starts a drain when none runs; false when the queue is full. */
+        boolean offer(byte[] payload, long now) {
+            boolean start;
+            synchronized (this) {
+                lastUsedMillis = now;
+                if (frames.size() >= TREE_QUEUE_FRAMES || bytes + payload.length > TREE_QUEUE_BYTES) {
+                    return false;
+                }
+                frames.addLast(payload);
+                bytes += payload.length;
+                start = !draining;
+                if (start) {
+                    draining = true;
+                }
+            }
+            if (start) {
+                handlers.execute(this::drain);
+            }
+            return true;
+        }
+
+        private void drain() {
+            while (true) {
+                byte[] payload;
+                synchronized (this) {
+                    payload = frames.pollFirst();
+                    if (payload == null) {
+                        draining = false;
+                        return;
+                    }
+                    bytes -= payload.length;
+                }
+                try {
+                    onFrame(peer, payload);
+                } catch (RuntimeException e) {
+                    treeMessagesDropped.incrementAndGet();
+                    LOG.warning(() -> "tree frame from " + peer.display() + " failed: " + e);
+                }
+                lastUsedMillis = clock.millis();
+            }
+        }
+
+        synchronized boolean idle(long now) {
+            return !draining && frames.isEmpty() && now - lastUsedMillis >= TREE_QUEUE_IDLE_MILLIS;
+        }
+    }
+
+    private static final class TreePending {
+        final TreeFetchSession session;
+        final Subscription holdings;
+        final List<Runnable> onDone = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        TreePending(TreeFetchSession session, Subscription holdings) {
+            this.session = session;
+            this.holdings = holdings;
+        }
     }
 
     /** What {@link #describe(String)} answers. */
@@ -143,6 +267,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     private final Lease holdingLease;
     private final Random random;
     private final int pieceSize;
+    /** Where this peer reads another member's current content-swarm advertisement (PD-X-01); may be null. */
+    private final java.util.function.Function<PeerId, Optional<CapabilityAdvertisement>> advertisements;
     private final AtomicInteger requestIds = new AtomicInteger();
     private final Map<String, Pending> fetches = new ConcurrentHashMap<>();
     private final Deque<Pending> queued = new ArrayDeque<>();
@@ -162,6 +288,30 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     private final AtomicLong bytesServed = new AtomicLong();
     private final AtomicLong wantsRefused = new AtomicLong();
     private final AtomicLong piecesStruck = new AtomicLong();
+    /** The tree exchange (srad/agentspaces-pdt.md): the store this peer serves trees from, or null. */
+    private final TreeStore treeStore;
+    private final TreeServer treeServer;
+    private final Map<String, TreePending> treeFetches = new ConcurrentHashMap<>();
+    /** Tree roots this peer publishes holdings for (PD-S-06). */
+    private final java.util.Set<String> treeRoots = ConcurrentHashMap.newKeySet();
+    private final AtomicLong nodesReceived = new AtomicLong();
+    private final AtomicLong treeMessagesDropped = new AtomicLong();
+    private final AtomicInteger batchIds = new AtomicInteger();
+    /**
+     * One serial, bounded queue per peer for tags 8 to 11, so a holder's
+     * breadth-first stream is verified in order (a parent before its children, a
+     * NODES before its TREE_END); piece frames keep one virtual thread each. A
+     * queue holds at most {@link #TREE_QUEUE_FRAMES} frames and
+     * {@link #TREE_QUEUE_BYTES} bytes (a frame past either is dropped and counted
+     * in {@code treeMessagesDropped}), and an idle queue is forgotten after
+     * {@link #TREE_QUEUE_IDLE_MILLIS}, so a flooding or departed member holds
+     * nothing here for long (§6.7 row 3).
+     */
+    private final Map<PeerId, TreeQueue> treeQueues = new ConcurrentHashMap<>();
+    /** Whether any member's current advertisement says the group's content travels sealed; may be null. */
+    private final java.util.function.BooleanSupplier groupSealsLookup;
+    private volatile boolean groupSeals;
+    private long groupSealsReadAtMillis = NEVER;
     /**
      * Content frames leave the transport's reader thread at once: a holder that
      * served on it and a fetcher that absorbed on it would each block writing to
@@ -190,12 +340,25 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         this.authorizer = b.authorizer;
         this.holdingLease = b.holdingLease == null ? Lease.of(Duration.ofMinutes(5)) : b.holdingLease;
         this.random = b.random == null ? new Random() : b.random;
+        this.advertisements = b.advertisements != null ? b.advertisements
+                : b.discovery == null ? null : advertisementsIn(b.discovery, this.clock);
+        this.treeStore = b.treeStore;
+        this.groupSealsLookup = b.groupSeals != null ? b.groupSeals
+                : b.discovery == null ? null : groupSealsIn(b.discovery, this.clock);
+        this.treeServer = new TreeServer(this.treeStore, treeHost);
         pipes.onCapability(TYPE, (from, payload) -> {
             if (closed) {
                 return;
             }
             try {
-                handlers.execute(() -> onFrame(from, payload));
+                int tag = Messages.peekTag(codec, payload).orElse(0);
+                if (tag >= Messages.NODE_WANT && tag <= Messages.TREE_END) {
+                    if (!treeQueues.computeIfAbsent(from, TreeQueue::new).offer(payload, clock.millis())) {
+                        treeMessagesDropped.incrementAndGet();
+                    }
+                } else {
+                    handlers.execute(() -> onFrame(from, payload));
+                }
             } catch (java.util.concurrent.RejectedExecutionException e) {
                 // closing
             }
@@ -223,6 +386,10 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         private Lease holdingLease;
         private Random random;
         private int pieceSize = ContentRoots.DEFAULT_PIECE_SIZE;
+        private java.util.function.Function<PeerId, Optional<CapabilityAdvertisement>> advertisements;
+        private DiscoveryService discovery;
+        private java.util.function.BooleanSupplier groupSeals;
+        private TreeStore treeStore;
 
         private Builder(PipeChannel pipes, GroupRuntime runtime, Space space, PeerId self) {
             this.pipes = pipes;
@@ -275,6 +442,44 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
 
         /**
+         * Where this peer reads a member's current content-swarm advertisement, so it
+         * sends the tree exchange only to members that advertise it (PD-X-01). The
+         * function answers the member's newest unexpired {@code aspace:cap/content-swarm}
+         * advertisement, or empty when none is known. Without one, no member is taken
+         * to speak the tree exchange. {@link #discovery} wires the group's cache; an
+         * explicit function here takes precedence over it.
+         */
+        public Builder advertisements(java.util.function.Function<PeerId, Optional<CapabilityAdvertisement>> value) {
+            this.advertisements = value;
+            return this;
+        }
+
+        /**
+         * The group's discovery service, read local-first ({@link DiscoveryService#find})
+         * for the content-swarm advertisements of members (PD-X-01). The cache evicts
+         * expired advertisements, and this lookup also refuses one expired at this
+         * peer's clock.
+         */
+        public Builder discovery(DiscoveryService value) {
+            this.discovery = value;
+            return this;
+        }
+
+        /**
+         * Whether the group's content travels sealed, as this peer knows it: true when
+         * any member's current content-swarm advertisement carries
+         * {@code sealing = group-key}. A holder without a content key ring refuses
+         * every tree request while this answers true (PD-P-03), whatever the asker's
+         * own advertisement says. {@link #discovery} derives it from the cache;
+         * an explicit supplier here takes precedence. Read once per
+         * {@link Content#GROUP_SEALS_REREAD_MILLIS} on the tick.
+         */
+        public Builder groupSeals(java.util.function.BooleanSupplier value) {
+            this.groupSeals = value;
+            return this;
+        }
+
+        /**
          * The piece size a publish without explicit options uses (the host's
          * {@code agentspaces.content.piece-size}); a power of two in [64 KiB, 4 MiB].
          *
@@ -288,6 +493,20 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
         public Builder random(Random value) {
             this.random = value;
+            return this;
+        }
+
+        /**
+         * The node store this peer serves trees from and fetches trees into
+         * (srad/agentspaces-pdt.md PD-X-03, PD-X-04). Without one the peer
+         * answers every {@code NODE_WANT} and {@code TREE_WANT} with {@code REJECT}
+         * reason 3 and {@link Content#fetchTree} refuses to start.
+         *
+         * @param value the store, or null
+         * @return this builder
+         */
+        public Builder treeStore(TreeStore value) {
+            this.treeStore = value;
             return this;
         }
 
@@ -310,8 +529,61 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                 self, group, clock.instant(), ADVERTISEMENT_TTL, TYPE, "0.1", "pipe",
                 Map.of("pieceSizes", Manifest.MIN_PIECE_SIZE + "-" + Manifest.MAX_PIECE_SIZE,
                         "sealing", keyRing == null ? Manifest.SEALING_NONE : Manifest.SEALING_GROUP_KEY,
-                        "seedMode", policy.seedMode().name().toLowerCase(java.util.Locale.ROOT)),
+                        "seedMode", policy.seedMode().name().toLowerCase(java.util.Locale.ROOT),
+                        TREES_PARAMETER, TREES_VERSION),
                 Map.of());
+    }
+
+    /**
+     * The newest unexpired content-swarm advertisement of each member, read
+     * local-first from a discovery cache (PD-X-01); what {@link Builder#discovery}
+     * installs.
+     *
+     * @param discovery the group's discovery service
+     * @param clock     the clock expiry is judged by
+     * @return the lookup
+     */
+    /**
+     * Whether any member's current content-swarm advertisement in a discovery cache
+     * says the group's content travels sealed (PD-P-03): the group-seals signal of
+     * {@link Builder#groupSeals} as {@link Builder#discovery} derives it.
+     */
+    public static java.util.function.BooleanSupplier groupSealsIn(DiscoveryService discovery, InstantSource clock) {
+        Objects.requireNonNull(discovery, "discovery");
+        Objects.requireNonNull(clock, "clock");
+        return () -> !discovery.find(CapabilityAdvertisement.class,
+                ad -> TYPE.equals(ad.capabilityType()) && !ad.expired(clock.instant())
+                        && Manifest.SEALING_GROUP_KEY.equals(ad.parameters().get("sealing"))).isEmpty();
+    }
+
+    public static java.util.function.Function<PeerId, Optional<CapabilityAdvertisement>> advertisementsIn(
+            DiscoveryService discovery, InstantSource clock) {
+        Objects.requireNonNull(discovery, "discovery");
+        Objects.requireNonNull(clock, "clock");
+        return peer -> discovery.find(CapabilityAdvertisement.class,
+                        ad -> TYPE.equals(ad.capabilityType()) && peer.equals(ad.issuer()) && !ad.expired(clock.instant()))
+                .stream().max(java.util.Comparator.comparing(CapabilityAdvertisement::issued));
+    }
+
+    /**
+     * Whether a member's current content-swarm advertisement carries
+     * {@code trees = "1"} (PD-X-01), so this peer may send it tags 8 to 11. A
+     * member without a known advertisement, or whose advertisement lacks the
+     * parameter (a 0.5.0 peer), does not. Reads the lookup the builder's
+     * {@code advertisements} or {@code discovery} gave; without one the answer
+     * is always false.
+     *
+     * @param peer the member
+     * @return true when the member advertises the tree exchange
+     */
+    public boolean advertisesTrees(PeerId peer) {
+        Objects.requireNonNull(peer, "peer");
+        if (advertisements == null) {
+            return false;
+        }
+        return advertisements.apply(peer)
+                .map(ad -> TREES_VERSION.equals(ad.parameters().get(TREES_PARAMETER)))
+                .orElse(false);
     }
 
     @Override
@@ -338,6 +610,17 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         long now = clock.millis();
         for (Pending pending : List.copyOf(fetches.values())) {
             drive(pending, now);
+        }
+        for (TreePending pending : List.copyOf(treeFetches.values())) {
+            pending.session.tick();
+            if (pending.session.isDone()) {
+                finishTree(pending);
+            }
+        }
+        treeQueues.values().removeIf(q -> q.idle(now));
+        if (groupSealsLookup != null && now - groupSealsReadAtMillis >= GROUP_SEALS_REREAD_MILLIS) {
+            groupSealsReadAtMillis = now;
+            groupSeals = groupSealsLookup.getAsBoolean();
         }
         // LB-H-05: a peer holding many roots visits at most HOLDINGS_PER_TICK of them per tick, in
         // turn, so its holding writes stay bounded however large its catalogue; each root still comes
@@ -367,11 +650,17 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     public void close() {
         closed = true;
         handlers.shutdownNow();
+        treeQueues.clear();
         for (Pending pending : List.copyOf(fetches.values())) {
             pending.session.cancel();
             pending.holdings.close();
         }
         fetches.clear();
+        for (TreePending pending : List.copyOf(treeFetches.values())) {
+            pending.session.cancel();
+            pending.holdings.close();
+        }
+        treeFetches.clear();
         try {
             store.flush(); // the file store persists what it batched (LB-T-01)
         } catch (RuntimeException e) {
@@ -398,7 +687,22 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             received += p.session.bytesReceived();
         }
         return new Stats(fetches.size(), store.roots().size(), bytesServed.get(), received,
-                wantsRefused.get(), piecesStruck.get());
+                wantsRefused.get(), piecesStruck.get(), treeFetches.size(), treeServer.nodesServed(),
+                nodesReceived.get(), treeServer.rejected(), treeServer.dropped() + treeMessagesDropped.get());
+    }
+
+    /** The node store this peer serves trees from, when it has one. */
+    /**
+     * The group's content-key ring this swarm seals under, when the group has one; a host
+     * that builds its own {@code Pdt} hands it to {@code Pdt.Builder.keyRing} so the
+     * sealed-nodes mode can seal (srad/agentspaces-pdt.md PD-P-05, PD-C-03).
+     */
+    public Optional<GroupKeyRing> keyRing() {
+        return Optional.ofNullable(keyRing);
+    }
+
+    public Optional<TreeStore> treeStore() {
+        return Optional.ofNullable(treeStore);
     }
 
     /**
@@ -587,11 +891,200 @@ public final class Content implements CapabilityProvider, AutoCloseable {
      */
     public void onFetchDone(String root, Runnable callback) {
         Pending pending = fetches.get(root);
-        if (pending == null) {
-            callback.run();
+        if (pending != null) {
+            pending.onDone.add(callback);
             return;
         }
-        pending.onDone.add(callback);
+        TreePending tree = treeFetches.get(root);
+        if (tree != null) {
+            tree.onDone.add(callback);
+            return;
+        }
+        callback.run();
+    }
+
+    // ------------------------------------------------------------ trees
+
+    /**
+     * Fetches every node under a tree root from the holders of the root and of
+     * the {@code haves} roots (srad/agentspaces-pdt.md §3.5, S2 and S3 of §6.4,
+     * PD-X-04 to PD-X-08). Holders prune the subtrees the haves already give
+     * this peer, so a version that shares most of its nodes with a held base
+     * costs its delta. On completion the root's holding is written as
+     * {@link #holdTree} does and the {@link #onFetchDone} callbacks run.
+     *
+     * @param root    the root CID
+     * @param haves   roots this peer's store holds complete, at most {@link Messages#MAX_HAVES}; may be empty
+     * @param options the options; {@code prefer} adds sources, {@code timeout} bounds the wait for one (PD-X-08)
+     * @return the handle; complete at once when the store already holds the tree
+     * @throws IllegalStateException when this peer has no tree store
+     */
+    public TreeFetch fetchTree(String root, List<String> haves, FetchOptions options) {
+        Objects.requireNonNull(root, "root");
+        Objects.requireNonNull(options, "options");
+        if (treeStore == null) {
+            throw new IllegalStateException("this peer has no tree store; give the builder one before fetching trees");
+        }
+        if (!ai.badmonkey.agentspaces.content.tree.Cids.isCid(root)) {
+            throw new IllegalArgumentException("not a CID: " + root);
+        }
+        List<String> bases = haves == null ? List.of() : List.copyOf(haves);
+        if (bases.size() > Messages.MAX_HAVES) {
+            throw new IllegalArgumentException("at most " + Messages.MAX_HAVES + " haves, got " + bases.size());
+        }
+        TreePending existing = treeFetches.get(root);
+        if (existing != null) {
+            return existing.session;
+        }
+        TreeFetchSession session = new TreeFetchSession(root, bases, List.of(), treeFabric, treeStore, options,
+                policy.maxSessions(), policy.maxWindow());
+        Subscription subscription = spaces.watchHoldings(root, ev -> session.holdingsChanged(), Lease.of(Duration.ofHours(24)));
+        TreePending pending = new TreePending(session, subscription);
+        TreePending raced = treeFetches.putIfAbsent(root, pending);
+        if (raced != null) {
+            subscription.close();
+            return raced.session;
+        }
+        session.start();
+        if (session.isDone()) {
+            finishTree(pending);
+        }
+        return session;
+    }
+
+    /** As {@link #fetchTree(String, List, FetchOptions)} with no haves and the default options. */
+    public TreeFetch fetchTree(String root) {
+        return fetchTree(root, List.of(), FetchOptions.defaults());
+    }
+
+    /**
+     * Fetches a batch of nodes by CID with {@code NODE_WANT} alone, following no
+     * links: what a node loader asks for when a value is read lazily (PD-V-06).
+     * Sources are the options' preferred peers and any holder of one of the CIDs
+     * as a root, so a loader passes the holders of the tree it reads from in
+     * {@code prefer}. Complete when every CID is held.
+     *
+     * @param cids    the CIDs, at most {@link Messages#MAX_WANT_CIDS}
+     * @param options the options
+     * @return the handle
+     * @throws IllegalStateException when this peer has no tree store
+     */
+    public TreeFetch fetchNodes(List<String> cids, FetchOptions options) {
+        Objects.requireNonNull(cids, "cids");
+        Objects.requireNonNull(options, "options");
+        if (treeStore == null) {
+            throw new IllegalStateException("this peer has no tree store; give the builder one before fetching nodes");
+        }
+        if (cids.isEmpty() || cids.size() > Messages.MAX_WANT_CIDS) {
+            throw new IllegalArgumentException("a batch names 1 to " + Messages.MAX_WANT_CIDS + " cids, got " + cids.size());
+        }
+        for (String cid : cids) {
+            if (!ai.badmonkey.agentspaces.content.tree.Cids.isCid(cid)) {
+                throw new IllegalArgumentException("not a CID: " + cid);
+            }
+        }
+        TreeFetchSession session = new TreeFetchSession(null, List.of(), cids, treeFabric, treeStore, options,
+                policy.maxSessions(), policy.maxWindow());
+        String key = "batch#" + batchIds.incrementAndGet() + ":" + cids.get(0);
+        Subscription subscription = spaces.watchHoldings(cids.get(0), ev -> session.holdingsChanged(), Lease.of(Duration.ofHours(24)));
+        TreePending pending = new TreePending(session, subscription);
+        treeFetches.put(key, pending);
+        session.start();
+        if (session.isDone()) {
+            finishTree(pending);
+        }
+        return session;
+    }
+
+    /**
+     * Publishes this peer's holding for a tree root (PD-S-06): {@code have} null,
+     * {@code complete} as the tree store reports it, {@code count} the nodes held
+     * under the root, {@code via} the relays this peer sits behind. The holdings
+     * tick refreshes it as it refreshes piece holdings until {@link #releaseTree}.
+     * A tree root has no manifest, so {@link #describe} answers empty for it; its
+     * holders are read through {@link ContentSpaces#holdings}.
+     *
+     * @param root the root CID
+     * @throws IllegalStateException when this peer has no tree store
+     */
+    public void holdTree(String root) {
+        Objects.requireNonNull(root, "root");
+        if (treeStore == null) {
+            throw new IllegalStateException("this peer has no tree store");
+        }
+        treeRoots.add(root);
+        refreshHolding(root, true);
+    }
+
+    /**
+     * Withdraws this peer's holding for a tree root.
+     *
+     * @param root the root CID
+     */
+    public void releaseTree(String root) {
+        treeRoots.remove(root);
+        Holder holder = holders.remove(root);
+        if (holder != null && holder.handle != null) {
+            try {
+                holder.handle.cancel();
+            } catch (RuntimeException ignored) {
+                // the holding lapses by lease in any case
+            }
+        }
+    }
+
+    /** The tree roots this peer publishes holdings for. */
+    public java.util.Set<String> treeRoots() {
+        return java.util.Set.copyOf(treeRoots);
+    }
+
+    /** Per-peer tree frame queues held now, idle ones included until the tick forgets them (§6.7 row 3). */
+    int treeQueuesHeld() {
+        return treeQueues.size();
+    }
+
+    /** The tree fetches and node batches in progress, for the console. */
+    public List<TreeFetch> activeTreeFetches() {
+        List<TreeFetch> active = new ArrayList<>();
+        for (TreePending p : treeFetches.values()) {
+            active.add(p.session);
+        }
+        return active;
+    }
+
+    private void finishTree(TreePending pending) {
+        String key = null;
+        for (Map.Entry<String, TreePending> e : treeFetches.entrySet()) {
+            if (e.getValue() == pending) {
+                key = e.getKey();
+                break;
+            }
+        }
+        if (key != null && treeFetches.remove(key, pending)) {
+            pending.holdings.close();
+            for (Runnable callback : pending.onDone) {
+                try {
+                    callback.run();
+                } catch (RuntimeException e) {
+                    LOG.warning(() -> "tree fetch-done callback for " + pending.session.root() + " failed: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /** Whether a member's current advertisement says its group content travels sealed. */
+    private boolean advertisesSealing(PeerId peer) {
+        if (advertisements == null) {
+            return false;
+        }
+        return advertisements.apply(peer)
+                .map(ad -> Manifest.SEALING_GROUP_KEY.equals(ad.parameters().get("sealing")))
+                .orElse(false);
+    }
+
+    /** The AAD a sealed NODES binds (PD-P-03): the recipient and the request. */
+    static byte[] treeSealingAad(PeerId recipient, int req) {
+        return (Messages.SEALING_AAD_PREFIX + recipient.value() + "|" + req).getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /**
@@ -912,6 +1405,25 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         return true;
     }
 
+    /**
+     * The download budget for node bytes that already arrived (PD-P-02): the bytes
+     * are charged whatever the answer, and the answer says whether the fetch may go
+     * on; zero bytes asks whether anything is left.
+     */
+    private synchronized boolean downloadBudgetAllows(long bytes) {
+        long budget = policy.downloadBytesPerDay();
+        if (budget <= 0) {
+            return true;
+        }
+        long day = clock.millis() / 86_400_000L;
+        if (day != downloadDay) {
+            downloadDay = day;
+            downloadedToday = 0;
+        }
+        downloadedToday += bytes;
+        return downloadedToday < budget;
+    }
+
     /** The piece table of a manifest held here: inline, or its block when held; empty when not here. */
     private Optional<byte[]> tableHere(Manifest m) {
         if (m.table() != null) {
@@ -958,8 +1470,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             if (!ok) {
                 LOG.warning("content store: root " + root
                         + " failed its sampled verification on start and is forgotten (LB-T-10)");
-                rootsDroppedOnSample.incrementAndGet();
                 store.forget(root);
+                rootsDroppedOnSample.incrementAndGet(); // counted after the forget, so the count says it is done
             }
         }
     }
@@ -1011,9 +1523,9 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             if (external.roots().contains(m.root())) { // two wants in flight count one drop
                 LOG.warning("content store: " + external.kind() + " root " + m.root() + " piece " + index
                         + " no longer matches its manifest; the root is forgotten (LB-T-10)");
-                rootsDroppedOnSample.incrementAndGet();
                 externalVerified.removeIf(k -> k.startsWith(m.root() + "#"));
                 store.forget(m.root());
+                rootsDroppedOnSample.incrementAndGet(); // counted after the forget, so the count says it is done
             }
         }
         return false;
@@ -1219,6 +1731,10 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         if (policy.seedMode() == ContentPolicy.SeedMode.NEVER) {
             return;
         }
+        if (treeRoots.contains(root)) {
+            refreshTreeHolding(root, force);
+            return;
+        }
         Optional<Manifest> manifest = store.manifest(root);
         if (manifest.isEmpty()) {
             return;
@@ -1260,6 +1776,65 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                 }
             }
         } else if (now - holder.renewedAtMillis >= holdingLease.duration().toMillis() / 2) {
+            try {
+                holder.handle.renew(holdingLease.duration());
+                holder.renewedAtMillis = now;
+            } catch (RuntimeException e) {
+                holder.handle = null; // lapsed or withdrawn: rewrite next tick
+            }
+        }
+    }
+
+    /**
+     * The holding of a tree root (PD-S-06): {@code have} null, {@code complete} and
+     * {@code count} from the tree store. The store is walked at most once per
+     * {@link #HOLDING_WRITE_INTERVAL_MILLIS} unless forced; between walks the
+     * holding renews at half-life like a piece holding.
+     */
+    private void refreshTreeHolding(String root, boolean force) {
+        if (treeStore == null) {
+            return;
+        }
+        Holder holder = holders.computeIfAbsent(root, r -> new Holder());
+        long now = clock.millis();
+        boolean walkDue = force || holder.handle == null || now - holder.writtenAtMillis >= HOLDING_WRITE_INTERVAL_MILLIS;
+        if (walkDue) {
+            int count = treeStore.reachable(root).size();
+            if (count == 0) {
+                return;
+            }
+            boolean complete = treeStore.complete(root);
+            if (policy.seedMode() == ContentPolicy.SeedMode.COMPLETE_ONLY && !complete) {
+                return;
+            }
+            boolean changed = holder.piecesAtWrite != count || holder.last == null || holder.last.complete() != complete;
+            if (force || holder.handle == null || changed) {
+                List<PeerId> via = runtime.viaRelays();
+                Holding holding = new Holding(Holding.VERSION, root, self, complete, null, count,
+                        via.isEmpty() ? null : via, null);
+                EntryHandle previous = holder.handle;
+                try {
+                    holder.handle = spaces.writeHolding(holding, holdingLease);
+                } catch (RuntimeException e) {
+                    LOG.fine(() -> "tree holding write deferred for " + root + ": " + e.getMessage());
+                    return;
+                }
+                holder.last = holding;
+                holder.writtenAtMillis = now;
+                holder.renewedAtMillis = now;
+                holder.piecesAtWrite = count;
+                if (previous != null) {
+                    try {
+                        previous.cancel();
+                    } catch (RuntimeException ignored) {
+                        // the previous holding lapses by lease in any case
+                    }
+                }
+                return;
+            }
+            holder.writtenAtMillis = now; // nothing changed: the next walk waits the interval
+        }
+        if (holder.handle != null && now - holder.renewedAtMillis >= holdingLease.duration().toMillis() / 2) {
             try {
                 holder.handle.renew(holdingLease.duration());
                 holder.renewedAtMillis = now;
@@ -1503,6 +2078,146 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     };
 
+    /** The checks and the sealing the tree server runs through (PD-P-01 to PD-P-03). */
+    private final TreeServer.Host treeHost = new TreeServer.Host() {
+        @Override
+        public boolean mayServe(PeerId from, String cid) {
+            if (!Content.this.mayServe(from, cid, null)) {
+                return false;
+            }
+            // PD-P-03: a keyless holder in a group that seals serves nothing. The group seals when any
+            // member's advertisement says so (this peer's own reading of the cache), or when the asker's
+            // does; the asker alone cannot talk a keyless holder into plaintext.
+            return keyRing != null || !(groupSeals() || advertisesSealing(from));
+        }
+
+        @Override
+        public boolean withinUploadBudget(int bytes) {
+            return Content.this.withinUploadBudget(bytes);
+        }
+
+        @Override
+        public long nowMillis() {
+            return clock.millis();
+        }
+
+        @Override
+        public Optional<Messages.Nodes> seal(PeerId to, int req, List<byte[]> nodes, List<String> missing) {
+            if (keyRing == null) {
+                return Optional.of(Messages.Nodes.plain(req, nodes, missing));
+            }
+            long epoch;
+            GroupKey key;
+            try {
+                epoch = keyRing.writeEpoch(clock.instant());
+                key = keyRing.sealingKey(epoch).orElse(null);
+            } catch (IllegalStateException e) {
+                return Optional.empty();
+            }
+            if (key == null) {
+                return Optional.empty();
+            }
+            byte[] sealed = key.encrypt(codec.toBytes(nodes.toArray(new byte[0][])), treeSealingAad(to, req));
+            return Optional.of(Messages.Nodes.sealed(req, sealed, epoch, missing));
+        }
+
+        @Override
+        public void send(PeerId to, Object message) {
+            pipes.send(to, TYPE, codec.toBytes(message));
+        }
+
+        @Override
+        public void served(int nodes, long bytes) {
+            bytesServed.addAndGet(bytes);
+        }
+    };
+
+    /** What a tree fetch needs from this capability (PD-X-04 to PD-X-08). */
+    private final TreeFetchSession.Fabric treeFabric = new TreeFetchSession.Fabric() {
+        @Override
+        public PeerId self() {
+            return self;
+        }
+
+        @Override
+        public long nowMillis() {
+            return clock.millis();
+        }
+
+        @Override
+        public void send(PeerId to, Object message) {
+            pipes.send(to, TYPE, codec.toBytes(message));
+        }
+
+        @Override
+        public int nextRequestId() {
+            return requestIds.incrementAndGet();
+        }
+
+        @Override
+        public List<Holding> holdings(String root) {
+            return spaces.holdings(root);
+        }
+
+        @Override
+        public void strike(PeerId peer, String reason) {
+            piecesStruck.incrementAndGet();
+            runtime.reportMisbehavior(peer, reason);
+        }
+
+        @Override
+        public int hopsTo(PeerId peer) {
+            return runtime.hopsTo(peer);
+        }
+
+        @Override
+        public boolean advertisesTrees(PeerId peer) {
+            return Content.this.advertisesTrees(peer);
+        }
+
+        @Override
+        public Optional<List<byte[]>> open(PeerId from, int req, Messages.Nodes nodes) {
+            if (nodes.plaintext()) {
+                return Optional.of(nodes.nodes());
+            }
+            if (keyRing == null) {
+                return Optional.empty();
+            }
+            byte[] aad = treeSealingAad(self, req);
+            for (GroupKey key : keyRing.openingKeys(nodes.epoch())) {
+                Optional<byte[]> plain = key.decrypt(nodes.sealed(), aad);
+                if (plain.isPresent()) {
+                    try {
+                        byte[][] list = codec.fromBytes(plain.get(), byte[][].class);
+                        return Optional.of(list == null ? List.of() : List.of(list));
+                    } catch (RuntimeException e) {
+                        return Optional.empty();
+                    }
+                }
+            }
+            return Optional.empty();
+        }
+
+        @Override
+        public void onNodesVerified(int count, long bytes) {
+            nodesReceived.addAndGet(count);
+        }
+
+        @Override
+        public boolean withinDownloadBudget(long bytes) {
+            return downloadBudgetAllows(bytes);
+        }
+
+        @Override
+        public void onComplete(TreeFetchSession session) {
+            if (!session.batch() && session.complete() && treeStore != null && treeStore.complete(session.root())
+                    && policy.seedMode() != ContentPolicy.SeedMode.NEVER) {
+                treeRoots.add(session.root());
+                refreshHolding(session.root(), true);
+            }
+        }
+    };
+
     // ------------------------------------------------------------ the holder side
 
     private void onFrame(PeerId from, byte[] payload) {
@@ -1528,6 +2243,14 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                     });
             case Messages.REJECT -> Messages.decode(codec, payload, Messages.Reject.class)
                     .ifPresent(reject -> {
+                        if (reject.index() == Messages.TREE_INDEX) {
+                            for (TreePending pending : treeFetches.values()) {
+                                if (pending.session.onReject(from, reject)) {
+                                    break;
+                                }
+                            }
+                            return;
+                        }
                         Pending pending = fetches.get(reject.root());
                         if (pending != null) {
                             pending.session.onReject(from, reject);
@@ -1551,6 +2274,56 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                             pipes.send(from, TYPE, codec.toBytes(new Messages.ManifestReply(want.root(), codec.toBytes(m))))));
             case Messages.MANIFEST -> Messages.decode(codec, payload, Messages.ManifestReply.class)
                     .ifPresent(reply -> onManifest(from, reply));
+            case Messages.NODE_WANT -> Messages.decode(codec, payload, Messages.NodeWant.class)
+                    .ifPresentOrElse(want -> treeServer.serve(from, want), treeMessagesDropped::incrementAndGet);
+            case Messages.TREE_WANT -> Messages.decode(codec, payload, Messages.TreeWant.class)
+                    .ifPresentOrElse(want -> treeServer.serve(from, want), treeMessagesDropped::incrementAndGet);
+            case Messages.NODES -> Messages.decode(codec, payload, Messages.Nodes.class)
+                    .ifPresentOrElse(nodes -> {
+                        if (nodes.violation().isPresent()) {
+                            treeMessagesDropped.incrementAndGet();
+                            // the request it answered is released, so the rest of its stream strikes nobody
+                            for (TreePending pending : treeFetches.values()) {
+                                if (pending.session.onUnusableNodes(from, nodes.req())) {
+                                    break;
+                                }
+                            }
+                            return;
+                        }
+                        boolean taken = false;
+                        for (TreePending pending : treeFetches.values()) {
+                            if (pending.session.onNodes(from, nodes)) {
+                                taken = true;
+                                if (pending.session.isDone()) {
+                                    finishTree(pending);
+                                }
+                                break;
+                            }
+                        }
+                        if (!taken) {
+                            treeMessagesDropped.incrementAndGet();
+                        }
+                    }, treeMessagesDropped::incrementAndGet);
+            case Messages.TREE_END -> Messages.decode(codec, payload, Messages.TreeEnd.class)
+                    .ifPresentOrElse(end -> {
+                        if (end.violation().isPresent()) {
+                            treeMessagesDropped.incrementAndGet();
+                            return;
+                        }
+                        boolean taken = false;
+                        for (TreePending pending : treeFetches.values()) {
+                            if (pending.session.onTreeEnd(from, end)) {
+                                taken = true;
+                                if (pending.session.isDone()) {
+                                    finishTree(pending);
+                                }
+                                break;
+                            }
+                        }
+                        if (!taken) {
+                            treeMessagesDropped.incrementAndGet();
+                        }
+                    }, treeMessagesDropped::incrementAndGet);
             default -> {
             }
         }
@@ -1562,9 +2335,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             reject(from, want, Messages.REASON_UNKNOWN_ROOT);
             return;
         }
-        if (policy.seedMode() == ContentPolicy.SeedMode.NEVER
-                || !policy.mayServe(runtime.id(), from, manifest.get())
-                || (authorizer != null && !authorizer.permits(from, Authorizer.Operation.CONTENT_FETCH, want.root()))) {
+        if (!mayServe(from, want.root(), manifest.get())) {
             reject(from, want, Messages.REASON_POLICY);
             return;
         }
@@ -1607,6 +2378,42 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
         bytesServed.addAndGet(bytes.get().length);
         pipes.send(from, TYPE, codec.toBytes(new Messages.Piece(want.root(), want.index(), want.offset(), payload, want.req())));
+    }
+
+    /**
+     * The checks every want passes before this peer serves (LB-P-02, PD-P-01): the
+     * seed mode, the policy, and the {@code CONTENT_FETCH} grant. For a piece want
+     * the scope is the root of the manifest. A null manifest is a request of the
+     * tree exchange, whose scope is the CID asked for (the root of a
+     * {@code TREE_WANT}, each CID of a {@code NODE_WANT}), since a tree root has no
+     * manifest and a holder cannot bind a node to a root without a walk; an
+     * authorizer that scopes a grant to one tree root therefore answers for the
+     * CIDs under it as well, for example by consulting its tree store. A policy that
+     * throws on a tree request (one that reads the manifest without overriding
+     * {@link ContentPolicy#mayServeTree}) refuses it.
+     */
+    private boolean mayServe(PeerId from, String root, Manifest manifest) {
+        if (policy.seedMode() == ContentPolicy.SeedMode.NEVER) {
+            return false;
+        }
+        try {
+            if (manifest == null ? !policy.mayServeTree(runtime.id(), from, root) : !policy.mayServe(runtime.id(), from, manifest)) {
+                return false;
+            }
+        } catch (RuntimeException e) {
+            LOG.fine(() -> "content policy failed for " + root + " from " + from.display() + ": " + e);
+            return false;
+        }
+        return authorizer == null || authorizer.permits(from, Authorizer.Operation.CONTENT_FETCH, root);
+    }
+
+    /** Whether the group's content travels sealed, as the tick last read it (PD-P-03). */
+    private boolean groupSeals() {
+        if (groupSealsLookup != null && groupSealsReadAtMillis == NEVER) {
+            groupSealsReadAtMillis = clock.millis();
+            groupSeals = groupSealsLookup.getAsBoolean();
+        }
+        return groupSeals;
     }
 
     private void reject(PeerId from, Messages.PieceWant want, int reason) {

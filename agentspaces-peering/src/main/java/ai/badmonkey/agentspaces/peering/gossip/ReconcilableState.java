@@ -44,4 +44,15 @@ public interface ReconcilableState {
      * @param delta the delta bytes
      */
     void applyDelta(byte[] delta);
+
+    /**
+     * A remote replica opened a hashed anti-entropy round (SPEC §5.3, v0.1.17) whose hash
+     * for this stream equals this replica's: the partner holds exactly what this replica
+     * holds, which is the digest match a writer takes as evidence that its own entries
+     * replicated (srad/agentspaces-pdt.md PD-L-01). The default ignores it.
+     *
+     * @param from the partner whose hash matched
+     */
+    default void matched(ai.badmonkey.agentspaces.common.id.PeerId from) {
+    }
 }

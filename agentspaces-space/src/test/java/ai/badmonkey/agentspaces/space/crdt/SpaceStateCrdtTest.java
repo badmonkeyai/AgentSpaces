@@ -149,6 +149,23 @@ class SpaceStateCrdtTest {
         assertThat(collected.merge(collected)).isEqualTo(collected);
     }
 
+    /** A lapsed present entry goes after a short grace however long the space's longest lease; a completed one keeps the full horizon. */
+    @Test
+    void aLapsedEntryIsCollectedAfterAShortGraceBesideALongLease() {
+        long day = 24L * 60 * 60 * 1000;
+        EntryRecord lapsed = record("lapsed");
+        EntryRecord done = record("done");
+        SpaceStateCrdt state = SpaceStateCrdt.empty()
+                .add(lapsed, new Dot("r1", 1), lease(10, "r1", 60_000))
+                .add(done, new Dot("r1", 2), lease(11, "r1", 60_000)).complete(done.entryId());
+        long grace = SpaceStateCrdt.LAPSED_GRACE_MILLIS;
+        assertThat(state.collectable(60_000 + grace - 1, day)).as("not yet").isEmpty();
+        assertThat(state.collectable(60_000 + grace, day)).as("the lapsed entry alone, five minutes after its lease").containsExactly(lapsed.entryId());
+        assertThat(state.collectable(60_000 + 2 * day - 1, day)).containsExactly(lapsed.entryId());
+        assertThat(state.collectable(60_000 + 2 * day, day)).as("the completed one after two maximum leases").containsExactlyInAnyOrder(lapsed.entryId(), done.entryId());
+        assertThat(state.collectable(60_000 + 2 * 3_000, 3_000)).as("a short maximum lease keeps the old rule for both").containsExactlyInAnyOrder(lapsed.entryId(), done.entryId());
+    }
+
     @ParameterizedTest
     @ValueSource(longs = {1, 7, 42, 20260826, 987654321})
     void randomOperationHistoriesConvergeRegardlessOfDeliveryOrder(long seed) {

@@ -33,7 +33,11 @@ import java.util.TreeMap;
  * counters as rates since the previous read, frames and bytes by {@link Envelope.Kind}, the
  * signed, session and bare split, and the robustness counters that say what the network did to
  * this node rather than what a signer did: frames dropped as unverifiable, as stale, as replays,
- * and the members held quarantined. Per group: the view and its suspects, anti-entropy rounds,
+ * as stamped past the drift ceiling by no more than the skew margin (HLC canonical stamps,
+ * 2026-11-08, decision B), and the members held quarantined. Beside them it shows the frames this
+ * node refused for a stamp whose logical counter is above the limit (HLC logical counter,
+ * 2026-11-08, Rust team report) and for a stamp further past the drift ceiling than the skew
+ * margin (ASF-020); a signer sent each of those, and the node struck it. Per group: the view and its suspects, anti-entropy rounds,
  * the gossip tree's lazy peers and its HAVE, GRAFT and PRUNE frames, and rumors by stream.
  *
  * <p>Registered like any {@link ConsolePanel}; the served UI polls its data every few seconds,
@@ -52,7 +56,8 @@ public final class TrafficPanel implements ConsolePanel {
     private Map<String, Object> lastRates = Map.of();
 
     private record Sample(long atMillis, PeerNode.Traffic traffic, long signed, long session, long bare,
-                          long dropped, long stale, long replayed) {
+                          long dropped, long stale, long replayed, long logicalRefused,
+                          long farFuture, long farFutureSkewed) {
     }
 
     private TrafficPanel(PeerNode node, InstantSource clock) {
@@ -85,7 +90,8 @@ public final class TrafficPanel implements ConsolePanel {
         long now = clock.millis();
         PeerNode.Traffic traffic = node.traffic();
         Sample current = new Sample(now, traffic, node.signedFramesSent(), node.sessionFramesSent(),
-                node.bareFramesSent(), node.framesDropped(), node.framesStale(), node.framesReplayed());
+                node.bareFramesSent(), node.framesDropped(), node.framesStale(), node.framesReplayed(),
+                node.framesLogicalRefused(), node.framesFarFuture(), node.framesFarFutureSkewed());
         Map<String, Object> doc = new LinkedHashMap<>();
         doc.put("peer", node.peerId().value());
         doc.put("totals", totals(current));
@@ -119,6 +125,9 @@ public final class TrafficPanel implements ConsolePanel {
         totals.put("droppedUnverifiable", s.dropped());
         totals.put("droppedStale", s.stale());
         totals.put("droppedReplayed", s.replayed());
+        totals.put("framesLogicalRefused", s.logicalRefused());
+        totals.put("framesFarFuture", s.farFuture());
+        totals.put("framesFarFutureSkewed", s.farFutureSkewed());
         totals.put("sentByKind", byKind(s.traffic().sentByKind()));
         totals.put("receivedByKind", byKind(s.traffic().receivedByKind()));
         totals.put("bytesSentByKind", byKind(s.traffic().bytesSentByKind()));
@@ -146,8 +155,8 @@ public final class TrafficPanel implements ConsolePanel {
         rates.put("bytesReceivedPerSecond", round((to.traffic().bytesReceived() - from.traffic().bytesReceived()) / seconds));
         rates.put("signedSentPerSecond", round((to.signed() - from.signed()) / seconds));
         rates.put("sessionSentPerSecond", round((to.session() - from.session()) / seconds));
-        rates.put("droppedPerSecond", round((to.dropped() + to.stale() + to.replayed()
-                - from.dropped() - from.stale() - from.replayed()) / seconds));
+        rates.put("droppedPerSecond", round((to.dropped() + to.stale() + to.replayed() + to.farFutureSkewed()
+                - from.dropped() - from.stale() - from.replayed() - from.farFutureSkewed()) / seconds));
         Map<String, Double> sent = new TreeMap<>();
         to.traffic().sentByKind().forEach((kind, count) -> {
             long delta = count - from.traffic().sentByKind().getOrDefault(kind, 0L);

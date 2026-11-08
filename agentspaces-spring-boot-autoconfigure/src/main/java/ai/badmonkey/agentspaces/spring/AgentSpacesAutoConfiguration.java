@@ -77,6 +77,7 @@ import java.util.EnumSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
 
@@ -92,6 +93,12 @@ import java.util.concurrent.TimeoutException;
  * through the {@link AgentSpaces} fluent facade, with
  * {@link AgentSpacesLifecycle} driving ticks and card/capability refresh and
  * {@link AgentSpacesBeanPostProcessor} binding annotated beans.
+ *
+ * <p>With {@code agentspaces.pdt.enabled} (srad/agentspaces-pdt.md PD-C-02)
+ * each group also gets a persistent-tree facade: its node store and
+ * {@code Pdt} are built before the group's content swarm, the swarm takes the
+ * facade's tree store, and the facade attaches after; the {@link Pdts} bean
+ * holds them by group and the sole group's is the {@code Pdt} bean.
  *
  * <p>The security profile also selects the fleet's {@link Authorizer}
  * (TODO-EFG §4, TODO item 6): the {@link Authorizers} bean holds a
@@ -770,6 +777,10 @@ public class AgentSpacesAutoConfiguration {
      * @param clock          the fabric's clock
      * @param agents         the agent identity factory
      * @param schemaRegistry the application's schema registry bean, if any
+     * @param locators       the application's bootstrap locators
+     * @param chains         the application's chain factory, if any
+     * @param pieceStores    the application's content-store backends
+     * @param pdts           the holder the persistent-tree facades register with (PD-C-02)
      * @return the facade, groups joined and spaces attached
      */
     @Bean
@@ -781,7 +792,8 @@ public class AgentSpacesAutoConfiguration {
                                    ObjectProvider<SchemaRegistry> schemaRegistry,
                                    ObjectProvider<BeaconLocator> locators,
                                    ObjectProvider<BootstrapChainFactory> chains,
-                                   ObjectProvider<ai.badmonkey.agentspaces.content.PieceStore> pieceStores) {
+                                   ObjectProvider<ai.badmonkey.agentspaces.content.PieceStore> pieceStores,
+                                   Pdts pdts) {
         List<ai.badmonkey.agentspaces.content.PieceStore> hosted = pieceStores.orderedStream().toList();
         if (!hosted.isEmpty()) {
             // LB-T-07: PieceStore beans join every group's swarm by kind.
@@ -789,7 +801,7 @@ public class AgentSpacesAutoConfiguration {
         }
         return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
                 agents, schemaRegistry.getIfAvailable(), locators.orderedStream().toList(),
-                chains.getIfAvailable(BootstrapChainFactory::defaults));
+                chains.getIfAvailable(BootstrapChainFactory::defaults), pdts);
     }
 
     /**
@@ -840,6 +852,39 @@ public class AgentSpacesAutoConfiguration {
                                    SchemaRegistry schemaRegistry,
                                    List<BeaconLocator> locators,
                                    BootstrapChainFactory chains) {
+        return agentSpacesWithRegistry(properties, node, identity, authorizers, embedder, clock,
+                agents, schemaRegistry, locators, chains, new Pdts());
+    }
+
+    /**
+     * The facade with the persistent-tree holder (srad/agentspaces-pdt.md
+     * PD-C-02): when {@code agentspaces.pdt.enabled} is true, each group's
+     * {@code Pdt} is built before its content swarm (the swarm takes the
+     * facade's tree store), attached after, and registered with {@code pdts}
+     * under the group's name; its tick and close join the group's.
+     *
+     * @param properties     the properties
+     * @param node           the node
+     * @param identity       the peer identity
+     * @param authorizers    the authorizers
+     * @param embedder       the embedder
+     * @param clock          the clock
+     * @param agents         the agent identity factory
+     * @param schemaRegistry the schema registry, or null
+     * @param locators       application locators, in order
+     * @param chains         the chain factory
+     * @param pdts           the holder the facades register with
+     * @return the facade
+     */
+    public AgentSpaces agentSpacesWithRegistry(AgentSpacesProperties properties, PeerNode node,
+                                   PeerIdentity identity, Authorizers authorizers, Embedder embedder,
+                                   InstantSource clock,
+                                   ai.badmonkey.agentspaces.agent.AgentIdentityFactory agents,
+                                   SchemaRegistry schemaRegistry,
+                                   List<BeaconLocator> locators,
+                                   BootstrapChainFactory chains,
+                                   Pdts pdts) {
+        Objects.requireNonNull(pdts, "pdts");
         AgentSpaces spaces = new AgentSpaces(identity, clock, agents);
         if (schemaRegistry != null) {
             // Before any group registers, so every group's binder gets it.
@@ -892,6 +937,20 @@ public class AgentSpacesAutoConfiguration {
             ai.badmonkey.agentspaces.content.Content content = null;
             ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk = null;
             long escalateAbove = 0;
+            // srad/agentspaces-pdt.md §7.2, PD-C-02: the trees ride the swarm, so the facade
+            // and its node store exist before the swarm is built and attach to it after.
+            ai.badmonkey.agentspaces.pdt.Pdt pdt = null;
+            if (properties.getPdt().isEnabled()) {
+                if (!properties.getContent().isEnabled()) {
+                    throw new IllegalStateException("agentspaces.pdt.enabled=true needs"
+                            + " agentspaces.content.enabled=true: the trees ride the content swarm");
+                }
+                AgentSpacesProperties.SpaceDef refDef = new AgentSpacesProperties.SpaceDef();
+                refDef.setName(properties.getPdt().getSpace());
+                ReplicatedSpace refSpace = buildSpace(runtime, identity, refDef, blocks, discovery,
+                        ring, authorizer, clock, schemaRegistry, null, 0, 0);
+                pdt = pdts.build(properties.getPdt(), groupConfig.getName(), refSpace, clock, ring);
+            }
             if (properties.getContent().isEnabled()) {
                 if (!properties.getCapabilities().isEnabled()) {
                     throw new IllegalStateException("agentspaces.content.enabled=true needs"
@@ -903,15 +962,42 @@ public class AgentSpacesAutoConfiguration {
                         ring, authorizer, clock, schemaRegistry, null, 0, 0);
                 content = buildContent(properties.getContent(), groupConfig.getName(), context.pipes(), runtime,
                         contentSpace, identity, codec, clock, blocks, ring, authorizer,
-                        hostPieceStores.apply(groupConfig.getName()));
+                        hostPieceStores.apply(groupConfig.getName()), discovery,
+                        // a host that builds its own facade (Micronaut, PD-C-03) hands the holder a store
+                        // resolver, so the swarm still carries a tree store over the group's node store
+                        pdt == null ? pdts.treeStoreFor(groupConfig.getName()).orElse(null) : pdt.treeStore());
                 bulk = new ai.badmonkey.agentspaces.content.SpacePayloads(content);
                 escalateAbove = properties.getContent().getEscalateAbove();
+                if (pdt != null) {
+                    pdts.register(groupConfig.getName(), pdt, content, runtime, node);
+                }
             }
             for (AgentSpacesProperties.SpaceDef spaceDef : groupConfig.getSpaces()) {
+                // srad/agentspaces-pdt.md §3.7, PD-E-01, PD-E-06: a space named under
+                // agentspaces.pdt.spaces escalates through the persistent trees, unsealed, with
+                // the flat swarm as its fallback unless it requires the trees.
+                AgentSpacesProperties.PersistentTrees.SpaceEscalation escalation =
+                        properties.getPdt().getSpaces().get(spaceDef.getName());
+                if (escalation != null && escalation.getEscalateAbove() > 0 && pdt == null) {
+                    throw new IllegalStateException("agentspaces.pdt.spaces." + spaceDef.getName()
+                            + ".escalate-above needs agentspaces.pdt.enabled=true");
+                }
+                ai.badmonkey.agentspaces.api.spi.BulkPayloads spaceBulk = bulk;
+                long spaceAbove = escalateAbove;
+                ai.badmonkey.agentspaces.api.spi.BulkPayloads fallback = null;
+                boolean treesRequired = false;
+                boolean sealBefore = true;
+                if (escalation != null && escalation.getEscalateAbove() > 0 && pdt != null) {
+                    spaceBulk = pdt.payloads();
+                    spaceAbove = escalation.getEscalateAbove();
+                    fallback = escalation.isRequire() ? null : bulk;
+                    treesRequired = escalation.isRequire();
+                    sealBefore = false;
+                }
                 context.space(spaceDef.getName(),
                         buildSpace(runtime, identity, spaceDef, blocks, discovery, ring,
-                                authorizer, clock, schemaRegistry, bulk, escalateAbove,
-                                properties.getBlocks().getMaxPayload()),
+                                authorizer, clock, schemaRegistry, spaceBulk, spaceAbove,
+                                properties.getBlocks().getMaxPayload(), sealBefore, fallback, treesRequired),
                         writer);
             }
             if (properties.getCapabilities().isEnabled()) {
@@ -945,6 +1031,42 @@ public class AgentSpacesAutoConfiguration {
     @ConditionalOnMissingBean
     public Authorizer agentSpacesAuthorizer(Authorizers authorizers, AgentSpaces spaces) {
         return authorizers.primary();
+    }
+
+    /**
+     * The holder of the persistent-tree facades (srad/agentspaces-pdt.md
+     * PD-C-02), one {@code Pdt} per group once {@code agentspaces.pdt.enabled}
+     * is true and the groups have joined; empty otherwise. It carries the
+     * application's {@link ai.badmonkey.agentspaces.pdt.NodeStore} bean, which
+     * replaces the store {@code agentspaces.pdt.store.kind} names, and its
+     * {@link PdtMergeFunction} beans, registered on every facade (PD-R-05).
+     *
+     * @param stores the application's node store bean, if any
+     * @param merges the application's merge functions
+     * @return the holder
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public Pdts agentSpacesPdts(ObjectProvider<ai.badmonkey.agentspaces.pdt.NodeStore> stores,
+                                ObjectProvider<PdtMergeFunction> merges) {
+        return new Pdts(stores.getIfAvailable(), merges.orderedStream().toList());
+    }
+
+    /**
+     * The sole group's persistent-tree facade as a bean (PD-C-02), the way the
+     * primary {@link Authorizer} is: present when {@code agentspaces.pdt.enabled}
+     * is true; with several groups use {@link Pdts#forGroup(String)}.
+     *
+     * @param pdts   the holder
+     * @param spaces the facade (ordering: the groups must have joined)
+     * @return the facade
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "agentspaces.pdt", name = "enabled",
+            havingValue = "true")
+    public ai.badmonkey.agentspaces.pdt.Pdt agentSpacesPdt(Pdts pdts, AgentSpaces spaces) {
+        return pdts.primary();
     }
 
     /**
@@ -1224,13 +1346,18 @@ public class AgentSpacesAutoConfiguration {
      * Builds the content swarm of a group from {@code agentspaces.content.*}
      * (srad/large-networks-bulk-data.md §7.2): the store composed from the listed
      * backends (a per-group directory for {@code file}), the policy from the
-     * property values, the group's key ring and authorizer.
+     * property values, the group's key ring and authorizer, the group's
+     * discovery for the tree-exchange advertisements of members
+     * (srad/agentspaces-pdt.md PD-X-01), and, when the persistent trees are
+     * on, the facade's tree store so the swarm serves and fetches trees
+     * (PD-C-02).
      */
     private static ai.badmonkey.agentspaces.content.Content buildContent(
             AgentSpacesProperties.ContentSwarm config, String groupName, CapabilityPipes pipes,
             GroupRuntime runtime, ReplicatedSpace contentSpace, PeerIdentity identity, CborCodec codec,
             InstantSource clock, BlockExchange blocks, GroupKeyRing ring, Authorizer authorizer,
-            List<ai.badmonkey.agentspaces.content.PieceStore> hosted) {
+            List<ai.badmonkey.agentspaces.content.PieceStore> hosted, DiscoveryService discovery,
+            ai.badmonkey.agentspaces.content.tree.TreeStore treeStore) {
         java.util.List<ai.badmonkey.agentspaces.content.PieceStore> backends = new java.util.ArrayList<>();
         java.util.List<ai.badmonkey.agentspaces.content.PieceStore> unplaced = new java.util.ArrayList<>(
                 hosted == null ? List.of() : hosted);
@@ -1314,11 +1441,16 @@ public class AgentSpacesAutoConfiguration {
                 return config.getMaxFetches();
             }
         };
-        return ai.badmonkey.agentspaces.content.Content.builder(pipes, runtime, contentSpace, identity.peerId())
+        ai.badmonkey.agentspaces.content.Content.Builder builder = ai.badmonkey.agentspaces.content.Content
+                .builder(pipes, runtime, contentSpace, identity.peerId())
                 .codec(codec).clock(clock).store(store).blocks(blocks).keyRing(ring).authorizer(authorizer)
                 .policy(policy).pieceSize(config.getPieceSize())
                 .holdingLease(ai.badmonkey.agentspaces.api.space.Lease.of(config.getHoldingLease()))
-                .build();
+                .discovery(discovery);
+        if (treeStore != null) {
+            builder.treeStore(treeStore);
+        }
+        return builder.build();
     }
 
     private static GroupKeyRing contentKeyRing(AgentSpacesProperties properties,
@@ -1497,6 +1629,27 @@ public class AgentSpacesAutoConfiguration {
                                               InstantSource clock, SchemaRegistry schemas,
                                               ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk,
                                               long escalateAbove, long maxPayload) {
+        return buildSpace(runtime, identity, spaceDef, blocks, discovery, contentKey, authorizer, clock, schemas,
+                bulk, escalateAbove, maxPayload, true, null, false);
+    }
+
+    /**
+     * As {@link #buildSpace(GroupRuntime, PeerIdentity, AgentSpacesProperties.SpaceDef, BlockExchange,
+     * DiscoveryService, GroupKeyRing, Authorizer, InstantSource, SchemaRegistry,
+     * ai.badmonkey.agentspaces.api.spi.BulkPayloads, long, long)} with the escalation shape of a
+     * space over the persistent trees (srad/agentspaces-pdt.md PD-E-04, PD-E-06): whether the
+     * payload is sealed before it goes to the seam, the seam a write falls back to when a member
+     * lacks the tree exchange, and whether such a write is refused instead.
+     */
+    private static ReplicatedSpace buildSpace(GroupRuntime runtime, PeerIdentity identity,
+                                              AgentSpacesProperties.SpaceDef spaceDef,
+                                              BlockExchange blocks, DiscoveryService discovery,
+                                              GroupKeyRing contentKey, Authorizer authorizer,
+                                              InstantSource clock, SchemaRegistry schemas,
+                                              ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk,
+                                              long escalateAbove, long maxPayload, boolean sealBeforeEscalate,
+                                              ai.badmonkey.agentspaces.api.spi.BulkPayloads fallback,
+                                              boolean bulkRequired) {
         ConflictStrategyType strategy =
                 ConflictStrategyType.valueOf(spaceDef.getStrategy().trim().toUpperCase());
         ReplicatedSpace.Builder builder =
@@ -1507,7 +1660,12 @@ public class AgentSpacesAutoConfiguration {
                         .blocks(blocks)
                         .advertise(discovery::publish);
         if (bulk != null && escalateAbove > 0) {
-            builder.bulk(bulk, escalateAbove); // LB-E-02
+            builder.bulk(bulk, escalateAbove) // LB-E-02
+                    .sealBeforeEscalate(sealBeforeEscalate) // PD-E-04
+                    .bulkRequired(bulkRequired); // PD-E-06
+            if (fallback != null) {
+                builder.bulkFallback(fallback);
+            }
         } else if (maxPayload > 0) {
             builder.maxPayload(maxPayload); // LB-E-06: refuse what no swarm carries, naming the property
         }

@@ -133,6 +133,23 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk;
     /** Payload bytes above which a write escalates to {@link #bulk}; 0 disables. */
     private final long escalateAbove;
+    /**
+     * Whether an escalated payload is sealed before it goes to {@link #bulk} (today's
+     * rule, the default). A PDT space sets it false (srad/agentspaces-pdt.md PD-E-04):
+     * nodes travel sealed per message and the record names the epoch in
+     * {@code keyEpoch}; the record signature over {@code payloadRef} binds the tree.
+     */
+    private final boolean sealBeforeEscalate;
+    /**
+     * The seam a write takes when {@link #bulk} cannot reach every member right now
+     * (PD-E-06: a member lacks the tree exchange); null for today's path (one block,
+     * or inline). A payload through it is sealed as today.
+     */
+    private final ai.badmonkey.agentspaces.api.spi.BulkPayloads bulkFallback;
+    /** Whether a write that {@link #bulk} cannot carry is refused naming the members (PD-E-06, {@code require}). */
+    private final boolean bulkRequired;
+    /** Whether this replica sends recordless renews, cancels, and completes when it may (PD-L-01, PD-L-03). */
+    private final boolean recordless;
     /** A payload cap for a space without the content swarm (LB-E-06); 0 leaves the block cap alone. */
     private final long maxPayload;
     /** The group's content keys by epoch (SPEC §11a.3); null for an unencrypted space. */
@@ -150,8 +167,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** Bounds {@link #refusedAck}. */
     private static final int REFUSED_ACK_CAP = 8192;
 
-    /** Bounds {@link #rejectedClaims}. */
-    private static final int REJECTED_CLAIMS_CAP = 4096;
+    /** Bounds {@link #rejectedOffers}. */
+    private static final int REJECTED_OFFERS_CAP = 4096;
 
     /**
      * Ceiling on the lease duration that feeds the tombstone GC horizon (spec
@@ -222,6 +239,33 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final List<Sub> subscriptions = new CopyOnWriteArrayList<>();
     private final AtomicLong dotCounter = new AtomicLong();
 
+    // ---- the record-free renew (srad/agentspaces-pdt.md §3.9, group L)
+    /** At most this many recordless states wait here for their record (PD-L-02). */
+    static final int MAX_PENDING_STATES = 1_024;
+    /** A pending recordless state is dropped after this long without its record (PD-L-02). */
+    static final long PENDING_STATE_TTL_MILLIS = 10 * 60 * 1000L;
+    /**
+     * Entries whose record this replica has evidence a remote replica holds: a remote
+     * digest line naming the entry, a remote state or claim for it, a record that came
+     * from a remote in the first place, or a quiet anti-entropy round after this
+     * replica's own write (PD-L-01). Under {@link #lock}.
+     */
+    private final Set<EntryId> replicated = new HashSet<>();
+    /** This replica's own writes and when they happened, until evidence arrives. Under {@link #lock}. */
+    private final Map<EntryId, Long> ownWrites = new HashMap<>();
+    /** A recordless state waiting for its record, and when it arrived. */
+    private record PendingState(SpaceWire.EntryStateDto dto, long sinceMillis) {
+    }
+    /** Recordless states whose record this replica lacks, by entry; bounded, insertion order. Under {@link #lock}. */
+    private final Map<EntryId, PendingState> pendingStates = new java.util.LinkedHashMap<>();
+    private final AtomicLong recordlessSent = new AtomicLong();
+    private final AtomicLong recordlessMerged = new AtomicLong();
+    private final AtomicLong recordlessHeld = new AtomicLong();
+    /** Distinct states and claims refused for a logical counter above LOGICAL_LIMIT. */
+    private final AtomicLong stampsLogicalRefused = new AtomicLong();
+    /** Space deltas, by rumor or by anti-entropy, that did not decode (HLC canonical stamps, 2026-11-08). */
+    private final AtomicLong deltasUndecodable = new AtomicLong();
+
     // ---- tombstone GC and lease-lapse events (spec §7.2, §7.3)
     /** Builder override for the GC horizon, or null to use the observed maximum. */
     private final Duration maxLeaseOverride;
@@ -234,13 +278,14 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** Claim epoch per entry whose TAKEN event already fired here: a won local take, or a merged remote claim
      *  (a replica that only watches a lane hears of its takes this way). Under {@link #lock}. */
     private final Map<EntryId, Long> takenEpochs = new HashMap<>();
-    /** Hashes of remote claims already rejected here, so a lagging honest replica
-     * re-offering the same contested claim is not struck once per round. */
-    private final Set<String> rejectedClaims = java.util.Collections.newSetFromMap(
+    /** Hashes of remote claims, and of states refused for their stamps, already rejected
+     * here, so a lagging honest replica re-offering the same contested claim or state is
+     * not struck once per round. Under {@link #lock}. */
+    private final Set<String> rejectedOffers = java.util.Collections.newSetFromMap(
             new java.util.LinkedHashMap<>(16, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
-                    return size() > REJECTED_CLAIMS_CAP;
+                    return size() > REJECTED_OFFERS_CAP;
                 }
             });
 
@@ -254,9 +299,14 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * callback. Driven from the group tick, so a {@code TestClock} governs it.
      */
     private final Map<String, BlockRetry> blockRetries = new ConcurrentHashMap<>();
+    /** Bulk fetches (a tree or a flat artifact) the seam gave up on, awaiting their next attempt (PD-Q-AVL-01). */
+    private final Map<String, BlockRetry> bulkRetries = new ConcurrentHashMap<>();
+    /** The arrival callback of a read's poll: nothing to run, so it never joins a fetch in flight. */
+    private static final Runnable NO_ARRIVAL = () -> { };
 
     /** Deregisters the block-retry tick work on close. */
     private final AutoCloseable blockRetryTick;
+    private final AutoCloseable bulkRetryTick;
 
     private record BlockRetry(EntryRecord record, int attempts, long nextAtMillis, Runnable onArrival) {
     }
@@ -305,6 +355,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         this.blocks = builder.blocks;
         this.bulk = builder.bulk;
         this.escalateAbove = builder.bulk == null ? 0 : builder.escalateAbove;
+        this.sealBeforeEscalate = builder.sealBeforeEscalate;
+        this.bulkFallback = builder.bulkFallback;
+        this.bulkRequired = builder.bulkRequired;
+        this.recordless = builder.recordless;
         this.maxPayload = builder.maxPayload;
         this.keyRing = builder.keyRing;
         this.tagShard = builder.tagShard;
@@ -323,6 +377,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         this.id = SpaceId.local(runtime.id().value() + "/" + builder.name);
         this.streamId = "space:" + builder.name;
         this.blockRetryTick = blocks == null ? () -> { } : runtime.onTick(this::retryBlockFetches);
+        this.bulkRetryTick = bulk == null ? () -> { } : runtime.onTick(this::retryBulkFetches);
         for (Class<?> hint : builder.schemaHints) {
             registerSchema(hint);
         }
@@ -347,6 +402,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             @Override
             public void applyDelta(byte[] delta) {
                 ReplicatedSpace.this.applySyncDelta(delta);
+            }
+
+            @Override
+            public void matched(PeerId from) {
+                ReplicatedSpace.this.digestMatched(from);
             }
         });
         // Spec §7.5: a member creates a space by publishing its advertisement.
@@ -383,6 +443,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         private ai.badmonkey.agentspaces.peering.blocks.BlockExchange blocks;
         private ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk;
         private long escalateAbove = DEFAULT_ESCALATE_ABOVE;
+        private boolean sealBeforeEscalate = true;
+        private ai.badmonkey.agentspaces.api.spi.BulkPayloads bulkFallback;
+        private boolean bulkRequired;
+        private boolean recordless = true;
         private long maxPayload;
         private ai.badmonkey.agentspaces.common.crypto.GroupKeyRing keyRing;
         private java.util.function.Predicate<Map<String, String>> tagShard;
@@ -515,6 +579,66 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         public Builder bulk(ai.badmonkey.agentspaces.api.spi.BulkPayloads bulk, long escalateAbove) {
             this.bulk = Objects.requireNonNull(bulk, "bulk");
             this.escalateAbove = escalateAbove;
+            return this;
+        }
+
+        /**
+         * Whether a payload is sealed under the group key before it goes to the bulk seam
+         * (srad/agentspaces-pdt.md PD-E-04). True by default, today's rule for the flat
+         * content swarm, which carries opaque bytes. A space over the persistent trees
+         * sets it false: the seam spills the plaintext CBOR into a tree so that unchanged
+         * sub-trees are shared between versions, the nodes travel sealed per message in
+         * {@code group-key} mode, the record still names the write epoch in
+         * {@code keyEpoch}, and the record signature over {@code payloadRef} binds the
+         * tree. A reader tells the two forms apart by the seam that accepts the reference.
+         *
+         * @param seal whether to seal before escalating
+         * @return this builder
+         */
+        public Builder sealBeforeEscalate(boolean seal) {
+            this.sealBeforeEscalate = seal;
+            return this;
+        }
+
+        /**
+         * The seam a write takes when the primary seam of {@link #bulk} cannot reach every
+         * current member (PD-E-06: {@code BulkPayloads.unable} names one); without it the
+         * write takes the block path, or inline, as a space without a seam does. A payload
+         * through the fallback is sealed as today, whatever {@link #sealBeforeEscalate} says.
+         *
+         * @param fallback the secondary seam (the flat {@code SpacePayloads})
+         * @return this builder
+         */
+        public Builder bulkFallback(ai.badmonkey.agentspaces.api.spi.BulkPayloads fallback) {
+            this.bulkFallback = Objects.requireNonNull(fallback, "fallback");
+            return this;
+        }
+
+        /**
+         * Whether a write the primary seam cannot carry is refused with a message naming
+         * the members that lack it, instead of falling back (PD-E-06,
+         * {@code agentspaces.pdt.spaces.<name>.require}).
+         *
+         * @param required whether to refuse
+         * @return this builder
+         */
+        public Builder bulkRequired(boolean required) {
+            this.bulkRequired = required;
+            return this;
+        }
+
+        /**
+         * Whether this replica omits the record from a renew, cancel, or complete once it
+         * has evidence the record replicated and every member of its view advertises the
+         * {@code wire.recordless} hint (srad/agentspaces-pdt.md §3.9, PD-L-01, PD-L-03).
+         * On by default; off, every state carries its record as in 0.5.0. A receiver
+         * accepts the recordless form either way.
+         *
+         * @param enabled whether to send recordless states
+         * @return this builder
+         */
+        public Builder recordless(boolean enabled) {
+            this.recordless = enabled;
             return this;
         }
 
@@ -1162,26 +1286,60 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         LeaseInfo writeLease = new LeaseInfo(actor.id(), expiresAt, LeaseKind.WRITE);
         byte[] payload = codec.toBytes(entry);
         Long keyEpoch = null;
-        if (keyRing != null) {
-            // SPEC §11a.3 v0.1.13: seal under the newest epoch in effect; the
-            // record names the epoch (absent for 0) and the AAD binds it.
-            long epoch = keyRing.writeEpoch(clock.instant());
-            payload = keyRing.sealingKey(epoch).orElseThrow(() -> new IllegalStateException(
-                    "content key epoch " + epoch + " is not held")).encrypt(payload, aadFor(entryId, epoch));
-            keyEpoch = epoch == 0 ? null : epoch;
+        long epoch = keyRing == null ? 0 : keyRing.writeEpoch(clock.instant());
+        // PD-E-06: the seam a payload above the threshold takes; the primary when every
+        // member can receive it, else the fallback, else the block path as today.
+        ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = null;
+        if (bulk != null && escalateAbove > 0 && payload.length > escalateAbove) {
+            seam = escalationSeam();
         }
         String payloadRef = null;
-        if (bulk == null && maxPayload > 0 && payload.length > maxPayload) {
-            throw new IllegalArgumentException("payload of " + payload.length + " bytes exceeds " + maxPayload
-                    + " bytes and this space has no content swarm to carry it; turn on agentspaces.content.enabled"
-                    + " (escalate-above) or write it through Content.publish");
+        if (seam == bulk && seam != null && !sealBeforeEscalate) {
+            // PD-E-04: a PDT space hands the seam the plaintext CBOR so unchanged sub-trees
+            // are shared between versions; the nodes travel sealed per message (group-key
+            // mode), the record names the write epoch, and its signature over payloadRef
+            // binds the tree. The writer must still hold the epoch's key, as for a sealed write.
+            if (keyRing != null) {
+                keyRing.sealingKey(epoch).orElseThrow(() -> new IllegalStateException(
+                        "content key epoch " + epoch + " is not held"));
+            }
+            try {
+                payloadRef = seam.publish(payload, lease);
+                payload = null;
+                keyEpoch = keyRing == null || epoch == 0 ? null : epoch;
+            } catch (IllegalArgumentException unspillable) {
+                // PD-E-02, PD-N-04: a value the spill rules cannot break up (a text string
+                // above the 1 MiB node bound) takes the sealed fallback or the block path,
+                // as a space without the trees carries it; the entry is still written.
+                seam = bulkFallback;
+                if (bulkRequired) {
+                    throw new IllegalArgumentException("space '" + name + "' requires the tree exchange for payloads"
+                            + " above " + escalateAbove + " bytes and this payload cannot become a tree: "
+                            + unspillable.getMessage(), unspillable);
+                }
+            }
         }
-        if (bulk != null && escalateAbove > 0 && payload.length > escalateAbove) {
-            // LB-E-02: above the threshold the payload becomes an artifact of the content
-            // swarm and the record carries its root; the space replicates the reference only.
-            payloadRef = bulk.publish(payload, lease);
-            payload = null;
-        } else if (payload.length > EntryRecord.INLINE_PAYLOAD_LIMIT) {
+        if (payloadRef == null) {
+            if (keyRing != null) {
+                // SPEC §11a.3 v0.1.13: seal under the newest epoch in effect; the
+                // record names the epoch (absent for 0) and the AAD binds it.
+                payload = keyRing.sealingKey(epoch).orElseThrow(() -> new IllegalStateException(
+                        "content key epoch " + epoch + " is not held")).encrypt(payload, aadFor(entryId, epoch));
+                keyEpoch = epoch == 0 ? null : epoch;
+            }
+            if (bulk == null && maxPayload > 0 && payload.length > maxPayload) {
+                throw new IllegalArgumentException("payload of " + payload.length + " bytes exceeds " + maxPayload
+                        + " bytes and this space has no content swarm to carry it; turn on agentspaces.content.enabled"
+                        + " (escalate-above) or write it through Content.publish");
+            }
+            if (seam != null) {
+                // LB-E-02: above the threshold the payload becomes an artifact of the content
+                // swarm and the record carries its root; the space replicates the reference only.
+                payloadRef = seam.publish(payload, lease);
+                payload = null;
+            }
+        }
+        if (payload != null && payload.length > EntryRecord.INLINE_PAYLOAD_LIMIT) {
             if (blocks == null) {
                 throw new IllegalStateException("payload of " + payload.length
                         + " bytes exceeds the inline limit; configure builder.blocks(...)");
@@ -1222,6 +1380,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
              * always signs with its own key.
              */
             dto = signedDto(prepared.entryId(), identity.rawPublicKey(), prepared.actor());
+            ownWrites.put(prepared.entryId(), nowMillis());
         }
         publishDelta(new SpaceWire.Delta(dto, null, null), "w:" + prepared.entryId());
         fire(SpaceEvent.Kind.WRITTEN, prepared.entryId(), prepared.value(), prepared.actor().id(),
@@ -1453,6 +1612,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             streamRegistration.close();
             reconcileRegistration.close();
             blockRetryTick.close();
+            bulkRetryTick.close();
         } catch (Exception e) {
             throw new IllegalStateException("failed deregistering space '" + name + "'", e);
         }
@@ -1488,8 +1648,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * @param signature the holder's signature over the claim's canonical bytes
      * @throws IllegalArgumentException when the key does not belong to the
      *                                  claim's holder or the signature does not
-     *                                  verify — the caller has proof that does
-     *                                  not prove what it claims
+     *                                  verify, since the caller's proof does not
+     *                                  prove what it claims, or when the claim's
+     *                                  stamp carries a logical counter above
+     *                                  {@link HybridLogicalClock#LOGICAL_LIMIT}
      */
     public void applyAuthorizedClaim(EntryId entryId, TakeClaim claim,
                                      byte[] holderKey, byte[] signature) {
@@ -1520,6 +1682,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (refusal != null) {
             throw new IllegalArgumentException(refusal);
         }
+        refuseLogClaimStamp(entryId, claim, claim.holder().peer());
         synchronized (lock) {
             claims.merge(entryId, attested, SpaceWire.SignedClaim::merge);
             generation++;
@@ -1544,7 +1707,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return false;
         }
         return claimRefusal(entryId, new SpaceWire.SignedClaim(claim, holderKey, signature,
-                certificate)) == null;
+                certificate)) == null && HybridLogicalClock.isAcceptable(claim.stamp());
     }
 
     /** The reason a log-committed claim is refused, or null when it is accepted. */
@@ -1581,10 +1744,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      *
      * @param entryId the entry
      * @param claim   the ordered claim
+     * @throws IllegalArgumentException when the claim's stamp carries a logical counter
+     *                                  above {@link HybridLogicalClock#LOGICAL_LIMIT}
      */
     public void applyAuthorizedClaim(EntryId entryId, TakeClaim claim) {
         Objects.requireNonNull(entryId, "entryId");
         Objects.requireNonNull(claim, "claim");
+        refuseLogClaimStamp(entryId, claim, null);
         synchronized (lock) {
             claims.merge(entryId, sign(claim, writer), SpaceWire.SignedClaim::merge);
             generation++;
@@ -1660,6 +1826,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
         }
         return Optional.empty();
+    }
+
+    /** How many decoded values this replica holds; live entries at most (package-private, for the leak tests). */
+    int cachedValues() {
+        return valueCache.size();
     }
 
     /** Returns how many entries this replica knows about, tombstones included. */
@@ -1799,7 +1970,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             proof = claims.get(t.entryId());
             valueCache.remove(t.entryId()); // #11: stop pinning the completed value
         }
-        publishDelta(new SpaceWire.Delta(dto, t.entryId(), proof), "d:" + t.entryId());
+        publishDelta(new SpaceWire.Delta(wireForm(t.entryId(), dto), t.entryId(), proof), "d:" + t.entryId());
         fire(SpaceEvent.Kind.COMPLETED, t.entryId(),
                 completedValue == null ? t.entry() : completedValue,
                 dto.record().issuer(), actor.id(), dto.record());
@@ -1813,9 +1984,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         try {
             delta = codec.fromBytes(payload, SpaceWire.Delta.class);
         } catch (RuntimeException e) {
+            deltasUndecodable.incrementAndGet(); // HLC canonical stamps, 2026-11-08
             return;
         }
         if (delta == null) {
+            deltasUndecodable.incrementAndGet();
             return;
         }
         // Merge the claim first: a completion state authenticates against the
@@ -1823,9 +1996,116 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (delta.claim() != null && delta.claimEntry() != null
                 && verifyClaim(delta.claimEntry(), delta.claim())) {
             mergeClaim(delta.claimEntry(), delta.claim());
+            noteReplicated(delta.claimEntry()); // a remote took the entry, so it holds the record (PD-L-01)
         }
         if (delta.state() != null) {
             mergeState(delta.state());
+        }
+    }
+
+    /**
+     * Records evidence that a remote replica holds an entry's record (PD-L-01), after
+     * which this replica's renews, cancels, and completes of it may omit the record.
+     */
+    private void noteReplicated(EntryId entryId) {
+        synchronized (lock) {
+            if (crdt.state(entryId).isPresent()) {
+                replicated.add(entryId);
+                ownWrites.remove(entryId);
+            }
+        }
+    }
+
+    /**
+     * The form a renew, cancel, or complete takes on the wire (srad/agentspaces-pdt.md
+     * §3.9, PD-L-01, PD-L-03): without the record when this replica has evidence the
+     * record replicated and every member of its view advertises {@code wire.recordless};
+     * else the full DTO, as 0.5.0 sends it. The signed state kept for anti-entropy is
+     * always the full form.
+     */
+    private SpaceWire.EntryStateDto wireForm(EntryId entryId, SpaceWire.EntryStateDto dto) {
+        if (!recordless || dto.record() == null) {
+            return dto;
+        }
+        if (!replicatedEvidence(entryId) || !runtime.viewAdvertisesRecordless()) {
+            return dto;
+        }
+        recordlessSent.incrementAndGet();
+        return dto.withoutRecord();
+    }
+
+    /**
+     * Whether this replica has evidence that a remote replica holds the entry's record
+     * (PD-L-01): a remote state, claim, or digest line for it, or a hashed anti-entropy
+     * round (SPEC §5.3, v0.1.17) a partner opened whose hash for this space's stream equaled
+     * this replica's while the entry was in its digest ({@link #digestMatched}): the partner
+     * then holds exactly what this replica holds, the write included. Bus idleness is no
+     * evidence (a lone or partitioned writer is idle too), so a write on a quiet fleet
+     * travels in full until a partner's hash matches.
+     */
+    boolean replicatedEvidence(EntryId entryId) { // package-private for tests
+        synchronized (lock) {
+            return replicated.contains(entryId);
+        }
+    }
+
+    /**
+     * A partner's hashed digest matched this replica's for the space's stream (PD-L-01):
+     * every own write in the digest at that moment is held by the partner, so each of
+     * them has the evidence a recordless renew, cancel, or complete needs.
+     */
+    private void digestMatched(PeerId from) {
+        synchronized (lock) {
+            if (ownWrites.isEmpty()) {
+                return;
+            }
+            for (EntryId entryId : new ArrayList<>(ownWrites.keySet())) {
+                if (crdt.state(entryId).isPresent()) {
+                    replicated.add(entryId);
+                }
+                ownWrites.remove(entryId);
+            }
+        }
+    }
+
+    /** Recordless states this replica published (PD-L-01); for tests and the console. */
+    public long recordlessSent() {
+        return recordlessSent.get();
+    }
+
+    /** Recordless states this replica merged over a held record (PD-L-02). */
+    public long recordlessMerged() {
+        return recordlessMerged.get();
+    }
+
+    /** Recordless states this replica held pending for their record (PD-L-02). */
+    public long recordlessHeld() {
+        return recordlessHeld.get();
+    }
+
+    /**
+     * Distinct folded states, gossip claims, and ordered-log claims this replica refused
+     * because a stamp carried a logical counter above {@link HybridLogicalClock#LOGICAL_LIMIT}
+     * (HLC logical counter, 2026-11-08, Rust team report). A re-offer of the same state or
+     * claim counts once; a state or claim whose signature does not verify never counts.
+     */
+    public long stampsLogicalRefused() {
+        return stampsLogicalRefused.get();
+    }
+
+    /**
+     * Space deltas this replica dropped because they did not decode, by rumor or by anti-entropy
+     * (HLC canonical stamps, 2026-11-08): bytes that are no delta, or a delta holding a stamp that
+     * is not canonical text. Such a delta names no verified signer, so it strikes nobody.
+     */
+    public long deltasUndecodable() {
+        return deltasUndecodable.get();
+    }
+
+    /** Recordless states waiting here for their record now. */
+    public int pendingRecordless() {
+        synchronized (lock) {
+            return pendingStates.size();
         }
     }
 
@@ -1834,11 +2114,32 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * dots would otherwise be stored and re-sorted forever. */
     static final int MAX_DOTS_PER_STATE = 1_024;
 
-    private void mergeState(SpaceWire.EntryStateDto dto) {
-        if ((dto.adds() != null && dto.adds().size() > MAX_DOTS_PER_STATE)
-                || (dto.removes() != null && dto.removes().size() > MAX_DOTS_PER_STATE)) {
+    private void mergeState(SpaceWire.EntryStateDto received) {
+        if ((received.adds() != null && received.adds().size() > MAX_DOTS_PER_STATE)
+                || (received.removes() != null && received.removes().size() > MAX_DOTS_PER_STATE)) {
             return; // inflated dot set: hostile, drop before verification cost
         }
+        boolean hadRecord = received.record() != null;
+        SpaceWire.EntryStateDto dto = received;
+        if (!hadRecord) {
+            // PD-L-02: a recordless state is merged over the record this replica holds, or
+            // waits for the record; it never creates an entry and never fires an event alone.
+            EntryId named = dto.entryIdOf();
+            if (named == null || dto.issuerPublicKey() == null || dto.adds() == null || dto.removes() == null) {
+                return;
+            }
+            EntryRecord held;
+            synchronized (lock) {
+                held = crdt.state(named).map(EntryState::record).orElse(null);
+                if (held == null) {
+                    keepPending(named, dto);
+                    return;
+                }
+            }
+            dto = received.withRecord(held);
+            recordlessMerged.incrementAndGet();
+        }
+        final SpaceWire.EntryStateDto full = dto;
         if (dto.record() == null || dto.issuerPublicKey() == null
                 || !id.equals(dto.record().spaceId()) // a record from another space is not ours (QA4 A4-11)
                 || !dotsBoundToIssuer(dto)
@@ -1849,6 +2150,15 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // Drop any state whose mutable fields are not authenticated by the
             // party authorized for the transition: this is what makes a forged
             // completion, removal, or lease unable to delete a signed entry.
+            return;
+        }
+        if (!stampsAcceptable(dto)) {
+            // HLC logical counter, 2026-11-08 (Rust team report): a record or lease
+            // stamp whose logical counter is above LOGICAL_LIMIT froze this space's
+            // clock below, and the state then carried the stamp on to every replica
+            // through gossip and anti-entropy. The space judges it after
+            // verification, so the refusal names the state's signer.
+            refuseStateStamps(dto);
             return;
         }
         // After verifyState: the revocation judgement reads the state's signing
@@ -1899,6 +2209,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             recordSignedState(entryId, dto);
             indexCredential(entryId);
+            // PD-L-01: the sender holds the record, whether it sent it or merged over its own copy.
+            replicated.add(entryId);
+            ownWrites.remove(entryId);
             isNew = !wasKnown;
             if (isNew && blocks != null && dto.record().payloadRef() != null && !isBulkRef(dto.record())) {
                 blocks.retain(dto.record().payloadRef()); // LB-B-04
@@ -1917,7 +2230,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             } else if (dto.record().payload() == null && isBulkRef(dto.record())) {
                 // LB-E-03: a bulk entry fires its WRITTEN once the artifact is complete here.
                 EntryRecord record = dto.record();
-                if (bulk != null) {
+                if (seamFor(record.payloadRef()) != null) {
                     ensureBulk(record, () -> decodeValue(record).ifPresent(v ->
                             fire(SpaceEvent.Kind.WRITTEN, entryId, v, record.issuer(),
                                     record.issuer(), record)));
@@ -1940,10 +2253,40 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 SpaceWire.SignedClaim claim = claims.get(entryId);
                 completer = claim == null ? dto.record().issuer() : claim.claim().holder();
             }
-            decodeValue(dto.record()).ifPresent(value ->
-                    fire(SpaceEvent.Kind.COMPLETED, entryId, value, dto.record().issuer(), completer,
-                            dto.record()));
+            decodeValue(full.record()).ifPresent(value ->
+                    fire(SpaceEvent.Kind.COMPLETED, entryId, value, full.record().issuer(), completer,
+                            full.record()));
             valueCache.remove(entryId); // #11: stop pinning a completed entry's decoded value
+        }
+        if (hadRecord) {
+            applyPending(entryId);
+        }
+    }
+
+    /** Keeps a recordless state for an entry this replica lacks, bounded (PD-L-02). Under {@link #lock}. */
+    private void keepPending(EntryId entryId, SpaceWire.EntryStateDto dto) {
+        if (!pendingStates.containsKey(entryId) && pendingStates.size() >= MAX_PENDING_STATES) {
+            EntryId eldest = pendingStates.keySet().iterator().next();
+            pendingStates.remove(eldest);
+        }
+        pendingStates.put(entryId, new PendingState(dto, nowMillis()));
+        recordlessHeld.incrementAndGet();
+    }
+
+    /** Merges the recordless state that waited for an entry's record, once the record is here (PD-L-02). */
+    private void applyPending(EntryId entryId) {
+        PendingState pending;
+        EntryRecord held;
+        synchronized (lock) {
+            pending = pendingStates.remove(entryId);
+            if (pending == null) {
+                return;
+            }
+            held = crdt.state(entryId).map(EntryState::record).orElse(null);
+        }
+        if (held != null) {
+            recordlessMerged.incrementAndGet();
+            mergeState(pending.dto().withRecord(held));
         }
     }
 
@@ -2080,6 +2423,83 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      */
     static final long MAX_CLAIM_PREDATES_ISSUE_MILLIS = HybridLogicalClock.MAX_DRIFT_MILLIS;
 
+    /**
+     * Whether every stamp a verified state carries is acceptable (HLC logical counter,
+     * 2026-11-08, Rust team report): the record's issue stamp and the lease stamp, which the
+     * state would feed this space's clock, and an agent-signed state's {@code signedAt}, which
+     * dates its certificate. HLC canonical stamps, 2026-11-08: the Python and Ruby replicas
+     * refused a {@code signedAt} above the limit while this one merged it, so it is judged too.
+     */
+    private static boolean stampsAcceptable(SpaceWire.EntryStateDto dto) {
+        return HybridLogicalClock.isAcceptable(dto.record().issued())
+                && (dto.leaseStamp() == null || HybridLogicalClock.isAcceptable(dto.leaseStamp()))
+                && (dto.signedAt() == null || HybridLogicalClock.isAcceptable(dto.signedAt()));
+    }
+
+    /**
+     * Counts a verified state refused for its stamps and strikes its signer, once per
+     * distinct state (HLC logical counter, 2026-11-08, Rust team report). The record's
+     * issuer signed the issue stamp; the party authorized for the transition signed the
+     * lease stamp and {@code signedAt}, the claim holder for a completion and the issuer
+     * otherwise. HLC canonical stamps, 2026-11-08: the refusal is acknowledged in the digest,
+     * as ASF-047 acknowledges a revoked actor's state, so partners stop re-offering it; only a
+     * state whose signatures verified reaches here.
+     */
+    private void refuseStateStamps(SpaceWire.EntryStateDto dto) {
+        EntryRecord record = dto.record();
+        PeerId signer = record.issuer().peer();
+        boolean first;
+        synchronized (lock) {
+            if (HybridLogicalClock.isAcceptable(record.issued()) && dto.completed()) {
+                // verifyState found the holder's claim; null only if collected since.
+                SpaceWire.SignedClaim claim = claims.get(record.entryId());
+                signer = claim == null ? null : claim.claim().holder().peer();
+            }
+            String hash = stateHash(dto.toState());
+            first = rejectedOffers.add("state:" + record.entryId().value() + "="
+                    + record.issued().encoded() + "/" + hash);
+            if (refusedAck.put("e:" + record.entryId().value() + "=" + hash, Boolean.TRUE) == null) {
+                generation++;
+            }
+        }
+        if (first) {
+            stampsLogicalRefused.incrementAndGet();
+            if (signer != null) {
+                runtime.reportMisbehavior(signer, LOGICAL_VIOLATION + " in a state for entry "
+                        + record.entryId());
+            }
+        }
+    }
+
+    /** The violation every stamp refusal reports (HLC logical counter, 2026-11-08, Rust team report). */
+    private static final String LOGICAL_VIOLATION = "logical counter above " + HybridLogicalClock.LOGICAL_LIMIT;
+
+    /**
+     * Refuses an ordered-log claim whose stamp may not merge, before the lattice (HLC
+     * logical counter, 2026-11-08, Rust team report). The space counts it once per
+     * distinct claim and strikes its holder when the holder's verified signature attests it.
+     *
+     * @param holder the holder whose signature verified, or null for a claim this node signs
+     * @throws IllegalArgumentException when the stamp's logical counter is above the limit
+     */
+    private void refuseLogClaimStamp(EntryId entryId, TakeClaim claim, PeerId holder) {
+        if (HybridLogicalClock.isAcceptable(claim.stamp())) {
+            return;
+        }
+        boolean first;
+        synchronized (lock) {
+            first = rejectedOffers.add(claimHash(claim) + "@" + entryId.value());
+        }
+        if (first) {
+            stampsLogicalRefused.incrementAndGet();
+            if (holder != null) {
+                runtime.reportMisbehavior(holder, LOGICAL_VIOLATION + " for entry " + entryId);
+            }
+        }
+        throw new IllegalArgumentException("claim on " + entryId.value() + " carries a "
+                + LOGICAL_VIOLATION + ": " + claim.stamp());
+    }
+
     private void mergeClaim(EntryId entryId, SpaceWire.SignedClaim claim) {
         if (runtime.revocationView().refuses(claim.claim().holder(), claimKey(claim), null)) {
             // ASF-047: a revoked peer takes nothing, however its claim arrives.
@@ -2116,6 +2536,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     .map(state -> state.record().issued()).orElse(null);
             if (!admitted) {
                 violation = "claim by unadmitted agent"; // spec §7.5, ALLOWLIST strikes
+            } else if (!HybridLogicalClock.isAcceptable(offered.stamp())) {
+                // HLC logical counter, 2026-11-08 (Rust team report): merged, this
+                // stamp froze the space clock below and the claim carried it on to
+                // every replica. The holder signed it, so it is reported like the rest.
+                violation = LOGICAL_VIOLATION;
             } else if (offered.epoch() > observed + MAX_CLAIM_EPOCH_JUMP) {
                 violation = "claim epoch jump";
             } else if (offered.expiresAtMillis() > now + MAX_CLAIM_HOLD_MILLIS) {
@@ -2158,7 +2583,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     takenHolder = merged.holder();
                 }
             } else {
-                firstRejection = rejectedClaims.add(claimHash(offered) + "@" + entryId.value());
+                firstRejection = rejectedOffers.add(claimHash(offered) + "@" + entryId.value());
             }
         }
         if (takenRecord != null) {
@@ -2168,6 +2593,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     holder, record));
         }
         if (violation != null && firstRejection) {
+            if (LOGICAL_VIOLATION.equals(violation)) {
+                stampsLogicalRefused.incrementAndGet();
+            }
             // The hostile claim carries its author's own verified signature
             // (verifyClaim ran first), so this is witnessed, attributable
             // misbehavior — report it toward local quarantine (WS5). Once per
@@ -2373,6 +2801,20 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         List<SpaceWire.EntryStateDto> states = new ArrayList<>();
         Map<String, SpaceWire.SignedClaim> missingClaims = new HashMap<>();
         synchronized (lock) {
+            for (String line : remote) {
+                // PD-L-01: a remote line naming an entry this replica holds is evidence the
+                // remote holds its record, whatever state hash it names.
+                if (line.startsWith("e:")) {
+                    int eq = line.indexOf('=');
+                    if (eq > 2) {
+                        EntryId listed = EntryId.of(line.substring(2, eq));
+                        if (crdt.state(listed).isPresent()) {
+                            replicated.add(listed);
+                            ownWrites.remove(listed);
+                        }
+                    }
+                }
+            }
             for (EntryRecord record : allRecords()) {
                 EntryState state = crdt.state(record.entryId()).orElseThrow();
                 String key = "e:" + record.entryId().value() + "=" + stateHash(state);
@@ -2407,9 +2849,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         try {
             sync = codec.fromBytes(delta, SpaceWire.SyncDelta.class);
         } catch (RuntimeException e) {
+            deltasUndecodable.incrementAndGet(); // HLC canonical stamps, 2026-11-08
             return;
         }
         if (sync == null) {
+            deltasUndecodable.incrementAndGet();
             return;
         }
         // Claims before states: a completed state authenticates against the
@@ -2432,9 +2876,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private List<EntryRecord> allRecords() {
         List<EntryRecord> records = new ArrayList<>(crdt.liveRecords());
         // liveRecords omits completed entries; digests must include tombstones so
-        // completion propagates. Walk known ids through claims and value cache:
+        // completion propagates. Walk known ids through claims and value cache.
+        // The live ids are a set: a scan of the live list per known id was the
+        // product of the two counts on every digest and delta under the lock,
+        // and the known ids grow with every lapsed entry until the GC horizon
+        // (a space updated every second cost a core after ten minutes, 2026-11-07).
+        Set<EntryId> live = new HashSet<>(records.size() * 2);
+        for (EntryRecord r : records) {
+            live.add(r.entryId());
+        }
         for (EntryId known : knownIds()) {
-            if (records.stream().noneMatch(r -> r.entryId().equals(known))) {
+            if (!live.contains(known)) {
                 crdt.state(known).map(EntryState::record).ifPresent(records::add);
             }
         }
@@ -2524,9 +2976,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (payload == null && isBulkRef(record)) {
                 // LB-E-03: a bulk reference is served when the artifact is complete here and
                 // acquired in the background otherwise, with the same never-block rule.
-                payload = bulk == null ? null : bulk.local(record.payloadRef()).orElse(null);
-                if (payload == null && bulk != null) {
-                    ensureBulk(record, () -> { });
+                ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(record.payloadRef());
+                payload = seam == null ? null : seam.local(record.payloadRef()).orElse(null);
+                if (payload == null && seam != null) {
+                    ensureBulk(record, NO_ARRIVAL);
                 }
             } else if (payload == null && record.payloadRef() != null && blocks != null) {
                 // Spec §7.2 / P7: reads never block on the network. Serve the
@@ -2542,7 +2995,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (payload == null) {
                 return Optional.empty(); // block not fetched yet; invisible for now
             }
-            if (keyRing != null) {
+            if (keyRing != null && payloadSealed(record)) {
                 payload = open(record, payload);
                 if (payload == null) {
                     return Optional.empty(); // sealed under a key this replica lacks
@@ -2568,13 +3021,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     private Optional<Object> decodeValue(EntryRecord record) {
+        return decodeValue(record, true);
+    }
+
+    /** Decodes an entry's value, keeping it in the value cache when {@code cache} is set (a lapsed entry's is not). */
+    private Optional<Object> decodeValue(EntryRecord record, boolean cache) {
         Object cached = valueCache.get(record.entryId());
         if (cached != null) {
             return Optional.of(cached);
         }
         byte[] payload = record.payload();
         if (payload == null && isBulkRef(record)) {
-            payload = bulk == null ? null : bulk.local(record.payloadRef()).orElse(null);
+            ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(record.payloadRef());
+            payload = seam == null ? null : seam.local(record.payloadRef()).orElse(null);
         } else if (payload == null && record.payloadRef() != null && blocks != null) {
             // A block-stored entry: fire its event once the block is available
             // locally. Consulting the local store only (no network) keeps this
@@ -2586,7 +3045,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (payload == null) {
             return Optional.empty();
         }
-        if (keyRing != null) {
+        if (keyRing != null && payloadSealed(record)) {
             payload = open(record, payload);
             if (payload == null) {
                 return Optional.empty();
@@ -2603,7 +3062,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (value == null) {
                 return Optional.empty(); // foreign bytes decoding as CBOR null (see decodeIfMatches)
             }
-            valueCache.put(record.entryId(), value);
+            if (cache) {
+                valueCache.put(record.entryId(), value);
+            }
             return Optional.of(value);
         });
     }
@@ -2618,20 +3079,133 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return ai.badmonkey.agentspaces.api.spi.BulkPayloads.isBulk(record.payloadRef());
     }
 
-    /** Starts acquiring a bulk artifact once; the arrival callback runs when it is complete here. */
+    /**
+     * The seam that carries a bulk reference (PD-E-01): the primary when it accepts the
+     * reference, else the fallback when it does, else null, so a reference of a form no
+     * seam here carries (a tree root on a replica that holds only the flat seam) waits for
+     * anti-entropy instead of opening a fetch that can never complete. A reader so
+     * reassembles a reference through the seam that published it, and the tree seam and
+     * the flat seam coexist in one space.
+     */
+    public ai.badmonkey.agentspaces.api.spi.BulkPayloads seamFor(String ref) { // public for tests and the console
+        if (bulk != null && bulk.accepts(ref)) {
+            return bulk;
+        }
+        if (bulkFallback != null && bulkFallback.accepts(ref)) {
+            return bulkFallback;
+        }
+        return null;
+    }
+
+    /**
+     * Whether a record's payload was sealed by this space before it left (today's rule,
+     * and the flat seam's): every inline and block payload, and a bulk payload unless the
+     * space escalates unsealed through its primary seam and that seam carries the reference
+     * (PD-E-04). Only called when the space has a key ring.
+     */
+    private boolean payloadSealed(EntryRecord record) {
+        if (sealBeforeEscalate || bulk == null || record.payloadRef() == null || !isBulkRef(record)) {
+            return true;
+        }
+        return !bulk.accepts(record.payloadRef());
+    }
+
+    /**
+     * The seam a write above the threshold takes (PD-E-06): the primary when every current
+     * member can receive its payloads, else the fallback, else null for the block path. A
+     * space that requires the primary refuses the write naming the members that lack it.
+     */
+    private ai.badmonkey.agentspaces.api.spi.BulkPayloads escalationSeam() {
+        List<PeerId> members = new ArrayList<>();
+        for (ai.badmonkey.agentspaces.peering.membership.GroupMembership.Member member
+                : runtime.membership().allMembers()) {
+            members.add(member.id());
+        }
+        List<PeerId> lacking = bulk.unable(members);
+        if (lacking.isEmpty()) {
+            return bulk;
+        }
+        if (bulkRequired) {
+            List<String> names = new ArrayList<>();
+            for (PeerId peer : lacking) {
+                names.add(peer.display());
+            }
+            throw new IllegalStateException("space '" + name + "' requires the tree exchange for payloads above "
+                    + escalateAbove + " bytes (agentspaces.pdt.spaces." + name + ".require) and these members"
+                    + " lack it: " + names);
+        }
+        return bulkFallback;
+    }
+
+    /**
+     * Starts acquiring a bulk artifact once; the arrival callback runs when it is complete
+     * here. A fetch the seam gives up on (every holder unreachable past its deadline) is
+     * retried with the back-off of the block path while the entry lives
+     * (srad/agentspaces-pdt.md PD-Q-AVL-01), as a block is; without the retry an entry
+     * whose first tree fetch failed stayed invisible here for the life of the space.
+     */
     private void ensureBulk(EntryRecord record, Runnable onArrival) {
+        ensureBulk(record, onArrival, 0);
+    }
+
+    private void ensureBulk(EntryRecord record, Runnable onArrival, int attempt) {
         String ref = record.payloadRef();
-        if (!fetching.add(ref)) {
+        ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(ref);
+        if (seam == null) {
+            return;
+        }
+        // One fetch per reference at a time: a read's poll adds nothing to a fetch in flight,
+        // while a callback that must run (the deferred WRITTEN, a retry's) joins it, since the
+        // seam keeps every callback of a reference; otherwise a poll that started the fetch
+        // first would have swallowed the event.
+        if (!fetching.add(ref) && onArrival == NO_ARRIVAL) {
             return;
         }
         try {
-            bulk.ensure(ref, record.issuer().peer(), () -> {
+            seam.ensure(ref, record.issuer().peer(), () -> {
                 fetching.remove(ref);
+                bulkRetries.remove(ref);
                 onArrival.run();
+            }, () -> {
+                fetching.remove(ref);
+                long delay = BLOCK_RETRY_DELAYS_MILLIS[Math.min(attempt, BLOCK_RETRY_DELAYS_MILLIS.length - 1)];
+                bulkRetries.put(ref, new BlockRetry(record, attempt + 1, nowMillis() + delay, onArrival));
             });
         } catch (RuntimeException e) {
             fetching.remove(ref);
         }
+    }
+
+    /**
+     * Tick work (PD-Q-AVL-01): starts the next attempt of every due bulk fetch whose entry
+     * is still present here and whose payload is still missing; forgets the rest.
+     */
+    private void retryBulkFetches() {
+        if (bulkRetries.isEmpty()) {
+            return;
+        }
+        long now = nowMillis();
+        for (Map.Entry<String, BlockRetry> entry : bulkRetries.entrySet()) {
+            BlockRetry retry = entry.getValue();
+            if (retry.nextAtMillis() > now) {
+                continue;
+            }
+            String ref = entry.getKey();
+            ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(ref);
+            if (seam == null || seam.local(ref).isPresent()
+                    || recordOf(retry.record().entryId(), true).isEmpty()) {
+                bulkRetries.remove(ref, retry);
+                continue;
+            }
+            if (bulkRetries.remove(ref, retry)) {
+                ensureBulk(retry.record(), retry.onArrival(), retry.attempts());
+            }
+        }
+    }
+
+    /** Bulk fetches awaiting a retry, by reference; for tests and the console. */
+    public int bulkRetriesPending() {
+        return bulkRetries.size();
     }
 
     private void fetchInBackground(EntryRecord record) {
@@ -2739,11 +3313,22 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private List<Runnable> sweepLocked() {
         List<Runnable> events = new ArrayList<>();
         long now = nowMillis();
+        // PD-L-02: a recordless state whose record never came is dropped after its TTL.
+        pendingStates.values().removeIf(pending -> now - pending.sinceMillis() > PENDING_STATE_TTL_MILLIS);
         for (EntryRecord record : crdt.liveRecords()) {
             EntryId entryId = record.entryId();
             if (record.lease().expiresAtMillis() <= now) {
                 if (expiredFired.add(entryId)) {
-                    deferredEvent(events, SpaceEvent.Kind.EXPIRED, record);
+                    // the decoded value of a lapsed entry is never read again (reads keep to live entries); the EXPIRED
+                    // event carries the cached value out rather than decoding it back in, so a stream of large entries
+                    // stops pinning minutes of values at the lapse, not at collection (2026-11-07)
+                    Object lapsed = valueCache.remove(entryId);
+                    if (lapsed != null) {
+                        events.add(() -> fire(SpaceEvent.Kind.EXPIRED, entryId, lapsed, record.issuer(), record.issuer(), record));
+                    } else {
+                        events.add(() -> decodeValue(record, false).ifPresent(value ->
+                                fire(SpaceEvent.Kind.EXPIRED, entryId, value, record.issuer(), record.issuer(), record)));
+                    }
                 }
                 continue;
             }
@@ -2764,8 +3349,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     crdt.state(entryId).map(EntryState::record).map(EntryRecord::payloadRef)
                             .ifPresent(ref -> {
                                 if (ai.badmonkey.agentspaces.api.spi.BulkPayloads.isBulk(ref)) {
-                                    if (bulk != null) {
-                                        bulk.release(ref); // LB-E-04: a collected entry unpins its artifact
+                                    ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(ref);
+                                    if (seam != null) {
+                                        seam.release(ref); // LB-E-04: a collected entry unpins its artifact
                                     }
                                 } else if (blocks != null) {
                                     blocks.release(ref); // LB-B-04: a collected entry unpins its block
@@ -2788,6 +3374,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 signedStates.remove(entryId);
                 valueCache.remove(entryId);
                 shardDropped.remove(entryId);
+                replicated.remove(entryId);
+                ownWrites.remove(entryId);
+                pendingStates.remove(entryId);
                 generation++;
                 expiredFired.remove(entryId);
                 reappearedEpochs.remove(entryId);
@@ -3190,7 +3779,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 dto = signedDto(entryId,
                         issuerKeys.getOrDefault(entryId, identity.rawPublicKey()), actor);
             }
-            publishDelta(new SpaceWire.Delta(dto, null, null), "r:" + entryId + ":" + nowMillis());
+            publishDelta(new SpaceWire.Delta(wireForm(entryId, dto), null, null), "r:" + entryId + ":" + nowMillis());
         }
 
         @Override
@@ -3207,7 +3796,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 }
             }
             if (dto != null) {
-                publishDelta(new SpaceWire.Delta(dto, null, null), "x:" + entryId);
+                publishDelta(new SpaceWire.Delta(wireForm(entryId, dto), null, null), "x:" + entryId);
             }
         }
     }

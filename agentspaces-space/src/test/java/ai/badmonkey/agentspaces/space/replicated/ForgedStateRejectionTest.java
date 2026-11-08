@@ -463,6 +463,344 @@ class ForgedStateRejectionTest {
         assertThat(b.space().read(Template.of(TaskEntry.class))).isPresent();
     }
 
+    /** A stamp just under the drift ceiling with the logical counter at its maximum: the reported attack. */
+    private HlcTimestamp freezingStamp(String node) {
+        return new HlcTimestamp(clock.millis() + HybridLogicalClock.MAX_DRIFT_MILLIS - 1_000,
+                Integer.MAX_VALUE, node);
+    }
+
+    /** Asserts a replica's space clock tracks the wall clock: a take stamps its claim from it. */
+    private void assertClockNotFrozen(Peer peer, TaskEntry entry) {
+        peer.space().write(entry, MINUTES_30);
+        Optional<TakenEntry<TaskEntry>> taken =
+                peer.space().take(Template.of(TaskEntry.class), MINUTES_10, Duration.ZERO);
+        assertThat(taken).isPresent();
+        assertThat(taken.get().entry()).isEqualTo(entry);
+        assertThat(peer.space().currentClaim(taken.get().entryId())).get()
+                .extracting(claim -> claim.stamp().physical())
+                .as("the space clock was not pulled onto the hostile stamp")
+                .matches(physical -> physical <= clock.millis() + 1_000);
+    }
+
+    /** Witnessed-violation strikes {@code node} holds against {@code peer} (PeerNode's test accessor). */
+    private static int strikes(PeerNode node, ai.badmonkey.agentspaces.common.id.PeerId peer) throws Exception {
+        java.lang.reflect.Method strikes = PeerNode.class.getDeclaredMethod("strikes",
+                ai.badmonkey.agentspaces.common.id.PeerId.class);
+        strikes.setAccessible(true);
+        return (int) strikes.invoke(node, peer);
+    }
+
+    /** Publishes a state as the attacker, under its own item id. */
+    private void publishState(Attacker evil, String itemId, SpaceWire.EntryStateDto state) {
+        evil.runtime().gossip().publish(STREAM, itemId, codec.toBytes(new SpaceWire.Delta(state, null, null)));
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): a folded state refused for its stamps
+     * is witnessed misbehavior once its signatures verify, so the receiver counts it and strikes
+     * its signer, once per distinct state. A state whose signature does not cover the hostile
+     * stamp proves nothing about its signer and is neither counted nor struck, and a re-offer
+     * of the same state (anti-entropy, a forward) adds nothing.
+     */
+    @Test
+    void aReceiverCountsAndStrikesAStateRefusedForItsStampsOncePerDistinctStateAfterItVerifies() throws Exception {
+        Peer a = newPeer("a", 1);
+        Attacker evil = attackerWithKey("evil", 3, "a", new AtomicReference<>());
+        tickAll(4);
+        ai.badmonkey.agentspaces.common.id.PeerId evilPeer = evil.id().peerId();
+        assertThat(strikes(a.node(), evilPeer)).isZero();
+        long expires = clock.millis() + Duration.ofMinutes(30).toMillis();
+        SpaceWire.EntryStateDto honest = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("hostile-lease", 1),
+                new HlcTimestamp(clock.millis(), 0, "evil"), expires);
+
+        publishState(evil, "unverified", new SpaceWire.EntryStateDto(honest.record(), honest.issuerPublicKey(),
+                honest.adds(), honest.removes(), freezingStamp("evil"), honest.leaseValue(), false,
+                honest.stateSig()));
+        tickAll(2);
+        assertThat(a.space().stampsLogicalRefused()).as("an unverified state is not counted").isZero();
+        assertThat(strikes(a.node(), evilPeer)).as("nor struck").isZero();
+
+        SpaceWire.EntryStateDto hostileRecord = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("hostile-record", 2), freezingStamp("evil"), expires);
+        publishState(evil, "record-1", hostileRecord);
+        tickAll(2);
+        assertThat(a.space().stampsLogicalRefused()).isEqualTo(1);
+        assertThat(strikes(a.node(), evilPeer)).isEqualTo(1);
+
+        publishState(evil, "record-2", hostileRecord);
+        tickAll(2);
+        assertThat(a.space().stampsLogicalRefused()).as("a re-offer is the same state").isEqualTo(1);
+        assertThat(strikes(a.node(), evilPeer)).isEqualTo(1);
+
+        publishState(evil, "lease", ForgeSupport.signState(evil.id(),
+                new SpaceWire.EntryStateDto(honest.record(), honest.issuerPublicKey(), honest.adds(),
+                        honest.removes(), freezingStamp("evil"), honest.leaseValue(), false, null)));
+        tickAll(2);
+        assertThat(a.space().stampsLogicalRefused()).as("a second distinct state").isEqualTo(2);
+        assertThat(strikes(a.node(), evilPeer)).isEqualTo(2);
+        assertThat(a.space().read(Template.of(TaskEntry.class))).as("no refused state merged").isEmpty();
+        assertClockNotFrozen(a, new TaskEntry("a-own", 3));
+    }
+
+    /**
+     * HLC canonical stamps, 2026-11-08: a state refused for its stamps is acknowledged in the
+     * replica's anti-entropy digest, as ASF-047 acknowledges a revoked actor's state, so its
+     * partners stop re-offering it. A state whose signature does not verify earns no line, so a
+     * forger cannot make the replica acknowledge a state it never judged.
+     */
+    @Test
+    void aStateRefusedForItsStampsIsAcknowledgedInTheDigestOnceItVerifies() throws Exception {
+        Peer a = newPeer("a", 1);
+        Attacker evil = attackerWithKey("evil", 3, "a", new AtomicReference<>());
+        tickAll(4);
+        long expires = clock.millis() + Duration.ofMinutes(30).toMillis();
+        SpaceWire.EntryStateDto honest = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("unverified", 1),
+                new HlcTimestamp(clock.millis(), 0, "evil"), expires);
+        publishState(evil, "unverified", new SpaceWire.EntryStateDto(honest.record(), honest.issuerPublicKey(),
+                honest.adds(), honest.removes(), freezingStamp("evil"), honest.leaseValue(), false,
+                honest.stateSig()));
+        SpaceWire.EntryStateDto hostile = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("refused", 2), freezingStamp("evil"), expires);
+        publishState(evil, "refused", hostile);
+        tickAll(2);
+
+        String digest = new String(a.space().digest(), java.nio.charset.StandardCharsets.UTF_8);
+        String line = "e:" + hostile.record().entryId().value() + "=";
+        assertThat(digest).as("the refused state is acknowledged").contains("a:" + line);
+        assertThat(digest).as("and not held").doesNotContain("\n" + line).doesNotStartWith(line);
+        assertThat(digest).as("an unverified state is not acknowledged")
+                .doesNotContain(honest.record().entryId().value());
+        assertThat(a.space().read(Template.of(TaskEntry.class))).isEmpty();
+    }
+
+    /**
+     * HLC canonical stamps, 2026-11-08: an agent-signed state's {@code signedAt} is a stamp the
+     * agent signed, and the Python and Ruby replicas refused one whose counter is above
+     * LOGICAL_LIMIT while Java merged it. Java now refuses it too, after the agent's signature
+     * verifies: counted, struck, and acknowledged. The same state with an honest
+     * {@code signedAt} merges, so the forge is sound.
+     */
+    @Test
+    void anAgentSignedStateWhoseSignedAtCounterIsAboveTheLimitIsRefused() throws Exception {
+        Peer a = newPeer("a", 1);
+        Attacker evil = attackerWithKey("evil", 3, "a", new AtomicReference<>());
+        tickAll(4);
+        ai.badmonkey.agentspaces.api.spi.AgentIdentity agent =
+                evil.id().subordinate("evil", clock.instant(), Duration.ofHours(1));
+        long expires = clock.millis() + Duration.ofMinutes(30).toMillis();
+
+        publishState(evil, "honest", agentSigned(agent, ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("honest signedAt", 1),
+                new HlcTimestamp(clock.millis(), 0, "evil"), expires),
+                new HlcTimestamp(clock.millis(), HybridLogicalClock.LOGICAL_LIMIT, "evil")));
+        tickAll(2);
+        assertThat(a.space().read(Template.of(TaskEntry.class)))
+                .as("a counter at the limit is honest").contains(new TaskEntry("honest signedAt", 1));
+
+        SpaceWire.EntryStateDto hostile = agentSigned(agent, ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("hostile signedAt", 2),
+                new HlcTimestamp(clock.millis(), 0, "evil"), expires),
+                new HlcTimestamp(clock.millis(), HybridLogicalClock.LOGICAL_LIMIT + 1, "evil"));
+        publishState(evil, "hostile", hostile);
+        tickAll(2);
+
+        assertThat(a.space().entryIdOf(new TaskEntry("hostile signedAt", 2))).as("refused").isEmpty();
+        assertThat(a.space().stampsLogicalRefused()).isEqualTo(1);
+        assertThat(strikes(a.node(), evil.id().peerId())).isEqualTo(1);
+        assertThat(new String(a.space().digest(), java.nio.charset.StandardCharsets.UTF_8))
+                .contains("a:e:" + hostile.record().entryId().value() + "=");
+    }
+
+    /** Re-signs a peer-signed state as the given agent with the given signing time. */
+    private static SpaceWire.EntryStateDto agentSigned(ai.badmonkey.agentspaces.api.spi.AgentIdentity agent,
+                                                       SpaceWire.EntryStateDto state, HlcTimestamp signedAt) {
+        SpaceWire.EntryStateDto unsigned = state.withAgentSigner(agent.id().encoded(), signedAt,
+                agent.certificate().orElseThrow());
+        return unsigned.withStateSig(agent.sign(ForgeSupport.stateSignBytes(unsigned)));
+    }
+
+    /**
+     * HLC canonical stamps, 2026-11-08: a space delta that does not decode, by rumor or by
+     * anti-entropy, was dropped with no trace. The replica now counts each one; a stamp that is
+     * not canonical text ("007:0:evil") is one such delta.
+     */
+    @Test
+    void aReplicaCountsTheDeltasItCannotDecode() throws Exception {
+        Peer a = newPeer("a", 1);
+        Attacker evil = attackerWithKey("evil", 3, "a", new AtomicReference<>());
+        tickAll(4);
+        assertThat(a.space().deltasUndecodable()).isZero();
+
+        evil.runtime().gossip().publish(STREAM, "garbage", new byte[]{9, 9, 9});
+        tickAll(2);
+        assertThat(a.space().deltasUndecodable()).as("a rumor that is no delta").isEqualTo(1);
+
+        SpaceWire.EntryStateDto write = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("leading zero", 1),
+                new HlcTimestamp(clock.millis(), 7, "evil"), clock.millis() + Duration.ofMinutes(30).toMillis());
+        String canonical = write.record().issued().encoded();
+        byte[] honestBytes = codec.toBytes(new SpaceWire.Delta(write, null, null));
+        byte[] padded = replaceAscii(honestBytes, canonical, canonical.replace(":7:", ":07:"));
+        evil.runtime().gossip().publish(STREAM, "leading-zero", padded);
+        tickAll(2);
+        assertThat(a.space().deltasUndecodable()).as("a delta whose stamp is not canonical").isEqualTo(2);
+        assertThat(a.space().read(Template.of(TaskEntry.class))).isEmpty();
+
+        AtomicInteger served = new AtomicInteger();
+        evil.runtime().gossip().reconcile(STREAM, new ReconcilableState() {
+            @Override
+            public byte[] digest() {
+                return "e:poison=ffffffff\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            }
+
+            @Override
+            public byte[] deltaFor(byte[] remoteDigest) {
+                served.incrementAndGet();
+                return new byte[]{9, 9, 9};
+            }
+
+            @Override
+            public void applyDelta(byte[] delta) {
+            }
+        });
+        tickAll(12);
+        assertThat(served.get()).as("the replica pulled from the attacker").isPositive();
+        assertThat(a.space().deltasUndecodable()).as("an anti-entropy delta that does not decode")
+                .isGreaterThan(2);
+    }
+
+    /** Rewrites every CBOR text string {@code from} to {@code to}; both are shorter than 256 bytes. */
+    private static byte[] replaceAscii(byte[] cbor, String from, String to) {
+        byte[] f = textString(from);
+        byte[] t = textString(to);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        int i = 0;
+        int replaced = 0;
+        while (i < cbor.length) {
+            if (i + f.length <= cbor.length && java.util.Arrays.equals(cbor, i, i + f.length, f, 0, f.length)) {
+                out.writeBytes(t);
+                i += f.length;
+                replaced++;
+            } else {
+                out.write(cbor[i]);
+                i++;
+            }
+        }
+        assertThat(replaced).as("the stamp text was found").isPositive();
+        return out.toByteArray();
+    }
+
+    /** A CBOR text string, header and bytes, for text shorter than 256 bytes. */
+    private static byte[] textString(String text) {
+        byte[] bytes = text.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        assertThat(bytes.length).isLessThan(256);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        if (bytes.length < 24) {
+            out.write(0x60 + bytes.length);
+        } else {
+            out.write(0x78);
+            out.write(bytes.length);
+        }
+        out.writeBytes(bytes);
+        return out.toByteArray();
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): a folded record or lease stamp with
+     * a logical counter above LOGICAL_LIMIT froze every replica's space clock, the stamp
+     * travelling on through gossip and anti-entropy. Both are now ignored before the merge,
+     * and a record stamped at exactly LOGICAL_LIMIT still merges.
+     */
+    @Test
+    void aRecordOrLeaseStampWithALogicalCounterAboveTheLimitIsIgnored() throws Exception {
+        Peer a = newPeer("a", 1);
+        Peer b = newPeer("b", 2, "a");
+        Attacker evil = attackerWithKey("evil", 3, "a", new AtomicReference<>());
+        tickAll(4);
+        long expires = clock.millis() + Duration.ofMinutes(30).toMillis();
+
+        SpaceWire.EntryStateDto hostileRecord = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("hostile-record", 1), freezingStamp("evil"), expires);
+        evil.runtime().gossip().publish(STREAM, "record:" + hostileRecord.record().entryId(),
+                codec.toBytes(new SpaceWire.Delta(hostileRecord, null, null)));
+        SpaceWire.EntryStateDto honest = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("hostile-lease", 2),
+                new HlcTimestamp(clock.millis(), 0, "evil"), expires);
+        SpaceWire.EntryStateDto hostileLease = ForgeSupport.signState(evil.id(),
+                new SpaceWire.EntryStateDto(honest.record(), honest.issuerPublicKey(), honest.adds(),
+                        honest.removes(), freezingStamp("evil"), honest.leaseValue(), false, null));
+        evil.runtime().gossip().publish(STREAM, "lease:" + honest.record().entryId(),
+                codec.toBytes(new SpaceWire.Delta(hostileLease, null, null)));
+        tickAll(4);
+
+        assertThat(a.space().read(Template.of(TaskEntry.class))).as("neither state merged").isEmpty();
+        assertThat(b.space().read(Template.of(TaskEntry.class))).isEmpty();
+        assertClockNotFrozen(a, new TaskEntry("a-own", 3));
+        assertClockNotFrozen(b, new TaskEntry("b-own", 4));
+        tickAll(4);
+
+        SpaceWire.EntryStateDto atLimit = ForgeSupport.authoredWrite(evil.id(), "evil",
+                a.space().id(), new TaskEntry("at-limit", 5),
+                new HlcTimestamp(clock.millis(), HybridLogicalClock.LOGICAL_LIMIT, "evil"), expires);
+        evil.runtime().gossip().publish(STREAM, "limit:" + atLimit.record().entryId(),
+                codec.toBytes(new SpaceWire.Delta(atLimit, null, null)));
+        tickAll(4);
+        assertThat(a.space().entryIdOf(new TaskEntry("at-limit", 5)))
+                .as("a record stamped at the limit is honest and merges").isPresent();
+        assertThat(b.space().entryIdOf(new TaskEntry("at-limit", 5))).isPresent();
+    }
+
+    /**
+     * HLC logical counter, 2026-11-08 (Rust team report): a validly signed claim with a logical
+     * counter above LOGICAL_LIMIT froze the space clock of every replica that folded it. Each
+     * replica now refuses it as a claim violation, counts it, and strikes its holder; it never
+     * enters the lattice, and a claim at exactly
+     * LOGICAL_LIMIT still merges.
+     */
+    @Test
+    void aClaimWithALogicalCounterAboveTheLimitIsIgnored() throws Exception {
+        Peer a = newPeer("a", 1);
+        Peer b = newPeer("b", 2, "a");
+        Attacker evil = attackerWithKey("evil", 3, "a", new AtomicReference<>());
+        tickAll(4);
+        a.space().write(new TaskEntry("contested", 1), MINUTES_30);
+        tickAll(4);
+        EntryId entryId = a.space().entryIdOf(new TaskEntry("contested", 1)).orElseThrow();
+        long holdUntil = clock.millis() + Duration.ofMinutes(10).toMillis();
+
+        TakeClaim hostile = new TakeClaim(entryId, a.space().id(), 1, freezingStamp("evil"),
+                evil.id().agent("evil"), 0.0, holdUntil);
+        evil.runtime().gossip().publish(STREAM, "freeze:" + entryId,
+                codec.toBytes(new SpaceWire.Delta(null, entryId, ForgeSupport.signClaim(evil.id(), hostile))));
+        tickAll(4);
+
+        assertThat(a.space().currentClaim(entryId)).as("the hostile claim never merged").isEmpty();
+        assertThat(b.space().currentClaim(entryId)).isEmpty();
+        assertThat(a.space().stampsLogicalRefused()).as("the refusal is counted").isEqualTo(1);
+        assertThat(strikes(a.node(), evil.id().peerId())).as("and its holder struck").isEqualTo(1);
+        Optional<TakenEntry<TaskEntry>> taken =
+                b.space().take(Template.of(TaskEntry.class), MINUTES_10, Duration.ZERO);
+        assertThat(taken).as("the entry is still takeable").isPresent();
+        assertThat(b.space().currentClaim(entryId)).get()
+                .extracting(claim -> claim.stamp().physical())
+                .as("B's space clock was not pulled onto the hostile stamp")
+                .matches(physical -> physical <= clock.millis() + 1_000);
+
+        a.space().write(new TaskEntry("raced", 2), MINUTES_30);
+        tickAll(2);
+        EntryId raced = a.space().entryIdOf(new TaskEntry("raced", 2)).orElseThrow();
+        TakeClaim atLimit = new TakeClaim(raced, a.space().id(), 1,
+                new HlcTimestamp(clock.millis(), HybridLogicalClock.LOGICAL_LIMIT, "evil"),
+                evil.id().agent("evil"), 0.0, holdUntil);
+        evil.runtime().gossip().publish(STREAM, "limit:" + raced,
+                codec.toBytes(new SpaceWire.Delta(null, raced, ForgeSupport.signClaim(evil.id(), atLimit))));
+        tickAll(4);
+        assertThat(a.space().currentClaim(raced)).map(TakeClaim::holder)
+                .as("a claim stamped at the limit is honest and merges").contains(evil.id().agent("evil"));
+    }
+
     /** ASF-025 (SPEC §11): oversize or foreign-replica dot sets are dropped even when the entry's own issuer signs them. */
     @Test
     void oversizeOrForeignDotSetsAreDroppedEvenWhenTheIssuerSignsThem() throws Exception {

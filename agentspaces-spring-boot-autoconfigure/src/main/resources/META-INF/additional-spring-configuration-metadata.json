@@ -477,6 +477,102 @@
       "type": "java.util.List<java.lang.String>",
       "description": "Peers or agents that may submit commands to an ordered log without voting (RAFT_CLIENT: browsers and the Python and TypeScript peers taking through the log); empty permits every admitted member.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Security$Grants"
+    },
+    {
+      "name": "agentspaces.pdt.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Build one Pdt facade per group over the content swarm and advertise trees=1 (srad/agentspaces-pdt.md PD-C-02, PD-X-01). Needs agentspaces.content.enabled=true.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.pdt.space",
+      "type": "java.lang.String",
+      "description": "The space each group's ref heads (PRef entries) live in.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees",
+      "defaultValue": "pdt"
+    },
+    {
+      "name": "agentspaces.pdt.inline-delta",
+      "type": "java.lang.Integer",
+      "description": "Largest delta carried on a head, in bytes, at most 32768 (PD-X-07).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees",
+      "defaultValue": 32768
+    },
+    {
+      "name": "agentspaces.pdt.load-timeout",
+      "type": "java.time.Duration",
+      "description": "How long a lazy load or a deref waits for a node or a delta (PD-V-06).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees",
+      "defaultValue": "10s"
+    },
+    {
+      "name": "agentspaces.pdt.follow",
+      "type": "java.lang.String",
+      "description": "full: a reader fetches each new head's tree as it arrives; lazy: nodes load on get (PD-X-10).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees",
+      "defaultValue": "full"
+    },
+    {
+      "name": "agentspaces.pdt.sealing",
+      "type": "java.lang.String",
+      "description": "The sealing every head names: group-key, sealed-nodes, or none (PD-P-03, PD-P-05). A group without a content-key names none.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees",
+      "defaultValue": "group-key"
+    },
+    {
+      "name": "agentspaces.pdt.store.kind",
+      "type": "java.lang.String",
+      "description": "pack: the append-only pack store under path/<group>; memory: on the heap; bean: the application's NodeStore bean, which also wins over the other kinds when present (PD-S-02).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Store",
+      "defaultValue": "pack"
+    },
+    {
+      "name": "agentspaces.pdt.store.path",
+      "type": "java.lang.String",
+      "description": "The pack directory. Blank with kind=pack falls back to memory with a warning, or refuses to start under store.require (PD-Q-AVL-02).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Store",
+      "defaultValue": "${user.home}/.agentspaces/pdt"
+    },
+    {
+      "name": "agentspaces.pdt.store.quota",
+      "type": "java.lang.Long",
+      "description": "The store quota in bytes (PD-S-05); 0 is unbounded. Recorded in this phase; the facade applies no quota yet.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Store",
+      "defaultValue": 0
+    },
+    {
+      "name": "agentspaces.pdt.store.require",
+      "type": "java.lang.Boolean",
+      "description": "Refuse to start without a durable store: a pack store with a path, or a NodeStore bean (PD-Q-AVL-02).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Store",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.pdt.retain.versions",
+      "type": "java.lang.Integer",
+      "description": "Versions kept per ref as delta bases (PD-S-03).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Retain",
+      "defaultValue": 64
+    },
+    {
+      "name": "agentspaces.pdt.retain.age",
+      "type": "java.time.Duration",
+      "description": "Age kept per ref as delta bases (PD-S-03).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Retain",
+      "defaultValue": "1h"
+    },
+    {
+      "name": "agentspaces.pdt.refs",
+      "type": "java.util.Map<java.lang.String,ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$RefDef>",
+      "description": "Per-ref settings by ref name: refs.<name>.mode (multi or linear, PD-R-04) and refs.<name>.follow (full or lazy, PD-X-10; the facade of this phase follows every ref in the global mode).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees"
+    },
+    {
+      "name": "agentspaces.pdt.spaces",
+      "type": "java.util.Map<java.lang.String,ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$SpaceEscalation>",
+      "description": "Per-space escalation by space name (srad/agentspaces-pdt.md group E): spaces.<name>.escalate-above (bytes, 0 off) opts the space into the persistent trees, so a payload above it travels as a tree and a later version as its delta, unsealed before escalation with the record naming the key epoch (PD-E-01, PD-E-04); spaces.<name>.require (PD-E-06) refuses a write a member without the tree exchange could not receive, naming the members, where the default falls back to the flat content swarm. Needs agentspaces.pdt.enabled=true.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees"
     }
   ],
   "hints": [
@@ -498,6 +594,53 @@
       "values": [
         {
           "value": "DTLSv1.2"
+        }
+      ]
+    },
+    {
+      "name": "agentspaces.pdt.follow",
+      "values": [
+        {
+          "value": "full",
+          "description": "Fetch each new head's tree as the head arrives."
+        },
+        {
+          "value": "lazy",
+          "description": "Fetch nothing on a head; load nodes on get (PD-V-06)."
+        }
+      ]
+    },
+    {
+      "name": "agentspaces.pdt.store.kind",
+      "values": [
+        {
+          "value": "pack",
+          "description": "Append-only packs under store.path/<group> (PD-S-02)."
+        },
+        {
+          "value": "memory",
+          "description": "On the heap; lost on restart."
+        },
+        {
+          "value": "bean",
+          "description": "The application's NodeStore bean."
+        }
+      ]
+    },
+    {
+      "name": "agentspaces.pdt.sealing",
+      "values": [
+        {
+          "value": "group-key",
+          "description": "Nodes travel sealed under the group's content key."
+        },
+        {
+          "value": "sealed-nodes",
+          "description": "Each node sealed on its own (PD-P-05)."
+        },
+        {
+          "value": "none",
+          "description": "Plain nodes."
         }
       ]
     }

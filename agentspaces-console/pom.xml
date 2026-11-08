@@ -72,6 +72,12 @@
       <artifactId>agentspaces-content</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- The PDT panel (srad/agentspaces-pdt.md PD-C-08) reads a group's persistent-tree facade. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-pdt</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-space</artifactId>

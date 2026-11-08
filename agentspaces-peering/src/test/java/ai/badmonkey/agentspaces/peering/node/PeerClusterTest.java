@@ -208,6 +208,35 @@ class PeerClusterTest {
         assertThat(seen).hasSize(3);
     }
 
+    /**
+     * FA2 §C.3.3 (enterprise platform audit of 2026-11-07): a listener registered on a built node can be taken off
+     * again, so an agent that stops deregisters its hint listener and a later refresh reaches nobody; taking off a
+     * listener that was never registered is a no-op that says so.
+     */
+    @Test
+    void aCredentialHintListenerCanBeDeregistered() throws Exception {
+        List<Map.Entry<PeerId, Map<String, String>>> seen = new CopyOnWriteArrayList<>();
+        PeerNode observer = PeerNode.builder(PeerIdentity.generate()).clock(clock).randomSeed(32).build();
+        observer.listen(network.register("obs2"), "obs2");
+        nodes.add(observer);
+        java.util.function.BiConsumer<PeerId, Map<String, String>> listener = (peer, hints) -> seen.add(Map.entry(peer, hints));
+        observer.onCredentialHints(listener);
+        assertThat(observer.credentialHintListeners()).isEqualTo(1);
+        PeerNode holder = newNode("holder2", 33);
+        holder.credentialHint(JoinCredentials.OIDC_HINT_KEY, "token-v1");
+        observer.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        holder.joinGroup(groupAd, GroupMembership.Config.defaults(), seed("obs2"));
+        tickAll(4);
+        assertThat(seen).hasSize(1);
+
+        assertThat(observer.offCredentialHints(listener)).isTrue();
+        assertThat(observer.credentialHintListeners()).isZero();
+        holder.credentialHint(JoinCredentials.OIDC_HINT_KEY, "token-v2");
+        tickAll(4);
+        assertThat(seen).as("a deregistered listener hears no refresh").hasSize(1);
+        assertThat(observer.offCredentialHints(listener)).as("taking off an absent listener is a no-op").isFalse();
+    }
+
     @Test
     void policyGroupDefersToTheValidator() throws Exception {
         PeerIdentity founderId = PeerIdentity.generate();

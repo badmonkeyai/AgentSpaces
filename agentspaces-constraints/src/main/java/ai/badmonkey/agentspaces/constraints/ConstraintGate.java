@@ -28,6 +28,7 @@ import ai.badmonkey.agentspaces.common.id.AgentId;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.InstantSource;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -43,7 +44,8 @@ import java.util.function.Supplier;
  * The gate (ISSUE-Constraints §9.4, FR-7 to FR-11): loads the newest complete version per book from the
  * {@code constraints} space (a {@code Vocabulary} and every {@code Constraint} carrying its hash, from an issuer
  * the authorizer permits to write the scope), keeps one key's events from the lanes it watches (seeded from what
- * the replica holds, then from each lane's notifications, so a take it cannot read back still counts), and answers
+ * the replica holds, then from each lane's notifications, so a take it cannot read back still counts; a lane is read
+ * again when a version or an interest names a new type), and answers
  * two questions: may this entry be claimed, and may this result be written. A refusal writes a
  * {@link ConstraintViolated} (24 h lease) once per unit, key, and entry, and logs one line. The gate admits
  * everything when no version is loaded, when the entry names no key it can read, when the space is unreachable,
@@ -72,11 +74,18 @@ public final class ConstraintGate implements AutoCloseable {
     private final int cacheKeys;
     private final Map<String, Version> versions = new ConcurrentHashMap<>();
     private final Map<String, List<Event>> eventsByKey = new LinkedHashMap<>();
-    private final Map<String, Set<String>> keysByEntry = new ConcurrentHashMap<>();
     private final List<Subscription> subscriptions = new ArrayList<>();
-    private final Set<String> watched = new LinkedHashSet<>();
+    private final Map<String, Space> lanes = new LinkedHashMap<>();
+    /** The types the lanes were read for, so a lane is read again only when a version or an interest names a new one. */
+    private final Set<String> seededTypes = new LinkedHashSet<>();
     private final Set<String> violated = new LinkedHashSet<>();
-    private final List<Object> pending = new ArrayList<>();
+    /**
+     * The takes of a type nothing names yet, kept for a later version or interest (bounded): a lane no longer shows a
+     * taken entry. A write is not kept here: the lane shows it while it lives and is read again when its type is named
+     * (FIT 2026-11-08: keeping every write held 4096 geo views with their forty-point tracks, about 200,000 maps, in
+     * each agent of the geo watch while no book named a View).
+     */
+    private final ArrayDeque<Event> pending = new ArrayDeque<>();
     private volatile long lastWarn;
     private volatile boolean closed;
 
@@ -112,16 +121,51 @@ public final class ConstraintGate implements AutoCloseable {
 
     /** Watches a lane: its entries now are the keys' past, its events keep them current. */
     public synchronized void watch(String name, Space lane) {
-        if (!watched.add(name)) {
+        if (lanes.putIfAbsent(name, lane) != null) {
             return;
         }
+        try {
+            seed(name, lane);
+            subscriptions.add(lane.notify(Template.of(Object.class), ev -> onLane(ev), Lease.of(SUBSCRIPTION)));
+        } catch (RuntimeException e) {
+            warn("lane " + name + " cannot be watched: " + e);
+        }
+    }
+
+    /** Records the entries a lane holds now (the events of the types nothing names are dropped by {@link #record}). */
+    private void seed(String name, Space lane) {
         try {
             for (Space.Entry<Object> e : lane.readAllEntries(Template.of(Object.class), 5000)) {
                 record(Event.of(e, Event.Kind.WRITTEN, clock.instant()), e.entryId().value());
             }
-            subscriptions.add(lane.notify(Template.of(Object.class), ev -> onLane(ev), Lease.of(SUBSCRIPTION)));
         } catch (RuntimeException e) {
-            warn("lane " + name + " cannot be watched: " + e);
+            warn("lane " + name + " cannot be read: " + e);
+        }
+    }
+
+    /**
+     * Brings the keys' past up to the types named now (FIT 2026-11-08): when a version or an interest names a type the
+     * lanes were not read for, every lane is read again (an event already held is not recorded twice), then the takes
+     * kept for a later version are replayed.
+     */
+    private void catchUp() {
+        Set<String> named = new LinkedHashSet<>(interests.keySet());
+        for (Version v : versions.values()) {
+            for (Constraint c : v.constraints()) {
+                named.add(Event.simpleName(c.a()));
+                if (!c.b().isBlank()) {
+                    named.add(Event.simpleName(c.b()));
+                }
+            }
+        }
+        if (!seededTypes.containsAll(named)) {
+            seededTypes.addAll(named);
+            lanes.forEach(this::seed);
+        }
+        List<Event> replay = new ArrayList<>(pending);
+        pending.clear();
+        for (Event e : replay) {
+            record(e, e.entryId());
         }
     }
 
@@ -152,7 +196,7 @@ public final class ConstraintGate implements AutoCloseable {
         } else {
             // a local space's event carries no view: the value, the id, and the tags are enough
             String wire = ev.entry() == null ? "" : ev.entry().getClass().getName();
-            e = new Event(Event.simpleName(wire), wire, ev.entryId().value(), now, Event.fieldsOf(ev.entry()), ev.tags(), kind);
+            e = Event.of(wire, ev.entryId().value(), now, ev.entry(), ev.tags(), kind);
         }
         if (kind == Event.Kind.CLAIMED) {
             e = new Event(e.type(), e.wireType(), e.entryId(), now, e.fields(), e.tags(), kind);
@@ -163,15 +207,7 @@ public final class ConstraintGate implements AutoCloseable {
     /** A watcher's interest beyond the constraints (a rule agent's reactions and goals): a type and its key spec. */
     public synchronized void interest(String type, String key) {
         interests.put(Event.simpleName(type), key == null || key.isBlank() ? "field:claimId" : key);
-        List<Object> replay;
-        synchronized (pending) {
-            replay = new ArrayList<>(pending);
-            pending.clear();
-        }
-        for (Object o : replay) {
-            Event e = (Event) o;
-            record(e, e.entryId());
-        }
+        catchUp();
     }
 
     private final Map<String, String> interests = new LinkedHashMap<>();
@@ -208,18 +244,16 @@ public final class ConstraintGate implements AutoCloseable {
             if (!dup) {
                 list.add(e);
             }
-            keysByEntry.computeIfAbsent(entryId, k -> new LinkedHashSet<>()).add(key);
         }
         while (eventsByKey.size() > cacheKeys) {
             eventsByKey.remove(eventsByKey.keySet().iterator().next());
         }
-        // an event of a type nothing names yet is kept for a later version or interest (bounded)
-        if (!named(e.type())) {
-            synchronized (pending) {
-                pending.add(e);
-                if (pending.size() > cacheKeys) {
-                    pending.remove(0);
-                }
+        // a take of a type nothing names yet is kept for a later version or interest (bounded); a write is read again
+        // from its lane when its type is named (FIT 2026-11-08)
+        if (e.kind() == Event.Kind.CLAIMED && !named(e.type())) {
+            pending.add(e);
+            if (pending.size() > cacheKeys) {
+                pending.removeFirst();
             }
         }
     }
@@ -256,15 +290,7 @@ public final class ConstraintGate implements AutoCloseable {
             });
             versions.clear();
             versions.putAll(loaded);
-            List<Object> replay;
-            synchronized (pending) {
-                replay = new ArrayList<>(pending);
-                pending.clear();
-            }
-            for (Object o : replay) {
-                Event e = (Event) o;
-                record(e, e.entryId());
-            }
+            catchUp();
         } catch (RuntimeException e) {
             warn("cannot read constraints: " + e);
         }
@@ -293,6 +319,15 @@ public final class ConstraintGate implements AutoCloseable {
     /** The events the gate holds for a key. */
     public synchronized List<Event> events(String key) {
         return List.copyOf(eventsByKey.getOrDefault(key, List.of()));
+    }
+
+    /** How many events the gate holds, every key's and those it keeps for a type nothing names yet (FIT 2026-11-08 lifecycle tests). */
+    synchronized int heldEvents() {
+        int n = 0;
+        for (List<Event> list : eventsByKey.values()) {
+            n += list.size();
+        }
+        return n + pending.size();
     }
 
     /** The marking of a key under one loaded version, from the events the gate holds (for a console or a test). */

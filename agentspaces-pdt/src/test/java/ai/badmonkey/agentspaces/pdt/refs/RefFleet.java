@@ -92,22 +92,30 @@ class RefFleet {
         }
     }
 
-    /** Per-peer choices; {@code store} reuses a node store, the shape of a restart over a durable store. */
-    record Spec(Consumer<Pdt.Builder> pdt, Consumer<ReplicatedSpace.Builder> refSpace, NodeStore store) {
+    /**
+     * Per-peer choices; {@code store} reuses a node store, the shape of a restart over a durable store, and
+     * {@code content} sets the swarm's options, such as its PDT feature level.
+     */
+    record Spec(Consumer<Pdt.Builder> pdt, Consumer<ReplicatedSpace.Builder> refSpace, NodeStore store,
+                Consumer<Content.Builder> content) {
         static Spec defaults() {
-            return new Spec(b -> { }, b -> { }, null);
+            return new Spec(b -> { }, b -> { }, null, b -> { });
         }
 
         Spec pdt(Consumer<Pdt.Builder> value) {
-            return new Spec(value, refSpace, store);
+            return new Spec(value, refSpace, store, content);
         }
 
         Spec refSpace(Consumer<ReplicatedSpace.Builder> value) {
-            return new Spec(pdt, value, store);
+            return new Spec(pdt, value, store, content);
         }
 
         Spec store(NodeStore value) {
-            return new Spec(pdt, refSpace, value);
+            return new Spec(pdt, refSpace, value, content);
+        }
+
+        Spec content(Consumer<Content.Builder> value) {
+            return new Spec(pdt, refSpace, store, value);
         }
     }
 
@@ -146,9 +154,11 @@ class RefFleet {
                 .collectEvery(Duration.ZERO);
         spec.pdt().accept(pdtBuilder);
         Pdt pdt = pdtBuilder.build();
-        Content content = Content.builder(new CapabilityPipes(runtime, codec), runtime, contentSpace, identity.peerId())
+        Content.Builder contentBuilder = Content.builder(new CapabilityPipes(runtime, codec), runtime, contentSpace, identity.peerId())
                 .codec(codec).clock(clock).store(new MemoryPieceStore(clock, 0)).blocks(blocks).random(new Random(seed))
-                .treeStore(pdt.treeStore()).advertisements(peer -> Optional.ofNullable(ads.get(peer))).build();
+                .treeStore(pdt.treeStore()).advertisements(peer -> Optional.ofNullable(ads.get(peer)));
+        spec.content().accept(contentBuilder);
+        Content content = contentBuilder.build();
         ads.put(identity.peerId(), content.describe(groupId));
         java.util.concurrent.atomic.AtomicLong pdtTickNanos = new java.util.concurrent.atomic.AtomicLong();
         java.util.concurrent.atomic.AtomicLong contentTickNanos = new java.util.concurrent.atomic.AtomicLong();
@@ -206,6 +216,22 @@ class RefFleet {
         return true;
     }
 
+    /**
+     * Ticks until the condition holds or the fleet clock has run the given time, so a wait sized to the swarm's own
+     * timers ends at the same tick however loaded the host is.
+     */
+    boolean runFor(Duration fleetTime, BooleanSupplier until) throws InterruptedException {
+        long deadline = clock.millis() + fleetTime.toMillis();
+        while (!until.getAsBoolean()) {
+            if (clock.millis() >= deadline) {
+                return false;
+            }
+            tickAll();
+            Thread.sleep(2);
+        }
+        return true;
+    }
+
     /** Every live peer's store holds the root complete. */
     boolean allHold(String root) {
         for (Peer p : peers) {
@@ -239,7 +265,7 @@ class RefFleet {
 
     /** As {@link #writeHead(Peer, String, String, String, String, long, long, Duration)}, with the given attrs. */
     static PRef writeHead(Peer peer, String name, String kind, String root, String baseRoot, long seq, long size,
-                          Duration lease, java.util.Map<String, String> attrs) {
+                          Duration lease, java.util.Map<String, ?> attrs) {
         Set<String> shared = baseRoot == null ? Set.of() : peer.store().reachable(baseRoot);
         List<byte[]> nodes = new ArrayList<>();
         for (String cid : peer.store().reachable(root)) {
@@ -247,7 +273,7 @@ class RefFleet {
                 nodes.add(peer.store().get(cid).orElseThrow());
             }
         }
-        PRef head = new PRef(PRef.VERSION, name, kind, root, baseRoot == null ? List.of() : List.of(baseRoot), seq, size,
+        PRef head = new PRef(PRef.versionFor(kind), name, kind, root, baseRoot == null ? List.of() : List.of(baseRoot), seq, size,
                 nodes.isEmpty() ? null : nodes, PRef.MODE_MULTI, PRef.SEALING_NONE, null, attrs);
         if (head.violation().isPresent()) {
             throw new IllegalStateException(head.violation().get());

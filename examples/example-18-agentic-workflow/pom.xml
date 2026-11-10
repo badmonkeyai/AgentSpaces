@@ -22,11 +22,11 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces-examples</artifactId>
-    <version>0.5.0</version>
+    <version>0.6.0</version>
   </parent>
 
   <artifactId>example-18-agentic-workflow</artifactId>
-  <name>AgentSpaces :: Example 12 :: ExactlyOnceDesk</name>
+  <name>AgentSpaces :: Example 18 :: AgenticWorkflow</name>
   <description>A claims intake flow built stage by stage: a kill-tolerant registrar, three fan-out specialists (one emitting an ontology instance), a duplicate-safe join, an auction of pricing work, a panel vote, an exactly-once payment, and fleet-wide reserve sensing, every stage an annotated POJO method</description>
 
   <dependencies>

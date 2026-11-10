@@ -23,21 +23,26 @@ import ai.badmonkey.agentspaces.content.tree.TreeStore;
 import ai.badmonkey.agentspaces.pdt.blob.FileEntry;
 import ai.badmonkey.agentspaces.pdt.blob.PBlob;
 import ai.badmonkey.agentspaces.pdt.escalation.PdtPayloads;
+import ai.badmonkey.agentspaces.pdt.refs.DbMerge;
 import ai.badmonkey.agentspaces.pdt.refs.MergeFunction;
 import ai.badmonkey.agentspaces.pdt.refs.Ref;
 import ai.badmonkey.agentspaces.pdt.refs.Refs;
 import ai.badmonkey.agentspaces.pdt.seal.NodeSealer;
 import ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore;
+import ai.badmonkey.agentspaces.pdt.store.MetaStore;
 import ai.badmonkey.agentspaces.pdt.store.NodeCollector;
 import ai.badmonkey.agentspaces.pdt.store.Retention;
 import ai.badmonkey.agentspaces.pdt.store.StoreThenFetchLoader;
 import ai.badmonkey.agentspaces.pdt.swarm.NodeStoreTreeStore;
 import ai.badmonkey.agentspaces.pdt.swarm.PdtSwarm;
 import ai.badmonkey.agentspaces.pdt.values.Codec;
+import ai.badmonkey.agentspaces.pdt.values.PDb;
 import ai.badmonkey.agentspaces.pdt.values.PMap;
 import ai.badmonkey.agentspaces.pdt.values.PSet;
 import ai.badmonkey.agentspaces.pdt.values.PVector;
 
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.time.Duration;
 import java.time.InstantSource;
 import java.util.HashMap;
@@ -96,7 +101,7 @@ public final class Pdt implements AutoCloseable {
      * @param deltasFetched heads whose delta a tree fetch brought
      * @param conflicts     merge decisions of §3.6.1 this reader made
      * @param bytesReceived node bytes received inline or by fetch
-     * @param headsIgnored  heads ignored: malformed, another kind, or a root that failed to load (S7, PD-P-04)
+     * @param headsIgnored  heads ignored for a fault: malformed, another kind, or no ref at all (S7, PD-P-04)
      * @param nodesDropped  inline nodes dropped for failing verification or reachability (PD-X-07)
      * @param headsRewritten lapsed heads this peer rewrote (PD-R-08)
      * @param basesFetched  bases fetched to keep the version graph held for the common-base walk (PD-R-06)
@@ -104,16 +109,18 @@ public final class Pdt implements AutoCloseable {
      * @param bytesHeld     bytes in the store
      * @param entriesTruncated reads of a name that filled {@code Refs.MAX_ENTRIES}, so the heads read then are untrustworthy
      * @param mergeFunctionFailures merge function calls that threw, after which the rule of §3.6.1 decided (PD-R-05)
+     * @param headsLate     heads left out of reads while their roots were still loading, a late fetch or a failed one
+     *                      that the tick retries ({@code Refs.headsLate()} gives the causes; swarm retries)
      */
     public record Stats(int refs, int heads, long deltasInline, long deltasFetched, long conflicts, long bytesReceived,
                         long headsIgnored, long nodesDropped, long headsRewritten, long basesFetched, int nodesHeld, long bytesHeld,
-                        long entriesTruncated, long mergeFunctionFailures) {
+                        long entriesTruncated, long mergeFunctionFailures, long headsLate) {
 
-        /** The twelve-figure form, kept for callers that predate the truncation and merge-failure counters. */
+        /** The twelve-figure form, kept for callers that predate the truncation, merge-failure, and late-head counters. */
         public Stats(int refs, int heads, long deltasInline, long deltasFetched, long conflicts, long bytesReceived,
                      long headsIgnored, long nodesDropped, long headsRewritten, long basesFetched, int nodesHeld, long bytesHeld) {
             this(refs, heads, deltasInline, deltasFetched, conflicts, bytesReceived, headsIgnored, nodesDropped, headsRewritten,
-                    basesFetched, nodesHeld, bytesHeld, 0, 0);
+                    basesFetched, nodesHeld, bytesHeld, 0, 0, 0);
         }
     }
 
@@ -130,6 +137,11 @@ public final class Pdt implements AutoCloseable {
     private volatile PdtPayloads payloads;
     private volatile Refs refs;
     private volatile NodeCollector collector;
+    private volatile ai.badmonkey.agentspaces.pdt.stores.Stores stores;
+    private final ai.badmonkey.agentspaces.discovery.DiscoveryService discovery;
+    private final Duration challengeDeadline;
+    private final ai.badmonkey.agentspaces.pdt.refs.PushPublisher.Config push;
+    private final ai.badmonkey.agentspaces.identity.PeerIdentity identity;
     private volatile boolean started;
     private volatile boolean closed;
     private long lastCollectMillis = Long.MIN_VALUE;
@@ -155,14 +167,25 @@ public final class Pdt implements AutoCloseable {
             chosen = new SealedNodeStore(chosen.backend(), clock, new NodeSealer(b.keyRing == null ? GroupKeyRing.empty() : b.keyRing, clock));
         }
         this.store = chosen;
+        // PDT 2 phase 4, P2-Z-02: the store's table of intra-chunk deltas follows the builder's options
+        store.deltas().retention(b.deltaRetention);
+        if (b.deltas != null) {
+            store.deltas().enabled(b.deltas && !(store instanceof SealedNodeStore));
+        }
         this.treeStore = b.content != null && b.content.treeStore().orElse(null) instanceof NodeStoreTreeStore adapter
-                && adapter.store() == store ? adapter : PdtSwarm.treeStore(store);
-        this.retention = new Retention(b.retainVersions, b.retainAge, clock);
+                && adapter.store() == store ? adapter : new NodeStoreTreeStore(store, b.quota);
+        // over a pack store the retained versions persist beside the pins (PDT 2 phase 1, P2-V-03)
+        this.retention = new Retention(b.retainVersions, b.retainAge, clock,
+                store.backend() instanceof MetaStore meta ? meta : null);
         this.loadTimeout = b.loadTimeout;
         this.refsConfig = new Refs.Config(b.loadTimeout, b.inlineDelta, FOLLOW_FULL.equals(b.follow), b.sealing,
-                b.headLease, b.takeLease, b.takeTimeout, b.takeRetries, b.modes, b.cancelGrace);
+                b.headLease, b.takeLease, b.takeTimeout, b.takeRetries, b.modes, b.follows, b.cancelGrace);
         this.collectEvery = b.collectEvery;
         this.collectorVisits = b.collectorVisits;
+        this.discovery = b.discovery;
+        this.challengeDeadline = b.challengeDeadline;
+        this.push = b.push;
+        this.identity = b.identity;
         if (b.content != null) {
             attach(b.content);
         }
@@ -204,6 +227,14 @@ public final class Pdt implements AutoCloseable {
         private Duration collectEvery = Duration.ofMinutes(1);
         private int collectorVisits = NodeCollector.DEFAULT_VISITS_PER_TICK;
         private final Map<String, String> modes = new HashMap<>();
+        private final Map<String, Boolean> follows = new HashMap<>();
+        private long quota = ai.badmonkey.agentspaces.pdt.store.QuotaNodeStore.UNBOUNDED;
+        private ai.badmonkey.agentspaces.discovery.DiscoveryService discovery;
+        private Duration challengeDeadline = ai.badmonkey.agentspaces.pdt.stores.Stores.DEFAULT_DEADLINE;
+        private ai.badmonkey.agentspaces.pdt.refs.PushPublisher.Config push = ai.badmonkey.agentspaces.pdt.refs.PushPublisher.Config.defaults();
+        private ai.badmonkey.agentspaces.identity.PeerIdentity identity;
+        private Boolean deltas;
+        private Duration deltaRetention = ai.badmonkey.agentspaces.pdt.blob.ChunkDeltas.DEFAULT_RETENTION;
 
         private Builder(Content content, Space refSpace) {
             this.content = content;
@@ -248,6 +279,19 @@ public final class Pdt implements AutoCloseable {
         }
 
         /**
+         * The follow of one ref ({@code agentspaces.pdt.refs.<name>.follow}; PDT 2 phase 7, P2-X-08):
+         * {@link #FOLLOW_FULL} or {@link #FOLLOW_LAZY} for that name, the facade's follow for the rest.
+         */
+        public Builder follow(String name, String value) {
+            Objects.requireNonNull(name, "name");
+            if (!FOLLOW_FULL.equals(value) && !FOLLOW_LAZY.equals(value)) {
+                throw new IllegalArgumentException("the follow of ref " + name + " is full or lazy, got " + value);
+            }
+            follows.put(name, FOLLOW_FULL.equals(value));
+            return this;
+        }
+
+        /**
          * The sealing every head names ({@code agentspaces.pdt.sealing}, §3.8):
          * {@code none}, {@code group-key}, or {@code sealed-nodes}. The last wraps the
          * store in a {@link SealedNodeStore} at build (PD-P-05).
@@ -280,6 +324,22 @@ public final class Pdt implements AutoCloseable {
         /** The write lease of a head, renewed at half-life (PD-R-08); ten minutes by default. */
         public Builder headLease(Duration value) {
             this.headLease = Objects.requireNonNull(value, "headLease");
+            return this;
+        }
+
+        /**
+         * The quota of the store behind the tree store this facade hands the swarm ({@code agentspaces.pdt.store.quota};
+         * PDT 2 phase 7, P2-X-08): a received node that would carry the store past it is refused and ends its fetch.
+         * A facade that adopts the tree store of a swarm built before it takes that tree store's quota.
+         *
+         * @param bytes the quota in bytes, or {@code QuotaNodeStore.UNBOUNDED}
+         * @return this builder
+         */
+        public Builder quota(long bytes) {
+            if (bytes <= 0) {
+                throw new IllegalArgumentException("a quota is a positive number of bytes, got " + bytes);
+            }
+            this.quota = bytes;
             return this;
         }
 
@@ -325,6 +385,53 @@ public final class Pdt implements AutoCloseable {
             return this;
         }
 
+        /** The group's discovery, where {@link Pdt#storeFor} finds the content stores' cards (PDT 2 phase 3, P2-S-11). */
+        public Builder discovery(ai.badmonkey.agentspaces.discovery.DiscoveryService value) {
+            this.discovery = Objects.requireNonNull(value, "discovery");
+            return this;
+        }
+
+        /**
+         * This peer's identity, which signs the pins {@link Pdt#storeFor} writes, so a store charges this peer only
+         * for what it signed (PDT 2 follow-ups, 2026-11-09, F1).
+         */
+        public Builder identity(ai.badmonkey.agentspaces.identity.PeerIdentity value) {
+            this.identity = Objects.requireNonNull(value, "identity");
+            return this;
+        }
+
+        /** How long a challenged store has to answer ({@code agentspaces.store.challenge-deadline}, P2-S-07); 2 s by default. */
+        public Builder challengeDeadline(Duration value) {
+            this.challengeDeadline = Objects.requireNonNull(value, "challengeDeadline");
+            return this;
+        }
+
+        /**
+         * Eager push ({@code agentspaces.pdt.push.*}, PDT 2 phase 5, P2-P-01, P2-Q-MNT-01): off by default. With it on,
+         * this peer pushes each delta above the inline bound down its ref's stream, within the budget, and follows the
+         * streams of the refs it follows fully.
+         */
+        public Builder push(ai.badmonkey.agentspaces.pdt.refs.PushPublisher.Config value) {
+            this.push = Objects.requireNonNull(value, "push");
+            return this;
+        }
+
+        /**
+         * Whether blob edits keep intra-chunk delta frames ({@code agentspaces.pdt.blobs.deltas}, PDT 2 phase 4,
+         * P2-Z-02, P2-Q-MNT-01): on by default, except over a sealed store, which keeps none. With it on, an edit
+         * keeps frames only while this peer and another member advertise level 2 (PDT 2 phase 4 measures, §10.14).
+         */
+        public Builder deltas(boolean value) {
+            this.deltas = value;
+            return this;
+        }
+
+        /** How long a kept frame stays ({@code agentspaces.pdt.blobs.delta-retention}, P2-Z-02); one hour by default. */
+        public Builder deltaRetention(Duration value) {
+            this.deltaRetention = Objects.requireNonNull(value, "deltaRetention");
+            return this;
+        }
+
         public Pdt build() {
             return new Pdt(this);
         }
@@ -348,10 +455,12 @@ public final class Pdt implements AutoCloseable {
             throw new IllegalStateException("a content swarm is attached already");
         }
         PdtSwarm attached = PdtSwarm.attach(content, store, loadTimeout);
-        Refs engine = new Refs(refSpace, attached, retention, clock, refsConfig);
+        Refs engine = new Refs(refSpace, attached, retention, clock, refsConfig, push);
         this.collector = new NodeCollector(store, engine::liveRoots, retention, collectorVisits);
         this.refs = engine;
         this.swarm = attached;
+        this.stores = new ai.badmonkey.agentspaces.pdt.stores.Stores(content, store, discovery, identity, clock, challengeDeadline,
+                new java.security.SecureRandom());
         return this;
     }
 
@@ -375,6 +484,7 @@ public final class Pdt implements AutoCloseable {
             return;
         }
         refs.tick();
+        flushMeta();
         if (!collectEvery.isZero()) {
             long now = clock.millis();
             NodeCollector c = collector;
@@ -398,9 +508,31 @@ public final class Pdt implements AutoCloseable {
         if (engine != null) {
             engine.close();
         }
+        flushMeta();
+    }
+
+    /** Writes the pins and the retained versions that changed to the store's meta records (P2-V-03). */
+    private void flushMeta() {
+        store.flushMeta();
+        retention.flush();
     }
 
     // ------------------------------------------------------------ refs
+
+    /**
+     * Shares a ref's current version into another group's facade (PDT 2 phase 1, P2-X-02): the
+     * other facade writes a head of the same name with the same root, and its swarm holds the
+     * root there; {@link Refs#share} gives the rules.
+     *
+     * @param ref   a handle of this facade
+     * @param group the facade of the second group
+     * @param <T>   the value type
+     * @return the handle of the same ref in the second group
+     */
+    public <T> Ref<T> share(Ref<T> ref, Pdt group) {
+        Objects.requireNonNull(group, "group");
+        return engine().share(ref, group.engine());
+    }
 
     /**
      * A ref by name and kind with untyped CBOR codecs: {@code PMap.class},
@@ -428,6 +560,70 @@ public final class Pdt implements AutoCloseable {
             return (Ref<T>) engine.blobRef(name);
         }
         throw new IllegalArgumentException("a ref holds a PMap, PSet, PVector, or PBlob, not " + kind.getName());
+    }
+
+    /**
+     * The handle a {@code @PdtRef} site of a declared type receives (PDT 2 phase 7, P2-X-03, PD-R-11); a host
+     * registers {@code pdt::refFor} as each group's {@code RefResolver}. The value type picks the kind:
+     * {@code Ref<PMap<K, V>>} a map ref with the canonical codecs of {@code K} and {@code V}
+     * ({@link Codec#of}), except {@code Ref<PMap<String, FileEntry>>}, the tree ref of PD-B-05;
+     * {@code Ref<PSet<E>>} and {@code Ref<PVector<E>>} with the codec of {@code E}; {@code Ref<PBlob>} a
+     * blob ref; and {@code Ref<PDb>} a database ref whose meeting heads keep the later one whole, as
+     * {@code dbRef(name, null)}. A raw value class, a wildcard, or a type variable reads untyped CBOR, as
+     * {@link #ref(String, Class)} does.
+     *
+     * @param name the ref name
+     * @param type the site's generic type
+     * @return the handle
+     * @throws IllegalArgumentException when the type is no {@code Ref} of one of those values
+     */
+    public Ref<?> refFor(String name, Type type) {
+        Objects.requireNonNull(type, "type");
+        if (!(type instanceof ParameterizedType site) || site.getRawType() != Ref.class) {
+            if (type == Ref.class) {
+                throw new IllegalArgumentException("declare the value type, for example Ref<PMap<String, Fact>>, not a raw Ref");
+            }
+            throw new IllegalArgumentException(type.getTypeName() + " is not a Ref; declare Ref<PMap<String, Fact>> or another ref");
+        }
+        Type value = site.getActualTypeArguments()[0];
+        Class<?> kind = value instanceof Class<?> raw ? raw
+                : value instanceof ParameterizedType parameterized ? (Class<?>) parameterized.getRawType() : null;
+        if (kind == null) {
+            throw new IllegalArgumentException(type.getTypeName() + " names no value; declare the value type, for example"
+                    + " Ref<PMap<String, Fact>>");
+        }
+        Type[] args = value instanceof ParameterizedType parameterized ? parameterized.getActualTypeArguments() : null;
+        if (kind == PMap.class) {
+            if (args == null) {
+                return ref(name, PMap.class);
+            }
+            if (args[0] == String.class && args[1] == FileEntry.class) {
+                return treeRef(name);
+            }
+            return mapRef(name, codecOf(args[0]), codecOf(args[1]));
+        }
+        if (kind == PSet.class) {
+            return setRef(name, args == null ? Codec.of(Object.class) : codecOf(args[0]));
+        }
+        if (kind == PVector.class) {
+            return vectorRef(name, args == null ? Codec.of(Object.class) : codecOf(args[0]));
+        }
+        if (kind == PBlob.class) {
+            return blobRef(name);
+        }
+        if (kind == PDb.class) {
+            return dbRef(name, null);
+        }
+        throw new IllegalArgumentException("a ref holds a PMap, PSet, PVector, PBlob, or PDb, not " + value.getTypeName());
+    }
+
+    /** The canonical codec of a declared key or element type: its raw class, or untyped CBOR for a wildcard or variable. */
+    private static Codec<Object> codecOf(Type type) {
+        Class<?> raw = type instanceof Class<?> c ? c
+                : type instanceof ParameterizedType parameterized ? (Class<?>) parameterized.getRawType() : Object.class;
+        @SuppressWarnings("unchecked")
+        Codec<Object> codec = (Codec<Object>) Codec.of(raw);
+        return codec;
     }
 
     /** A map ref with typed codecs; {@code kind} must be {@code PMap.class}. */
@@ -479,6 +675,19 @@ public final class Pdt implements AutoCloseable {
     }
 
     /**
+     * A DataScript database ref (PDT 2 phase 2, P2-D-03, P2-D-06): version 2 heads of kind
+     * {@code db}, linear by default, merged by datoms through {@code merge} when heads meet.
+     * {@code agentspaces-datascript} builds its conn on this.
+     *
+     * @param name  the ref name
+     * @param merge the datom merge, or null for the later head whole
+     * @return the handle
+     */
+    public Ref<PDb> dbRef(String name, DbMerge merge) {
+        return engine().dbRef(name, merge);
+    }
+
+    /**
      * Registers the merge function every reader of a name applies when heads
      * meet (PD-R-05).
      *
@@ -516,6 +725,47 @@ public final class Pdt implements AutoCloseable {
             throw new IllegalStateException("attach the content swarm before creating refs");
         }
         return engine;
+    }
+
+    // ------------------------------------------------------------ content stores (PDT 2 phase 3)
+
+    /**
+     * Asks the group's content stores to hold a root (P2-S-11, P2-S-03): the planner's {@code StoreChooser}
+     * picks stores from their cards, and the facade writes one {@code SignedPin} naming them, signed by the
+     * identity of {@link Builder#identity}; writing again
+     * renews the lease (P2-S-04). {@link ai.badmonkey.agentspaces.pdt.stores.Stores#storeFor} gives the rules.
+     *
+     * @param root  a tree root this peer holds complete, or an artifact root
+     * @param need  the copies, tier, price, and stores to avoid
+     * @param lease how long the stores should hold it
+     * @return the pin and the chosen cards
+     */
+    public ai.badmonkey.agentspaces.pdt.stores.Stores.Pinning storeFor(String root,
+                                                                        ai.badmonkey.agentspaces.planner.StoreChooser.Need need,
+                                                                        Duration lease) {
+        return stores().storeFor(root, need, lease);
+    }
+
+    /**
+     * Challenges a store's possession of a root (P2-S-07); two failures in a row strike the store and stop
+     * its receipts counting.
+     *
+     * @param root  the root
+     * @param store the store's peer
+     * @return the outcome
+     */
+    public java.util.concurrent.CompletableFuture<Content.ChallengeResult> challenge(String root,
+                                                                                     ai.badmonkey.agentspaces.common.id.PeerId store) {
+        return stores().challenge(root, store);
+    }
+
+    /** The requester's view of the content stores, or a failure before {@link #attach}. */
+    public ai.badmonkey.agentspaces.pdt.stores.Stores stores() {
+        ai.badmonkey.agentspaces.pdt.stores.Stores view = stores;
+        if (view == null) {
+            throw new IllegalStateException("attach the content swarm before asking content stores");
+        }
+        return view;
     }
 
     // ------------------------------------------------------------ parts
@@ -596,7 +846,7 @@ public final class Pdt implements AutoCloseable {
         return new Stats(engine.refCount(), engine.headCount(), engine.deltasInline(), engine.deltasFetched(),
                 engine.conflicts(), engine.bytesReceived(), engine.headsIgnored(), engine.nodesDropped(),
                 engine.headsRewritten(), engine.basesFetched(), store.size(), store.bytesUsed(),
-                engine.entriesTruncated(), engine.mergeFunctionFailures());
+                engine.entriesTruncated(), engine.mergeFunctionFailures(), engine.headsLate().total());
     }
 
     @Override

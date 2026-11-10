@@ -53,7 +53,7 @@ public final class CapabilityPipes implements PipeChannel {
         runtime.onKind(Envelope.Kind.PIPE_DATA, (from, body) -> {
             PipeFrame frame;
             try {
-                frame = codec.fromBytes(body, PipeFrame.class);
+                frame = codec.fromWire(body, PipeFrame.class);
             } catch (RuntimeException e) {
                 return;
             }

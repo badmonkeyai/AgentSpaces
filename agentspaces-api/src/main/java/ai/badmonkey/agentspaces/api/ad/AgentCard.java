@@ -43,6 +43,8 @@ import java.util.Objects;
  * @param consumes    schema names of entry types the agent consumes
  * @param produces    schema names of entry types the agent produces
  * @param costHints   free-form cost hints (tokens, latency, price, …)
+ * @param spill       the reference to the card's parts document when the card is a stub (SPEC §6.1a.5, v0.1.32),
+ *                    omitted when absent
  */
 public record AgentCard(
         String id,
@@ -84,7 +86,60 @@ public record AgentCard(
         // byte-identical to v0.1.25.
         @com.fasterxml.jackson.annotation.JsonInclude(
                 com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
-        UiDeclaration ui) implements Advertisement {
+        UiDeclaration ui,
+        // Appended in v0.1.32 (SPEC §6.1a.5; AppCard origin and formats, 2026-11-09), omitted when absent: a card whose
+        // encoding passes the spill threshold travels as a stub, its actions and ui in a content-swarm document this
+        // names. A card without it is byte-identical to v0.1.31.
+        @com.fasterxml.jackson.annotation.JsonInclude(
+                com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        CardSpill spill) implements Advertisement {
+
+    /** The fields a stub moves into its parts document, in field order (SPEC §6.1a.5). */
+    public static final List<String> SPILL_SET = List.of("actions", "ui");
+
+    /**
+     * The fields of a card that its stub moves into the parts document (SPEC §6.1a.5): the full values of
+     * {@link #SPILL_SET}, and nothing else.
+     *
+     * @param actions the declared actions, omitted when absent
+     * @param ui      the ui declaration, omitted when absent
+     */
+    public record Parts(
+            @com.fasterxml.jackson.annotation.JsonInclude(
+                    com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+            List<CardAction> actions,
+            @com.fasterxml.jackson.annotation.JsonInclude(
+                    com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+            UiDeclaration ui) {
+
+        public Parts {
+            actions = actions == null ? null : List.copyOf(actions);
+        }
+
+        /** The names of the fields whose value is non-empty, in field order: what {@code spill.parts} lists. */
+        public List<String> nonEmpty() {
+            List<String> out = new java.util.ArrayList<>(SPILL_SET.size());
+            if (actions != null && !actions.isEmpty()) {
+                out.add("actions");
+            }
+            if (ui != null) {
+                out.add("ui");
+            }
+            return List.copyOf(out);
+        }
+    }
+
+    /** The v0.1.26 to v0.1.31 shape: everything but the spill reference. */
+    public AgentCard(String id, PeerId issuer, GroupId group, Instant issued, Duration ttl,
+                     AgentId agent, String description, List<String> goals,
+                     List<String> consumes, List<String> produces, Map<String, String> costHints,
+                     Map<String, String> spaceBindings, byte[] agentPublicKey,
+                     List<CardAction> actions,
+                     ai.badmonkey.agentspaces.api.security.AgentCertificate agentCertificate,
+                     UiDeclaration ui) {
+        this(id, issuer, group, issued, ttl, agent, description, goals, consumes, produces,
+                costHints, spaceBindings, agentPublicKey, actions, agentCertificate, ui, null);
+    }
 
     /** The v0.1.25 shape: everything but the ui declaration. */
     public AgentCard(String id, PeerId issuer, GroupId group, Instant issued, Duration ttl,
@@ -170,6 +225,13 @@ public record AgentCard(
                 throw new IllegalArgumentException("action names must be unique within a card");
             }
         }
+        if (spill != null) {
+            // FR-14 (AppCard origin and formats, 2026-11-09): a stub's actions and ui are absent, in its document
+            spill.requireWithin(SPILL_SET);
+            if (actions != null || ui != null) {
+                throw new IllegalArgumentException("a stub carries no actions and no ui; its parts are in the spill document");
+            }
+        }
         if (ui != null) {
             // FR-3: a control names an action the card declares (a surface action the agent answers is a card action too)
             java.util.Set<String> names = new java.util.HashSet<>();
@@ -190,7 +252,59 @@ public record AgentCard(
     /** The card with its ui declaration (v0.1.26), every other field unchanged; null clears it. */
     public AgentCard withUi(UiDeclaration declaration) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, declaration);
+                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, declaration, spill);
+    }
+
+    /** The card with its spill reference (v0.1.32); null clears it. */
+    public AgentCard withSpill(CardSpill reference) {
+        return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
+                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, ui, reference);
+    }
+
+    /**
+     * The full values of the spill set (SPEC §6.1a.5), what a publisher writes as the parts document.
+     *
+     * @return the parts
+     * @throws IllegalStateException on a stub, whose parts are in its document
+     */
+    public Parts parts() {
+        if (spill != null) {
+            throw new IllegalStateException("a stub's parts are in its spill document; resolve the card first");
+        }
+        return new Parts(actions, ui);
+    }
+
+    /**
+     * The stub of this card (SPEC §6.1a.5): no actions, no ui, and {@code spill} set.
+     *
+     * @param reference the parts document's reference; its {@code parts} are this card's non-empty spill-set fields
+     * @return the stub
+     */
+    public AgentCard toStub(CardSpill reference) {
+        Objects.requireNonNull(reference, "reference");
+        if (!reference.parts().equals(parts().nonEmpty())) {
+            throw new IllegalArgumentException("a stub moves every non-empty part " + parts().nonEmpty() + ": " + reference.parts());
+        }
+        return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
+                produces, costHints, spaceBindings, agentPublicKey, null, agentCertificate, null, reference);
+    }
+
+    /**
+     * The full card of this stub (FR-15): the document's values in place and no {@code spill}.
+     *
+     * @param document the decoded parts document, whose non-empty fields are exactly {@code spill.parts}
+     * @return the full card
+     */
+    public AgentCard complete(Parts document) {
+        Objects.requireNonNull(document, "document");
+        if (spill == null) {
+            throw new IllegalStateException("only a stub completes; this card carries its parts inline");
+        }
+        if (!document.nonEmpty().equals(spill.parts())) {
+            throw new IllegalArgumentException("the parts document holds " + document.nonEmpty() + " where the stub names " + spill.parts());
+        }
+        return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
+                produces, costHints, spaceBindings, agentPublicKey, document.actions(), agentCertificate, document.ui(), null);
     }
 
     /** Whether the card declares what its agent can show. */
@@ -214,14 +328,15 @@ public record AgentCard(
                 && java.util.Arrays.equals(agentPublicKey, that.agentPublicKey)
                 && Objects.equals(actions, that.actions)
                 && Objects.equals(agentCertificate, that.agentCertificate)
-                && Objects.equals(ui, that.ui);
+                && Objects.equals(ui, that.ui)
+                && Objects.equals(spill, that.spill);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(id, issuer, group, issued, ttl, agent, description, goals, consumes,
                 produces, costHints, spaceBindings, java.util.Arrays.hashCode(agentPublicKey),
-                actions, agentCertificate, ui);
+                actions, agentCertificate, ui, spill);
     }
 
     /**
@@ -245,7 +360,7 @@ public record AgentCard(
      */
     public AgentCard withActions(List<CardAction> declared) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, declared, agentCertificate, ui);
+                produces, costHints, spaceBindings, agentPublicKey, declared, agentCertificate, ui, spill);
     }
 
     /**
@@ -257,7 +372,7 @@ public record AgentCard(
      */
     public AgentCard withAgentCertificate(ai.badmonkey.agentspaces.api.security.AgentCertificate certificate) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, actions, certificate, ui);
+                produces, costHints, spaceBindings, agentPublicKey, actions, certificate, ui, spill);
     }
 
 }

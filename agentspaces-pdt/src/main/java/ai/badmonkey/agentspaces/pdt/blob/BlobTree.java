@@ -21,6 +21,7 @@ import ai.badmonkey.agentspaces.pdt.Link;
 import ai.badmonkey.agentspaces.pdt.NodeCodec;
 import ai.badmonkey.agentspaces.pdt.NodeFormatException;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
+import ai.badmonkey.agentspaces.pdt.values.NodeLoader;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -52,6 +53,10 @@ import java.util.Optional;
  * differs from what its parent claims for it is refused, and a chunk whose length
  * differs from the entry that names it is refused by {@link #chunk(Entry)}, each
  * with a {@link NodeFormatException} naming the CID.
+ *
+ * <p>A tree opened with a {@link NodeLoader} reads the nodes and chunks its store lacks through it (PDT 2 phase 4,
+ * P2-B-03), and {@link #chunksIn} descends only the nodes that overlap a range, so a window of a large blob loads
+ * its own path and chunks and nothing else.
  */
 public final class BlobTree {
 
@@ -103,6 +108,8 @@ public final class BlobTree {
     }
 
     private final NodeStore store;
+    /** Where a node the store lacks comes from, or null to read the store alone. */
+    private final NodeLoader loader;
     private final String root;
     private final long size;
     private final int height;
@@ -110,9 +117,10 @@ public final class BlobTree {
     private final int writtenNodes;
     private List<Entry> chunks;
 
-    private BlobTree(NodeStore store, String root, long size, int height, long writtenBytes, int writtenNodes,
-                     List<Entry> chunks) {
+    private BlobTree(NodeStore store, NodeLoader loader, String root, long size, int height, long writtenBytes,
+                     int writtenNodes, List<Entry> chunks) {
         this.store = store;
+        this.loader = loader;
         this.root = root;
         this.size = size;
         this.height = height;
@@ -183,7 +191,7 @@ public final class BlobTree {
         }
         if (level0.isEmpty()) {
             String root = store.put(new byte[0], Cids.RAW);
-            return new BlobTree(store, root, 0, 0, 0, 0, List.of());
+            return new BlobTree(store, null, root, 0, 0, 0, 0, List.of());
         }
         long written = 0;
         int writtenNodes = 0;
@@ -209,7 +217,7 @@ public final class BlobTree {
             }
             level = next;
         }
-        return new BlobTree(store, level.get(0).cid(), size, height, written, writtenNodes, level0);
+        return new BlobTree(store, null, level.get(0).cid(), size, height, written, writtenNodes, level0);
     }
 
     /**
@@ -222,18 +230,31 @@ public final class BlobTree {
      * @throws NodeFormatException when the root is absent or is a node of another kind
      */
     public static BlobTree open(NodeStore store, String root) {
+        return open(store, null, root);
+    }
+
+    /**
+     * Opens a tree whose nodes load through a loader when the store lacks them (PDT 2 phase 4, P2-B-03).
+     *
+     * @param store  the store
+     * @param loader where a node the store lacks comes from, or null to read the store alone
+     * @param root   the root CID: a {@code b} node or a single raw chunk
+     * @return the tree
+     * @throws NodeFormatException when the root is absent or is a node of another kind
+     */
+    public static BlobTree open(NodeStore store, NodeLoader loader, String root) {
         Objects.requireNonNull(store, "store");
         Objects.requireNonNull(root, "root");
         Cids.Parsed parsed = Cids.parse(root);
-        byte[] bytes = store.get(root)
-                .orElseThrow(() -> new NodeFormatException(root, "blob root is not in the store"));
+        BlobTree reader = new BlobTree(store, loader, root, 0, 0, 0, 0, null);
+        byte[] bytes = reader.fetch(root, "blob root");
         if (parsed.codec() == Cids.RAW) {
-            return new BlobTree(store, root, bytes.length, 0, 0, 0,
+            return new BlobTree(store, loader, root, bytes.length, 0, 0, 0,
                     bytes.length == 0 ? List.of() : List.of(new Entry(root, bytes.length)));
         }
         Map<String, Object> node = decodeB(root, bytes);
         long size = sum(root, sizes(node));
-        return new BlobTree(store, root, size, (int) (long) (Long) node.get("h"), 0, 0, null);
+        return new BlobTree(store, loader, root, size, (int) (long) (Long) node.get("h"), 0, 0, null);
     }
 
     /** The store the tree reads from. */
@@ -333,6 +354,47 @@ public final class BlobTree {
     }
 
     /**
+     * The chunks that hold the bytes of {@code [offset, offset + length)}, in order (PDT 2 phase 4, P2-B-03),
+     * found by descending only the nodes that overlap the range, so a window of a large blob reads its own path.
+     *
+     * @param offset the first byte, at most {@link #size()}
+     * @param length how many bytes, at most {@code size() - offset}
+     * @return the chunks and the offset of each one's first byte
+     * @throws IndexOutOfBoundsException when the range leaves the blob
+     */
+    public List<Located> chunksIn(long offset, long length) {
+        if (offset < 0 || length < 0 || offset > size || length > size - offset) {
+            throw new IndexOutOfBoundsException("range " + offset + "+" + length + " outside a blob of " + size + " bytes");
+        }
+        List<Located> out = new ArrayList<>();
+        if (length > 0) {
+            collectRange(root, 0, size, offset, offset + length, out, 1);
+        }
+        return out;
+    }
+
+    private void collectRange(String cid, long start, long under, long from, long to, List<Located> out, int depth) {
+        if (Cids.parse(cid).codec() == Cids.RAW) {
+            out.add(new Located(cid, start, under));
+            return;
+        }
+        if (depth > NodeStore.MAX_DEPTH) {
+            throw new NodeFormatException(cid, "tree deeper than " + NodeStore.MAX_DEPTH + " levels");
+        }
+        Map<String, Object> node = load(cid, under);
+        List<Link> links = links(node);
+        List<Long> sizes = sizes(node);
+        long at = start;
+        for (int i = 0; i < links.size() && at < to; i++) {
+            long end = at + sizes.get(i);
+            if (end > from) {
+                collectRange(links.get(i).cid(), at, sizes.get(i), from, to, out, depth + 1);
+            }
+            at = end;
+        }
+    }
+
+    /**
      * The bytes of one chunk, verified against its CID.
      *
      * @param cid the chunk's CID
@@ -340,8 +402,22 @@ public final class BlobTree {
      * @throws NodeFormatException when the chunk is absent
      */
     public byte[] chunk(String cid) {
+        return fetch(cid, "chunk");
+    }
+
+    /**
+     * A node or chunk from the store, else through the loader (P2-B-03); the outboard's {@code bo} nodes of a
+     * verified window load the same way.
+     */
+    byte[] fetch(String cid, String what) {
         Optional<byte[]> bytes = store.get(cid);
-        return bytes.orElseThrow(() -> new NodeFormatException(cid, "chunk is not in the store"));
+        if (bytes.isPresent()) {
+            return bytes.get();
+        }
+        if (loader != null) {
+            return loader.load(cid);
+        }
+        throw new NodeFormatException(cid, what + " is not in the store");
     }
 
     /**
@@ -362,7 +438,7 @@ public final class BlobTree {
 
     /** Loads a {@code b} node whose parent claims {@code under} bytes beneath it. */
     private Map<String, Object> load(String cid, long under) {
-        byte[] bytes = store.get(cid).orElseThrow(() -> new NodeFormatException(cid, "blob node is not in the store"));
+        byte[] bytes = fetch(cid, "blob node");
         Map<String, Object> node = decodeB(cid, bytes);
         long held = sum(cid, sizes(node));
         if (held != under) {

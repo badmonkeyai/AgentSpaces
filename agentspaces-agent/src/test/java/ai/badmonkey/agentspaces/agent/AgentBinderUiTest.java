@@ -48,16 +48,16 @@ class AgentBinderUiTest {
     private LocalSpace tasks;
     private AgentBinder binder;
 
-    /** A standard entry stands in for the platform's; the IRI is what the fleet speaks. */
-    public record SharedObject(String id) {
+    /** A standard entry; the IRI is what the fleet speaks (neutral vectors, 2026-11-09). */
+    public record SharedItem(String id) {
     }
 
     @AgentSpec(name = "desk", description = "A desk that shows what it holds")
-    @UiComponent(catalog = "bma-widgets", component = "ObjectShare", entry = SharedObject.class,
-            entryIri = "https://badmonkey.ai/ns/apps/v1/SharedObject", controls = {"research"})
+    @UiComponent(catalog = "example-widgets", component = "ItemPanel", entry = SharedItem.class,
+            entryIri = "https://example.org/ns/demo/v1/SharedItem", controls = {"research"})
     public static class Desk {
         @SpaceTake(space = "tasks", pollTimeout = "PT0.2S")
-        @UiComponent(catalog = "bma-widgets", component = "ChatInput", id = "ask", entry = TaskEntry.class, role = "control", reads = false, writes = true)
+        @UiComponent(catalog = "example-widgets", component = "MessageInput", id = "ask", entry = TaskEntry.class, role = "control", reads = false, writes = true)
         public FindingEntry research(TaskEntry task) {
             return new FindingEntry(task.topic(), "done");
         }
@@ -72,7 +72,7 @@ class AgentBinderUiTest {
     }
 
     @AgentSpec(name = "wrong", description = "A control nobody answers")
-    @UiComponent(catalog = "bma-widgets", component = "ObjectShare", controls = {"fly"})
+    @UiComponent(catalog = "example-widgets", component = "ItemPanel", controls = {"fly"})
     public static class Wrong {
         @SpaceTake(space = "tasks", pollTimeout = "PT0.2S")
         public FindingEntry research(TaskEntry task) {
@@ -100,14 +100,14 @@ class AgentBinderUiTest {
         UiDeclaration ui = card.ui();
         assertThat(ui).isNotNull();
         assertThat(ui.protocol()).isEqualTo("a2ui");
-        assertThat(ui.components()).extracting(UiDeclaration.Component::id).containsExactly("ObjectShare", "ask");
+        assertThat(ui.components()).extracting(UiDeclaration.Component::id).containsExactly("ItemPanel", "ask");
         assertThat(ui.components().get(0).controls()).containsExactly("research");
-        assertThat(ui.components().get(0).entry()).isEqualTo("https://badmonkey.ai/ns/apps/v1/SharedObject");
+        assertThat(ui.components().get(0).entry()).isEqualTo("https://example.org/ns/demo/v1/SharedItem");
         assertThat(ui.components().get(1).role()).isEqualTo("control");
         assertThat(ui.components().get(1).entry()).isEqualTo(TaskEntry.class.getName());
-        assertThat(ui.entries().reads()).containsExactly("https://badmonkey.ai/ns/apps/v1/SharedObject");
+        assertThat(ui.entries().reads()).containsExactly("https://example.org/ns/demo/v1/SharedItem");
         assertThat(ui.entries().writes()).containsExactly(TaskEntry.class.getName());
-        assertThat(ui.catalogIds()).containsExactly("bma-widgets");
+        assertThat(ui.catalogIds()).containsExactly("example-widgets");
         assertThat(card.declaresUi()).isTrue();
         assertThat(card.actions()).extracting(a -> a.name()).contains("research");
     }

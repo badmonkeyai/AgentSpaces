@@ -149,7 +149,9 @@ class HeadBoundsTest {
         long waited = (System.nanoTime() - started) / 1_000_000;
         assertThat(seen.root()).isEqualTo(v1.root());
         assertThat(waited).as("ten unloadable heads waited one load timeout together").isGreaterThanOrEqualTo(250).isLessThan(1_200);
-        assertThat(b.pdt().stats().headsIgnored()).isEqualTo(n);
+        // swarm retries (ROBUSTNESS.md §10.3 P1): roots still loading are late, apart from the heads ignored for a fault
+        assertThat(b.pdt().stats().headsIgnored()).isZero();
+        assertThat(b.pdt().refs().headsLate().total()).as("each late entry counts once per cause").isBetween((long) n, 2L * n);
         started = System.nanoTime();
         assertThat(onB.deref().root()).isEqualTo(v1.root());
         assertThat((System.nanoTime() - started) / 1_000_000).as("a second deref does not wait").isLessThan(250);

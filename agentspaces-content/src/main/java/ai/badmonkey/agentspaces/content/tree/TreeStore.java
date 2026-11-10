@@ -15,7 +15,10 @@
  */
 package ai.badmonkey.agentspaces.content.tree;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -54,6 +57,8 @@ public interface TreeStore {
      *
      * @param cid   the node's CID
      * @param bytes the node bytes
+     * @throws StoreRefusedException when the store refuses the node, past a quota for one; the fetch that
+     *                               received it ends with the refusal (PDT 2 phase 7, P2-X-08)
      */
     void putVerified(String cid, byte[] bytes);
 
@@ -95,4 +100,30 @@ public interface TreeStore {
      * @return the reachable held CIDs; empty when the root is not held
      */
     Set<String> reachable(String root);
+
+    /**
+     * The intra-chunk deltas this store keeps that rebuild a held chunk, each a {@code dcz} frame over a base
+     * chunk (PDT 2 phase 4, P2-Z-02; srad/agentspaces-pdt2.md §3.8). A holder sends one in place of the chunk
+     * to a level-2 asker whose haves hold the base. A store that keeps none returns an empty list.
+     *
+     * @param cid the chunk's CID
+     * @return the deltas, newest first
+     */
+    default List<ai.badmonkey.agentspaces.content.Messages.NodeDelta> deltas(String cid) {
+        return List.of();
+    }
+
+    /**
+     * The identity attributes of a plaintext flat artifact (PDT 2 phase 4, P2-B-06, P2-H-05; rule 11 of
+     * srad/agentspaces-pdt2.md §6.10.3): {@code pdt.blake3}, the BLAKE3 identity of the content, and {@code pdt.bao},
+     * the root of its outboard, which this store keeps and serves by the tree exchange. A store that builds no
+     * outboard returns an empty map, and the manifest names no identity.
+     *
+     * @param content the artifact's bytes, read to the end and not closed
+     * @return the attributes, or an empty map
+     * @throws IOException when the stream fails
+     */
+    default Map<String, String> outboard(InputStream content) throws IOException {
+        return Map.of();
+    }
 }

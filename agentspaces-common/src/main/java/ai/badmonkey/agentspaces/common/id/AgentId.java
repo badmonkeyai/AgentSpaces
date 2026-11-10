@@ -25,7 +25,8 @@ import java.util.Objects;
  * {@code AgentID = (PeerID, local-name)}. One peer commonly hosts several agents,
  * as an Embabel application does.
  *
- * <p>The canonical string form is {@code <peerId>/<localName>}.
+ * <p>The canonical string form is {@code <peerId>/<localName>}: both parts non-empty, and the
+ * local name holding neither a slash nor a colon.
  *
  * @param peer      the hosting peer's ID
  * @param localName the agent's name, unique within its peer
@@ -35,9 +36,11 @@ public record AgentId(PeerId peer, String localName) {
     public AgentId {
         Objects.requireNonNull(peer, "peer");
         Objects.requireNonNull(localName, "localName");
-        if (localName.isEmpty() || localName.indexOf('/') >= 0) {
+        // HLC round six, 2026-11-08 (ruling R5): no colon either, as every implementation reads
+        // an agent id, so an id that one replica parses is one that every replica parses
+        if (localName.isEmpty() || localName.indexOf('/') >= 0 || localName.indexOf(':') >= 0) {
             throw new IllegalArgumentException(
-                    "localName must be non-empty and contain no '/': " + localName);
+                    "localName must be non-empty and contain no '/' and no ':': " + localName);
         }
     }
 

@@ -139,6 +139,29 @@ class AdCacheTest {
         assertThat(cache.size()).isZero();
     }
 
+    /**
+     * HLC round six, 2026-11-08 (owner rulings F1 and F3): an advertisement decodes only from its
+     * own wire encoding. Its issuer's signature over other bytes (a duration Java does not print,
+     * a field the card does not name) leaves it out of the cache, as every implementation refuses it.
+     */
+    @Test
+    void anAdvertisementSignedInAnyFormButItsOwnEncodingIsRefused() {
+        AdCache.StoredAd good = stored(card("x", clock.instant(), Duration.ofMinutes(15)), issuer);
+        String hex = java.util.HexFormat.of().formatHex(good.adBytes());
+        String ttl = "6374746c" + "65505431354d"; // "ttl": "PT15M"
+        assertThat(hex).contains(ttl);
+        List<String> relabels = List.of(
+                hex.replace(ttl, "6374746c" + "66505439303053"), // "ttl": "PT900S"
+                hex.replace(ttl, ttl + "6178f5")); // "x": true
+        for (String relabel : relabels) {
+            byte[] adBytes = java.util.HexFormat.of().parseHex(relabel);
+            assertThat(cache.accept(new AdCache.StoredAd(good.adType(), adBytes, good.publicKey(),
+                    issuer.sign(adBytes)))).as(relabel).isEmpty();
+        }
+        assertThat(cache.size()).isZero();
+        assertThat(cache.accept(good)).isPresent();
+    }
+
     /** ISSUE-ModelCard FR-2: a ModelCard is cached, refreshed by a newer issue, and expired like an AssetCard. */
     @Test
     void aModelCardIsCachedRefreshedAndExpired() {
@@ -191,7 +214,9 @@ class AdCacheTest {
         // The same canonical shape a SpaceAdvertisement encodes to (indefinite map,
         // declared field order), but with an admission rule minted by a future
         // revision. Signed by a genuine issuer so only the decode can refuse it.
-        Map<String, Object> future = new java.util.LinkedHashMap<>();
+        // HLC round six, 2026-11-08 (owner ruling F3): a Verbatim map keeps the declared order,
+        // where a LinkedHashMap is written in the RFC 8949 key order and no longer reads as the ad
+        Map<String, Object> future = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
         future.put("id", "aspace://" + groupId.value() + "/tasks");
         future.put("issuer", issuer.peerId().value());
         future.put("group", groupId.value());

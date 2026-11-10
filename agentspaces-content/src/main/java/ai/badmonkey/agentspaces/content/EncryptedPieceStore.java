@@ -69,6 +69,10 @@ public final class EncryptedPieceStore implements PieceStore {
      */
     public EncryptedPieceStore(PieceStore inner, byte[] key) {
         this.inner = Objects.requireNonNull(inner, "inner");
+        if (inner instanceof HashPieceStore) {
+            // a hash store names each piece by its plaintext hash and verifies it on write (P2-H-01)
+            throw new IllegalArgumentException("a hash store keeps pieces under their plaintext hashes; encrypt at rest over a file store");
+        }
         if (key == null || key.length != 32) {
             throw new IllegalArgumentException("an at-rest key is 32 bytes");
         }

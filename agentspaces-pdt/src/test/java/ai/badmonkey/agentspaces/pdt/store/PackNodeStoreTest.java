@@ -286,6 +286,47 @@ class PackNodeStoreTest {
         }
     }
 
+    /**
+     * PDT 2 phase 1, P2-V-03: a meta record lives in the packs beside the nodes, the latest one of
+     * a name wins, a clean close and a crash both keep it, compaction carries it, and it is no node:
+     * {@code cids}, {@code size}, and {@code bytesUsed} never count it, so a collector never sweeps it.
+     */
+    @Test
+    void metaRecordsSurviveCloseCrashAndCompactionAndAreNoNodes(@TempDir Path dir) throws IOException {
+        PackNodeStore.Options options = PackNodeStore.Options.defaults().withMaxPackBytes(8192);
+        Map<String, byte[]> nodes;
+        try (PackNodeStore store = PackNodeStore.open(dir, options)) {
+            store.putMeta("pins", new byte[]{1});
+            store.putMeta("pins", new byte[]{2});
+            store.putMeta("retention:72", new byte[]{3, 3});
+            nodes = fill(store, 2, 200);
+            assertThat(store.meta("pins")).contains(new byte[]{2});
+            assertThat(store.meta("absent")).isEmpty();
+            assertThat(store.metaNames()).containsExactlyInAnyOrder("pins", "retention:72");
+            assertThat(store.cids()).containsExactlyInAnyOrderElementsOf(nodes.keySet());
+            assertThat(store.size()).isEqualTo(2);
+            assertThat(store.bytesUsed()).isEqualTo(400);
+        }
+        PackNodeStore reopened = PackNodeStore.open(dir, options);
+        assertThat(reopened.rebuiltOnOpen()).isFalse();
+        assertThat(reopened.meta("pins")).as("through the index file").contains(new byte[]{2});
+        reopened.putMeta("pins", new byte[]{4});
+        reopened.abandon();
+        PackNodeStore rebuilt = PackNodeStore.open(dir, options);
+        assertThat(rebuilt.rebuiltOnOpen()).isTrue();
+        assertThat(rebuilt.meta("pins")).as("through a rebuild, the latest record").contains(new byte[]{4});
+        assertThat(rebuilt.meta("retention:72")).contains(new byte[]{3, 3});
+        assertThat(rebuilt.size()).isEqualTo(2);
+        long first = rebuilt.packIds().get(0);
+        assertThat(rebuilt.compact(first)).isTrue();
+        assertThat(rebuilt.packIds()).doesNotContain(first);
+        assertThat(rebuilt.meta("retention:72")).as("compaction carries the live meta record").contains(new byte[]{3, 3});
+        assertThat(rebuilt.meta("pins")).contains(new byte[]{4});
+        assertHolds(rebuilt, nodes);
+        rebuilt.close();
+        assertThatThrownBy(() -> rebuilt.putMeta("bad name", new byte[0])).isInstanceOf(IllegalArgumentException.class);
+    }
+
     @Test
     void compactingTheCurrentPackRollsFirst(@TempDir Path dir) throws IOException {
         try (PackNodeStore store = PackNodeStore.open(dir)) {

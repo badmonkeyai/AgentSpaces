@@ -21,7 +21,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.5.0</version>
+    <version>0.6.0</version>
   </parent>
   <artifactId>agentspaces-content</artifactId>
   <name>AgentSpaces :: Content Swarm (Layer 4)</name>
@@ -70,6 +70,11 @@
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-connect-core</artifactId>
       <version>${project.version}</version>
+    </dependency>
+    <!-- PDT 2 phase 4, P2-Z-01 and P2-Z-04: the dcz frames of NODES.deltas (srad/agentspaces-pdt2.md §3.8). -->
+    <dependency>
+      <groupId>com.github.luben</groupId>
+      <artifactId>zstd-jni</artifactId>
     </dependency>
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>

@@ -22,8 +22,9 @@
  * {@link ai.badmonkey.agentspaces.agent.annotation.ProvidesCapability},
  * {@link ai.badmonkey.agentspaces.agent.annotation.Ballot},
  * {@link ai.badmonkey.agentspaces.agent.annotation.OnDecision},
- * {@link ai.badmonkey.agentspaces.agent.annotation.OrderedTake} and
- * {@link ai.badmonkey.agentspaces.agent.annotation.CapabilityRef}.
+ * {@link ai.badmonkey.agentspaces.agent.annotation.OrderedTake},
+ * {@link ai.badmonkey.agentspaces.agent.annotation.CapabilityRef} and
+ * {@link ai.badmonkey.agentspaces.agent.annotation.PdtRef}.
  * Stability: API.
  */
 package ai.badmonkey.agentspaces.agent.annotation;

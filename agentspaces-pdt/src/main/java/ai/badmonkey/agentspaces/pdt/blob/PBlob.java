@@ -18,6 +18,7 @@ package ai.badmonkey.agentspaces.pdt.blob;
 import ai.badmonkey.agentspaces.content.tree.Cids;
 import ai.badmonkey.agentspaces.pdt.NodeFormatException;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
+import ai.badmonkey.agentspaces.pdt.values.NodeLoader;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -36,6 +37,7 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * A persistent byte sequence (srad/agentspaces-pdt.md §3.3; PD-B-03, PD-B-04): the
@@ -65,6 +67,14 @@ import java.util.Objects;
  * it ({@link BlobTree#chunk(BlobTree.Entry)}), so a crafted interior node whose byte
  * counts lie ends in a {@link NodeFormatException} naming the chunk, before any
  * misaligned read.
+ *
+ * <p>PDT 2 phase 4 (srad/agentspaces-pdt2.md §3.5, §3.8). {@link #identity()} is the BLAKE3 identity of the content,
+ * whatever its chunking (P2-B-01), and {@link #outboard()} builds the Bao outboard as {@code bo} nodes in the store,
+ * reached by no blob node (rule 5). A value {@linkplain #claiming claims} the identity a head or a manifest names, and
+ * {@link #openVerified} then delivers each 16 KiB chunk group only after it verifies against that identity
+ * (P2-B-03). An edit keeps the {@code dcz} frame of each new chunk over the chunk it replaced in the store's
+ * {@link ChunkDeltas} (P2-Z-02), so a holder can send the frame in its place, while some member at level 2 could
+ * receive it (PDT 2 phase 4 measures, §10.14).
  */
 public final class PBlob {
 
@@ -72,13 +82,23 @@ public final class PBlob {
     private final BlobTree tree;
     private final long writtenChunkBytes;
     private final int writtenChunks;
+    /** The identity a head or a manifest names for this value, or null (P2-B-01). */
+    private final BlobIdentity claim;
     private long[] starts;
+    /** The outboard of the content, built on first use; its nodes enter the store once {@link #outboard()} asks. */
+    private BaoOutboard.Built built;
+    private boolean stored;
 
     private PBlob(NodeStore store, BlobTree tree, long writtenChunkBytes, int writtenChunks) {
+        this(store, tree, writtenChunkBytes, writtenChunks, null);
+    }
+
+    private PBlob(NodeStore store, BlobTree tree, long writtenChunkBytes, int writtenChunks, BlobIdentity claim) {
         this.store = store;
         this.tree = tree;
         this.writtenChunkBytes = writtenChunkBytes;
         this.writtenChunks = writtenChunks;
+        this.claim = claim;
     }
 
     // ------------------------------------------------------------------ factories
@@ -98,6 +118,20 @@ public final class PBlob {
      */
     public static PBlob load(NodeStore store, String root) {
         return new PBlob(store, BlobTree.open(store, root), 0, 0);
+    }
+
+    /**
+     * Opens a blob whose nodes and chunks load through a loader when the store lacks them (PDT 2 phase 4,
+     * P2-B-03), so a verified window reads its own path, chunks, and outboard nodes and nothing else.
+     *
+     * @param store  the store
+     * @param loader where a node the store lacks comes from
+     * @param root   the root CID
+     * @return the blob
+     */
+    public static PBlob load(NodeStore store, NodeLoader loader, String root) {
+        Objects.requireNonNull(loader, "loader");
+        return new PBlob(store, BlobTree.open(store, loader, root), 0, 0);
     }
 
     /**
@@ -207,6 +241,83 @@ public final class PBlob {
     /** The chunks in order. */
     public List<BlobTree.Entry> chunks() {
         return tree.chunks();
+    }
+
+    // ------------------------------------------------------------------ identity (PDT 2 phase 4, group B)
+
+    /**
+     * The BLAKE3 identity of the content (P2-B-01): a CIDv1 of codec {@code raw} over multihash 0x1e, equal for
+     * equal bytes whatever their chunking. Computed on demand from the content, as a blob inside a map carries
+     * no stored identity (rule 5 of §6.10.3).
+     *
+     * @return the identity CID
+     */
+    public String identity() {
+        return built().identity();
+    }
+
+    /**
+     * The Bao outboard of the content as {@code bo} nodes, written to the store on first use (P2-B-02): the writer's
+     * side, whose root a head names under {@code pdt.bao}. No blob node links it, so a fetch of the blob tree never
+     * moves it, and a reader fetches it only to verify a window.
+     *
+     * @return the outboard
+     */
+    public synchronized BaoOutboard.Built outboard() {
+        BaoOutboard.Built outboard = built();
+        if (!stored) {
+            store.putAll(outboard.nodes());
+            stored = true;
+        }
+        return outboard;
+    }
+
+    private synchronized BaoOutboard.Built built() {
+        if (built == null) {
+            try (InputStream in = open(0, size())) {
+                built = BaoOutboard.of(in);
+            } catch (IOException e) {
+                throw new UncheckedIOException("reading blob " + root(), e);
+            }
+        }
+        return built;
+    }
+
+    /**
+     * This value with the identity a head or a manifest claims for it (P2-B-01), which {@link #openVerified} checks.
+     *
+     * @param identity the claim
+     * @return a value over the same tree that carries the claim
+     */
+    public PBlob claiming(BlobIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        return new PBlob(store, tree, writtenChunkBytes, writtenChunks, identity);
+    }
+
+    /** The identity a head or a manifest claims for this value, when one does. */
+    public Optional<BlobIdentity> claim() {
+        return Optional.ofNullable(claim);
+    }
+
+    /**
+     * Opens a range that delivers each covering 16 KiB chunk group only after its chaining value verifies against
+     * the claimed identity through the outboard (P2-B-03, S6 of §6.4). The outboard's nodes on the paths of the range
+     * load at once and verify up to the identity; each group loads and verifies as the stream reaches it, so a read
+     * delivers the groups before a corrupt one and then fails with an {@link IOException} naming the group.
+     *
+     * @param offset the first byte
+     * @param length how many bytes, clipped to the end of the blob
+     * @return the stream
+     * @throws IOException           when the outboard does not chain to the identity, does not cover the blob, or cannot be had
+     * @throws IllegalStateException when the value claims no identity
+     */
+    public InputStream openVerified(long offset, long length) throws IOException {
+        if (claim == null) {
+            throw new IllegalStateException("a verified read needs the identity a head or a manifest names under pdt.blake3"
+                    + " and pdt.bao; give it with claiming");
+        }
+        checkRange(offset, length);
+        return new VerifiedWindow(tree, claim, offset, Math.min(length, size() - offset));
     }
 
     /** The chunk and interior bytes the operation that produced this value wrote to the store. */
@@ -364,12 +475,18 @@ public final class PBlob {
 
         Writer writer = new Writer(store);
         List<BlobTree.Entry> fresh = new ArrayList<>();
+        List<byte[]> framed = new ArrayList<>();
+        // PDT 2 phase 4 measures (§10.14): asked once per edit, since the answer reads the members' advertisements
+        boolean recording = store.deltas().recording();
         Iterator<byte[]> chunks = FastCdc.chunks(stream);
         long position = chunkStart;
         int resumeAt = old.size();
         while (chunks.hasNext()) {
             byte[] chunk = chunks.next();
             fresh.add(writer.write(chunk));
+            if (recording && framed.size() < ChunkDeltas.MAX_FRAMES_PER_EDIT) {
+                framed.add(chunk);
+            }
             position += chunk.length;
             if (position >= editEnd) {
                 int k = oldChunkEndingAt(position - delta, ends, first);
@@ -379,11 +496,27 @@ public final class PBlob {
                 }
             }
         }
+        recordFrames(old, first, resumeAt, fresh, framed);
         List<BlobTree.Entry> level0 = new ArrayList<>(first + fresh.size() + old.size() - resumeAt);
         level0.addAll(old.subList(0, first));
         level0.addAll(fresh);
         level0.addAll(old.subList(resumeAt, old.size()));
         return new PBlob(store, BlobTree.build(level0, store), writer.bytes, writer.count);
+    }
+
+    /**
+     * Keeps the {@code dcz} frame of each of the first new chunks over the old chunk at its place in the replaced run
+     * (P2-Z-02): the writer holds both chunks now, and the table keeps a frame only under half its chunk.
+     */
+    private void recordFrames(List<BlobTree.Entry> old, int first, int resumeAt, List<BlobTree.Entry> fresh, List<byte[]> framed) {
+        int replaced = resumeAt - first;
+        for (int i = 0; i < framed.size() && replaced > 0; i++) {
+            BlobTree.Entry base = old.get(first + Math.min(i, replaced - 1));
+            BlobTree.Entry made = fresh.get(i);
+            if (!base.cid().equals(made.cid())) {
+                store.deltas().record(base.cid(), tree.chunk(base), made.cid(), framed.get(i));
+            }
+        }
     }
 
     /** The index of the chunk re-chunking starts at: the one holding the offset, or the one before an append. */

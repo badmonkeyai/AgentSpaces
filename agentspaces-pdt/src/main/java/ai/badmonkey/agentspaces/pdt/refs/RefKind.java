@@ -17,16 +17,21 @@ package ai.badmonkey.agentspaces.pdt.refs;
 
 import ai.badmonkey.agentspaces.agent.pdt.PRef;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
+import ai.badmonkey.agentspaces.pdt.blob.BlobIdentity;
 import ai.badmonkey.agentspaces.pdt.blob.FileEntry;
 import ai.badmonkey.agentspaces.pdt.blob.PBlob;
 import ai.badmonkey.agentspaces.pdt.values.Codec;
 import ai.badmonkey.agentspaces.pdt.values.Merge;
 import ai.badmonkey.agentspaces.pdt.values.NodeLoader;
+import ai.badmonkey.agentspaces.pdt.values.PDb;
 import ai.badmonkey.agentspaces.pdt.values.PMap;
 import ai.badmonkey.agentspaces.pdt.values.PSet;
+import ai.badmonkey.agentspaces.pdt.values.PText;
 import ai.badmonkey.agentspaces.pdt.values.PVector;
 
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * What the ref engine needs from a value kind (srad/agentspaces-pdt.md §3.6):
@@ -63,6 +68,19 @@ interface RefKind<T> {
      * head whole. The resolver decides a key changed on both sides.
      */
     T merge3(T earlier, T base, T later, Merge.Resolver<Object, Object> resolver);
+
+    /** Whether {@link #merge3} merges against a common base, so a merge of heads looks for one first. */
+    default boolean mergesByKey() {
+        return false;
+    }
+
+    /**
+     * The {@code PRef.v} a head of a value writes (srad/agentspaces-pdt2.md §6.10.3, rule 8):
+     * version 2 when the value's tree holds a level-2 kind, else version 1.
+     */
+    default int version(T value) {
+        return PRef.versionFor(name());
+    }
 
     /** A map or a tree (a map of file entries). */
     static <K, V> RefKind<PMap<K, V>> map(String name, Codec<K> keys, Codec<V> values) {
@@ -108,6 +126,17 @@ interface RefKind<T> {
                                 (java.util.Optional<Object>) (java.util.Optional<?>) m,
                                 (java.util.Optional<Object>) (java.util.Optional<?>) t);
                 return earlier.merge3(base, later, typed);
+            }
+
+            @Override
+            public boolean mergesByKey() {
+                return true;
+            }
+
+            @Override
+            public int version(PMap<K, V> value) {
+                // PDT 2 phase 6, P2-T-01 (rule 3): a map of texts holds text values and t nodes
+                return values instanceof PText.TextCodec ? PRef.VERSION_2 : PRef.VERSION;
             }
         };
     }
@@ -160,6 +189,11 @@ interface RefKind<T> {
             public PSet<E> merge3(PSet<E> earlier, PSet<E> base, PSet<E> later, Merge.Resolver<Object, Object> resolver) {
                 return earlier.merge3(base, later);
             }
+
+            @Override
+            public boolean mergesByKey() {
+                return true;
+            }
         };
     }
 
@@ -201,11 +235,24 @@ interface RefKind<T> {
             public PVector<E> merge3(PVector<E> earlier, PVector<E> base, PVector<E> later, Merge.Resolver<Object, Object> resolver) {
                 return null;
             }
+
+            @Override
+            public int version(PVector<E> value) {
+                // PDT 2 phase 6, P2-R-01 (rule 2): a relaxed tree holds rr and rv nodes; P2-T-01 (rule 3): texts
+                return value.relaxed() || codec instanceof PText.TextCodec ? PRef.VERSION_2 : PRef.VERSION;
+            }
         };
     }
 
-    /** A blob; reads need the tree held, so a reader fetches it whatever its follow mode. */
-    static RefKind<PBlob> blob() {
+    /**
+     * A blob; reads need the tree held, so a reader fetches it whatever its follow mode. A value loaded at a root
+     * carries the identity its head claims (PDT 2 phase 4, P2-B-01) and loads through the loader what its store
+     * lacks, so a verified window fetches the outboard nodes it needs.
+     *
+     * @param claims the identity a head claims for a root, when one does
+     */
+    static RefKind<PBlob> blob(Function<String, Optional<BlobIdentity>> claims) {
+        Objects.requireNonNull(claims, "claims");
         return new RefKind<>() {
             @Override
             public String name() {
@@ -214,7 +261,8 @@ interface RefKind<T> {
 
             @Override
             public PBlob load(NodeStore store, NodeLoader loader, String root) {
-                return PBlob.load(store, root);
+                PBlob blob = PBlob.load(store, loader, root);
+                return claims.apply(root).map(blob::claiming).orElse(blob);
             }
 
             @Override
@@ -240,6 +288,55 @@ interface RefKind<T> {
             @Override
             public PBlob merge3(PBlob earlier, PBlob base, PBlob later, Merge.Resolver<Object, Object> resolver) {
                 return null;
+            }
+        };
+    }
+
+    /**
+     * A DataScript database (PDT 2 phase 2, P2-D-03 and P2-D-06): a {@code db} root over {@code dn}
+     * indexes, read lazily. Heads of two writers merge by datoms through {@code merge} against
+     * their common base; without one the later head wins whole.
+     */
+    static RefKind<PDb> db(DbMerge merge) {
+        return new RefKind<>() {
+            @Override
+            public String name() {
+                return PRef.KIND_DB;
+            }
+
+            @Override
+            public PDb load(NodeStore store, NodeLoader loader, String root) {
+                return PDb.load(store, loader, root);
+            }
+
+            @Override
+            public PDb empty(NodeStore store, NodeLoader loader) {
+                return PDb.empty(store, loader);
+            }
+
+            @Override
+            public String root(PDb value) {
+                return value.root();
+            }
+
+            @Override
+            public long size(PDb value) {
+                return value.size();
+            }
+
+            @Override
+            public boolean lazy() {
+                return true;
+            }
+
+            @Override
+            public PDb merge3(PDb earlier, PDb base, PDb later, Merge.Resolver<Object, Object> resolver) {
+                return merge.merge(earlier, base, later, resolver);
+            }
+
+            @Override
+            public boolean mergesByKey() {
+                return merge != null;
             }
         };
     }

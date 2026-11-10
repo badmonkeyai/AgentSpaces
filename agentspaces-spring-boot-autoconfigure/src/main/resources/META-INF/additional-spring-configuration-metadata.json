@@ -479,6 +479,105 @@
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Security$Grants"
     },
     {
+      "name": "agentspaces.store.enabled",
+      "type": "java.lang.Boolean",
+      "description": "This peer is a content store (srad/agentspaces-pdt2.md P2-S-10): one ContentStore per group over its Pdt facade; the swarm advertises pdt=2. Needs agentspaces.content.enabled and agentspaces.pdt.enabled.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.store.name",
+      "type": "java.lang.String",
+      "description": "The card name (asset content-store:<name>); the peer id when blank (P2-S-01).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer"
+    },
+    {
+      "name": "agentspaces.store.capacity",
+      "type": "java.lang.String",
+      "description": "Required: the bytes the store holds, such as 2TiB (P2-S-05).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer"
+    },
+    {
+      "name": "agentspaces.store.reserve",
+      "type": "java.lang.String",
+      "description": "The bytes kept free below the capacity: a size or a percentage (P2-S-05).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "5%"
+    },
+    {
+      "name": "agentspaces.store.max-object",
+      "type": "java.lang.String",
+      "description": "The largest root accepted (P2-S-05).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "64GiB"
+    },
+    {
+      "name": "agentspaces.store.lease-default",
+      "type": "java.time.Duration",
+      "description": "The lease of a pin asked by invoke without one (P2-S-04).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "30d"
+    },
+    {
+      "name": "agentspaces.store.lease-max",
+      "type": "java.time.Duration",
+      "description": "The longest lease honoured (P2-S-04).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "365d"
+    },
+    {
+      "name": "agentspaces.store.copies-max",
+      "type": "java.lang.Integer",
+      "description": "The largest copies a pin may ask for (P2-S-03).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": 3
+    },
+    {
+      "name": "agentspaces.store.accept-kinds",
+      "type": "java.util.List<java.lang.String>",
+      "description": "The pin kinds taken: tree, artifact (P2-S-05).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": [
+        "tree",
+        "artifact"
+      ]
+    },
+    {
+      "name": "agentspaces.store.accept-requesters",
+      "type": "java.lang.String",
+      "description": "open, or grant: the requester needs CONTENT_FETCH on the root (P2-S-05, P2-Q-SEC-06). A grant store without an authorizer takes no pins, and its card says it waits for one.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "grant"
+    },
+    {
+      "name": "agentspaces.store.blind",
+      "type": "java.lang.Boolean",
+      "description": "Hold sealed bytes only, without the content key (P2-S-08).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.store.tier",
+      "type": "java.lang.String",
+      "description": "hot or cold (P2-S-05).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "hot"
+    },
+    {
+      "name": "agentspaces.store.challenge-deadline",
+      "type": "java.time.Duration",
+      "description": "How long a challenged store has to answer this peer's challenges (P2-S-07).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": "2s"
+    },
+    {
+      "name": "agentspaces.store.price-per-gib-month",
+      "type": "java.lang.Long",
+      "description": "The price hint on the card's costHints; 0 for none (P2-S-01).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$StorePeer",
+      "defaultValue": 0
+    },
+    {
       "name": "agentspaces.pdt.enabled",
       "type": "java.lang.Boolean",
       "description": "Build one Pdt facade per group over the content swarm and advertise trees=1 (srad/agentspaces-pdt.md PD-C-02, PD-X-01). Needs agentspaces.content.enabled=true.",
@@ -514,6 +613,27 @@
       "defaultValue": "full"
     },
     {
+      "name": "agentspaces.content.store.backends",
+      "values": [
+        {
+          "value": "file",
+          "description": "One directory per root under agentspaces.content.store.path/<group>; a restart reads it back."
+        },
+        {
+          "value": "hash",
+          "description": "Every piece once under its sha2-256 in agentspaces.content.store.path/<group>.hash, shared by every root that names it (PDT 2, P2-H-01 to P2-H-04); not with encrypt-at-rest."
+        },
+        {
+          "value": "memory",
+          "description": "On the heap; lost on restart."
+        },
+        {
+          "value": "in-place",
+          "description": "Serves published files where they lie."
+        }
+      ]
+    },
+    {
       "name": "agentspaces.pdt.sealing",
       "type": "java.lang.String",
       "description": "The sealing every head names: group-key, sealed-nodes, or none (PD-P-03, PD-P-05). A group without a content-key names none.",
@@ -537,7 +657,7 @@
     {
       "name": "agentspaces.pdt.store.quota",
       "type": "java.lang.Long",
-      "description": "The store quota in bytes (PD-S-05); 0 is unbounded. Recorded in this phase; the facade applies no quota yet.",
+      "description": "The store quota in bytes (PD-S-05); 0 is unbounded. Every node the content swarm hands the store passes it, and a fetch past it fails with the refusal (PDT 2 phase 7, P2-X-08).",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$Store",
       "defaultValue": 0
     },
@@ -565,7 +685,7 @@
     {
       "name": "agentspaces.pdt.refs",
       "type": "java.util.Map<java.lang.String,ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$RefDef>",
-      "description": "Per-ref settings by ref name: refs.<name>.mode (multi or linear, PD-R-04) and refs.<name>.follow (full or lazy, PD-X-10; the facade of this phase follows every ref in the global mode).",
+      "description": "Per-ref settings by ref name: refs.<name>.mode (multi or linear, PD-R-04) and refs.<name>.follow (full or lazy, PD-X-10), the ref's own follow in place of agentspaces.pdt.follow (PDT 2 phase 7, P2-X-08).",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees"
     },
     {
@@ -573,6 +693,25 @@
       "type": "java.util.Map<java.lang.String,ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees$SpaceEscalation>",
       "description": "Per-space escalation by space name (srad/agentspaces-pdt.md group E): spaces.<name>.escalate-above (bytes, 0 off) opts the space into the persistent trees, so a payload above it travels as a tree and a later version as its delta, unsealed before escalation with the record naming the key epoch (PD-E-01, PD-E-04); spaces.<name>.require (PD-E-06) refuses a write a member without the tree exchange could not receive, naming the members, where the default falls back to the flat content swarm. Needs agentspaces.pdt.enabled=true.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PersistentTrees"
+    },
+    {
+      "name": "agentspaces.discovery.cache.max-entries",
+      "type": "java.lang.Integer",
+      "description": "The most advertisements each group's cache holds (SPEC §6.3). Unset: 8192, times four on a RENDEZVOUS peer; a set value applies as given. A full cache refuses a new id and counts adsRefusedCacheFull.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Discovery$Cache"
+    },
+    {
+      "name": "agentspaces.discovery.cache.max-bytes",
+      "type": "java.lang.Long",
+      "description": "The byte budget of each group's cache, the sum of its advertisements' encodings (SPEC §6.3, v0.1.32). Unset: 33554432 (32 MiB), times four on a RENDEZVOUS peer; a set value applies as given. A new id, or a newer version, that would pass it is refused and counted in adsRefusedCacheFull.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Discovery$Cache"
+    },
+    {
+      "name": "agentspaces.discovery.spill.max-fetch-bytes",
+      "type": "java.lang.Long",
+      "description": "The largest parts document a stub card's resolution fetches from the content swarm (SPEC §6.1a.5, v0.1.32), in bytes; a larger one fails at once and counts spillsOverLimit.",
+      "defaultValue": 16777216,
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Discovery$Spill"
     }
   ],
   "hints": [
@@ -624,6 +763,27 @@
         {
           "value": "bean",
           "description": "The application's NodeStore bean."
+        }
+      ]
+    },
+    {
+      "name": "agentspaces.content.store.backends",
+      "values": [
+        {
+          "value": "file",
+          "description": "One directory per root under agentspaces.content.store.path/<group>; a restart reads it back."
+        },
+        {
+          "value": "hash",
+          "description": "Every piece once under its sha2-256 in agentspaces.content.store.path/<group>.hash, shared by every root that names it (PDT 2, P2-H-01 to P2-H-04); not with encrypt-at-rest."
+        },
+        {
+          "value": "memory",
+          "description": "On the heap; lost on restart."
+        },
+        {
+          "value": "in-place",
+          "description": "Serves published files where they lie."
         }
       ]
     },

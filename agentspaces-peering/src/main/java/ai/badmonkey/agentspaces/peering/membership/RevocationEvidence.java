@@ -81,7 +81,7 @@ public record RevocationEvidence(List<byte[]> chain,
             return Optional.empty();
         }
         try {
-            RevocationEvidence evidence = codec.fromBytes(bytes, RevocationEvidence.class);
+            RevocationEvidence evidence = codec.fromWire(bytes, RevocationEvidence.class);
             if (evidence == null || evidence.chain() == null || evidence.chain().isEmpty()
                     || evidence.chain().size() > MAX_CHAIN
                     || (evidence.crl() != null && evidence.crl().length > MAX_CRL)) {

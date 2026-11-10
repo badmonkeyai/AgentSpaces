@@ -269,6 +269,66 @@ class TreeFetchSessionTest {
                 stopped, v1.nodes().size(), requests);
     }
 
+    /**
+     * Swarm retries, B6 (ROBUSTNESS.md §10.3): a holder that answered {@code missing} for a node is benched for that
+     * node alone, for a backoff, and asked again once the bench ends, so a fetch whose only holder comes to hold the
+     * node later completes instead of failing at its timeout.
+     */
+    @Test
+    void aHolderThatLackedANodeIsAskedAgainOnceItsBenchEndsAndTheFetchCompletes() {
+        NodeFixtures.Tree v1 = v1();
+        SimTreeFabric fabric = new SimTreeFabric();
+        SimTreeFabric.Holder late = fabric.holder("zLate").holds(v1);
+        String leaf = null;
+        for (String cid : v1.nodes().keySet()) {
+            if (NodeFixtures.linksOf(v1.nodes().get(cid)).isEmpty()) {
+                leaf = cid;
+                break;
+            }
+        }
+        late.store.remove(leaf);
+        MemoryTreeStore mine = new MemoryTreeStore();
+        TreeFetchSession session = start(fabric, mine, v1.root(), List.of(),
+                FetchOptions.defaults().withTimeout(Duration.ofSeconds(5)));
+        assertThat(fabric.runUntilDone(8, TICK)).as("two seconds: the holder still lacks the leaf").isFalse();
+        late.store.putVerified(leaf, v1.nodes().get(leaf)); // the holder's own fetch ran on and brought the leaf
+        assertThat(fabric.runUntilDone(80, TICK)).as(session.trace().toString()).isTrue();
+        assertThat(session.complete()).as("asked again after its bench, the holder serves the leaf").isTrue();
+        assertThat(mine.has(leaf)).isTrue();
+        assertThat(fabric.strikes).isEmpty();
+        assertThat(late.askedByNodeWantFor(leaf)).as("the leaf was asked for again by NODE_WANT").isTrue();
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): a bare {@code NODE_WANT} batch, which names
+     * no root, fails at its timeout when every source lacks its CID. Its stall check asked the store whether the
+     * absent root was complete, the store refused the null, and every tick threw before the timeout check, so the
+     * batch never ended and a lazy load that joined it (P3) waited on it for good.
+     */
+    @Test
+    void aBareBatchThatNoSourceCanServeFailsAtItsTimeout() {
+        NodeFixtures.Tree v1 = v1();
+        SimTreeFabric fabric = new SimTreeFabric();
+        SimTreeFabric.Holder lacking = fabric.holder("zLacking").holds(v1);
+        String leaf = null;
+        for (String cid : v1.nodes().keySet()) {
+            if (NodeFixtures.linksOf(v1.nodes().get(cid)).isEmpty()) {
+                leaf = cid;
+                break;
+            }
+        }
+        lacking.store.remove(leaf);
+        MemoryTreeStore mine = new MemoryTreeStore();
+        TreeFetchSession session = new TreeFetchSession(null, List.of(), List.of(leaf), fabric, mine,
+                FetchOptions.defaults().withTimeout(Duration.ofSeconds(2)).prefer(lacking.id), 16, 32);
+        fabric.session = session;
+        session.start();
+        fabric.pump();
+        assertThat(fabric.runUntilDone(200, TICK)).as(session.trace().toString()).isTrue();
+        assertThat(session.failure()).as("no source holds the CID: the batch fails at its timeout").isPresent();
+        assertThat(mine.has(leaf)).isFalse();
+    }
+
     @Test
     void aPartialHolderAnsweringMissingHandsTheGapToAnotherSource() {
         NodeFixtures.Tree v1 = v1();

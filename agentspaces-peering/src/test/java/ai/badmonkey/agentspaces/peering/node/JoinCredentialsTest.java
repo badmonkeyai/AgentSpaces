@@ -156,6 +156,32 @@ class JoinCredentialsTest {
                 guestId.peerId(), invite, codec)).as("the genuine article verifies").isTrue();
     }
 
+    /**
+     * HLC round six, 2026-11-08 (owner rulings F1 and F3): a credential decodes only from its own
+     * wire encoding. The founder's genuine signature in a credential whose fields arrive in another
+     * order, or with a field the credential does not name, admits nobody, as every implementation
+     * refuses such a credential.
+     */
+    @Test
+    void aCredentialInAnyFormButItsOwnEncodingIsRefused() {
+        PeerIdentity guestId = PeerIdentity.generate();
+        String genuine = JoinCredentials.issue(founderId, groupId, guestId.peerId());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> fields = codec.fromBytes(Base64.getDecoder().decode(genuine), Map.class);
+        ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim reordered =
+                new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        reordered.put("signature", fields.get("signature"));
+        reordered.put("founderKey", fields.get("founderKey"));
+        ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim extra =
+                new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim(fields);
+        extra.put("x", true);
+        for (ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim relabel : List.of(reordered, extra)) {
+            String encoded = Base64.getEncoder().encodeToString(codec.toBytes(relabel));
+            assertThat(JoinCredentials.verify(encoded, guestId.peerId(), invite, codec)).as("%s", relabel.keySet()).isFalse();
+        }
+        assertThat(JoinCredentials.verify(genuine, guestId.peerId(), invite, codec)).isTrue();
+    }
+
     /** Spec §5.1: the founder created the group and is admitted by members without a credential. */
     @Test
     void theFounderAdmitsItselfWithoutACredential() throws Exception {

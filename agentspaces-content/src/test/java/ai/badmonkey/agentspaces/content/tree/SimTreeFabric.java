@@ -50,6 +50,9 @@ final class SimTreeFabric implements TreeFetchSession.Fabric {
         boolean silent;
         boolean sealsBadly;
         long uploadBudget = Long.MAX_VALUE;
+        /** Whether this holder advertises the PDT feature level 2, and whether it reads the asker at level 2 (P2-F-05). */
+        boolean levelTwo;
+        boolean askerReadsLevelTwo;
         final TreeServer server;
 
         Holder(PeerId id, int walkCap) {
@@ -88,6 +91,16 @@ final class SimTreeFabric implements TreeFetchSession.Fabric {
                 public long nowMillis() {
                     return now;
                 }
+
+                @Override
+                public boolean levelTwo() {
+                    return levelTwo;
+                }
+
+                @Override
+                public boolean readsLevelTwo(PeerId peer) {
+                    return askerReadsLevelTwo;
+                }
             }, walkCap);
         }
 
@@ -100,6 +113,16 @@ final class SimTreeFabric implements TreeFetchSession.Fabric {
         Holder holdsRoot(String root) {
             roots.add(root);
             return this;
+        }
+
+        /** Whether a NODE_WANT asked this holder for a CID. */
+        boolean askedByNodeWantFor(String cid) {
+            for (Object m : received) {
+                if (m instanceof Messages.NodeWant want && want.cids().contains(cid)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /** Whether a request id came in as a NODE_WANT rather than a TREE_WANT. */
@@ -128,6 +151,8 @@ final class SimTreeFabric implements TreeFetchSession.Fabric {
     long now = 1_000_000;
     int reqs;
     long downloadBudget = Long.MAX_VALUE;
+    /** Whether the asker reads the level-2 forms, so it applies NODES.deltas (PDT 2 phase 4, P2-F-05). */
+    boolean readsDeltas;
     long downloaded;
     boolean completed;
     TreeFetchSession session;
@@ -207,6 +232,11 @@ final class SimTreeFabric implements TreeFetchSession.Fabric {
     @Override
     public void onComplete(TreeFetchSession session) {
         completed = true;
+    }
+
+    @Override
+    public boolean readsDeltas() {
+        return readsDeltas;
     }
 
     /** Moves every queued request to its holder and every queued answer to the session, until nothing moves. */

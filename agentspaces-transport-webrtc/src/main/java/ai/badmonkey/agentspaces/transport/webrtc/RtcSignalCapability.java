@@ -125,7 +125,7 @@ public final class RtcSignalCapability {
                 runtime.onKind(Envelope.Kind.PIPE_DATA, (from, body) -> {
                     PipeFrame frame;
                     try {
-                        frame = codec.fromBytes(body, PipeFrame.class);
+                        frame = codec.fromWire(body, PipeFrame.class);
                     } catch (RuntimeException e) {
                         return;
                     }
@@ -172,7 +172,7 @@ public final class RtcSignalCapability {
         }
         RtcSignal signal;
         try {
-            signal = codec.fromBytes(payload, RtcSignal.class);
+            signal = codec.fromWire(payload, RtcSignal.class);
         } catch (RuntimeException e) {
             counters.dropped("malformed");
             return;

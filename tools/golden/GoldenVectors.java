@@ -1256,25 +1256,16 @@ public final class GoldenVectors {
                 hex.formatHex(new AdvertisementSigner(codec).sign(actionCard, identity).signature())));
         // v0.1.26 (ISSUE-UiComponents, SPEC §6.1a.3): the same card with a ui declaration appended last.
         //   agent_card_ui_cbor  the card with ui {protocol, version, components, entries, catalogIds}
-        AgentCard uiCard = actionCard.withUi(ai.badmonkey.agentspaces.api.ad.UiDeclaration.of(List.of(
-                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component("ObjectShare", "bma-widgets", "ObjectShare",
-                        "https://badmonkey.ai/ns/apps/v1/SharedObject", List.of("research"), "panel"),
-                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component("ask", "bma-widgets", "ChatInput",
-                        "https://badmonkey.ai/ns/apps/v1/ChatMessage", List.of(), "control")),
-                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Entries(List.of("https://badmonkey.ai/ns/apps/v1/SharedObject"),
-                        List.of("https://badmonkey.ai/ns/apps/v1/ChatMessage"))));
+        //   neutral vectors, 2026-11-09: example values, so no platform's catalog or records reach the protocol's vectors
+        AgentCard uiCard = actionCard.withUi(exampleUi());
         require(codec.toBytes(uiCard.withUi(null)).length == codec.toBytes(actionCard).length, "a card without ui keeps its bytes");
         json.append(field("agent_card_ui_cbor", hex.formatHex(codec.toBytes(uiCard))));
         // v0.1.28 (ISSUE-AppHost, SPEC §6.1a.4): an AppCard with a host group appended last; the same bytes the api
         // module pins in src/test/resources/vectors/app_card_host_cbor.hex (AppCardHostTest).
         //   app_card_host_cbor  the card with host {url, port, hostAgent, path, signOn, publishedBy, publishedAt, status}
-        java.time.Instant hostAt = java.time.Instant.parse("2026-11-06T09:00:00Z");
-        ai.badmonkey.agentspaces.api.ad.AppCard hostCard = new ai.badmonkey.agentspaces.api.ad.AppCard("aspace://zApps/app/zPeerA/claims-chat",
-                ai.badmonkey.agentspaces.common.id.PeerId.of("zPeerA"), ai.badmonkey.agentspaces.common.id.GroupId.of("zApps"), hostAt,
-                java.time.Duration.ofMinutes(15), "Claims chat", "fed", "a2ui", "claims", List.of("zApps/conversations"), List.of("ask"), "", "", "", "1", List.of("conversations"),
-                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "v0.9.1", List.of("bma-widgets", "bma-viz"), "summariser", "views", List.of("chat-1")))
-                .withHost(new ai.badmonkey.agentspaces.api.ad.AppCard.Host("https://chat.acme.example", 7801, "zHostPeer", "/", "tenant", "summariser", hostAt, "serving"));
-        json.append(field("app_card_host_cbor", hex.formatHex(codec.toBytes(hostCard))));
+        //   v0.1.32 (AppCard origin and formats, 2026-11-09): signOn idp, neutral catalogs and names
+        json.append(field("app_card_host_cbor", hex.formatHex(codec.toBytes(hostCardOf()))));
+        json.append(appCardVectors(codec, hex));
 
         // ------------------------------------------------------------------
         // v0.1.13 audit item 10: the remaining v0.1.13 transitions and their
@@ -1602,6 +1593,7 @@ public final class GoldenVectors {
         json.append(connectVectors(codec, hex));
         json.append(contentVectors(codec, hex, wire.encode(ping, identity), self, group, issued));
         json.append(pdtVectors(previous));
+        json.append(storeVectors(previous));
         json.append(field("dtls_pdu_ping", "01030000"));
         json.append(field("dtls_pdu_pong", "01040000"));
         json.append(field("dtls_pdu_close_idle", "01050300"));
@@ -1681,6 +1673,239 @@ public final class GoldenVectors {
         return new ObjectMapper().readValue(out.toFile(), Map.class);
     }
 
+    // ------------------------------------------------------------------
+    // v0.1.32 (SPEC §6.1a.2 to §6.1a.5, annex I.3; AppCard origin and formats, 2026-11-09; neutral vectors,
+    // 2026-11-09): the AppCard's origin and formats, the card spill, and the refusals a reader applies at decode.
+    // The api module pins the same accept bytes (AppCardOriginTest, CardSpillTest), built by hand there.
+
+    private static final String EXAMPLE_ITEM = "https://example.org/ns/demo/v1/SharedItem";
+    private static final String EXAMPLE_MESSAGE = "https://example.org/ns/demo/v1/Message";
+
+    /** The two example-widgets components of the neutral vectors. */
+    private static List<ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component> exampleComponents() {
+        return List.of(new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component("share", "example-widgets", "ItemPanel",
+                        EXAMPLE_ITEM, List.of("research"), "panel"),
+                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Component("ask", "example-widgets", "MessageInput",
+                        EXAMPLE_MESSAGE, List.of(), "control"));
+    }
+
+    /** The ui of agent_card_ui_cbor, which agent_card_parts_cbor carries too. */
+    private static ai.badmonkey.agentspaces.api.ad.UiDeclaration exampleUi() {
+        return ai.badmonkey.agentspaces.api.ad.UiDeclaration.of(exampleComponents(),
+                new ai.badmonkey.agentspaces.api.ad.UiDeclaration.Entries(List.of(EXAMPLE_ITEM), List.of(EXAMPLE_MESSAGE)));
+    }
+
+    /** An unchecked mirror of AppCard.Origin, for the refusal vectors. */
+    record RawOrigin(String system, String ref, String version, @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, String> attrs) {
+    }
+
+    /** An unchecked mirror of AppCard.Host. */
+    record RawHost(String url, int port, String hostAgent, String path, String signOn, String publishedBy, java.time.Instant publishedAt,
+                   String status) {
+    }
+
+    /** An unchecked mirror of CardSpill. */
+    record RawSpill(String root, long size, List<String> parts) {
+    }
+
+    /** An unchecked mirror of AppCard (v0.1.32 shape), so a vector carries what the real record refuses. */
+    record RawAppCard(String id, PeerId issuer, GroupId group, java.time.Instant issued, Duration ttl, String name, String kind,
+                      String shape, String owner, List<String> reads, List<String> actions, String idpClient, String url, String pkg,
+                      String version, List<String> views,
+                      @JsonInclude(JsonInclude.Include.NON_NULL) ai.badmonkey.agentspaces.api.ad.AppCard.Ui ui,
+                      @JsonInclude(JsonInclude.Include.NON_NULL) RawHost host,
+                      @JsonInclude(JsonInclude.Include.NON_NULL) RawOrigin origin,
+                      @JsonInclude(JsonInclude.Include.NON_NULL) List<String> formats,
+                      @JsonInclude(JsonInclude.Include.NON_NULL) RawSpill spill) {
+
+        static RawAppCard of(ai.badmonkey.agentspaces.api.ad.AppCard c) {
+            ai.badmonkey.agentspaces.api.ad.AppCard.Host h = c.host();
+            ai.badmonkey.agentspaces.api.ad.AppCard.Origin o = c.origin();
+            ai.badmonkey.agentspaces.api.ad.CardSpill s = c.spill();
+            return new RawAppCard(c.id(), c.issuer(), c.group(), c.issued(), c.ttl(), c.name(), c.kind(), c.shape(), c.owner(),
+                    c.reads(), c.actions(), c.idpClient(), c.url(), c.pkg(), c.version(), c.views(), c.ui(),
+                    h == null ? null : new RawHost(h.url(), h.port(), h.hostAgent(), h.path(), h.signOn(), h.publishedBy(),
+                            h.publishedAt(), h.status()),
+                    o == null ? null : new RawOrigin(o.system(), o.ref(), o.version(), o.attrs()),
+                    c.formats(), s == null ? null : new RawSpill(s.root(), s.size(), s.parts()));
+        }
+
+        RawAppCard with(String newKind, ai.badmonkey.agentspaces.api.ad.AppCard.Ui newUi, RawHost newHost, RawOrigin newOrigin,
+                        List<String> newFormats, RawSpill newSpill) {
+            return new RawAppCard(id, issuer, group, issued, ttl, name, newKind, shape, owner, reads, actions, idpClient, url, pkg,
+                    version, views, newUi, newHost, newOrigin, newFormats, newSpill);
+        }
+    }
+
+    /** An unchecked mirror of AgentCard (v0.1.32 shape). */
+    record RawAgentCard(String id, PeerId issuer, GroupId group, java.time.Instant issued, Duration ttl,
+                        ai.badmonkey.agentspaces.common.id.AgentId agent, String description, List<String> goals,
+                        List<String> consumes, List<String> produces, Map<String, String> costHints, Map<String, String> spaceBindings,
+                        @JsonInclude(JsonInclude.Include.NON_NULL) byte[] agentPublicKey,
+                        @JsonInclude(JsonInclude.Include.NON_NULL) List<ai.badmonkey.agentspaces.api.ad.CardAction> actions,
+                        @JsonInclude(JsonInclude.Include.NON_NULL) Object agentCertificate,
+                        @JsonInclude(JsonInclude.Include.NON_NULL) ai.badmonkey.agentspaces.api.ad.UiDeclaration ui,
+                        @JsonInclude(JsonInclude.Include.NON_NULL) RawSpill spill) {
+    }
+
+    /** The content root of a parts document over 65,536-byte pieces, as the content swarm computes it. */
+    private static String spillRoot(byte[] document) {
+        return ai.badmonkey.agentspaces.content.ContentRoots.hash(document, ai.badmonkey.agentspaces.api.ad.CardSpill.PIECE_SIZE).root();
+    }
+
+    /** The entries of SPEC annex I.3: five accept vectors, two values, and eighteen refusals. */
+    private static String appCardVectors(CborCodec codec, HexFormat hex) {
+        assertSameNames(ai.badmonkey.agentspaces.api.ad.AppCard.class, RawAppCard.class);
+        assertSameNames(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.class, RawOrigin.class);
+        assertSameNames(ai.badmonkey.agentspaces.api.ad.AppCard.Host.class, RawHost.class);
+        assertSameNames(ai.badmonkey.agentspaces.api.ad.CardSpill.class, RawSpill.class);
+        assertSameNames(AgentCard.class, RawAgentCard.class);
+        StringBuilder json = new StringBuilder();
+        PeerId peer = PeerId.of("zPeerA");
+        GroupId apps = GroupId.of("zApps");
+        java.time.Instant at = java.time.Instant.parse("2026-11-09T09:00:00Z");
+
+        // app_card_origin_formats_cbor: a fed static card with origin and formats; the three attrs keys pin the P2 key order
+        Map<String, String> attrs = new java.util.LinkedHashMap<>();
+        attrs.put("realm.namespace", "urn:realm:example-realm#");
+        attrs.put("realm.reads", "Item,Order");
+        attrs.put("realm.format", "1");
+        ai.badmonkey.agentspaces.api.ad.AppCard imported = new ai.badmonkey.agentspaces.api.ad.AppCard(
+                "aspace://zApps/app/zPeerA/example-app", peer, apps, at, Duration.ofMinutes(15), "example-app", "fed", "static",
+                "example-realm", List.of(), List.of(), "", "https://apps.example.org/example-app.html", "", "1", List.of(), null)
+                .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("realm", "example-realm/example-app", "", attrs))
+                .withFormats(List.of("text/html", "application/geo+json", "urn:realm:example-realm#"));
+        json.append(field("app_card_origin_formats_cbor", hex.formatHex(codec.toBytes(imported))));
+
+        // app_card_spill_cbor and app_card_parts_cbor: a fed a2ui stub and its parts document
+        ai.badmonkey.agentspaces.api.ad.AppCard board = new ai.badmonkey.agentspaces.api.ad.AppCard(
+                "aspace://zApps/app/zPeerA/example-board", peer, apps, at, Duration.ofMinutes(15), "example-board", "fed", "a2ui",
+                "example", List.of("zApps/items", "zApps/orders"), List.of(), "", "", "", "1", List.of("board", "items", "orders"),
+                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets"), "board", "views",
+                        List.of("board-1"), exampleComponents()))
+                .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("console", "example-console/example-board", "", null));
+        byte[] boardParts = codec.toBytes(board.parts());
+        ai.badmonkey.agentspaces.api.ad.AppCard boardStub = board.toStub(new ai.badmonkey.agentspaces.api.ad.CardSpill(
+                spillRoot(boardParts), boardParts.length, board.parts().nonEmpty()));
+        require(boardStub.spill().parts().equals(List.of("reads", "views", "ui")), "the board stub names reads, views, and ui");
+        require(boardStub.complete(codec.fromWire(boardParts, ai.badmonkey.agentspaces.api.ad.AppCard.Parts.class)).equals(board),
+                "the board document completes its stub");
+        json.append(field("app_card_spill_cbor", hex.formatHex(codec.toBytes(boardStub))));
+        json.append(field("app_card_parts_cbor", hex.formatHex(boardParts)));
+
+        // agent_card_spill_cbor and agent_card_parts_cbor: an AgentCard stub and its document (one action with a contract
+        // and the ui of agent_card_ui_cbor)
+        AgentCard researcher = new AgentCard("aspace://zApps/agent/zPeerA/researcher", peer, apps, at, Duration.ofMinutes(15),
+                new ai.badmonkey.agentspaces.common.id.AgentId(peer, "researcher"), "Researches a topic and writes a finding",
+                List.of("every topic gets a finding"), List.of("Task"), List.of("Finding"), Map.of(), Map.of("Task", "tasks"), null,
+                List.of(new ai.badmonkey.agentspaces.api.ad.CardAction("research", "Researches a topic and writes a finding",
+                        List.of("Task"), List.of("Finding"), "tasks", ai.badmonkey.agentspaces.api.ad.CardAction.TAKE,
+                        new ai.badmonkey.agentspaces.api.ad.CardAction.Contract(List.of("topic-open"), List.of("finding-written"), "low",
+                                List.of()))),
+                null, exampleUi());
+        byte[] researcherParts = codec.toBytes(researcher.parts());
+        AgentCard researcherStub = researcher.toStub(new ai.badmonkey.agentspaces.api.ad.CardSpill(
+                spillRoot(researcherParts), researcherParts.length, researcher.parts().nonEmpty()));
+        require(researcherStub.complete(codec.fromWire(researcherParts, AgentCard.Parts.class)).equals(researcher),
+                "the researcher document completes its stub");
+        json.append(field("agent_card_spill_cbor", hex.formatHex(codec.toBytes(researcherStub))));
+        json.append(field("agent_card_parts_cbor", hex.formatHex(researcherParts)));
+        json.append(number("card_spill_threshold_bytes", ai.badmonkey.agentspaces.api.ad.CardSpill.SPILL_THRESHOLD_BYTES));
+        json.append(number("card_spill_warn_bytes", ai.badmonkey.agentspaces.api.ad.CardSpill.WARN_THRESHOLD_BYTES));
+
+        // the refusals: each is undecodable under SPEC §6.1b and §6.1a.2 to §6.1a.5
+        RawAppCard raw = RawAppCard.of(imported);
+        RawOrigin origin = raw.origin();
+        RawAppCard hosted = RawAppCard.of(hostCardOf());
+        RawAppCard stub = RawAppCard.of(boardStub);
+        RawSpill spill = stub.spill();
+        byte[] dagCbor = new byte[36];
+        dagCbor[0] = 0x01;
+        dagCbor[1] = 0x71;
+        dagCbor[2] = 0x12;
+        dagCbor[3] = 0x20;
+        System.arraycopy(ai.badmonkey.agentspaces.common.crypto.Digests.sha256(boardParts), 0, dagCbor, 4, 32);
+        List<String> seventeen = new java.util.ArrayList<>();
+        for (int i = 0; i < 17; i++) {
+            seventeen.add("text/x-" + i);
+        }
+        Map<String, Object> refusals = new java.util.LinkedHashMap<>();
+        refusals.put("adv_app_card_kind_realm_cbor", raw.with("realm", raw.ui(), raw.host(), origin, raw.formats(), null));
+        refusals.put("adv_app_card_sign_on_tenant_cbor", hosted.with(hosted.kind(), hosted.ui(), new RawHost(hosted.host().url(),
+                hosted.host().port(), hosted.host().hostAgent(), hosted.host().path(), "tenant", hosted.host().publishedBy(),
+                hosted.host().publishedAt(), hosted.host().status()), null, null, null));
+        refusals.put("adv_app_card_formats_empty_cbor", raw.with(raw.kind(), raw.ui(), raw.host(), origin, List.of(), null));
+        refusals.put("adv_app_card_origin_attrs_empty_cbor", raw.with(raw.kind(), raw.ui(), raw.host(),
+                new RawOrigin(origin.system(), origin.ref(), origin.version(), Map.of()), raw.formats(), null));
+        refusals.put("adv_app_card_formats_bound_cbor", raw.with(raw.kind(), raw.ui(), raw.host(), origin, seventeen, null));
+        refusals.put("adv_app_card_formats_upper_cbor", raw.with(raw.kind(), raw.ui(), raw.host(), origin,
+                List.of("Application/Geo+JSON"), null));
+        refusals.put("adv_app_card_formats_duplicate_cbor", raw.with(raw.kind(), raw.ui(), raw.host(), origin,
+                List.of("text/html", "text/html"), null));
+        refusals.put("adv_app_card_formats_parameter_cbor", raw.with(raw.kind(), raw.ui(), raw.host(), origin,
+                List.of("text/html;charset=utf-8"), null));
+        refusals.put("adv_app_card_origin_system_cbor", raw.with(raw.kind(), raw.ui(), raw.host(),
+                new RawOrigin("Realm Two", origin.ref(), origin.version(), null), raw.formats(), null));
+        refusals.put("adv_app_card_origin_attrs_prefix_cbor", raw.with(raw.kind(), raw.ui(), raw.host(),
+                new RawOrigin(origin.system(), origin.ref(), origin.version(), Map.of("namespace", "urn:realm:example-realm#")),
+                raw.formats(), null));
+        refusals.put("adv_app_card_origin_ref_bound_cbor", raw.with(raw.kind(), raw.ui(), raw.host(),
+                new RawOrigin(origin.system(), "r".repeat(257), origin.version(), null), raw.formats(), null));
+        refusals.put("adv_app_card_spill_placeholder_cbor", stub.with(stub.kind(), board.ui(), stub.host(), stub.origin(),
+                stub.formats(), spill));
+        refusals.put("adv_app_card_spill_parts_order_cbor", stub.with(stub.kind(), null, stub.host(), stub.origin(), stub.formats(),
+                new RawSpill(spill.root(), spill.size(), List.of("ui", "reads"))));
+        refusals.put("adv_app_card_spill_parts_unknown_cbor", stub.with(stub.kind(), null, stub.host(), stub.origin(), stub.formats(),
+                new RawSpill(spill.root(), spill.size(), List.of("host"))));
+        refusals.put("adv_app_card_spill_parts_empty_cbor", stub.with(stub.kind(), null, stub.host(), stub.origin(), stub.formats(),
+                new RawSpill(spill.root(), spill.size(), List.of())));
+        refusals.put("adv_app_card_spill_root_codec_cbor", stub.with(stub.kind(), null, stub.host(), stub.origin(), stub.formats(),
+                new RawSpill(ai.badmonkey.agentspaces.common.codec.Multibase.base32(dagCbor), spill.size(), spill.parts())));
+        refusals.put("adv_app_card_spill_size_zero_cbor", stub.with(stub.kind(), null, stub.host(), stub.origin(), stub.formats(),
+                new RawSpill(spill.root(), 0, spill.parts())));
+        refusals.put("adv_agent_card_spill_actions_cbor", new RawAgentCard(researcherStub.id(), researcherStub.issuer(),
+                researcherStub.group(), researcherStub.issued(), researcherStub.ttl(), researcherStub.agent(),
+                researcherStub.description(), researcherStub.goals(), researcherStub.consumes(), researcherStub.produces(),
+                researcherStub.costHints(), researcherStub.spaceBindings(), null, List.of(), null, null,
+                new RawSpill(researcherStub.spill().root(), researcherStub.spill().size(), researcherStub.spill().parts())));
+        for (Map.Entry<String, Object> refusal : refusals.entrySet()) {
+            byte[] bytes = codec.toBytes(refusal.getValue());
+            Class<?> type = refusal.getValue() instanceof RawAgentCard ? AgentCard.class : ai.badmonkey.agentspaces.api.ad.AppCard.class;
+            boolean refused;
+            try {
+                codec.fromWire(bytes, type);
+                refused = false;
+            } catch (RuntimeException expected) {
+                refused = true;
+            }
+            require(refused, refusal.getKey() + " is undecodable");
+            json.append(field(refusal.getKey(), hex.formatHex(bytes)));
+        }
+        require(refusals.size() == 18, "eighteen refusal vectors");
+        return json.toString();
+    }
+
+    /** The card of app_card_host_cbor, the vector and its refusal twin. */
+    private static ai.badmonkey.agentspaces.api.ad.AppCard hostCardOf() {
+        java.time.Instant hostAt = java.time.Instant.parse("2026-11-06T09:00:00Z");
+        return new ai.badmonkey.agentspaces.api.ad.AppCard("aspace://zApps/app/zPeerA/support-chat", PeerId.of("zPeerA"),
+                GroupId.of("zApps"), hostAt, Duration.ofMinutes(15), "Support chat", "fed", "a2ui", "support",
+                List.of("zApps/conversations"), List.of("ask"), "", "", "", "1", List.of("conversations"),
+                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets", "agentspaces-viz"), "summariser",
+                        "views", List.of("chat-1")))
+                .withHost(new ai.badmonkey.agentspaces.api.ad.AppCard.Host("https://chat.example.org", 7801, "zHostPeer", "/", "idp",
+                        "summariser", hostAt, "serving"));
+    }
+
+    /** Fails the run when an unchecked mirror's component names drift from the record it mirrors. */
+    private static void assertSameNames(Class<?> real, Class<?> mirror) {
+        List<String> realNames = Arrays.stream(real.getRecordComponents()).map(RecordComponent::getName).toList();
+        List<String> mirrorNames = Arrays.stream(mirror.getRecordComponents()).map(RecordComponent::getName).toList();
+        if (!realNames.equals(mirrorNames)) {
+            throw new IllegalStateException("mirror drift for " + real.getName() + ": real " + realNames + " vs mirror " + mirrorNames);
+        }
+    }
+
     /**
      * Fails the run when a mirror record here no longer matches the private
      * record it stands in for: same component names, same order, and the same
@@ -1732,6 +1957,44 @@ public final class GoldenVectors {
             computed = (Map<String, String>) vectors.getMethod("vectors").invoke(null);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("PdtVectors.vectors() failed", e.getCause() == null ? e : e.getCause());
+        }
+        computed.forEach((name, value) -> out.append(field(name, value)));
+        return out.toString();
+    }
+
+    // ---- srad/agentspaces-pdt2.md PDT 2 phase 3: the content store vectors ----
+
+    /** The names {@code StoreVectors.vectors()} emits, carried forward when the class is absent. */
+    private static final java.util.List<String> STORE_VECTORS = java.util.List.of("content_challenge_cbor",
+            "asset_card_content_store_cbor");
+
+    /**
+     * The PDT 2 phase 3 vectors ({@code content_challenge_cbor}, {@code asset_card_content_store_cbor}), computed
+     * by {@code agentspaces-store}'s {@code StoreVectors.vectors()} through reflection, as {@link #pdtVectors}
+     * does; without the class on the classpath the previous file's values are carried forward.
+     */
+    @SuppressWarnings("unchecked")
+    private static String storeVectors(Map<String, Object> previous) {
+        StringBuilder out = new StringBuilder();
+        Class<?> vectors;
+        try {
+            vectors = Class.forName("ai.badmonkey.agentspaces.store.golden.StoreVectors");
+        } catch (ClassNotFoundException absent) {
+            System.err.println("note: ai.badmonkey.agentspaces.store.golden.StoreVectors is not on the classpath; "
+                    + "the content store vectors are carried forward from the previous file this run "
+                    + "(add agentspaces-store/target/classes to CP to regenerate them)");
+            for (String name : STORE_VECTORS) {
+                if (previous.get(name) instanceof String value) {
+                    out.append(field(name, value));
+                }
+            }
+            return out.toString();
+        }
+        Map<String, String> computed;
+        try {
+            computed = (Map<String, String>) vectors.getMethod("vectors").invoke(null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("StoreVectors.vectors() failed", e.getCause() == null ? e : e.getCause());
         }
         computed.forEach((name, value) -> out.append(field(name, value)));
         return out.toString();

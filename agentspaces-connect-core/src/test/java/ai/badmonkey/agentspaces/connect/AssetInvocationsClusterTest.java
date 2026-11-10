@@ -284,6 +284,72 @@ class AssetInvocationsClusterTest {
         assertThat(release.result()).containsEntry("rule", "aspace:connector-invoke:inventory:release");
     }
 
+    /**
+     * The requester is the signer of the invocation the connector took (PDT 2 follow-ups, 2026-11-09, adversary of
+     * F1: a store's {@code pin} invoke charges the invocation's signer). A writer that copies another member's
+     * invocation id under its own parameters runs them under its own name, so it borrows no grant.
+     */
+    @Test
+    @Timeout(60)
+    void anInvocationRunsUnderItsOwnSignerWhenAnotherWriterReusesItsId() throws Exception {
+        Wired connectorPeer = newPeer("conn", 1);
+        Wired planner = newPeer("planner", 2, "conn");
+        Wired stranger = newPeer("stranger", 3, "conn");
+        tickAll(4);
+        PeerId connectorId = connectorPeer.identity().peerId();
+        PeerId plannerId = planner.identity().peerId();
+        PeerId strangerId = stranger.identity().peerId();
+        Authorizer authorizer = (peer, operation, scope) -> switch (operation) {
+            case CONNECTOR_SERVE -> connectorId.equals(peer);
+            case CONNECTOR_INVOKE -> plannerId.equals(peer);
+            default -> false;
+        };
+        InventoryProvider inventory = new InventoryProvider();
+        List<String> runs = new CopyOnWriteArrayList<>();
+        AssetProvider provider = new AssetProvider() {
+            @Override
+            public List<AssetCard> describeAssets(GroupId group, PeerId issuer, Instant now) {
+                return inventory.describeAssets(group, issuer, now);
+            }
+
+            @Override
+            public QueryResult query(String asset, Map<String, String> parameters) {
+                return inventory.query(asset, parameters);
+            }
+
+            @Override
+            public InvokeResult invoke(String asset, String operation, Map<String, String> params, String invocationId,
+                                       PeerId requester) {
+                runs.add(params.get("qty") + "@" + (requester == null ? "unknown" : requester.value()));
+                return InvokeResult.of(Map.of("reserved", params.get("qty")));
+            }
+        };
+        // planners' invocations and the stranger's copies of their ids, written in both orders, all waiting when
+        // the connector starts
+        int pairs = 6;
+        for (int i = 0; i < pairs; i++) {
+            AssetInvocation mine = AssetInvocation.of("inventory", "reserve", Map.of("qty", "1"));
+            AssetInvocation copy = new AssetInvocation(mine.v(), "inventory", "reserve", Map.of("qty", "999"),
+                    mine.invocationId());
+            Wired first = i % 2 == 0 ? planner : stranger;
+            Wired second = i % 2 == 0 ? stranger : planner;
+            first.data().write(first == planner ? mine : copy, ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofMinutes(1)));
+            tickAll(2);
+            second.data().write(second == planner ? mine : copy, ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofMinutes(1)));
+            tickAll(2);
+        }
+        assertThat(connectorPeer.data().readAllIssued(Template.of(AssetInvocation.class), 32)).hasSize(2 * pairs);
+        connector = new ConnectorRuntime(connectorPeer.data(), connectorPeer.discovery(), connectorPeer.identity(),
+                "cell-connector", provider, groupId, clock, Duration.ofMinutes(1)).authorizer(authorizer);
+        connector.start();
+        await(() -> (int) (connector.invoked() + connector.refused() + connector.repeated()), 2 * pairs);
+
+        assertThat(runs).as("the stranger's parameters never run under the planner's grant")
+                .noneMatch(run -> run.startsWith("999@"));
+        assertThat(runs).allMatch(run -> run.equals("1@" + plannerId.value()));
+        assertThat(runs).doesNotContain("1@" + strangerId.value());
+    }
+
     /** JS-F-06: the entries carry {@code v} and a reader ignores fields it does not know. */
     /** A provider whose operation takes a while, so the claim must outlive the invoke lease. */
     private static final class SlowProvider implements AssetProvider {

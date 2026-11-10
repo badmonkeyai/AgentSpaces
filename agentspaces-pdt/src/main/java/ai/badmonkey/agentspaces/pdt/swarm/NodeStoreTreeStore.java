@@ -19,13 +19,19 @@ import ai.badmonkey.agentspaces.content.tree.TreeStore;
 import ai.badmonkey.agentspaces.pdt.NodeCodec;
 import ai.badmonkey.agentspaces.pdt.NodeFormatException;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
+import ai.badmonkey.agentspaces.pdt.blob.BaoOutboard;
+import ai.badmonkey.agentspaces.pdt.blob.BlobIdentity;
+import ai.badmonkey.agentspaces.pdt.store.QuotaNodeStore;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -51,18 +57,45 @@ import java.util.Set;
  * {@link NodeStore#get} refuses, reads as absent, so a holder never serves it and
  * a fetcher asks for it again. The store is safe for concurrent use, as the
  * exchange's handler threads require.
+ *
+ * <p>With a quota ({@code agentspaces.pdt.store.quota}; PDT 2 phase 7, P2-X-08, PD-S-05) every node the swarm
+ * hands {@link #putVerified} passes a {@link QuotaNodeStore} first: a node that would carry the store past the
+ * quota is refused with a {@link ai.badmonkey.agentspaces.pdt.store.QuotaExceededException}, which ends the
+ * fetch that received it, and a warning is logged. The facade's own writes and pushed bundles do not pass here.
  */
 public final class NodeStoreTreeStore implements TreeStore {
 
+    private static final System.Logger LOG = System.getLogger(NodeStoreTreeStore.class.getName());
+
     private final NodeStore store;
+    /** The quota received nodes pass, or null when unbounded. */
+    private final QuotaNodeStore quota;
 
     /**
-     * The adapter.
+     * The adapter without a quota.
      *
      * @param store the node store the swarm serves from and fetches into
      */
     public NodeStoreTreeStore(NodeStore store) {
+        this(store, QuotaNodeStore.UNBOUNDED);
+    }
+
+    /**
+     * The adapter behind a quota on received nodes (PDT 2 phase 7, P2-X-08).
+     *
+     * @param store      the node store the swarm serves from and fetches into
+     * @param quotaBytes the most bytes the store may hold after a received node, or {@link QuotaNodeStore#UNBOUNDED}
+     */
+    public NodeStoreTreeStore(NodeStore store, long quotaBytes) {
         this.store = Objects.requireNonNull(store, "store");
+        this.quota = quotaBytes == QuotaNodeStore.UNBOUNDED ? null
+                : new QuotaNodeStore(store, quotaBytes, refusal -> LOG.log(System.Logger.Level.WARNING,
+                        "the PDT store refused a received node: {0}", refusal.getMessage()));
+    }
+
+    /** The quota received nodes pass, {@link QuotaNodeStore#UNBOUNDED} when none. */
+    public long quota() {
+        return quota == null ? QuotaNodeStore.UNBOUNDED : quota.quota();
     }
 
     /** The node store behind this adapter. */
@@ -87,7 +120,11 @@ public final class NodeStoreTreeStore implements TreeStore {
 
     @Override
     public void putVerified(String cid, byte[] bytes) {
-        store.putVerified(cid, bytes);
+        if (quota == null) {
+            store.putVerified(cid, bytes);
+        } else {
+            quota.putVerified(cid, bytes);
+        }
     }
 
     @Override
@@ -122,6 +159,28 @@ public final class NodeStoreTreeStore implements TreeStore {
         } catch (NodeFormatException e) {
             return lenientWalk(root, null);
         }
+    }
+
+    /**
+     * A flat artifact's identity and outboard (PDT 2 phase 4, P2-B-06): the {@code bo} nodes go into the store, pinned
+     * so the collector keeps them for the artifact, and the attributes name them. A sealed store names none, since a
+     * sealed group's content key seals the plaintext the identity would name.
+     */
+    @Override
+    public Map<String, String> outboard(InputStream content) throws IOException {
+        if (store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore) {
+            return Map.of();
+        }
+        BaoOutboard.Built outboard = BaoOutboard.of(content);
+        store.putAll(outboard.nodes());
+        store.pin(outboard.root());
+        return BlobIdentity.of(outboard).attrs();
+    }
+
+    /** The frames the store's edits kept for a chunk (PDT 2 phase 4, P2-Z-02), which a holder may send in its place. */
+    @Override
+    public List<ai.badmonkey.agentspaces.content.Messages.NodeDelta> deltas(String cid) {
+        return store.deltas().deltas(cid);
     }
 
     /**

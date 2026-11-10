@@ -273,6 +273,9 @@ public final class Composition {
     private final Fleet fleet;
     private final Sizes sizes;
     private final Path work;
+    /** How long a root check waits for the Python reader to reach the Java readers' root (HLC round four, 2026-11-08). */
+    private static final Duration PYTHON_CONVERGE = Duration.ofSeconds(30);
+
     private final PythonReader python;
     private final PrintStream out;
     private final List<Update> updates = new ArrayList<>();
@@ -363,7 +366,7 @@ public final class Composition {
             for (Peer reader : readers) {
                 require(derefRoot(reader.facts()).equals(javaRoot), label + ": " + reader.name() + " derefs " + javaRoot);
             }
-            rootChecks.add(new RootCheck("after round " + round, heads.size(), javaRoot, pythonRoot()));
+            rootChecks.add(new RootCheck("after round " + round, heads.size(), javaRoot, pythonRoot(javaRoot)));
             long valueBytes = bytesUnder(curator.store(), latestRoot(curator.facts()));
             long delta = bytesOfNewNodes(curator, heads, previousHeads);
             Meter meter = meterFetch(latestRoot(curator.facts()), previousHeads);
@@ -379,7 +382,8 @@ public final class Composition {
             factsRoots.put(reader.name(), derefRoot(reader.facts()));
         }
         factsRoots.put(curator.name(), derefRoot(curator.facts()));
-        rootChecks.add(new RootCheck("after the fold", headRoots(curator.facts()).size(), derefRoot(curator.facts()), pythonRoot()));
+        String foldRoot = derefRoot(curator.facts());
+        rootChecks.add(new RootCheck("after the fold", headRoots(curator.facts()).size(), foldRoot, pythonRoot(foldRoot)));
         if (python != null) {
             python.close();
         }
@@ -772,6 +776,22 @@ public final class Composition {
             total += peer.store().get(cid).orElseThrow().length;
         }
         return total;
+    }
+
+    /**
+     * The Python reader's root once it equals the Java readers' root, or its last answer after
+     * {@link #PYTHON_CONVERGE}: the Java readers wait in {@link #awaitConverged}, and the Python reader
+     * now waits as they do (HLC round four, 2026-11-08). One sample read a root two seconds behind
+     * the Java readers in one run of five, and two or three samples later it equalled theirs.
+     */
+    private String pythonRoot(String javaRoot) throws InterruptedException {
+        String root = pythonRoot();
+        long deadline = System.nanoTime() + PYTHON_CONVERGE.toNanos();
+        while (root != null && !root.equals(javaRoot) && System.nanoTime() < deadline) {
+            Thread.sleep(200);
+            root = pythonRoot();
+        }
+        return root;
     }
 
     private String pythonRoot() {

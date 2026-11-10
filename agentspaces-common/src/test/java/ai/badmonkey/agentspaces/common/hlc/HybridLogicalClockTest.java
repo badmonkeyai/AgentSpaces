@@ -36,6 +36,39 @@ class HybridLogicalClockTest {
         }
     }
 
+    /**
+     * HLC round four, 2026-11-08 (decision D6): a peer never emits a stamp whose node breaks
+     * the grammar, so the clock refuses such a node where it is built. Before, the clock was
+     * built and only its first stamp threw.
+     */
+    @Test
+    void aClockRefusesANodeThatNoStampCouldCarry() {
+        FixedSource source = new FixedSource();
+        for (String node : new String[]{"", "agent:one", "line\nbreak", "nul\u0000", "del\u007f"}) {
+            assertThatThrownBy(() -> new HybridLogicalClock(source, node))
+                    .as(node).isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThat(new HybridLogicalClock(source, "zPeer/agent-1").now().node()).isEqualTo("zPeer/agent-1");
+    }
+
+    /**
+     * HLC round five, 2026-11-08 (decision E11): a node holding a lone surrogate, U+D800 to
+     * U+DFFF without its pair, has no UTF-8 form, so no peer could send a stamp carrying it and
+     * Java's encoder would replace it with '?'. The clock refuses it where it is built, and the
+     * stamp constructor refuses it too. A surrogate pair is one code point and stays valid.
+     */
+    @Test
+    void aClockRefusesANodeHoldingALoneSurrogate() {
+        FixedSource source = new FixedSource();
+        for (String node : new String[]{"a\uD800", "\uDC00b", "a\uD83Db", "\uDE00\uD83D", "\uDFFF"}) {
+            assertThatThrownBy(() -> new HybridLogicalClock(source, node))
+                    .as(node).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new HlcTimestamp(1, 0, node))
+                    .as(node).isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThat(new HybridLogicalClock(source, "z\uD83D\uDE00").now().node()).isEqualTo("z\uD83D\uDE00");
+    }
+
     @Test
     void timestampsAreStrictlyMonotonicWithinTheSameMillisecond() {
         FixedSource source = new FixedSource();
@@ -293,6 +326,30 @@ class HybridLogicalClockTest {
             assertThatThrownBy(() -> new HlcTimestamp(1, 0, node)).as(node)
                     .isInstanceOf(IllegalArgumentException.class);
         }
+    }
+
+    @Test
+    void aStampIsATextOfAtMost3996Utf16UnitsAndAClockRefusesANodeThatCouldPassIt() {
+        // HLC round seven, 2026-11-08 (SPEC §9.1, S6): a stamp is one definite text, and a text
+        // past 3996 UTF-16 units travels only in Jackson's chunks, so no such text is a stamp
+        String prefix = "1800000000000:0:";
+        String edge = prefix + "n".repeat(HlcTimestamp.MAX_STAMP_UNITS - prefix.length());
+        assertThat(HlcTimestamp.parse(edge).encoded()).isEqualTo(edge);
+        assertThatThrownBy(() -> HlcTimestamp.parse(edge + "n")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new HlcTimestamp(1, 0, "n".repeat(HlcTimestamp.MAX_STAMP_UNITS)))
+                .isInstanceOf(IllegalArgumentException.class);
+        // a pair is two units: 3996 units hold 1990 pairs after the prefix's 16
+        String pairs = prefix + "\uD83D\uDE00".repeat((HlcTimestamp.MAX_STAMP_UNITS - prefix.length()) / 2);
+        assertThat(HlcTimestamp.parse(pairs).encoded()).hasSize(HlcTimestamp.MAX_STAMP_UNITS);
+        assertThatThrownBy(() -> HlcTimestamp.parse(pairs + "n")).isInstanceOf(IllegalArgumentException.class);
+
+        // a clock's node leaves room for the longest physical and logical parts and their colons
+        FixedSource wall = new FixedSource();
+        String longest = "n".repeat(HlcTimestamp.MAX_NODE_UNITS);
+        new HybridLogicalClock(wall, longest).now();
+        assertThat(Long.MAX_VALUE + ":" + Integer.MAX_VALUE + ":" + longest).hasSize(HlcTimestamp.MAX_STAMP_UNITS);
+        assertThatThrownBy(() -> new HybridLogicalClock(wall, longest + "n"))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

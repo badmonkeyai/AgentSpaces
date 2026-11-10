@@ -17,6 +17,12 @@ package ai.badmonkey.agentspaces.space.replicated;
 
 import ai.badmonkey.agentspaces.common.id.AgentId;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Objects;
@@ -39,7 +45,9 @@ import java.util.Set;
  * @param scopes the scopes granted; normalized to ordinal order so the
  *               canonical CBOR is stable
  */
-public record SpaceCredential(AgentId agent, Set<SpaceAdmission.Scope> scopes) {
+public record SpaceCredential(AgentId agent,
+                              @JsonSerialize(using = SpaceCredential.InOrdinalOrder.class)
+                              Set<SpaceAdmission.Scope> scopes) {
 
     public SpaceCredential {
         Objects.requireNonNull(agent, "agent");
@@ -53,5 +61,31 @@ public record SpaceCredential(AgentId agent, Set<SpaceAdmission.Scope> scopes) {
     /** Whether the credential grants the scope. */
     public boolean grants(SpaceAdmission.Scope scope) {
         return scopes.contains(scope);
+    }
+
+    /**
+     * Writes the scopes in ordinal order, the order the golden vector
+     * {@code space_credential_record_cbor} pins and every client writes. The codec orders any
+     * other set by its elements' encodings (HLC round six, 2026-11-08, change JC-4), which here
+     * would put {@code TAKE} before {@code WRITE}; an ordinal order is already a function of the
+     * value, so the credential keeps it.
+     */
+    static final class InOrdinalOrder extends StdSerializer<Set<SpaceAdmission.Scope>> {
+        private static final long serialVersionUID = 1L;
+
+        @SuppressWarnings("unchecked")
+        InOrdinalOrder() {
+            super((Class<Set<SpaceAdmission.Scope>>) (Class<?>) Set.class);
+        }
+
+        @Override
+        public void serialize(Set<SpaceAdmission.Scope> scopes, JsonGenerator gen, SerializerProvider provider)
+                throws IOException {
+            gen.writeStartArray(scopes, scopes.size());
+            for (SpaceAdmission.Scope scope : EnumSet.copyOf(scopes)) {
+                gen.writeString(scope.name());
+            }
+            gen.writeEndArray();
+        }
     }
 }

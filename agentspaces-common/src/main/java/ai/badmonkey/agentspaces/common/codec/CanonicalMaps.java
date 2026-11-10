@@ -21,6 +21,7 @@ import com.fasterxml.jackson.databind.SerializationConfig;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.databind.ser.BeanSerializerModifier;
 import com.fasterxml.jackson.databind.ser.std.StdDelegatingSerializer;
+import com.fasterxml.jackson.databind.type.CollectionType;
 import com.fasterxml.jackson.databind.type.MapType;
 import com.fasterxml.jackson.databind.util.StdConverter;
 
@@ -30,6 +31,8 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
 
 /**
  * The canonical order of map entries (ISSUE-CanonicalMaps, wire version 3,
@@ -80,8 +83,16 @@ public final class CanonicalMaps {
         return out;
     }
 
-    /** The Jackson module that installs the order on every map serializer. */
-    static SimpleModule module() {
+    /**
+     * The Jackson module that installs the order on every map serializer, and on every set
+     * serializer the order of its elements' encodings (HLC round six, 2026-11-08, change JC-4):
+     * shorter encoding first, then bytewise unsigned, which for text is {@link #KEY_ORDER}. A
+     * set's iteration order says nothing about its value ({@code Set.copyOf} iterates in a
+     * per-JVM order), so without it two Java peers wrote one advertisement two ways.
+     *
+     * @param encoder the codec's encoding of one element
+     */
+    static SimpleModule module(Function<Object, byte[]> encoder) {
         SimpleModule module = new SimpleModule("agentspaces-canonical-maps");
         module.setSerializerModifier(new BeanSerializerModifier() {
             @Override
@@ -92,8 +103,48 @@ public final class CanonicalMaps {
                 }
                 return new StdDelegatingSerializer(new ToSorted());
             }
+
+            @Override
+            public JsonSerializer<?> modifyCollectionSerializer(SerializationConfig config, CollectionType valueType,
+                                                                BeanDescription beanDesc, JsonSerializer<?> serializer) {
+                if (!Set.class.isAssignableFrom(valueType.getRawClass())) {
+                    return serializer;
+                }
+                return new StdDelegatingSerializer(new SetInEncodingOrder(encoder));
+            }
         });
         return module;
+    }
+
+    /** A set as a list in the order of its elements' encodings. */
+    private static final class SetInEncodingOrder extends StdConverter<Set<?>, List<Object>> {
+        private static final byte[] NULL = {(byte) 0xF6};
+
+        private final Function<Object, byte[]> encoder;
+
+        SetInEncodingOrder(Function<Object, byte[]> encoder) {
+            this.encoder = encoder;
+        }
+
+        @Override
+        public List<Object> convert(Set<?> value) {
+            List<Map.Entry<byte[], Object>> encoded = new ArrayList<>(value.size());
+            for (Object element : value) {
+                encoded.add(Map.entry(element == null ? NULL : encoder.apply(element), new Holder(element)));
+            }
+            encoded.sort((a, b) -> a.getKey().length != b.getKey().length
+                    ? Integer.compare(a.getKey().length, b.getKey().length)
+                    : java.util.Arrays.compareUnsigned(a.getKey(), b.getKey()));
+            List<Object> out = new ArrayList<>(encoded.size());
+            for (Map.Entry<byte[], Object> e : encoded) {
+                out.add(((Holder) e.getValue()).element());
+            }
+            return out;
+        }
+
+        /** Holds a possibly null element, since a map entry holds no null. */
+        private record Holder(Object element) {
+        }
     }
 
     /**

@@ -295,7 +295,7 @@ public final class JoinCredentials {
             return judgeDelegated(trimmed, candidate, groupAd, codec, now);
         }
         try {
-            Credential credential = codec.fromBytes(Base64.getDecoder().decode(trimmed), Credential.class);
+            Credential credential = codec.fromWire(Base64.getDecoder().decode(trimmed), Credential.class);
             if (credential == null || credential.founderKey() == null
                     || credential.signature() == null
                     || credential.founderKey().length != Ed25519.RAW_PUBLIC_KEY_LENGTH) {
@@ -398,7 +398,7 @@ public final class JoinCredentials {
             return null;
         }
         try {
-            Delegation parsed = codec.fromBytes(Base64.getDecoder().decode(delegation.trim()), Delegation.class);
+            Delegation parsed = codec.fromWire(Base64.getDecoder().decode(delegation.trim()), Delegation.class);
             return parsed == null || parsed.founderKey() == null || parsed.inviteKey() == null
                     || parsed.signature() == null || parsed.group() == null ? null : parsed;
         } catch (RuntimeException e) {
@@ -408,7 +408,7 @@ public final class JoinCredentials {
 
     private static DelegatedCredential parseDelegated(String encoded, CborCodec codec) {
         try {
-            DelegatedCredential parsed = codec.fromBytes(
+            DelegatedCredential parsed = codec.fromWire(
                     Base64.getDecoder().decode(stripPrefix(encoded)), DelegatedCredential.class);
             return parsed == null || parsed.delegation() == null ? null : parsed;
         } catch (RuntimeException e) {

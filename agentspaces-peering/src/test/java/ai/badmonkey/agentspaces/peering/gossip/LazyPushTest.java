@@ -37,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class LazyPushTest {
 
-    private record Sent(PeerId to, String kind, Object body) { }
+    private record Sent(PeerId to, String kind, Object body, long at) { }
 
     private final PeerId p1 = PeerIdentity.generate().peerId();
     private final PeerId p2 = PeerIdentity.generate().peerId();
@@ -50,15 +50,18 @@ class LazyPushTest {
     private final PeerSampler sampler = n -> members.size() <= n ? members : members.subList(0, n);
     private final List<Sent> sent = new ArrayList<>();
     private final List<String> delivered = new ArrayList<>();
+    /** The node's clock: a wait reads it (swarm retries), so a test moves it by hand. */
+    private final long[] clock = {0};
     private final GossipBus.FrameSender sender = new GossipBus.FrameSender() {
-        @Override public void sendRumor(PeerId to, Bodies.Rumor rumor) { sent.add(new Sent(to, "RUMOR", rumor)); }
-        @Override public void sendDigest(PeerId to, Bodies.Digest digest) { sent.add(new Sent(to, "DIGEST", digest)); }
-        @Override public void sendPullResp(PeerId to, Bodies.PullResp resp) { sent.add(new Sent(to, "PULL_RESP", resp)); }
-        @Override public void sendHave(PeerId to, Bodies.Have have) { sent.add(new Sent(to, "HAVE", have)); }
-        @Override public void sendGraft(PeerId to, Bodies.Graft graft) { sent.add(new Sent(to, "GRAFT", graft)); }
-        @Override public void sendPrune(PeerId to, Bodies.Prune prune) { sent.add(new Sent(to, "PRUNE", prune)); }
+        @Override public void sendRumor(PeerId to, Bodies.Rumor rumor) { sent.add(new Sent(to, "RUMOR", rumor, clock[0])); }
+        @Override public void sendDigest(PeerId to, Bodies.Digest digest) { sent.add(new Sent(to, "DIGEST", digest, clock[0])); }
+        @Override public void sendPullResp(PeerId to, Bodies.PullResp resp) { sent.add(new Sent(to, "PULL_RESP", resp, clock[0])); }
+        @Override public void sendHave(PeerId to, Bodies.Have have) { sent.add(new Sent(to, "HAVE", have, clock[0])); }
+        @Override public void sendGraft(PeerId to, Bodies.Graft graft) { sent.add(new Sent(to, "GRAFT", graft, clock[0])); }
+        @Override public void sendPrune(PeerId to, Bodies.Prune prune) { sent.add(new Sent(to, "PRUNE", prune, clock[0])); }
     };
-    private final GossipBus bus = new GossipBus(sampler, sender, CborCodec.defaultCodec(), 3, 6);
+    private final GossipBus bus = new GossipBus(sampler, sender, CborCodec.defaultCodec(), 3, 6, () -> clock[0],
+            new java.util.Random(7));
 
     private static byte[] bytes(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
@@ -70,6 +73,22 @@ class LazyPushTest {
 
     private List<PeerId> sentTo(String kind) {
         return sent.stream().filter(f -> f.kind().equals(kind)).map(Sent::to).toList();
+    }
+
+    /** Ticks every 250 ms of the clock until it reads {@code millis}, as the node's scheduler does. */
+    private void runUntil(long millis) {
+        while (clock[0] + 250 <= millis) {
+            clock[0] += 250;
+            bus.tick(clock[0]);
+        }
+    }
+
+    private List<Long> graftTimes() {
+        return sent.stream().filter(f -> f.kind().equals("GRAFT")).map(Sent::at).toList();
+    }
+
+    private static Bodies.Have have(byte[] hash) {
+        return new Bodies.Have(List.of(new Bodies.HaveItem("news", hash)));
     }
 
     private void enable() {
@@ -148,36 +167,351 @@ class LazyPushTest {
     }
 
     @Test
-    void anAnnouncedItemThatNeverArrivesIsGraftedFromTheAnnouncerThenTheNext() {
+    void anAnnouncedItemThatNeverArrivesIsGraftedAfterAWaitInTimeAndAnAnnouncementOfASeenItemIsIgnored() {
         enable();
         byte[] hash = Digests.sha256(bytes("missing"));
         bus.onPrune(p3, new Bodies.Prune("news", hash));
         assertThat(bus.lazyPeers()).containsExactly(p3);
-        bus.onHave(p3, new Bodies.Have(List.of(new Bodies.HaveItem("news", hash))));
-        bus.onHave(p4, new Bodies.Have(List.of(new Bodies.HaveItem("news", hash))));
-        bus.tick(1);
+        bus.onHave(p3, have(hash));
+        runUntil(GossipBus.GRAFT_BASE_MILLIS - 1);
         assertThat(sentTo("GRAFT")).as("not yet: the eager copy may still be on its way").isEmpty();
-        bus.tick(2);
-        assertThat(sentTo("GRAFT")).as("the first announcer is asked after two ticks").containsExactly(p3);
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).as("the only announcer is asked once the spread wait ends").containsExactly(p3);
         assertThat(bus.lazyPeers()).as("asking makes the announcer eager").isEmpty();
-        Bodies.Graft graft = (Bodies.Graft) sent.get(0).body();
+        Bodies.Graft graft = (Bodies.Graft) sent.get(sent.size() - 1).body();
         assertThat(graft.streamId()).isEqualTo("news");
         assertThat(graft.hash()).isEqualTo(hash);
-        for (int i = 0; i < GossipBus.GRAFT_RETRY_TICKS - 1; i++) {
-            bus.tick(2 + i);
-        }
-        assertThat(sentTo("GRAFT")).as("the retry waits").hasSize(1);
-        bus.tick(10);
-        assertThat(sentTo("GRAFT")).as("then the next announcer is asked").containsExactly(p3, p4);
-        bus.tick(20);
-        bus.tick(30);
-        assertThat(sentTo("GRAFT")).as("no announcer left: the item is left to anti-entropy").hasSize(2);
-        sent.clear();
-        bus.onRumor(p4, rumor("missing"));
+        bus.onRumor(p3, rumor("missing"));
         assertThat(delivered).containsExactly("missing");
-        bus.onHave(p1, new Bodies.Have(List.of(new Bodies.HaveItem("news", hash))));
-        bus.tick(40);
+        sent.clear();
+        bus.onHave(p1, have(hash));
+        runUntil(clock[0] + 20_000);
         assertThat(sentTo("GRAFT")).as("an announcement of a seen item is ignored").isEmpty();
+    }
+
+    /**
+     * Swarm retries, A1 (ROBUSTNESS.md §10.4, test 1): every member hears the origin's announcement first, so the
+     * first announcer heard is almost always the origin, and a member with another announcer queued asks that one.
+     */
+    @Test
+    void theFirstAskGoesToAnAnnouncerOtherThanTheFirstHeard() {
+        enable();
+        for (int i = 0; i < 20; i++) {
+            byte[] hash = Digests.sha256(bytes("item-" + i));
+            bus.onHave(p3, have(hash));
+            bus.onHave(p4, have(hash));
+        }
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).as("every item is asked of p4, never of p3, the first heard").hasSize(20)
+                .containsOnly(p4);
+        assertThat(bus.repairCounters().get("GRAFT_FIRST_HEARD")).isZero();
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): a member that announces items quickly and
+     * answers none of its asks would draw the first ask of every item it announced second. Once its asks went
+     * unanswered, a member asks the announcers that answered first, so a refusing announcer costs no wait.
+     */
+    @Test
+    void anAnnouncerThatLeftItsAsksUnansweredIsAskedAfterTheOthers() {
+        enable();
+        for (int i = 0; i < 4; i++) {
+            byte[] hash = Digests.sha256(bytes("refused-" + i));
+            bus.onHave(p1, have(hash));
+            bus.onHave(p3, have(hash));
+        }
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).as("p3 is the only announcer besides the first heard").hasSize(4).containsOnly(p3);
+        for (int i = 0; i < 4; i++) {
+            bus.onRumor(p4, rumor("refused-" + i)); // p3 never answered; the items came from p4
+        }
+        sent.clear();
+        long now = clock[0];
+        for (int i = 0; i < 10; i++) {
+            byte[] hash = Digests.sha256(bytes("next-" + i));
+            bus.onHave(p1, have(hash));
+            bus.onHave(p3, have(hash));
+            bus.onHave(p4, have(hash));
+        }
+        runUntil(now + GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).as("every first ask goes to p4, which answered").hasSize(10).containsOnly(p4);
+    }
+
+    /**
+     * Swarm retries, A1 (ROBUSTNESS.md §10.4): an eager copy that is merely late, here 600 ms after the announcement,
+     * arrives before any ask, so no graft fetches a copy already on its way and no duplicate prunes a sound edge
+     * (scenario 7 of §3).
+     */
+    @Test
+    void aCopyMerelyLateArrivesBeforeAnyAsk() {
+        enable();
+        bus.onHave(p3, have(Digests.sha256(bytes("late"))));
+        runUntil(600);
+        bus.onRumor(p1, rumor("late"));
+        runUntil(10_000);
+        assertThat(sentTo("GRAFT")).as("no graft of a copy on its way").isEmpty();
+        assertThat(sentTo("PRUNE")).isEmpty();
+        assertThat(delivered).containsExactly("late");
+    }
+
+    /**
+     * Swarm retries, A3 (ROBUSTNESS.md §10.3): after a stall the scheduler runs the missed ticks back to back, and a
+     * wait counted in ticks would end within milliseconds; the wait reads the clock, so catch-up ticks change nothing.
+     */
+    @Test
+    void catchUpTicksAfterAStallDoNotShortenTheWait() {
+        enable();
+        bus.onHave(p3, have(Digests.sha256(bytes("stalled"))));
+        for (int i = 0; i < 12; i++) {
+            bus.tick(clock[0]);
+        }
+        assertThat(sentTo("GRAFT")).as("twelve ticks in the same millisecond ask nothing").isEmpty();
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).containsExactly(p3);
+    }
+
+    /**
+     * Swarm retries, A2 (ROBUSTNESS.md §10.4, test 3): a member that asked every announcer once asks again, backing off
+     * 1, 2, 4, 8 s with a spread and going round the announcers again, while members still announce the item; it
+     * stops once the item arrives.
+     */
+    @Test
+    void anItemEveryAnnouncerWasAskedForIsAskedAgainWithBackoffUntilItArrives() {
+        enable();
+        byte[] hash = Digests.sha256(bytes("slow"));
+        bus.onHave(p3, have(hash));
+        bus.onHave(p4, have(hash));
+        for (long t = 5_000; t <= 40_000; t += 5_000) {
+            runUntil(t);
+            bus.onHave(p4, have(hash)); // p4's probes keep carrying the item
+        }
+        List<Long> times = graftTimes();
+        assertThat(times).as("asked again after both announcers were asked once").hasSizeGreaterThanOrEqualTo(6);
+        assertThat(sentTo("GRAFT").subList(0, 2)).as("one round asks each announcer").containsExactlyInAnyOrder(p3, p4);
+        for (int i = 1; i < times.size(); i++) {
+            long gap = times.get(i) - times.get(i - 1);
+            long backoff = Math.min(GossipBus.GRAFT_BACKOFF_MAX_MILLIS, GossipBus.GRAFT_BACKOFF_MILLIS << Math.min(i - 1, 10));
+            assertThat(gap).as("ask %d waits its backoff", i).isGreaterThanOrEqualTo(backoff);
+        }
+        assertThat(bus.repairCounters().get("GRAFT_RETRY")).isEqualTo(times.size() - 1);
+        bus.onRumor(p4, rumor("slow"));
+        int asked = times.size();
+        runUntil(clock[0] + 30_000);
+        assertThat(graftTimes()).as("nothing more once the item arrived").hasSize(asked);
+    }
+
+    /**
+     * Swarm retries (ROBUSTNESS.md §10.2): an item no member announces any more is given up once its last
+     * announcement is older than the horizon, so an announcer that never serves costs a bounded number of asks.
+     */
+    @Test
+    void anItemNoMemberAnnouncesAnyMoreIsDroppedAfterTheHorizon() {
+        enable();
+        bus.onHave(p3, have(Digests.sha256(bytes("gone"))));
+        runUntil(GossipBus.MISSING_HORIZON_MILLIS + GossipBus.GRAFT_BACKOFF_MAX_MILLIS * 3);
+        List<Long> times = graftTimes();
+        assertThat(times).isNotEmpty();
+        assertThat(times.get(times.size() - 1)).as("no ask past the horizon and one backoff")
+                .isLessThanOrEqualTo(GossipBus.MISSING_HORIZON_MILLIS + 2 * GossipBus.GRAFT_BACKOFF_MAX_MILLIS);
+        assertThat(bus.repairCounters().get("GRAFT_DROPPED")).isEqualTo(1);
+    }
+
+    /**
+     * Swarm retries (ROBUSTNESS.md §10.2): a graft whose item then arrives from another member anyway counts as
+     * premature, once.
+     */
+    @Test
+    void aGraftWhoseItemCameFromAnotherMemberCountsAsPremature() {
+        enable();
+        bus.onHave(p3, have(Digests.sha256(bytes("raced"))));
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).containsExactly(p3);
+        bus.onRumor(p1, rumor("raced"));
+        bus.onRumor(p3, new Bodies.Rumor("news", "raced", 5, bytes("raced")));
+        assertThat(bus.repairCounters().get("GRAFT_PREMATURE")).isEqualTo(1);
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): only the copy that repairs an item gives a
+     * round trip. A member that answers its asks late on purpose, after the item came from another member, repaired
+     * nothing, so its late answers must not widen the spread of every later ask.
+     */
+    @Test
+    void aLateAnswerToAnItemThatArrivedAnywayLeavesTheSpreadAlone() {
+        enable();
+        long floor = bus.repairWindowMillis();
+        for (int i = 0; i < 10; i++) {
+            bus.onHave(p3, have(Digests.sha256(bytes("late-" + i))));
+        }
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).hasSize(10).containsOnly(p3);
+        for (int i = 0; i < 10; i++) {
+            bus.onRumor(p1, rumor("late-" + i)); // the eager copy comes from another member first
+        }
+        clock[0] += 3_000; // p3 answers three seconds later
+        for (int i = 0; i < 10; i++) {
+            bus.onRumor(p3, new Bodies.Rumor("news", "late-" + i, 5, bytes("late-" + i)));
+        }
+        assertThat(bus.repairWindowMillis()).as("no repair was observed, so the window stays at its floor").isEqualTo(floor);
+        assertThat(bus.repairCounters().get("GRAFT_PREMATURE")).as("each item's asks count once").isEqualTo(10);
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): once a member asked answers, a later copy
+     * from anyone else is a duplicate of a repaired item, so the asks for it were not premature.
+     */
+    @Test
+    void aDuplicateAfterAnAskedMemberAnsweredIsNotPremature() {
+        enable();
+        byte[] hash = Digests.sha256(bytes("two-asks"));
+        bus.onHave(p3, have(hash));
+        bus.onHave(p4, have(hash));
+        long firstBy = GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250;
+        runUntil(firstBy + GossipBus.GRAFT_BACKOFF_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).as("both announcers asked, the first heard last").containsExactly(p4, p3);
+        bus.onRumor(p3, new Bodies.Rumor("news", "two-asks", 5, bytes("two-asks")));
+        bus.onRumor(p1, rumor("two-asks"));
+        assertThat(bus.repairCounters().get("GRAFT_PREMATURE")).isZero();
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): a flood of announcements pushes the oldest
+     * items this node still wants out of its bounded memory, and each such give-up counts, so a flood shows on the
+     * counters before anyone needs a trace.
+     */
+    @Test
+    void anAnnouncedItemPushedOutOfTheBoundedMemoryCountsAsEvicted() {
+        enable();
+        List<Bodies.HaveItem> items = new ArrayList<>();
+        for (int i = 0; i < GossipBus.MISSING_CAPACITY + 10; i++) {
+            items.add(new Bodies.HaveItem("news", Digests.sha256(bytes("evicted-" + i))));
+        }
+        bus.onHave(p1, new Bodies.Have(items.subList(0, GossipBus.HAVE_ITEMS_MAX)));
+        bus.onHave(p1, new Bodies.Have(items.subList(GossipBus.HAVE_ITEMS_MAX, items.size())));
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED")).isEqualTo(10);
+    }
+
+    /** A HAVE from {@code from} of {@code count} new items no member serves, named with {@code prefix}. */
+    private void flood(PeerId from, String prefix, int count) {
+        List<Bodies.HaveItem> items = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            items.add(new Bodies.HaveItem("news", Digests.sha256(bytes(prefix + i))));
+        }
+        bus.onHave(from, new Bodies.Have(items));
+    }
+
+    private List<byte[]> graftedHashes(PeerId to) {
+        return sent.stream().filter(f -> f.kind().equals("GRAFT") && f.to().equals(to))
+                .map(f -> ((Bodies.Graft) f.body()).hash()).toList();
+    }
+
+    /**
+     * Swarm retries, flood shares (ROBUSTNESS.md §10.7): a flood of announcements every 250 ms pushed every item an honest
+     * member announced out of the bounded memory before its first ask. Each announcer has its own share now, and a flood
+     * pushes out the flooder's own oldest items, so the honest item is still asked for once its wait ends.
+     */
+    @Test
+    void aFloodOfAnnouncementsPushesOutTheFloodersOwnItemsFirst() {
+        enable();
+        byte[] honest = Digests.sha256(bytes("honest"));
+        bus.onHave(p3, have(honest));
+        for (int round = 0; round < 3; round++) {
+            runUntil(clock[0] + 250);
+            flood(p1, "flood-" + round + "-", GossipBus.HAVE_ITEMS_MAX);
+        }
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(graftedHashes(p3)).as("the honest item outlived three floods and was asked of its announcer")
+                .singleElement().isEqualTo(honest);
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED_OWN")).as("each flood pushed out the flooder's own items")
+                .isEqualTo(3L * GossipBus.HAVE_ITEMS_MAX - (GossipBus.MISSING_CAPACITY - 1));
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED_OTHER")).isZero();
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED")).isEqualTo(bus.repairCounters().get("GRAFT_EVICTED_OWN"));
+    }
+
+    /**
+     * Swarm retries, flood shares (ROBUSTNESS.md §10.7): a flooder that names an honest item first must not carry it out
+     * with its own flood. A share gives up an item another member named too only after the items it alone named.
+     */
+    @Test
+    void aShareGivesUpAnItemAnotherMemberNamedTooLast() {
+        enable();
+        byte[] honest = Digests.sha256(bytes("named-first-by-the-flooder"));
+        flood(p1, "before-", 10);
+        bus.onHave(p1, have(honest));
+        bus.onHave(p3, have(honest));
+        runUntil(250);
+        flood(p1, "flood-", GossipBus.HAVE_ITEMS_MAX);
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(graftedHashes(p3)).as("the item p3 named too outlived p1's flood and was asked of p3")
+                .singleElement().isEqualTo(honest);
+    }
+
+    /**
+     * Swarm retries, flood shares, the gate (ROBUSTNESS.md §10.7): a flooder that names an honest member's items just
+     * before its flood must not carry them out with it. The bus moved half of them into the flooder's smaller share, and
+     * the flood then pushed them out with the flooder's own items, though the honest member held ten items, far below an
+     * even split.
+     */
+    @Test
+    void aFlooderThatNamesAnHonestMembersItemsBeforeItsFloodCannotCarryThemOut() {
+        enable();
+        List<Bodies.HaveItem> honest = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            honest.add(new Bodies.HaveItem("news", Digests.sha256(bytes("honest-" + i))));
+        }
+        bus.onHave(p3, new Bodies.Have(honest));
+        bus.onHave(p1, new Bodies.Have(honest));
+        flood(p1, "flood-", GossipBus.HAVE_ITEMS_MAX);
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        List<String> asked = sent.stream().filter(f -> f.kind().equals("GRAFT"))
+                .map(f -> java.util.HexFormat.of().formatHex(((Bodies.Graft) f.body()).hash())).toList();
+        assertThat(asked).as("every item p3 named is asked for after p1's flood")
+                .containsAll(honest.stream().map(item -> java.util.HexFormat.of().formatHex(item.hash())).toList());
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED_OWN")).as("the flood pushed out ten items of p1's share").isEqualTo(10);
+    }
+
+    /**
+     * Swarm retries, flood shares (ROBUSTNESS.md §10.7): one announcer alone may fill the whole memory; another announcer
+     * below an even split takes its room from the largest share, and the largest share then makes room from its own items.
+     */
+    @Test
+    void anAnnouncerBelowAnEvenSplitTakesTheRoomFromTheLargestShare() {
+        enable();
+        flood(p1, "busy-", GossipBus.MISSING_CAPACITY);
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED")).as("one announcer alone fills the whole memory").isZero();
+        byte[] other = Digests.sha256(bytes("other"));
+        bus.onHave(p3, have(other));
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED_OTHER")).as("p1's oldest item made room for p3's").isEqualTo(1);
+        flood(p1, "more-", 1);
+        assertThat(bus.repairCounters().get("GRAFT_EVICTED_OWN")).as("p1 holds more than half, so its own item goes").isEqualTo(1);
+        runUntil(10_000); // the first asks of p1's 254 older items go first, 16 a tick
+        assertThat(graftedHashes(p3)).first().isEqualTo(other);
+        assertThat(sent.stream().filter(f -> f.kind().equals("GRAFT") && f.to().equals(p1)).map(f -> ((Bodies.Graft) f.body()).hash()))
+                .as("p1's two oldest items left the memory").doesNotContain(Digests.sha256(bytes("busy-0")), Digests.sha256(bytes("busy-1")));
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): the ring of graft round trips keeps working
+     * once its sample count passes the int range, which a node grafting at its whole budget reaches in about a year.
+     */
+    @Test
+    void theRoundTripRingKeepsWorkingPastTheIntRange() throws ReflectiveOperationException {
+        enable();
+        java.lang.reflect.Field count = GossipBus.class.getDeclaredField("graftRttCount");
+        count.setAccessible(true);
+        count.set(bus, Integer.MAX_VALUE);
+        for (int i = 0; i < 3; i++) {
+            bus.onHave(p3, have(Digests.sha256(bytes("wrap-" + i))));
+        }
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).hasSize(3);
+        for (int i = 0; i < 3; i++) {
+            bus.onRumor(p3, rumor("wrap-" + i));
+        }
+        assertThat(delivered).hasSize(3);
+        assertThat(bus.repairWindowMillis()).isBetween(GossipBus.GRAFT_BASE_MILLIS + 2 * GossipBus.GRAFT_SPREAD_MIN_MILLIS
+                + GossipBus.GRAFT_BACKOFF_MILLIS, GossipBus.GRAFT_BASE_MILLIS + 2 * GossipBus.GRAFT_SPREAD_MAX_MILLIS
+                + GossipBus.GRAFT_BACKOFF_MILLIS);
     }
 
     @Test
@@ -213,6 +547,57 @@ class LazyPushTest {
         assertThat(sent).hasSize(3);
     }
 
+    /**
+     * Swarm retries (ROBUSTNESS.md §10.2, P4 of §10.3): the repair window covers the first ask and one retry, each
+     * with its spread, and widens with the graft round trips the node observes, so a stream's own fallback waits for it.
+     */
+    @Test
+    void theRepairWindowCoversTheFirstAskAndOneRetryAndWidensWithSlowGrafts() {
+        enable();
+        assertThat(bus.repairWindowMillis()).isEqualTo(GossipBus.GRAFT_BASE_MILLIS + 2 * GossipBus.GRAFT_SPREAD_MIN_MILLIS
+                + GossipBus.GRAFT_BACKOFF_MILLIS);
+        for (int i = 0; i < 10; i++) {
+            bus.onHave(p3, have(Digests.sha256(bytes("slow-" + i))));
+        }
+        runUntil(GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sentTo("GRAFT")).hasSize(10);
+        clock[0] += 1_500; // every answer takes about a second and a half
+        for (int i = 0; i < 10; i++) {
+            bus.onRumor(p3, rumor("slow-" + i));
+        }
+        long window = bus.repairWindowMillis();
+        assertThat(window).as("twice a p90 of about 1.5 to 2.5 s, below the ceiling")
+                .isBetween(GossipBus.GRAFT_BASE_MILLIS + 2 * 3_000 + GossipBus.GRAFT_BACKOFF_MILLIS,
+                        GossipBus.GRAFT_BASE_MILLIS + 2 * GossipBus.GRAFT_SPREAD_MAX_MILLIS + GossipBus.GRAFT_BACKOFF_MILLIS);
+    }
+
+    /**
+     * Swarm retries, the gate's adversarial review (ROBUSTNESS.md §10.6): the retries of items a flood of announcements
+     * named, which nobody serves, keep the per-tick budget busy for the whole horizon, so the first ask of an item an
+     * honest member announces goes before them and is not delayed past its spread wait.
+     */
+    @Test
+    void theFirstAskOfANewItemGoesBeforeTheRetriesOfAFlood() {
+        enable();
+        List<Bodies.HaveItem> flood = new ArrayList<>();
+        for (int i = 0; i < GossipBus.HAVE_ITEMS_MAX; i++) {
+            flood.add(new Bodies.HaveItem("news", Digests.sha256(bytes("never-served-" + i))));
+        }
+        bus.onHave(p1, new Bodies.Have(flood));
+        runUntil(5_000);
+        byte[] honest = Digests.sha256(bytes("honest"));
+        bus.onHave(p3, have(honest));
+        runUntil(5_000 + GossipBus.GRAFT_BASE_MILLIS + GossipBus.GRAFT_SPREAD_MIN_MILLIS + 250);
+        assertThat(sent.stream().filter(f -> f.kind().equals("GRAFT") && f.to().equals(p3)).toList())
+                .as("the honest item is asked for within its spread wait").hasSize(1)
+                .allSatisfy(f -> assertThat(((Bodies.Graft) f.body()).hash()).isEqualTo(honest));
+    }
+
+    /**
+     * The budgets bound a hostile announcer (swarm retries, ROBUSTNESS.md §10.2): a member that announces items it
+     * never serves, again and again, gets at most {@link GossipBus#GRAFTS_PER_TICK} asks a tick, the node tracks at
+     * most {@link GossipBus#MISSING_CAPACITY} items, and each item's asks back off.
+     */
     @Test
     void graftsPerTickAndAnnouncedItemsAreBounded() {
         enable();
@@ -220,17 +605,21 @@ class LazyPushTest {
         for (int i = 0; i < GossipBus.HAVE_ITEMS_MAX + 50; i++) {
             items.add(new Bodies.HaveItem("news", Digests.sha256(bytes("flood-" + i))));
         }
-        bus.onHave(p1, new Bodies.Have(items));
-        bus.tick(1);
-        bus.tick(2);
-        assertThat(sentTo("GRAFT")).as("one tick asks for a bounded number").hasSize(GossipBus.GRAFTS_PER_TICK);
-        int total = 0;
-        for (int t = 2; t < 200; t++) {
-            bus.tick(t);
+        int maxPerTick = 0;
+        for (int t = 0; t < 240; t++) { // a minute, the flood announced again every second
+            if (t % 4 == 0) {
+                bus.onHave(p1, new Bodies.Have(items));
+            }
+            int before = sentTo("GRAFT").size();
+            clock[0] += 250;
+            bus.tick(clock[0]);
+            maxPerTick = Math.max(maxPerTick, sentTo("GRAFT").size() - before);
         }
-        total = sentTo("GRAFT").size();
-        assertThat(total).as("every announced item is asked for once at most, and the flood was capped")
-                .isLessThanOrEqualTo(GossipBus.HAVE_ITEMS_MAX);
+        assertThat(maxPerTick).as("one tick asks for a bounded number").isEqualTo(GossipBus.GRAFTS_PER_TICK);
+        long total = sentTo("GRAFT").size();
+        long perItem = 1 + 60_000 / GossipBus.GRAFT_BACKOFF_MAX_MILLIS + 4;
+        assertThat(total).as("each tracked item's asks back off: at most about %d each in a minute", perItem)
+                .isLessThanOrEqualTo(GossipBus.MISSING_CAPACITY * perItem);
     }
 
     @Test

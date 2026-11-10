@@ -38,7 +38,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * are the same everywhere; a reader that joins after the writers finish and a
  * reader restarted over its store (its version memory gone) deref the same
  * root too, because every version on a path from a head to the common base
- * stays a live entry while the fork lasts (PD-R-06, review of 2026-11-08).
+ * stays a live entry while the fork lasts (PD-R-06, review of 2026-11-08), and
+ * a version whose entry left anyway is read from its chain node (PDT 2 phase 1,
+ * P2-V-02, P2-V-04).
  */
 class ConcurrentHeadsTest {
 
@@ -47,7 +49,11 @@ class ConcurrentHeadsTest {
     private static final int READERS = 8;
     private static final int SWAPS = 100;
     private static final int KEYS = 40;
-    /** Three seeded repeats fit the 60 s budget (about 9 s each on the inline fabric); {@code -Dpdt.repeats=10} runs the row's ten. */
+    /**
+     * Three seeded repeats fit the 60 s budget (about 9 s each on the inline fabric); {@code -Dpdt.repeats=10} runs
+     * the row's ten, and {@code -Dpdt.repeats=20} the twenty loaded repeats of PDT 2 phase 1, P2-V-04, in which the
+     * late joiner walks the version chain (P2-V-02) past every version whose entry is gone.
+     */
     private static final int REPEATS = Integer.getInteger("pdt.repeats", 3);
 
     @Test
@@ -133,23 +139,36 @@ class ConcurrentHeadsTest {
         long writerTickMillis = writers.stream().mapToLong(p -> fleet.nodeTickNanos.get(p.name()).get()).sum() / 1_000_000;
         long readerTickMillis = readers.stream().mapToLong(p -> fleet.nodeTickNanos.get(p.name()).get()).sum() / 1_000_000;
         int writerConflicts = 0;
-        // gossip settles: every peer sees the same heads
+        // concurrent heads (srad/agentspaces-pdt2.md §10.20): the writers are done, but the cancels of superseded heads
+        // still travel by lazy repair, and a member that hears one cancel before another reads an older entry as a head
+        // again for a while; the fleet has settled once every peer derefs one root and keeps it for a cancel grace and a
+        // repair window, and it must settle within that and the longest retry of a head fetch or a chain node
+        long quiet = Refs.CANCEL_GRACE_MILLIS
+                + fleet.peers.stream().mapToLong(p -> p.runtime().gossip().repairWindowMillis()).max().orElseThrow();
+        Duration bound = Duration.ofMillis(quiet + Refs.UNLOADABLE_BACKOFF * RefFleet.DEADLINE.toMillis() * 3 / 2);
+        List<Ref<PMap<String, String>>> everyRef = new ArrayList<>(writerRefs);
+        everyRef.addAll(readerRefs);
         long t1 = System.nanoTime();
+        long settleFrom = fleet.clock.millis();
+        String[] agreed = {null};
+        long[] agreedSince = {0};
         int[] polls = {0};
-        assertThat(fleet.runUntil(Duration.ofSeconds(30), () -> {
+        assertThat(fleet.runFor(bound, () -> {
             polls[0]++;
-            Set<List<String>> headSets = new HashSet<>();
-            for (RefFleet.Peer p : fleet.peers) {
-                Heads heads = p.pdt().refs().heads(NAME);
-                if (heads.isEmpty()) {
-                    return false;
-                }
-                headSets.add(heads.roots());
+            Set<String> held = new HashSet<>();
+            for (Ref<PMap<String, String>> ref : everyRef) {
+                held.add(ref.deref().root());
             }
-            return headSets.size() == 1;
-        })).as("every peer sees the same heads").isTrue();
+            String root = held.size() == 1 ? held.iterator().next() : null;
+            if (root == null || !root.equals(agreed[0])) {
+                agreed[0] = root;
+                agreedSince[0] = fleet.clock.millis();
+                return false;
+            }
+            return fleet.clock.millis() - agreedSince[0] >= quiet;
+        })).as("every peer derefs one root and keeps it").isTrue();
         long settleMillis = (System.nanoTime() - t1) / 1_000_000;
-        fleet.settle(2);
+        long settleFleetMillis = agreedSince[0] - settleFrom;
         Heads settled = readers.get(0).pdt().refs().heads(NAME);
         Set<String> roots = new HashSet<>();
         Set<Long> readerConflicts = new HashSet<>();
@@ -194,7 +213,7 @@ class ConcurrentHeadsTest {
         Ref<PMap<String, String>> onAgain = again.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
         Ref<PMap<String, String>> onJoiner = joiner.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
         List<String> settledRoots = settled.roots();
-        assertThat(fleet.runUntil(Duration.ofSeconds(30), () -> onAgain.heads().roots().equals(settledRoots)
+        assertThat(fleet.runFor(bound, () -> onAgain.heads().roots().equals(settledRoots)
                 && onJoiner.heads().roots().equals(settledRoots)
                 && settledRoots.stream().allMatch(root -> joiner.store().complete(root) && again.store().complete(root))))
                 .as("the joiner and the restarted reader see the settled heads and hold them").isTrue();
@@ -208,11 +227,13 @@ class ConcurrentHeadsTest {
         assertThat(joinerConflicts).hasSize((int) perReader);
         long basesFetched = fleet.peers.stream().mapToLong(p -> p.pdt().stats().basesFetched()).sum();
         long deltasFetched = fleet.peers.stream().mapToLong(p -> p.pdt().stats().deltasFetched()).sum();
-        System.out.printf("PD-Q-REL-02 repeat %d: %d swaps by %d writers over %d ticks (fleet %d ms, swaps %d ms, settle %d ms in %d polls;"
+        System.out.printf("PD-Q-REL-02 repeat %d: %d swaps by %d writers over %d ticks (fleet %d ms, swaps %d ms, one root after %d ms"
+                        + " of fleet time, settle %d ms in %d polls;"
                         + " node ticks writers %d ms, readers %d ms) ended on %d head(s) at seq %d: one deref root on 13 peers, %d conflicts per reader"
                         + " on the final deref, %d conflicts across the writers, %d keys, %d deltas and %d bases fetched fleet-wide, %d ref entries known,"
                 + " %d live; late joiner and restarted reader deref the same root with %d conflicts (joiner fetched %d bases)%n",
-                repeat, SWAPS * WRITERS, WRITERS, swapTicks, fleetMillis, swapMillis, settleMillis, polls[0], writerTickMillis, readerTickMillis,
+                repeat, SWAPS * WRITERS, WRITERS, swapTicks, fleetMillis, swapMillis, settleFleetMillis, settleMillis, polls[0],
+                writerTickMillis, readerTickMillis,
                 settled.heads().size(), settled.maxSeq(), perReader, writerConflicts, reference.size(), deltasFetched, basesFetched,
                 readers.get(0).refSpace().knownEntries(), RefFleet.headEntries(readers.get(0), NAME).size(), joinerConflicts.size(),
                 joiner.pdt().stats().basesFetched());

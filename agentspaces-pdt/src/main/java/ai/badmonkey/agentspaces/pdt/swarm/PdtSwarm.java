@@ -40,7 +40,9 @@ import java.util.Objects;
  * {@link #fetchTree} fetches a version pruned by the bases the store holds
  * (S2 of §6.4), and {@link #loader} is the {@link NodeLoader} of PD-V-06, a
  * {@link StoreThenFetchLoader} over a {@link SwarmFetcher}, which a value reads
- * through so that a cold {@code get} fetches only the nodes on its path.
+ * through so that a cold {@code get} fetches only the nodes on its path. Attaching
+ * also tells the store's table of intra-chunk deltas when a frame could reach a
+ * member ({@code Content.framesReachAMember}, PDT 2 phase 4 measures, §10.14).
  */
 public final class PdtSwarm {
 
@@ -54,6 +56,8 @@ public final class PdtSwarm {
         this.store = store;
         this.fetcher = new SwarmFetcher(content, store, deadline);
         this.loader = new StoreThenFetchLoader(store, fetcher, deadline);
+        // PDT 2 phase 4 measures (§10.14): an edit keeps intra-chunk frames only while a level-2 member could receive one
+        store.deltas().audience(content::framesReachAMember);
     }
 
     /**

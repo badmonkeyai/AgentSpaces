@@ -137,6 +137,35 @@ class AgentCertificateTest {
                 .as("the other checks still apply").isFalse();
     }
 
+    /**
+     * HLC round five, 2026-11-08 (decision E4): a record or a claim certified by an agent
+     * certificate is judged at its stamp by the certificate's validity window alone. How far the
+     * stamp leads the receiver's clock is the far-future rule's question, which a peer-signed
+     * carrier already answers by deferring or refusing it, so the certificate check no longer
+     * drops a stamp the drift ceiling would.
+     */
+    @Test
+    void verifyCoveringJudgesTheSigningTimeByTheWindowAlone() {
+        long drift = ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.MAX_DRIFT_MILLIS;
+        AgentIdentity agent = peer.subordinate("taker", now, Duration.ofHours(4));
+        AgentCertificate cert = agent.certificate().orElseThrow();
+        byte[] key = peer.rawPublicKey();
+        Instant ahead = now.plusMillis(drift + 30_000);
+        Instant hours = now.plus(Duration.ofHours(2));
+        assertThat(certificates.verifyAt(cert, key, agent.id(), ahead, now))
+                .as("verifyAt keeps its drift ceiling for its other callers").isFalse();
+        assertThat(certificates.verifyCovering(cert, key, agent.id(), ahead))
+                .as("past the drift ceiling, inside the window").isTrue();
+        assertThat(certificates.verifyCovering(cert, key, agent.id(), hours)).isTrue();
+        assertThat(certificates.verifyCovering(cert, key, agent.id(), now.plus(Duration.ofHours(4))))
+                .as("expiry is exclusive").isFalse();
+        assertThat(certificates.verifyCovering(cert, key, agent.id(), now.minusMillis(1)))
+                .as("before issue").isFalse();
+        assertThat(certificates.verifyCovering(cert, other.rawPublicKey(), agent.id(), ahead))
+                .as("the other checks still apply").isFalse();
+        assertThat(certificates.verifyCovering(cert, key, peer.agent("someone-else"), ahead)).isFalse();
+    }
+
     /** SPEC §4.2 v0.1.13 (TODO-9-10-11 B3): a renewing identity keeps its key, re-issues at half-life on its clock, retains earlier certificates for signatures made under them, and caps what it retains. */
     @Test
     void aRenewingIdentityReissuesAtHalfLifeAndKeepsEarlierCertificates() {

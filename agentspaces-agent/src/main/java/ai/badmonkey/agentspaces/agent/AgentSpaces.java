@@ -289,7 +289,9 @@ public final class AgentSpaces implements AutoCloseable {
         }
         if (bound.isEmpty()) {
             throw new IllegalArgumentException("no joined group registers the spaces "
-                    + type.getName() + " binds to; joined groups: " + groups.keySet());
+                    + type.getName() + " binds to" + (AgentBinder.takesRefs(type)
+                            ? " or has the persistent trees its @PdtRef sites need (agentspaces.pdt.enabled=true)" : "")
+                    + "; joined groups: " + groups.keySet());
         }
         return bound;
     }

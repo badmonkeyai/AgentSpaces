@@ -100,6 +100,10 @@ public final class AgentCertificates {
      * the signing time may lead the receiver's clock by at most the bounded HLC
      * drift. Judged so, an agent's history stays verifiable after its
      * certificate lapses, while a stamp from beyond the drift ceiling is refused.
+     * An agent card's attestation and a group key request keep this bound; the
+     * records and claims of a space use {@link #verifyCovering} (HLC round five,
+     * 2026-11-08, decision E4), and so does an agent-signed state's
+     * {@code signedAt} (HLC round six, 2026-11-08, owner ruling F4).
      *
      * @param certificate the certificate
      * @param peerRawKey  the raw Ed25519 key claimed to be the certifying peer's
@@ -112,12 +116,35 @@ public final class AgentCertificates {
                             Instant signingTime, Instant receiverNow) {
         Objects.requireNonNull(signingTime, "signingTime");
         Objects.requireNonNull(receiverNow, "receiverNow");
-        if (!certificate.covers(signingTime)
-                || signingTime.isAfter(receiverNow.plusMillis(
-                        ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.MAX_DRIFT_MILLIS))) {
+        if (signingTime.isAfter(receiverNow.plusMillis(
+                ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.MAX_DRIFT_MILLIS))) {
             return false;
         }
-        // The window already holds signingTime; judge the remaining checks there.
-        return verify(certificate, peerRawKey, expected, signingTime);
+        return verifyCovering(certificate, peerRawKey, expected, signingTime);
+    }
+
+    /**
+     * Verifies a certificate for a record or a claim it certifies, judged at the stamp the
+     * certified key signed (HLC round five, 2026-11-08, decision E4): every check of
+     * {@link #verify}, with the validity window holding the signing time in place of the
+     * receiver's now, and no bound on how far the signing time leads the receiver's clock. The
+     * space judges that lead afterwards exactly as it judges a peer-signed carrier's stamp: it
+     * merges, defers, or refuses the carrier, and strikes its signer only when the stamp is
+     * hostile. An agent-signed state's {@code signedAt} is judged the same way (HLC round six,
+     * 2026-11-08, owner ruling F4), where the drift ceiling of {@link #verifyAt} once dropped
+     * it silently.
+     *
+     * @param certificate the certificate
+     * @param peerRawKey  the raw Ed25519 key claimed to be the certifying peer's
+     * @param expected    the agent the caller is attributing something to
+     * @param signingTime the instant the certified key signed at (an HLC stamp's physical time)
+     * @return true only when every check passes
+     */
+    public boolean verifyCovering(AgentCertificate certificate, byte[] peerRawKey, AgentId expected,
+                                  Instant signingTime) {
+        Objects.requireNonNull(certificate, "certificate");
+        Objects.requireNonNull(signingTime, "signingTime");
+        // The window holds signingTime; judge the remaining checks there.
+        return certificate.covers(signingTime) && verify(certificate, peerRawKey, expected, signingTime);
     }
 }

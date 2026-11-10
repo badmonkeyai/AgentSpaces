@@ -37,7 +37,9 @@ import java.util.concurrent.TimeoutException;
  * its CID and stored before it is returned, so the next load is local. When the
  * deadline passes, the fetch fails, or the bytes do not hash to the CID, the loader
  * throws {@link NodeUnavailableException} naming the CID and the sources the fetcher
- * reports. The tree exchange supplies the production fetcher in phase 2; the
+ * reports. The deadline ends the caller's wait alone: the fetch goes on, so a node
+ * that is merely late lands in the store and the next load of it finds it there or
+ * joins the same fetch (swarm retries, ROBUSTNESS.md §10.3 P3). The tree exchange supplies the production fetcher in phase 2; the
  * persistent values of §3.2 call {@link #load} through the {@link NodeLoader}
  * interface this class implements.
  */
@@ -123,7 +125,6 @@ public final class StoreThenFetchLoader implements NodeLoader {
         try {
             bytes = future.get(deadline.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            future.cancel(true);
             throw new NodeUnavailableException(cid, fetcher.sourcesTried(cid),
                     "deadline of " + deadline.toMillis() + " ms passed", e);
         } catch (ExecutionException e) {

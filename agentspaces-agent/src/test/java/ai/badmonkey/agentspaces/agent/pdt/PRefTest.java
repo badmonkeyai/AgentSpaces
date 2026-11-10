@@ -59,7 +59,7 @@ class PRefTest {
         assertThat(back.nodes()).hasSize(2);
         assertThat(back.inlineBytes()).isEqualTo(4);
         assertThat(back.keyEpoch()).isEqualTo(7L);
-        assertThat(back.attrs()).containsEntry("origin", "test");
+        assertThat(back.attrs()).extractingByKey("origin").isEqualTo("test");
     }
 
     @Test
@@ -87,11 +87,33 @@ class PRefTest {
         assertThat(PRef.ROOT_TAG).isEqualTo("root");
     }
 
+    /**
+     * PDT 2 phase 2, P2-D-03 and P2-F-06 (srad/agentspaces-pdt2.md §6.10.3, rule 8): a level-2 reader
+     * accepts version 1 and 2, kind {@code db} joins the kinds, and a {@code db} head is always version 2,
+     * so a level-1 reader ignores it under its version rule; every other kind keeps version 1 or 2.
+     */
+    @Test
+    void aDbHeadIsVersionTwoAndALevelTwoReaderAcceptsBothVersions() {
+        assertThat(PRef.KINDS).contains(PRef.KIND_DB);
+        assertThat(PRef.KIND_DB).isEqualTo("db");
+        assertThat(PRef.VERSION_2).isEqualTo(2);
+        assertThat(PRef.versionFor(PRef.KIND_DB)).isEqualTo(PRef.VERSION_2);
+        assertThat(PRef.versionFor(PRef.KIND_MAP)).isEqualTo(PRef.VERSION);
+        PRef db = new PRef(PRef.VERSION_2, "graph", PRef.KIND_DB, ROOT, List.of(BASE), 2, 3, null, PRef.MODE_LINEAR,
+                PRef.SEALING_NONE, null, null);
+        assertThat(db.violation()).isEmpty();
+        assertThat(codec.fromWire(codec.toBytes(db), PRef.class)).isEqualTo(db);
+        assertThat(new PRef(1, "graph", PRef.KIND_DB, ROOT, null, 1, 0, null, "linear", "none", null, null).violation())
+                .contains("a db head is version 2, found 1");
+        assertThat(new PRef(2, "facts", PRef.KIND_MAP, ROOT, null, 1, 0, null, "multi", "none", null, null).violation())
+                .isEmpty();
+    }
+
     @Test
     void everyBoundIsNamedByViolation() {
         PRef base = min();
-        assertThat(new PRef(2, "facts", "map", ROOT, null, 1, 0, null, "multi", "none", null, null).violation())
-                .contains("unsupported PRef version 2");
+        assertThat(new PRef(3, "facts", "map", ROOT, null, 1, 0, null, "multi", "none", null, null).violation())
+                .contains("unsupported PRef version 3");
         assertThat(new PRef(1, "", "map", ROOT, null, 1, 0, null, "multi", "none", null, null).violation())
                 .contains("empty name");
         assertThat(new PRef(1, "n".repeat(257), "map", ROOT, null, 1, 0, null, "multi", "none", null, null).violation())

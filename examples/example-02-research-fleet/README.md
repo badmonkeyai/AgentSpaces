@@ -126,4 +126,4 @@ mvn -q -pl examples/example-02-research-fleet test
   [developer guide's Embabel section](../developer-guide.html#embabel).
 - **Harden the transport.** Swap `TcpTransport` for TLS 1.3 or QUIC (RFC 9000),
   and choose a security profile (`DEV_LOCAL`, `MTLS`, `MTLS_OIDC`, `ZERO_TRUST`);
-  the [main README](../../README.md#adding-a-transport) explains the transport SPI.
+  the [main README](../../docs/extending.md#adding-a-transport) explains the transport SPI.

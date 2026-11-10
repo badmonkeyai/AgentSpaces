@@ -192,7 +192,8 @@ class RelayPolicyTest {
         Fleet fleet = fleet(RelayPolicy.ALLOW.refusingKinds("PIPE_DATA:aspace:cap/content-swarm"));
         ai.badmonkey.agentspaces.common.codec.CborCodec codec = ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
         java.util.function.Function<String, byte[]> pipe = capability -> {
-            Map<String, Object> frame = new java.util.LinkedHashMap<>();
+            // the pipe frame record's declared order, as CapabilityPipes writes it (HLC round six, 2026-11-08)
+            Map<String, Object> frame = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
             frame.put("capability", capability);
             frame.put("payload", "x".getBytes(StandardCharsets.UTF_8));
             return codec.toBytes(frame);

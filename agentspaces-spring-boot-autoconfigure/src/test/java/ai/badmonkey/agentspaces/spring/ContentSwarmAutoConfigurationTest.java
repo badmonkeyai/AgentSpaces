@@ -148,6 +148,64 @@ class ContentSwarmAutoConfigurationTest {
         assertThat(b.content().store().roots()).hasSize(1);
     }
 
+    /**
+     * SPEC §6.1a.5 and §6.3 (v0.1.32; AppCard origin and formats, 2026-11-09): a group with a content swarm spills its
+     * large cards through it, and {@code agentspaces.discovery.*} sets the cache's two bounds and the spill fetch bound;
+     * the rendezvous multiplier applies to the defaults alone.
+     */
+    @Test
+    void theSwarmServesTheCardSpillAndTheDiscoveryBoundsBind(@TempDir Path dir) throws Exception {
+        AgentSpacesProperties properties = properties(freePort(), 0, dir.resolve("a"));
+        properties.setRoles(List.of("RENDEZVOUS"));
+        properties.getDiscovery().getCache().setMaxBytes(8L * 1024 * 1024);
+        properties.getDiscovery().getSpill().setMaxFetchBytes(2L * 1024 * 1024);
+        Wired a = wire(properties);
+        ai.badmonkey.agentspaces.discovery.DiscoveryService discovery = a.spaces().group("fleet").discovery();
+        assertThat(discovery.spiller().store()).isInstanceOf(ai.badmonkey.agentspaces.content.ContentSpillStore.class);
+        assertThat(discovery.cache().maxBytes()).as("an explicit setting applies as given").isEqualTo(8L * 1024 * 1024);
+        assertThat(discovery.cache().maxEntries()).as("the default, times four for a rendezvous")
+                .isEqualTo(4 * ai.badmonkey.agentspaces.discovery.AdCache.DEFAULT_MAX_ENTRIES);
+        assertThat(discovery.maxSpillFetchBytes()).isEqualTo(2L * 1024 * 1024);
+        AgentSpacesProperties.Discovery defaults = new AgentSpacesProperties.Discovery();
+        assertThat(defaults.getCache().getMaxEntries()).isNull();
+        assertThat(defaults.getCache().getMaxBytes()).isNull();
+        assertThat(defaults.getSpill().getMaxFetchBytes())
+                .isEqualTo(ai.badmonkey.agentspaces.api.ad.CardSpill.DEFAULT_MAX_FETCH_BYTES);
+    }
+
+    /**
+     * PDT 2 phase 2, the starter half of P2-H-04: {@code agentspaces.content.store.backends} selects the hash-keyed
+     * piece store under its own directory beside the file store's, refuses it with encrypt-at-rest (its pieces are
+     * named by their plaintext hashes), and the metadata lists the value.
+     */
+    @Test
+    void theHashBackendIsSelectableAndTheMetadataNamesIt(@TempDir Path dir) throws Exception {
+        AgentSpacesProperties properties = properties(freePort(), 0, dir.resolve("h"));
+        properties.getContent().getStore().setBackends(List.of("hash"));
+        Wired a = wire(properties);
+        assertThat(a.content().store()).isInstanceOf(ai.badmonkey.agentspaces.content.HashPieceStore.class);
+        assertThat(a.content().store().kind()).isEqualTo("hash");
+        assertThat(dir.resolve("h").resolve("fleet.hash").resolve(ai.badmonkey.agentspaces.content.HashPieceStore.PIECES))
+                .as("a directory of its own, beside the file store's").isDirectory();
+
+        AgentSpacesProperties sealed = properties(freePort(), 0, dir.resolve("s"));
+        sealed.getContent().getStore().setBackends(List.of("hash"));
+        sealed.getContent().getStore().setEncryptAtRest(true);
+        assertThatThrownBy(() -> wire(sealed)).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.content.store.encrypt-at-rest");
+
+        try (java.io.InputStream in = getClass().getResourceAsStream("/META-INF/additional-spring-configuration-metadata.json")) {
+            com.fasterxml.jackson.databind.JsonNode hints = new com.fasterxml.jackson.databind.ObjectMapper().readTree(in).get("hints");
+            java.util.List<String> values = new java.util.ArrayList<>();
+            for (com.fasterxml.jackson.databind.JsonNode hint : hints) {
+                if (hint.get("name").asText().equals("agentspaces.content.store.backends")) {
+                    hint.get("values").forEach(v -> values.add(v.get("value").asText()));
+                }
+            }
+            assertThat(values).containsExactly("file", "hash", "memory", "in-place");
+        }
+    }
+
     @Test
     void theSwarmNeedsTheCapabilityRuntimeAndAKnownBackend(@TempDir Path dir) throws Exception {
         AgentSpacesProperties noCaps = properties(freePort(), 0, dir.resolve("x"));

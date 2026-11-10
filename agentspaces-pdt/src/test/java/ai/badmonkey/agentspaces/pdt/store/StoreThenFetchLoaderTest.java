@@ -128,7 +128,8 @@ class StoreThenFetchLoaderTest {
                 .hasMessageContaining("sources tried: none");
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isGreaterThanOrEqualTo(Duration.ofMillis(90));
         assertThat(futures).hasSize(1);
-        assertThat(futures.get(0).isCancelled()).as("the stalled fetch is cancelled").isTrue();
+        assertThat(futures.get(0).isCancelled())
+                .as("swarm retries, P3: the deadline ends the caller's wait and the fetch goes on").isFalse();
     }
 
     /** PD-V-06 end to end: a map built in one store opens in an empty store through the loader, path by path. */

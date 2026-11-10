@@ -23,6 +23,8 @@ import ai.badmonkey.agentspaces.pdt.values.PMap;
 import ai.badmonkey.agentspaces.pdt.values.PVector;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -41,7 +43,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * yields {@code NO_COMMON_BASE} and the later head whole; a chain longer than
  * the walk bound between two forks does the same; a merge function that throws
  * falls back to the rule with {@code MERGE_FUNCTION_FAILED}; and a function
- * registered for another kind is refused.
+ * registered for another kind is refused. Two writers whose histories start
+ * from the empty value and share no version merge from the empty value, so
+ * every key of both survives, while their walks end at first versions within
+ * the bound (HLC round five, 2026-11-08, decision E16).
  */
 class MergeFunctionTest {
 
@@ -226,5 +231,101 @@ class MergeFunctionTest {
         assertThat(RefFleet.headEntries(b, name).size()).isGreaterThan(Refs.MAX_BASE_STEPS);
         System.out.printf("PD-R-06: %d versions on one side of a fork: NO_COMMON_BASE and the later head whole, %d live entries%n",
                 steps, RefFleet.headEntries(b, name).size());
+    }
+
+    /**
+     * HLC round five, 2026-11-08 (decision E16): two writers that each started the ref from the
+     * empty value, and wrote on top of their own first version before they saw each other, share
+     * no version. Every base walk ends at a first version within the bound, so the empty value is
+     * their common base: the three-way merge keeps every key of both writers, and the key both
+     * changed goes to the head with the later issued stamp, as before. Before E16 the later head
+     * won whole and the earlier writer's keys were lost (example-33's PythonInteropTest).
+     */
+    @Test
+    void twoWritersWhoseHistoriesStartFromEmptyAndShareNoVersionMergeToTheUnionOfTheirKeys() throws Exception {
+        String name = "facts";
+        RefFleet.Peer a = fleet.newPeer("a", 1);
+        RefFleet.Peer b = fleet.newPeer("b", 2, "a");
+        fleet.settle(6);
+        Ref<PMap<String, String>> onA = a.pdt().mapRef(name, RefFleet.STR, RefFleet.STR);
+        Ref<PMap<String, String>> onB = b.pdt().mapRef(name, RefFleet.STR, RefFleet.STR);
+        PMap<String, String> lastA = chainFromEmpty(a, name, "a", 2);
+        fleet.settle(1);
+        PMap<String, String> lastB = chainFromEmpty(b, name, "b", 2);
+        assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> onA.heads().heads().size() == 2 && onB.heads().heads().size() == 2
+                && fleet.allHold(lastA.root()) && fleet.allHold(lastB.root()))).isTrue();
+        fleet.settle(2);
+        List<PConflict> conflicts = new CopyOnWriteArrayList<>();
+        onA.onConflict(conflicts::add);
+        PMap<String, String> seenA = onA.deref();
+        PMap<String, String> seenB = onB.deref();
+
+        assertThat(seenA.root()).as("every reader merges to the same root").isEqualTo(seenB.root());
+        assertThat(seenA.keys()).as("every key of both writers survives the merge")
+                .containsExactlyInAnyOrder("a-0", "a-1", "b-0", "b-1", "shared");
+        assertThat(seenA.get("shared")).as("the key both changed goes to the later head").contains("b-1");
+        assertThat(conflicts).extracting(PConflict::reason).containsExactly(PConflict.LATER_HLC);
+        assertThat(conflicts.get(0).key()).isEqualTo("shared");
+        System.out.printf("PD-R-06/E16: two histories from empty with no shared version merged to %d keys%n", seenA.count());
+    }
+
+    /**
+     * HLC round five, 2026-11-08 (decision E16): the walk reaches a first version within the bound
+     * when that version sits at most {@value Refs#MAX_BASE_STEPS} steps from its head, and the
+     * empty value is then the base. One step further the walk stops at a version that still has a
+     * base, so it does not end at first versions, and the later head wins whole as before.
+     */
+    @ParameterizedTest
+    @CsvSource({"65, true", "66, false"})
+    void aFirstVersionCountsAsTheEndOfTheWalkOnlyWithinTheBound(int versionsOnA, boolean merges) throws Exception {
+        String name = "facts";
+        RefFleet.Peer a = fleet.newPeer("a", 1);
+        RefFleet.Peer b = fleet.newPeer("b", 2, "a");
+        fleet.settle(6);
+        Ref<PMap<String, String>> onA = a.pdt().mapRef(name, RefFleet.STR, RefFleet.STR);
+        Ref<PMap<String, String>> onB = b.pdt().mapRef(name, RefFleet.STR, RefFleet.STR);
+        PMap<String, String> lastA = chainFromEmpty(a, name, "a", versionsOnA);
+        fleet.settle(1);
+        PMap<String, String> lastB = chainFromEmpty(b, name, "b", 1);
+        assertThat(fleet.runUntil(Duration.ofSeconds(20), () -> onB.heads().heads().size() == 2
+                && RefFleet.headEntries(b, name).size() == versionsOnA + 1
+                && fleet.allHold(lastA.root()) && fleet.allHold(lastB.root()))).isTrue();
+        fleet.settle(2);
+        List<PConflict> conflicts = new CopyOnWriteArrayList<>();
+        onB.onConflict(conflicts::add);
+        PMap<String, String> seen = onB.deref();
+
+        if (merges) {
+            assertThat(seen.count()).as("every key of both writers survives").isEqualTo(versionsOnA + 2);
+            assertThat(seen.get("a-0")).contains("a");
+            assertThat(seen.get("b-0")).contains("b");
+            assertThat(conflicts).extracting(PConflict::reason).doesNotContain(PConflict.NO_COMMON_BASE);
+        } else {
+            assertThat(seen.root()).as("past the bound the later head wins whole").isEqualTo(lastB.root());
+            assertThat(conflicts).extracting(PConflict::reason).containsExactly(PConflict.NO_COMMON_BASE);
+        }
+        assertThat(onA.deref().root()).as("both readers agree").isEqualTo(seen.root());
+        System.out.printf("PD-R-06/E16: a first version %d steps from its head %s%n", versionsOnA - 1,
+                merges ? "is the end of the walk: merged from empty" : "is past the bound: NO_COMMON_BASE");
+    }
+
+    /**
+     * Writes {@code versions} versions of a map by hand on one peer: the first over the empty
+     * value with no base, each later one over the previous. Version i adds the key
+     * {@code <prefix>-i} and sets {@code shared} to {@code <prefix>-i}.
+     */
+    private PMap<String, String> chainFromEmpty(RefFleet.Peer peer, String name, String prefix, int versions) {
+        PMap<String, String> last = null;
+        for (int i = 0; i < versions; i++) {
+            PMap<String, String> from = last == null ? PMap.empty(peer.store(), RefFleet.STR, RefFleet.STR) : last;
+            PMap<String, String> next = from.assoc(prefix + "-" + i, prefix).assoc("shared", prefix + "-" + i);
+            RefFleet.writeHead(peer, name, PRef.KIND_MAP, next.root(), last == null ? null : last.root(), i + 1L,
+                    next.count(), Duration.ofMinutes(10));
+            last = next;
+            if (i % 10 == 9) {
+                fleet.tickAll();
+            }
+        }
+        return last;
     }
 }

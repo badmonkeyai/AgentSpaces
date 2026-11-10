@@ -20,6 +20,7 @@ import ai.badmonkey.agentspaces.pdt.Kind;
 import ai.badmonkey.agentspaces.pdt.Link;
 import ai.badmonkey.agentspaces.pdt.NodeCodec;
 import ai.badmonkey.agentspaces.pdt.NodeFormatException;
+import ai.badmonkey.agentspaces.pdt.kinds.RrRoot;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -35,6 +36,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * outside the trie, {@code tailoff = n < 32 ? 0 : ((n - 1) >>> 5) << 5}, and
  * {@code conj} and {@code pop} rewrite only this node until the tail fills or
  * empties. The shape is a function of {@code n}, so the layout is canonical.
+ *
+ * <p>PDT 2 phase 6 (P2-R-01; srad/agentspaces-pdt2.md §3.7). A {@link #relaxed} root is the root
+ * of an RRB tree: its tail holds 1 to 32 elements whatever the count, its trie may hold relaxed
+ * nodes and short leaves, it encodes as kind {@code rr}, and {@link Rrb} runs its operations. A
+ * relaxed root whose tree has the {@code vr} shape is no longer relaxed, so it encodes as the
+ * {@code vr} root of the same elements.
  */
 final class VecRoot extends TreeNode {
 
@@ -46,13 +53,27 @@ final class VecRoot extends TreeNode {
     Object trie;
     Object[] tail;
     AtomicReference<Thread> edit;
+    /** PDT 2 phase 6 (P2-R-01): whether the tree lacks the {@code vr} shape and so is an RRB tree of kind {@code rr}. */
+    final boolean relaxed;
+    /** PDT 2 phase 6 (P2-R-03): the root of the packed form, once computed. */
+    volatile String packedCid;
 
     VecRoot(int n, int shift, Object trie, Object[] tail, AtomicReference<Thread> edit) {
+        this(n, shift, trie, tail, edit, false);
+    }
+
+    VecRoot(int n, int shift, Object trie, Object[] tail, AtomicReference<Thread> edit, boolean relaxed) {
         this.n = n;
         this.shift = shift;
         this.trie = trie;
         this.tail = tail;
         this.edit = edit;
+        this.relaxed = relaxed;
+    }
+
+    /** The elements in the trie: every element but the tail's. */
+    int trieCount() {
+        return n - tail.length;
     }
 
     static VecRoot empty() {
@@ -71,7 +92,7 @@ final class VecRoot extends TreeNode {
         if (ctx.owns(edit)) {
             return this;
         }
-        return new VecRoot(n, shift, trie, tail.clone(), ctx.edit);
+        return new VecRoot(n, shift, trie, tail.clone(), ctx.edit, relaxed);
     }
 
     VecNode trieNode(Ctx ctx) {
@@ -264,7 +285,7 @@ final class VecRoot extends TreeNode {
     @Override
     byte[] encode(Flusher flusher) {
         Map<String, Object> node = new LinkedHashMap<>();
-        node.put(NodeCodec.KIND_KEY, Kind.VR);
+        node.put(NodeCodec.KIND_KEY, relaxed ? Kind.RR : Kind.VR);
         node.put("n", (long) n);
         node.put("s", (long) shift);
         node.put("r", trie == null ? null : new Link(flusher.cidOf(trie)));
@@ -277,6 +298,9 @@ final class VecRoot extends TreeNode {
     }
 
     static VecRoot decode(String cid, byte[] bytes) {
+        if (Kind.RR.equals(NodeCodec.kindOf(bytes))) {
+            return decodeRelaxed(cid, bytes);
+        }
         Map<String, Object> node = NodeCodec.decode(cid, bytes);
         if (!Kind.VR.equals(node.get(NodeCodec.KIND_KEY))) {
             throw new NodeFormatException(cid, "expected a vector root, found kind '" + node.get(NodeCodec.KIND_KEY) + "'");
@@ -303,6 +327,26 @@ final class VecRoot extends TreeNode {
             tail[i] = Spill.refOf(((Embedded) t.get(i)).bytes());
         }
         VecRoot r = new VecRoot(count, (int) shift, trie, tail, null);
+        r.cid = cid;
+        return r;
+    }
+
+    /**
+     * Reads an {@code rr} root (PDT 2 phase 6, P2-R-04): the shape {@link RrRoot} checks, a count
+     * a vector can hold, and a shift of at most 30. The nodes below it load on demand through
+     * {@link VecNode#decodeRelaxed}.
+     */
+    private static VecRoot decodeRelaxed(String cid, byte[] bytes) {
+        RrRoot rr = RrRoot.decode(cid, bytes);
+        if (rr.count() > Integer.MAX_VALUE || rr.shift() > 30) {
+            throw new NodeFormatException(cid, "rr root with count " + rr.count() + " and shift " + rr.shift());
+        }
+        Object[] tail = new Object[rr.tail().size()];
+        for (int i = 0; i < tail.length; i++) {
+            tail[i] = Spill.refOf(rr.tail().get(i).bytes());
+        }
+        VecRoot r = new VecRoot((int) rr.count(), (int) rr.shift(), rr.trie() == null ? null : rr.trie().cid(), tail,
+                null, true);
         r.cid = cid;
         return r;
     }

@@ -18,6 +18,8 @@ package ai.badmonkey.agentspaces.content.tree;
 import ai.badmonkey.agentspaces.common.crypto.GroupKey;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.content.Messages;
+import ai.badmonkey.agentspaces.content.tree.sync.Negentropy;
+import ai.badmonkey.agentspaces.content.tree.sync.SketchServer;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -46,6 +48,34 @@ class TreeServerTest {
         GroupKey key;
         long uploadBudget = Long.MAX_VALUE;
         long now = 5_000;
+        /** The feature level this holder advertises (PDT 2 phase 3, P2-F-05). */
+        boolean levelTwo = true;
+        /** The artifact pieces this holder answers a pick from, by root and piece CID. */
+        final java.util.Map<String, byte[]> pieces = new java.util.HashMap<>();
+        /** Whether this holder reads the asker's advertisement at level 2 (P2-F-05); false, as the default reads. */
+        boolean askerAtLevelTwo;
+        /** The holder's side of a reconciliation, or null when it does not reconcile (P2-K-02). */
+        SketchServer sketches;
+
+        @Override
+        public boolean levelTwo() {
+            return levelTwo;
+        }
+
+        @Override
+        public boolean readsLevelTwo(PeerId peer) {
+            return askerAtLevelTwo;
+        }
+
+        @Override
+        public Optional<SketchServer> sketches() {
+            return Optional.ofNullable(sketches);
+        }
+
+        @Override
+        public Optional<byte[]> piece(String root, String cid) {
+            return Optional.ofNullable(pieces.get(root + "#" + cid));
+        }
 
         @Override
         public boolean mayServe(PeerId from, String cid) {
@@ -379,5 +409,98 @@ class TreeServerTest {
         for (byte[] node : host.nodes()) {
             assertThat(secret.nodes()).doesNotContainKey(NodeFixtures.cid(node));
         }
+    }
+
+    // ------------------------------------------------------------ PDT 2 phase 3, P2-S-07
+
+    @Test
+    void aChallengeIsAnsweredWithTheHeldPicksAndTheRestMissing() {
+        NodeFixtures.Tree tree = NodeFixtures.tree(21, 3, 3, 100);
+        MemoryTreeStore store = new MemoryTreeStore().putAll(tree);
+        List<String> cids = new ArrayList<>(tree.nodes().keySet());
+        String gone = cids.get(1);
+        store.remove(gone);
+        byte[] identity = new byte[36];
+        identity[0] = 0x01;
+        identity[1] = 0x55;
+        identity[2] = 0x1e;
+        identity[3] = 0x20;
+        String chunkGroup = ai.badmonkey.agentspaces.common.codec.Multibase.base32(identity); // a BLAKE3 identity
+        RecordingHost host = new RecordingHost();
+        new TreeServer(store, host).serve(ASKER, new Messages.Challenge(5, tree.root(), List.of(
+                Messages.Pick.node(cids.get(0)), Messages.Pick.node(gone), Messages.Pick.chunkGroup(chunkGroup, 0L, 1024))));
+        assertThat(host.sent).hasSize(1);
+        Messages.Nodes answer = (Messages.Nodes) host.sent.get(0);
+        assertThat(answer.req()).isEqualTo(5);
+        assertThat(host.cids()).containsExactly(cids.get(0));
+        assertThat(answer.missing()).as("a pick not held, and a chunk group this phase does not read")
+                .containsExactly(gone, chunkGroup);
+    }
+
+    @Test
+    void aHolderOfNoPickRejectsTheRootNotHeldAndAGrantIsChecked() {
+        NodeFixtures.Tree tree = NodeFixtures.tree(22, 2, 2, 50);
+        String other = NodeFixtures.tree(23, 1, 2, 10).root();
+        RecordingHost host = new RecordingHost();
+        new TreeServer(new MemoryTreeStore(), host).serve(ASKER, new Messages.Challenge(6, tree.root(), List.of(Messages.Pick.node(other))));
+        assertThat(host.sent).singleElement().isEqualTo(new Messages.Reject(tree.root(), Messages.TREE_INDEX, Messages.REASON_NOT_HELD));
+
+        RecordingHost refusing = new RecordingHost();
+        refusing.allowed = Set.of(other);
+        new TreeServer(new MemoryTreeStore().putAll(tree), refusing)
+                .serve(ASKER, new Messages.Challenge(7, tree.root(), List.of(Messages.Pick.node(tree.root()))));
+        assertThat(refusing.sent).as("no CONTENT_FETCH on the root, no answer (P2-Q-SEC-06)")
+                .singleElement().isEqualTo(new Messages.Reject(tree.root(), Messages.TREE_INDEX, Messages.REASON_POLICY));
+    }
+
+    @Test
+    void anArtifactPickIsAnsweredFromItsPieceAndALevelOneHolderDropsAChallenge() {
+        String root = Cids.of(new byte[]{9, 9}, Cids.RAW); // an artifact root is the raw CID of its table
+        byte[] piece = new byte[]{1, 2, 3, 4};
+        String pieceCid = Cids.of(piece, Cids.RAW);
+        RecordingHost host = new RecordingHost();
+        host.pieces.put(root + "#" + pieceCid, piece);
+        TreeServer server = new TreeServer(null, host);
+        server.serve(ASKER, new Messages.Challenge(8, root, List.of(Messages.Pick.node(pieceCid))));
+        assertThat(host.nodes()).singleElement().isEqualTo(piece);
+
+        RecordingHost levelOne = new RecordingHost();
+        levelOne.levelTwo = false;
+        TreeServer old = new TreeServer(null, levelOne);
+        old.serve(ASKER, new Messages.Challenge(9, root, List.of(Messages.Pick.node(pieceCid))));
+        old.serve(ASKER, new Messages.TreeWant(Messages.TREE_WANT, 10, "", List.of(), 1 << 20, new byte[]{1}));
+        assertThat(levelOne.sent).as("a level-1 holder reads no level-2 form").isEmpty();
+        assertThat(old.dropped()).isEqualTo(2);
+    }
+
+    @Test
+    void aLevelTwoHolderThatDoesNotReconcileRejectsASketchWant() {
+        RecordingHost host = new RecordingHost();
+        new TreeServer(new MemoryTreeStore(), host)
+                .serve(ASKER, new Messages.TreeWant(Messages.TREE_WANT, 11, "", List.of(), 1 << 20, new byte[]{1}));
+        assertThat(host.sent).as("rule 12: REJECT reason 3")
+                .singleElement().isEqualTo(new Messages.Reject("", Messages.TREE_INDEX, Messages.REASON_POLICY));
+    }
+
+    /**
+     * PDT 2 phase 5 adversary, P2-F-05: a {@code TREE_END} with a sketch is a level-2 form, which goes only to a member
+     * whose advertisement reads level 2. A holder answered every sketch want, so a member it read at level 1 got one.
+     * It now refuses with the level-1 {@code REJECT} reason 3, so the asker fails at once.
+     */
+    @Test
+    void aSketchFromAMemberThisHolderReadsAtLevelOneGetsAPlainRefusal() {
+        RecordingHost host = new RecordingHost();
+        host.sketches = new SketchServer(
+                () -> List.of(Cids.of(new byte[]{1}, Cids.DAG_CBOR)), () -> host.now);
+        TreeServer server = new TreeServer(new MemoryTreeStore(), host);
+        byte[] sketch = new Negentropy(Negentropy.Storage.of(List.of()), 0).initiate();
+        server.serve(ASKER, new Messages.TreeWant(Messages.TREE_WANT, 12, "", List.of(), 1 << 20, sketch));
+        assertThat(host.sent).as("no level-2 form to a level-1 reader")
+                .singleElement().isEqualTo(new Messages.Reject("", Messages.TREE_INDEX, Messages.REASON_POLICY));
+
+        host.sent.clear();
+        host.askerAtLevelTwo = true;
+        server.serve(ASKER, new Messages.TreeWant(Messages.TREE_WANT, 13, "", List.of(), 1 << 20, sketch));
+        assertThat(host.end().reason()).isEqualTo(Messages.END_SKETCH);
     }
 }

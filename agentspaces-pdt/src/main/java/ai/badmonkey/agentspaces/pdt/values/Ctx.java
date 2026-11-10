@@ -22,17 +22,27 @@ import java.util.concurrent.atomic.AtomicReference;
  * PD-V-06): the loader for cold nodes, the hasher for keys, and the edit token of
  * a transient, which is null for a persistent operation. A node whose own token is
  * this context's token belongs to the running transient and may change in place.
+ *
+ * <p>PDT 2 phase 6 (srad/agentspaces-pdt2.md §6.10.3, rule 7): a level-one context writes the
+ * level-1 kinds only, so an escalated payload, which every member of its space reads, never holds
+ * a {@code t} node.
  */
 final class Ctx {
 
     final NodeLoader loader;
     final KeyHasher hasher;
     final AtomicReference<Thread> edit;
+    final boolean levelOne;
 
     Ctx(NodeLoader loader, KeyHasher hasher, AtomicReference<Thread> edit) {
+        this(loader, hasher, edit, false);
+    }
+
+    Ctx(NodeLoader loader, KeyHasher hasher, AtomicReference<Thread> edit, boolean levelOne) {
         this.loader = loader;
         this.hasher = hasher;
         this.edit = edit;
+        this.levelOne = levelOne;
     }
 
     /** Whether a node carrying {@code token} may change in place under this context. */

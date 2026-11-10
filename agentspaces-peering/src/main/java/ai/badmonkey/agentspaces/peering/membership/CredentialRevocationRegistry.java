@@ -242,7 +242,7 @@ public final class CredentialRevocationRegistry implements ReconcilableState {
     public Optional<CredentialRevocation> accept(byte[] payload) {
         RevocationRegistry.SignedRevocation signed;
         try {
-            signed = codec.fromBytes(payload, RevocationRegistry.SignedRevocation.class);
+            signed = codec.fromWire(payload, RevocationRegistry.SignedRevocation.class);
         } catch (RuntimeException e) {
             return Optional.empty();
         }
@@ -317,7 +317,7 @@ public final class CredentialRevocationRegistry implements ReconcilableState {
         }
         CredentialRevocation ad;
         try {
-            ad = codec.fromBytes(signed.adBytes(), CredentialRevocation.class);
+            ad = codec.fromWire(signed.adBytes(), CredentialRevocation.class);
         } catch (RuntimeException e) {
             return null;
         }
@@ -367,7 +367,7 @@ public final class CredentialRevocationRegistry implements ReconcilableState {
         }
         RevocationRegistry.SignedRevocation[] entries;
         try {
-            entries = codec.fromBytes(delta, RevocationRegistry.SignedRevocation[].class);
+            entries = codec.fromWire(delta, RevocationRegistry.SignedRevocation[].class);
         } catch (RuntimeException e) {
             return;
         }

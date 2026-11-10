@@ -114,6 +114,26 @@ class ContentVectorsConformanceTest {
         assertThat(complete.decodeHave(3).cardinality()).isEqualTo(3);
     }
 
+    /** PDT 2 phase 1, P2-X-09: every message vector and the manifest record pass the strict receive path. */
+    @Test
+    void everyMessageVectorPassesTheStrictReceivePath() {
+        Map<String, Class<?>> types = new java.util.LinkedHashMap<>();
+        types.put("content_piece_want_cbor", Messages.PieceWant.class);
+        types.put("content_piece_cbor", Messages.Piece.class);
+        types.put("content_have_cbor", Messages.Have.class);
+        types.put("content_cancel_cbor", Messages.Cancel.class);
+        types.put("content_reject_cbor", Messages.Reject.class);
+        types.put("content_manifest_want_cbor", Messages.ManifestWant.class);
+        types.put("content_manifest_cbor", Messages.ManifestReply.class);
+        types.put("content_node_want_cbor", Messages.NodeWant.class);
+        types.put("content_nodes_cbor", Messages.Nodes.class);
+        types.put("content_tree_want_cbor", Messages.TreeWant.class);
+        types.put("content_tree_end_cbor", Messages.TreeEnd.class);
+        types.forEach((name, type) -> assertThat(Messages.decode(codec, hex(name), type)).as(name).isPresent());
+        Messages.ManifestReply reply = Messages.decode(codec, hex("content_manifest_cbor"), Messages.ManifestReply.class).orElseThrow();
+        assertThat(codec.fromWire(reply.record(), Manifest.class).root()).isEqualTo(golden.get("content_root_cidv1"));
+    }
+
     @Test
     void everyMessageDecodesWithItsTag() {
         assertThat(roundTrip("content_piece_want_cbor", Messages.PieceWant.class).t()).isEqualTo(Messages.PIECE_WANT);

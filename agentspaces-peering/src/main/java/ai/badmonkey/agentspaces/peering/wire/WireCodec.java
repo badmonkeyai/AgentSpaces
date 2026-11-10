@@ -216,7 +216,9 @@ public final class WireCodec {
         Objects.requireNonNull(attestedPeer, "attestedPeer");
         Signed signed;
         try {
-            signed = codec.fromBytes(frame, Signed.class);
+            // HLC round six, 2026-11-08 (owner ruling F3): the frame decodes only from its own wire
+            // encoding, so the envelope's encoding the signature covers is the bytes that arrived
+            signed = codec.fromWire(frame, Signed.class);
         } catch (RuntimeException e) {
             return Optional.empty();
         }

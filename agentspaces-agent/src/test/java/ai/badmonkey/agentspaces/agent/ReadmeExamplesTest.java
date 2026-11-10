@@ -46,7 +46,7 @@ import java.util.function.BooleanSupplier;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The snippets in the root README's "How to use AI with AgentSpaces" section,
+ * The snippets in the core's "How to use AI with AgentSpaces" document (docs/how-to-use-ai.md),
  * verbatim, run over the in-JVM {@code mem} transport (FEATURES.md §15 item
  * 18: every documentation snippet is cut from checked-in code that runs under
  * the gate). A desk peer writes orders and binds no agent; worker peers take

@@ -439,7 +439,7 @@ public final class GroupKeyDistributor implements CapabilityProvider {
         }
         EpochProof decoded;
         try {
-            decoded = codec.fromBytes(proof, EpochProof.class);
+            decoded = codec.fromWire(proof, EpochProof.class);
         } catch (RuntimeException e) {
             return false;
         }
@@ -734,7 +734,7 @@ public final class GroupKeyDistributor implements CapabilityProvider {
 
     private Object decode(byte[] payload) {
         try {
-            KeyRequest request = codec.fromBytes(payload, KeyRequest.class);
+            KeyRequest request = codec.fromWire(payload, KeyRequest.class);
             if (request != null && request.encryptionPublicKey() != null) {
                 return request;
             }
@@ -742,7 +742,7 @@ public final class GroupKeyDistributor implements CapabilityProvider {
             // Not a request; try the response shape.
         }
         try {
-            return codec.fromBytes(payload, KeyResponse.class);
+            return codec.fromWire(payload, KeyResponse.class);
         } catch (RuntimeException e) {
             return null;
         }

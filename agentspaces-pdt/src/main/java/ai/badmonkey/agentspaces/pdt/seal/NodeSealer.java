@@ -81,7 +81,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * are the pure functions of the format, which the golden vector
  * {@code pdt_sealed_node} pins over a fixed test key; an instance binds them to
  * a group's key ring and clock, so {@link #seal(byte[], int)} writes under the
- * ring's write epoch and {@link #open(byte[])} tries every key the ring holds for
+ * ring's write epoch and {@link #open(String, byte[])} tries every key the ring holds for
  * the envelope's epoch. A sealer over an empty ring opens nothing and seals
  * nothing: it is what a keyless member runs.
  */

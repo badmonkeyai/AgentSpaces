@@ -32,7 +32,8 @@ import java.util.TreeMap;
  * The wire, as the console peer sees it (PERF2 §4, ROBUSTNESS.md §6b): the node's traffic
  * counters as rates since the previous read, frames and bytes by {@link Envelope.Kind}, the
  * signed, session and bare split, and the robustness counters that say what the network did to
- * this node rather than what a signer did: frames dropped as unverifiable, as stale, as replays,
+ * this node rather than what a signer did: frames dropped as unverifiable (a frame whose stamp is
+ * no canonical CBOR text among them, HLC round four, 2026-11-08), as stale, as replays,
  * as stamped past the drift ceiling by no more than the skew margin (HLC canonical stamps,
  * 2026-11-08, decision B), and the members held quarantined. Beside them it shows the frames this
  * node refused for a stamp whose logical counter is above the limit (HLC logical counter,

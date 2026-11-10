@@ -50,7 +50,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * meaning over the group's advertisements. The structural path answers "who
  * produces a Finding#v1?"; this capability answers "who can summarize legal
  * PDFs cheaply?" and "who holds customer order history?" by ranking AgentCards,
- * AssetCards, and CapabilityAdvertisements against a free-text query under the
+ * AssetCards, AppCards, and CapabilityAdvertisements against a free-text query under the
  * pluggable {@link Embedder}.
  *
  * <p>Queries are local-first (spec P7): {@link #query} ranks the local
@@ -288,7 +288,7 @@ public final class SemanticDiscovery implements CapabilityProvider {
 
     private Object decode(byte[] payload) {
         try {
-            SemQuery query = codec.fromBytes(payload, SemQuery.class);
+            SemQuery query = codec.fromWire(payload, SemQuery.class);
             if (query != null && query.text() != null) {
                 return query;
             }
@@ -296,7 +296,7 @@ public final class SemanticDiscovery implements CapabilityProvider {
             // Not a query; try the response shape.
         }
         try {
-            return codec.fromBytes(payload, SemResponse.class);
+            return codec.fromWire(payload, SemResponse.class);
         } catch (RuntimeException e) {
             return null;
         }
@@ -329,6 +329,7 @@ public final class SemanticDiscovery implements CapabilityProvider {
         List<Advertisement> ads = new ArrayList<>();
         ads.addAll(discovery.find(AgentCard.class, card -> true));
         ads.addAll(discovery.find(AssetCard.class, card -> true));
+        ads.addAll(discovery.find(ai.badmonkey.agentspaces.api.ad.AppCard.class, card -> true));
         ads.addAll(discovery.find(CapabilityAdvertisement.class, ad -> true));
         ads.addAll(discovery.find(SpaceAdvertisement.class, ad -> true));
         return ads;
@@ -352,6 +353,18 @@ public final class SemanticDiscovery implements CapabilityProvider {
         if (ad instanceof AssetCard card) {
             return card.description() + " " + card.asset() + " " + card.uri()
                     + " " + card.shape();
+        }
+        if (ad instanceof ai.badmonkey.agentspaces.api.ad.AppCard app) {
+            // SPEC §6.1a.2 v0.1.32 (AppCard origin and formats, 2026-11-09): the inline fields, which a stub keeps
+            StringBuilder text = new StringBuilder(app.name()).append(' ').append(app.kind()).append(' ')
+                    .append(app.shape()).append(' ').append(app.owner()).append(' ').append(app.url());
+            if (app.origin() != null) {
+                text.append(' ').append(app.origin().system()).append(' ').append(app.origin().ref());
+            }
+            if (app.formats() != null) {
+                text.append(' ').append(String.join(" ", app.formats()));
+            }
+            return text.toString();
         }
         if (ad instanceof CapabilityAdvertisement cap) {
             return cap.capabilityType() + " " + cap.binding() + " " + cap.parameters();

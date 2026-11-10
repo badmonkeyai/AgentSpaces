@@ -40,6 +40,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>Age is measured against the clock given at construction, so a test can move
  * time; {@link #retainedRoots(long)} takes an explicit now. A version that falls
  * outside both rules is forgotten on the next record for its ref.
+ *
+ * <p>Over a {@link MetaStore} the versions persist (PDT 2 phase 1, P2-V-03): the
+ * retention reads every {@value #META_PREFIX} record when it is built, and
+ * {@link #flush} writes the record of each ref that changed since the last flush,
+ * named by the hex of the sha-256 of the ref name's UTF-8 bytes, so a restart keeps the delta
+ * bases and the collector's third mark source. {@code Pdt} flushes on its tick and
+ * on close.
  */
 public final class Retention {
 
@@ -52,10 +59,28 @@ public final class Retention {
     /** One recorded version. */
     public record Version(String root, long recordedMillis) { }
 
+    /** The prefix of the meta record of one ref's versions (P2-V-03). */
+    public static final String META_PREFIX = "retention:";
+
+    /**
+     * The meta record of one ref.
+     *
+     * @param v        the format version, 1
+     * @param ref      the ref name
+     * @param versions the versions, oldest first; empty once the ref is forgotten
+     */
+    record Persisted(int v, String ref, List<Version> versions) { }
+
+    private static final ai.badmonkey.agentspaces.common.codec.CborCodec CODEC =
+            ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+
     private final int versions;
     private final long ageMillis;
     private final InstantSource clock;
     private final Map<String, Deque<Version>> history = new ConcurrentHashMap<>();
+    private final MetaStore meta;
+    /** Refs recorded or forgotten since the last {@link #flush}. */
+    private final Set<String> dirty = ConcurrentHashMap.newKeySet();
 
     /**
      * A retention with explicit limits.
@@ -65,6 +90,18 @@ public final class Retention {
      * @param clock    the clock age is measured against
      */
     public Retention(int versions, Duration age, InstantSource clock) {
+        this(versions, age, clock, null);
+    }
+
+    /**
+     * A retention whose versions persist in a meta store, starting from what it holds (P2-V-03).
+     *
+     * @param versions how many versions to keep per ref regardless of age; at least 1
+     * @param age      the age under which every version is kept; zero keeps by count alone
+     * @param clock    the clock age is measured against
+     * @param meta     where the versions persist; null keeps them in memory only
+     */
+    public Retention(int versions, Duration age, InstantSource clock, MetaStore meta) {
         if (versions < 1) {
             throw new IllegalArgumentException("versions must be at least 1");
         }
@@ -75,6 +112,42 @@ public final class Retention {
         this.versions = versions;
         this.ageMillis = age.toMillis();
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.meta = meta;
+        if (meta != null) {
+            for (String name : meta.metaNames()) {
+                if (name.startsWith(META_PREFIX)) {
+                    meta.meta(name).ifPresent(bytes -> {
+                        Persisted stored = CODEC.fromBytes(bytes, Persisted.class);
+                        if (!stored.versions().isEmpty()) {
+                            history.put(stored.ref(), new ArrayDeque<>(stored.versions()));
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /** Writes the record of every ref that changed since the last flush; nothing without a meta store. */
+    public void flush() {
+        if (meta == null) {
+            return;
+        }
+        for (String ref : List.copyOf(dirty)) {
+            dirty.remove(ref);
+            Deque<Version> deque = history.get(ref);
+            List<Version> versionsOfRef;
+            if (deque == null) {
+                versionsOfRef = List.of();
+            } else {
+                synchronized (deque) {
+                    versionsOfRef = List.copyOf(deque);
+                }
+            }
+            // the sha-256 of the name keeps a 256-byte ref name inside the meta name bound (PDT 2 phase 1, P2-V-03)
+            String name = META_PREFIX + java.util.HexFormat.of().formatHex(
+                    ai.badmonkey.agentspaces.common.crypto.Digests.sha256(ref.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            meta.putMeta(name, CODEC.toBytes(new Persisted(1, ref, versionsOfRef)));
+        }
     }
 
     /** The default limits, 64 versions or one hour, on a clock. */
@@ -113,6 +186,7 @@ public final class Retention {
             prune(deque, nowMillis);
             return deque;
         });
+        dirty.add(refName);
     }
 
     /** Every retained root across every ref, as of the clock. */
@@ -177,7 +251,11 @@ public final class Retention {
      * @return whether the ref was known
      */
     public boolean forget(String refName) {
-        return history.remove(refName) != null;
+        boolean known = history.remove(refName) != null;
+        if (known) {
+            dirty.add(refName);
+        }
+        return known;
     }
 
     /** Drops the versions that neither rule keeps; the deque is held under compute. */

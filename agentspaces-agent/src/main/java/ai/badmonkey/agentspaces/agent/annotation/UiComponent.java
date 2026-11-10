@@ -25,13 +25,13 @@ import java.lang.annotation.Target;
  * Declares an A2UI component this agent serves (SPEC §6.1a.3, v0.1.26; ISSUE-UiComponents). The binder derives the
  * card's {@code ui} group from every such annotation on the agent class or its bound methods: the component, its
  * catalog, the standard entry behind it, the controls a person may trigger, and the role the component plays in an
- * assembled application. A control must name an action the card declares. An agent with no annotation has no
+ * application a console drafts from the group's cards. A control must name an action the card declares. An agent with no annotation has no
  * {@code ui}; a card without one is byte-identical to v0.1.25.
  *
  * <pre>{@code
  * @SpaceAgent(name = "notify")
- * @UiComponent(catalog = "bma-widgets", component = "ObjectShare", entry = SharedObject.class, controls = {"open", "share"})
- * @UiComponent(catalog = "bma-widgets", component = "ChatInput", entry = ChatMessage.class, role = "control", writes = true)
+ * @UiComponent(catalog = "example-widgets", component = "ItemPanel", entry = SharedItem.class, controls = {"open", "share"})
+ * @UiComponent(catalog = "example-widgets", component = "MessageInput", entry = Message.class, role = "control", writes = true)
  * public class Notify { ... }
  * }</pre>
  */

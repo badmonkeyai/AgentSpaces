@@ -222,6 +222,23 @@ public interface Space {
     }
 
     /**
+     * The entries {@link #readAllEntries} matches by type and tags but cannot decode (HLC round
+     * six, 2026-11-08, ruling R3): live, unclaimed, held here in the clear, and holding no value
+     * of the template's type. The reads skip them; a reader that counts the records it refuses,
+     * as the ref heads do, learns of them here.
+     *
+     * <p>The default reports none: a space that holds the values its writers gave it decodes
+     * every one of them.
+     *
+     * @param template the template to match by type and tags
+     * @param limit    the maximum number of entries to return
+     * @return the ids of the matched entries that do not decode, possibly empty
+     */
+    default List<EntryId> undecodableEntries(Template<?> template, int limit) {
+        return List.of();
+    }
+
+    /**
      * Destructive, exclusive match under the space's conflict strategy (spec §7.4),
      * waiting up to the timeout for a matching entry. The returned take holds a
      * TAKE lease: if the taker dies or lets the lease lapse without

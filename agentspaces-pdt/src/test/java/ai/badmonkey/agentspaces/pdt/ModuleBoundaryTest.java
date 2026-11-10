@@ -29,10 +29,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The drift guard of srad/agentspaces-pdt.md §6.9: this module opens no socket,
- * starts no gossip, and owns no replication. It scans every source file under
+ * starts no gossip of its own, and owns no replication. It scans every source file under
  * {@code src/main/java} and fails on an import of {@code peering.transport},
  * {@code GossipBus}, {@code PeerNode}, or a JDK socket. The swarm moves nodes; this
- * module only shapes them.
+ * module only shapes them. Eager push (PDT 2 phase 5, P2-P-01) publishes a ref's bundles
+ * on the group's existing bus through {@code Content.gossip()}, by stream name alone, as
+ * the design says, and imports none of these.
  */
 class ModuleBoundaryTest {
 

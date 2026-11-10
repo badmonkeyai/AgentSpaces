@@ -30,6 +30,12 @@ import java.util.Objects;
  * ({@link #DAG_CBOR}); a blob chunk uses {@code raw} ({@link #RAW}). {@link #parse}
  * refuses any other codec or multihash by name (PD-N-04).
  *
+ * <p>A blob's identity (PDT 2 phase 4, P2-B-01; srad/agentspaces-pdt2.md §3.5) is a CIDv1 of codec {@code raw}
+ * over the BLAKE3 multihash 0x1e ({@link #BLAKE3}), which {@link #identity}, {@link #isIdentity}, and
+ * {@link #identityDigest} read and write. Nodes keep sha2-256 (decision 9), so {@link #parse} and
+ * {@link #isCid} still name nodes alone, and a node link over BLAKE3 stays refused, as annex H and the
+ * clients' node readers refuse it.
+ *
  * <p>The class lives in the content module because the tree exchange verifies
  * every received node against its CID here (PD-X-04) and the content module
  * must not depend on {@code agentspaces-pdt} (srad/agentspaces-pdt.md §6.9);
@@ -45,6 +51,9 @@ public final class Cids {
 
     /** Multihash code of sha2-256, the only multihash the design uses. */
     public static final int SHA2_256 = 0x12;
+
+    /** Multihash code of BLAKE3, which names a blob's identity and no node (PDT 2 phase 4, P2-B-01). */
+    public static final int BLAKE3 = 0x1e;
 
     /** The sha2-256 digest length in bytes. */
     public static final int DIGEST_LENGTH = 32;
@@ -155,14 +164,19 @@ public final class Cids {
         return parseBinary(binary, cid);
     }
 
-    /** Whether a string parses as a CID the design uses. */
+    /**
+     * Whether a string is a CID the design uses in its one canonical text: it parses, and it is
+     * the base32 form of the bytes it parses to, so text with non-zero padding bits or upper-case
+     * letters, which name the same bytes, is no CID (PDT 2 phase 1, P2-X-09; phase 0 gate
+     * finding G2, which every port already applies).
+     */
     public static boolean isCid(String s) {
         if (s == null) {
             return false;
         }
         try {
-            parse(s);
-            return true;
+            Parsed parsed = parse(s);
+            return ofDigest(parsed.digest(), parsed.codec()).equals(s);
         } catch (IllegalArgumentException e) {
             return false;
         }
@@ -190,6 +204,67 @@ public final class Cids {
     public static String fromBinary(byte[] binary) {
         Objects.requireNonNull(binary, "binary");
         return parseBinary(binary, null).cid();
+    }
+
+    /**
+     * The identity of a blob (PDT 2 phase 4, P2-B-01): the CIDv1 of codec {@code raw} over the BLAKE3 hash of
+     * its whole content, multihash 0x1e, in base32. The text starts {@code bafkr4i}.
+     *
+     * @param blake3 the 32-byte BLAKE3 hash
+     * @return the identity CID
+     */
+    public static String identity(byte[] blake3) {
+        Objects.requireNonNull(blake3, "blake3");
+        if (blake3.length != DIGEST_LENGTH) {
+            throw new IllegalArgumentException("a BLAKE3 identity names a 32-byte hash, found " + blake3.length);
+        }
+        byte[] binary = new byte[BINARY_LENGTH];
+        binary[0] = VERSION;
+        binary[1] = (byte) RAW;
+        binary[2] = (byte) BLAKE3;
+        binary[3] = DIGEST_LENGTH;
+        System.arraycopy(blake3, 0, binary, 4, DIGEST_LENGTH);
+        return Multibase.base32(binary);
+    }
+
+    /**
+     * Whether text is a blob identity in its canonical form: base32 of a CIDv1 of codec {@code raw} over
+     * multihash 0x1e and a 32-byte digest, with no padding bit set (P2-B-01).
+     *
+     * @param text the text, or null
+     * @return true when {@link #identityDigest} reads it
+     */
+    public static boolean isIdentity(String text) {
+        try {
+            identityDigest(text);
+            return true;
+        } catch (IllegalArgumentException | NullPointerException e) {
+            return false;
+        }
+    }
+
+    /**
+     * The BLAKE3 hash a blob identity names (P2-B-01).
+     *
+     * @param text the identity
+     * @return the 32-byte hash
+     * @throws IllegalArgumentException when the text is no canonical BLAKE3 identity
+     */
+    public static byte[] identityDigest(String text) {
+        Objects.requireNonNull(text, "text");
+        byte[] binary = null;
+        if (text.length() > 1 && text.charAt(0) == Multibase.BASE32_PREFIX) {
+            try {
+                binary = Base32.decode(text.substring(1));
+            } catch (IllegalArgumentException e) {
+                binary = null;
+            }
+        }
+        if (binary == null || binary.length != BINARY_LENGTH || binary[0] != VERSION || binary[1] != RAW
+                || binary[2] != BLAKE3 || binary[3] != DIGEST_LENGTH || !Multibase.base32(binary).equals(text)) {
+            throw new IllegalArgumentException("not a BLAKE3 identity (a canonical CIDv1 of codec raw over multihash 0x1e): " + text);
+        }
+        return Arrays.copyOfRange(binary, 4, BINARY_LENGTH);
     }
 
     /**
@@ -237,6 +312,10 @@ public final class Cids {
                     "unknown codec 0x" + Integer.toHexString(codec) + " (only dag-cbor 0x71 and raw 0x55): " + shown);
         }
         int multihash = binary[2] & 0xff;
+        if (multihash == BLAKE3) {
+            throw new IllegalArgumentException("multihash 0x1e names a BLAKE3 identity, which identityDigest reads;"
+                    + " a node CID names sha2-256 0x12: " + shown);
+        }
         if (multihash != SHA2_256) {
             throw new IllegalArgumentException(
                     "unknown multihash 0x" + Integer.toHexString(multihash) + " (only sha2-256 0x12): " + shown);

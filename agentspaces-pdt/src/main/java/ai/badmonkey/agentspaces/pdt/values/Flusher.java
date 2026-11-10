@@ -35,8 +35,22 @@ final class Flusher {
     private final NodeStore store;
     private final Map<String, byte[]> fresh = new LinkedHashMap<>();
 
-    private Flusher(NodeStore store) {
+    /** A batch over a store; {@link #commit} writes what {@link #put} and {@link #cidOf} queued. */
+    Flusher(NodeStore store) {
         this.store = store;
+    }
+
+    /**
+     * Writes the queued nodes in one batch (PDT 2 phase 2, P2-D-02: the DataScript adapter's fold
+     * writes its dirty paths through one batch).
+     *
+     * @return the nodes written, CID to bytes, in the order queued
+     */
+    Map<String, byte[]> commit() {
+        if (!fresh.isEmpty()) {
+            store.putAll(fresh);
+        }
+        return Collections.unmodifiableMap(fresh);
     }
 
     /**
@@ -47,10 +61,7 @@ final class Flusher {
     static Map<String, byte[]> flush(TreeNode root, NodeStore store) {
         Flusher flusher = new Flusher(store);
         flusher.cidOf(root);
-        if (!flusher.fresh.isEmpty()) {
-            store.putAll(flusher.fresh);
-        }
-        return Collections.unmodifiableMap(flusher.fresh);
+        return flusher.commit();
     }
 
     /** The CID of a child reference: the string itself, or the node's CID after hashing it. */

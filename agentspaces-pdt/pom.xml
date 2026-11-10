@@ -21,7 +21,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.5.0</version>
+    <version>0.6.0</version>
   </parent>
   <artifactId>agentspaces-pdt</artifactId>
   <name>AgentSpaces :: Persistent Data Trees (Layer 4)</name>
@@ -61,6 +61,12 @@
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-space</artifactId>
+    </dependency>
+    <!-- PDT 2 phase 3, P2-S-11: Pdt.storeFor chooses content stores through the planner's StoreChooser. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-planner</artifactId>
+      <version>${project.version}</version>
     </dependency>
     <!-- AES-GCM-SIV (RFC 8452) for the sealed-nodes mode of §3.8 (PD-P-05); the version is pinned in the parent. -->
     <dependency>

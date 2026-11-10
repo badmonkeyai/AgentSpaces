@@ -16,6 +16,7 @@
 package ai.badmonkey.agentspaces.pdt;
 
 import ai.badmonkey.agentspaces.content.tree.Cids;
+import ai.badmonkey.agentspaces.pdt.store.MetaStore;
 import ai.badmonkey.agentspaces.peering.blocks.BlockStore;
 import ai.badmonkey.agentspaces.peering.blocks.MemoryBlockStore;
 
@@ -56,8 +57,16 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Retention of delta bases and collection (PD-S-03 to PD-S-05) live in
  * {@code pdt.store} and build on this class; nothing here removes a node.
+ *
+ * <p>Pins persist when the backend is a {@link MetaStore} (PDT 2 phase 1, P2-V-03): the
+ * store reads the meta record {@value #PINS_META} when it is built and writes it on
+ * {@link #flushMeta} after a pin or a release, so a restart over the same packs starts with
+ * the counts of the last flush. {@code Pdt} flushes on its tick and on close.
  */
 public class NodeStore {
+
+    /** The meta record of the pins: a CBOR map from root to reference count (P2-V-03). */
+    public static final String PINS_META = "pins";
 
     /** The deepest tree a walk follows: a node at this depth may not link further (PD-N-04). */
     public static final int MAX_DEPTH = NodeCodec.MAX_DEPTH;
@@ -72,12 +81,19 @@ public class NodeStore {
     public record Stored(String cid, byte[] bytes) {
     }
 
+    private static final ai.badmonkey.agentspaces.common.codec.CborCodec CODEC =
+            ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+
     private final BlockStore backend;
     private final InstantSource clock;
+    /** The intra-chunk deltas edits over this store keep (PDT 2 phase 4, P2-Z-02); a sibling shares them. */
+    private final ai.badmonkey.agentspaces.pdt.blob.ChunkDeltas deltas;
     /** Reference counts by root; every change is one atomic map operation, so pins and unpins never race. */
     private final Map<String, Integer> pins = new ConcurrentHashMap<>();
     /** Advances on every pin, so a collector can tell cheaply whether a root was pinned since it last read the roots (PD-S-04). */
     private final AtomicLong pinGeneration = new AtomicLong();
+    /** Pins changed since the last {@link #flushMeta}. */
+    private final java.util.concurrent.atomic.AtomicBoolean pinsDirty = new java.util.concurrent.atomic.AtomicBoolean();
 
     /**
      * A store over a backend.
@@ -86,8 +102,37 @@ public class NodeStore {
      * @param clock   the clock the backend wants for its last-served marks
      */
     public NodeStore(BlockStore backend, InstantSource clock) {
+        this(backend, clock, new ai.badmonkey.agentspaces.pdt.blob.ChunkDeltas(clock, true));
+    }
+
+    /**
+     * A store over a backend that keeps its intra-chunk deltas in a given table (PDT 2 phase 4, P2-Z-02), so a
+     * sibling store's edits land where this store's holder serves them.
+     *
+     * @param backend where the bytes live
+     * @param clock   the clock the backend wants for its last-served marks
+     * @param deltas  the table of intra-chunk deltas
+     */
+    protected NodeStore(BlockStore backend, InstantSource clock, ai.badmonkey.agentspaces.pdt.blob.ChunkDeltas deltas) {
         this.backend = Objects.requireNonNull(backend, "backend");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.deltas = Objects.requireNonNull(deltas, "deltas");
+        if (backend instanceof MetaStore meta) {
+            meta.meta(PINS_META).ifPresent(bytes -> {
+                Map<?, ?> stored = CODEC.fromBytes(bytes, Map.class);
+                stored.forEach((root, count) -> pins.put((String) root, ((Number) count).intValue()));
+            });
+        }
+    }
+
+    /**
+     * Writes the pins to the backend's meta record when they changed since the last call; a
+     * backend that is no {@link MetaStore} keeps them in memory only (P2-V-03).
+     */
+    public void flushMeta() {
+        if (backend instanceof MetaStore meta && pinsDirty.getAndSet(false)) {
+            meta.putMeta(PINS_META, CODEC.toBytes(new java.util.TreeMap<>(pins)));
+        }
     }
 
     /** A store on the heap over a {@link MemoryBlockStore} with the system clock (PD-S-07). */
@@ -105,7 +150,12 @@ public class NodeStore {
      * @return the sibling store
      */
     public NodeStore over(BlockStore other) {
-        return new NodeStore(other, clock);
+        return new NodeStore(other, clock, deltas);
+    }
+
+    /** The intra-chunk deltas edits over this store keep (PDT 2 phase 4, P2-Z-02). */
+    public ai.badmonkey.agentspaces.pdt.blob.ChunkDeltas deltas() {
+        return deltas;
     }
 
     /** The backend. */
@@ -221,6 +271,7 @@ public class NodeStore {
         Objects.requireNonNull(root, "root");
         int count = pins.merge(root, 1, Integer::sum);
         pinGeneration.incrementAndGet();
+        pinsDirty.set(true);
         return count;
     }
 
@@ -238,6 +289,9 @@ public class NodeStore {
             left[0] = count - 1;
             return count <= 1 ? null : count - 1;
         });
+        if (left[0] >= 0) {
+            pinsDirty.set(true);
+        }
         return left[0];
     }
 

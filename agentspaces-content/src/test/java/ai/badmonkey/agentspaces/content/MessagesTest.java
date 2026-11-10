@@ -140,7 +140,8 @@ class MessagesTest {
                 .mapToObj(i -> Cids.of(new byte[]{(byte) i, (byte) (i >> 8)}, Cids.DAG_CBOR)).toList();
         assertThat(new Messages.TreeEnd(1, bigFrontier, Messages.END_DONE).violation().orElse("")).contains("at most 1024 frontier cids, got 1025");
         assertThat(new Messages.TreeEnd(1, List.of(), 0).violation().orElse("")).contains("unknown TREE_END reason 0");
-        assertThat(new Messages.TreeEnd(1, List.of(), 5).violation().orElse("")).contains("unknown TREE_END reason 5");
+        // PDT 2 phase 3: reason 5 is the level-2 sketch round, so 6 is the first unknown reason
+        assertThat(new Messages.TreeEnd(1, List.of(), 6).violation().orElse("")).contains("unknown TREE_END reason 6");
         assertThat(new Messages.TreeEnd(1, List.of("?"), Messages.END_DONE).violation().orElse("")).contains("frontier holds a value that is not a CID");
         for (int reason : new int[]{Messages.END_DONE, Messages.END_BUDGET, Messages.END_HAVES_NOT_HELD, Messages.END_WALK_CAP}) {
             assertThat(new Messages.TreeEnd(1, List.of(cid), reason).violation()).isEmpty();
@@ -158,6 +159,83 @@ class MessagesTest {
             return m.violation();
         }
         return ((Messages.TreeEnd) message).violation();
+    }
+
+    /**
+     * PDT 2 phase 1, P2-X-09 (srad/agentspaces-pdt2.md §6.10.1; SPEC v0.1.31 §9.1 and §9.3): every
+     * content-swarm message reads through {@code CborCodec.fromWire}, so a message with a field its
+     * schema does not name, its fields out of order, or a field of the wrong type is undecodable,
+     * where the lenient reader had dropped the field, reordered the map, or coerced the value.
+     */
+    @Test
+    void everyMessageReadsUnderItsWireSchemaAndRefusesARelabel() {
+        String root = Cids.of(new byte[]{1}, Cids.RAW);
+        String node = Cids.of(new byte[]{(byte) 0xa0}, Cids.DAG_CBOR);
+        Object[] messages = {
+                new Messages.PieceWant(root, 3, 0, 65_536, 42),
+                new Messages.Piece(root, 3, 0, new byte[]{1, 2, 3}, 42),
+                new Messages.Have(root, new byte[]{1, 2}, false),
+                new Messages.Cancel(root, 3, 42),
+                new Messages.Reject(root, 3, Messages.REASON_OVER_BUDGET),
+                new Messages.ManifestWant(root),
+                new Messages.ManifestReply(root, new byte[]{(byte) 0xa0}),
+                new Messages.NodeWant(7, List.of(node)),
+                Messages.Nodes.plain(7, List.of(new byte[]{(byte) 0xa0}), null),
+                new Messages.TreeWant(9, node, List.of(), Messages.MAX_TREE_BUDGET),
+                new Messages.TreeEnd(9, List.of(node), Messages.END_DONE),
+        };
+        for (Object message : messages) {
+            byte[] honest = codec.toBytes(message);
+            assertThat(Messages.decode(codec, honest, message.getClass())).as("honest %s", message).isPresent();
+            java.util.Map<String, Object> fields = codec.fromBytes(honest, java.util.LinkedHashMap.class);
+            List<String> keys = new java.util.ArrayList<>(fields.keySet());
+            assertThat(Messages.decode(codec, inOrder(keys, fields), message.getClass()))
+                    .as("%s rebuilt item by item in its own order", message).isPresent();
+            java.util.Map<String, Object> extra = new java.util.LinkedHashMap<>(fields);
+            extra.put("x", 1);
+            List<String> extraKeys = new java.util.ArrayList<>(keys);
+            extraKeys.add("x");
+            assertThat(Messages.decode(codec, inOrder(extraKeys, extra), message.getClass()))
+                    .as("%s with a field its schema does not name", message).isEmpty();
+            List<String> reversed = new java.util.ArrayList<>(keys);
+            java.util.Collections.reverse(reversed);
+            assertThat(Messages.decode(codec, inOrder(reversed, fields), message.getClass()))
+                    .as("%s with its fields out of order", message).isEmpty();
+            java.util.Map<String, Object> retyped = new java.util.LinkedHashMap<>(fields);
+            retyped.put("t", String.valueOf(fields.get("t")));
+            assertThat(Messages.decode(codec, inOrder(keys, retyped), message.getClass()))
+                    .as("%s with its tag as text", message).isEmpty();
+        }
+    }
+
+    /**
+     * PDT 2 phase 1, P2-X-09: the opened plaintext of a sealed {@code NODES} is a nested document,
+     * the nodes list in its own encoding, so a fetcher reads no other encoding of it.
+     */
+    @Test
+    void theSealedNodesListReadsOnlyInItsOwnEncoding() {
+        java.util.HexFormat hex = java.util.HexFormat.of();
+        byte[] honest = codec.toBytes(new byte[][]{{(byte) 0xa0}, {1, 2}});
+        assertThat(hex.formatHex(honest)).isEqualTo("8241a0420102");
+        assertThat(Content.sealedNodesList(codec, honest)).hasValueSatisfying(nodes ->
+                assertThat(nodes).containsExactly(new byte[]{(byte) 0xa0}, new byte[]{1, 2}));
+        for (String other : List.of("980241a0420102", "9f41a0420102ff", "8241a042010200", "8241a0f6",
+                "8241a06131", "8241a05f420102ff", "8241a0c2420102", "a0")) {
+            assertThat(Content.sealedNodesList(codec, hex.parseHex(other))).as(other).isEmpty();
+        }
+    }
+
+    /** An indefinite-length map, as Jackson writes a record, with the entries in the given order. */
+    private byte[] inOrder(List<String> keys, java.util.Map<String, Object> fields) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        out.write(0xbf);
+        for (String key : keys) {
+            out.writeBytes(codec.toBytes(key));
+            Object value = fields.get(key);
+            out.writeBytes(value == null ? new byte[]{(byte) 0xf6} : codec.toBytes(value));
+        }
+        out.write(0xff);
+        return out.toByteArray();
     }
 
     @Test

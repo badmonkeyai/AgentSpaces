@@ -144,7 +144,9 @@ class HeadLifecycleTest {
         assertThat(onA.deref().root()).isEqualTo(v1.root());
         assertThat(onB.deref().root()).isEqualTo(v1.root());
         assertThat(onB.deref().count()).isEqualTo(1);
-        assertThat(b.pdt().stats().headsIgnored()).as("the phantom head is ignored and counted on b").isEqualTo(1);
+        // swarm retries (ROBUSTNESS.md §10.3 P1): the phantom head is left out and counted as late, never as a fault
+        assertThat(b.pdt().stats().headsIgnored()).isZero();
+        assertThat(b.pdt().stats().headsLate()).as("the phantom head is late: its fetch runs on and is retried").isPositive();
         // the next swap continues the history from v1 rather than restarting the ref
         PMap<String, String> v2 = onA.swap(m -> m.assoc("k2", "v2"));
         assertThat(v2.count()).isEqualTo(2);
@@ -259,14 +261,339 @@ class HeadLifecycleTest {
 
     /**
      * HLC canonical stamps, 2026-11-08: a {@code pdt.issued} attr orders a head only when it is a
-     * canonical, acceptable stamp. Java read "099999999999999:0:n" as a far-future stamp and
-     * ordered by a counter above 65536, so a head carrying either sorted after every honest one
-     * and won every contested key. The attr is advisory, so such a head falls back to its
-     * entry's own stamp, and the later honest head wins.
+     * canonical, acceptable stamp. Java read "0<physical>:0:n" as a stamp and ordered by a counter
+     * above 65536, so a head carrying either sorted after every honest one and won every
+     * contested key. The attr is advisory, so such a head falls back to its entry's own stamp, and
+     * the later honest head wins. HLC round six, 2026-11-08: each stamp lies five minutes ahead,
+     * inside the far-future margin of ruling R2, so only the rule under test makes it fall back.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"99999999999999:65537:zEvil", "099999999999999:0:zEvil"})
+    @ValueSource(strings = {"%d:65537:zEvil", "0%d:0:zEvil"})
     void aPdtIssuedAttrThatIsNoAcceptableStampFallsBackToTheEntrysOwnStamp(String hostile) throws Exception {
+        assertHeadOrdersByItsOwnStamp(java.util.Map.of(PRef.ISSUED_ATTR, hostile.formatted(ahead(Duration.ofMinutes(5)))));
+    }
+
+    /**
+     * HLC round four, 2026-11-08 (decision D2): a {@code pdt.issuer} that does not parse as an
+     * agent id makes the head fall back to its entry's own stamp and issuer together, however
+     * acceptable its {@code pdt.issued}. Nothing is refused or counted for it; the attrs are
+     * advisory payload and only order. Honoured, this stamp five minutes ahead would win every key.
+     */
+    @Test
+    void aPdtIssuerAttrThatIsNoAgentIdFallsBackToTheEntrysOwnStampAndIssuer() throws Exception {
+        assertHeadOrdersByItsOwnStamp(java.util.Map.of(PRef.ISSUED_ATTR, aheadStamp(Duration.ofMinutes(5)),
+                PRef.ISSUER_ATTR, "no-agent-id"));
+    }
+
+    /**
+     * HLC round five, 2026-11-08 (decision E10): a {@code pdt.issuer} that is present and null
+     * makes the head fall back to its entry's own stamp and issuer together, however acceptable
+     * its {@code pdt.issued}; pairing the stamp ahead with the entry's issuer instead would win
+     * every key. A {@code pdt.issued} that is present and null falls back the same way. The head
+     * still decodes and orders, and nothing is refused or counted for the attrs.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {PRef.ISSUER_ATTR, PRef.ISSUED_ATTR})
+    void aNullPdtIssuerOrPdtIssuedAttrFallsBackToTheEntrysOwnStampAndIssuer(String nulled) throws Exception {
+        java.util.Map<String, Object> attrs = new java.util.HashMap<>();
+        attrs.put(PRef.ISSUED_ATTR, aheadStamp(Duration.ofMinutes(5)));
+        attrs.put(PRef.ISSUER_ATTR, "zEvil/app");
+        attrs.put(nulled, null);
+        assertHeadOrdersByItsOwnStamp(attrs);
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R1): under {@code pdt.issued} and {@code pdt.issuer} any
+     * application value travels, and one that is no text makes the head fall back to its entry's
+     * own stamp and issuer together. The head decodes on every replica and nothing counts it. The
+     * byte string is the base64 of "zEvi/app", an agent id Java once read from it.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"bytes", "list", "map", "integer", "boolean", "float"})
+    void aPdtIssuerThatIsNoTextFallsBackToTheEntrysOwnStampAndIssuer(String shape) throws Exception {
+        java.util.Map<String, Object> attrs = new java.util.HashMap<>();
+        attrs.put(PRef.ISSUED_ATTR, aheadStamp(Duration.ofMinutes(5)));
+        attrs.put(PRef.ISSUER_ATTR, nonText(shape));
+        assertHeadOrdersByItsOwnStamp(attrs);
+    }
+
+    /**
+     * The control of the fallback tests above: an acceptable {@code pdt.issued} five minutes
+     * ahead with an agent id under {@code pdt.issuer} orders the head after the later honest one,
+     * so the head wins the contested key. Each fallback test therefore shows its rule at work.
+     */
+    @Test
+    void anAcceptablePdtIssuedAheadOrdersTheHeadByItAndWinsTheKey() throws Exception {
+        assertHeadOrdersByTheAttrs(java.util.Map.of(PRef.ISSUED_ATTR, aheadStamp(Duration.ofMinutes(5)),
+                PRef.ISSUER_ATTR, "zEvil/app"));
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R2): a {@code pdt.issued} whose physical time lies beyond
+     * the reader's wall plus {@code MAX_DRIFT} plus the five-second skew margin is no acceptable
+     * stamp, so the head falls back to its entry's own stamp and issuer and can no longer win
+     * every conflict by stamping ahead.
+     */
+    @Test
+    void aPdtIssuedBeyondTheFarFutureMarginFallsBackToTheEntrysOwnStampAndIssuer() throws Exception {
+        assertHeadOrdersByItsOwnStamp(java.util.Map.of(PRef.ISSUED_ATTR, aheadStamp(Duration.ofMinutes(11)),
+                PRef.ISSUER_ATTR, "zEvil/app"));
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R2): a reader judges {@code pdt.issued} against its own
+     * wall at each read, so a head whose attr lies past the bound orders by its entry's own stamp
+     * until the wall comes within the bound, and by its attrs from then on. The version this
+     * engine records for the root follows the head, so {@code version} and a rewrite of the lapsed
+     * head (PD-R-08) carry the order the head has; the record once kept the first fallback stamp.
+     */
+    @Test
+    void aPdtIssuedTheWallComesWithinTheBoundOfOrdersTheHeadAndItsRecordedVersionFromThen() throws Exception {
+        Fork fork = forkWithAttrs(java.util.Map.of(PRef.ISSUED_ATTR, aheadStamp(Duration.ofMinutes(11)),
+                PRef.ISSUER_ATTR, "zEvil/app"));
+        Ref<PMap<String, String>> onR = fork.reader().pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        assertThat(onR.heads().heads().get(0).root()).as("past the bound the head orders by its own stamp")
+                .isEqualTo(fork.attributed());
+        assertThat(onR.deref().get("kc")).contains("b");
+        fleet.clock.advance(Duration.ofMinutes(2));
+        Heads.Head last = onR.heads().heads().get(1);
+        assertThat(last.root()).as("within the bound the head orders by its attrs").isEqualTo(fork.attributed());
+        assertThat(last.issuer().peer()).isEqualTo(EVIL);
+        assertThat(onR.deref().get("kc")).contains("a");
+        Heads.Head version = fork.reader().pdt().refs().version(NAME, fork.attributed()).orElseThrow();
+        assertThat(version.issued()).as("the recorded version orders as the head does").isEqualTo(last.issued());
+        assertThat(version.issuer()).isEqualTo(last.issuer());
+        assertThat(fork.reader().pdt().stats().headsIgnored()).isZero();
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R2), at its bound: a {@code pdt.issued} exactly at the
+     * reader's wall plus {@code MAX_DRIFT} plus five seconds is acceptable, and one millisecond
+     * later is not. The margin is the far-future margin a frame's stamp is judged by.
+     */
+    @Test
+    void theFarFutureBoundOfPdtIssuedIsTheWallPlusMaxDriftPlusFiveSeconds() {
+        long wall = 1_800_000_000_000L;
+        long bound = wall + ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock.MAX_DRIFT_MILLIS + 5_000L;
+        assertThat(Refs.ISSUED_SKEW_MARGIN_MILLIS)
+                .isEqualTo(ai.badmonkey.agentspaces.peering.node.PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS);
+        assertThat(Refs.issuedAttrAcceptable(new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(bound, 0, "n"), wall))
+                .isTrue();
+        assertThat(Refs.issuedAttrAcceptable(new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(bound + 1, 0, "n"), wall))
+                .isFalse();
+        assertThat(Refs.issuedAttrAcceptable(new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(wall, 65_536, "n"), wall))
+                .isTrue();
+        assertThat(Refs.issuedAttrAcceptable(new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(wall, 65_537, "n"), wall))
+                .isFalse();
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R1): a head decodes, through the read every entry
+     * payload takes, with any application value under {@code pdt.issued} or {@code pdt.issuer},
+     * null included; the value stays as it arrived, so the head re-encodes to its own bytes; and
+     * a value that is no text reads as no reserved attr. Java once read an integer as its text,
+     * a byte string as base64, and dropped the head for an array or a map.
+     */
+    @Test
+    void anyApplicationValueUnderAReservedAttrDecodesAndReadsAsNoTextWhenItIsNone() throws Exception {
+        String[] shapes = {"null", "bytes", "list", "map", "integer", "boolean", "float"};
+        for (String shape : shapes) {
+            java.util.Map<String, Object> attrs = new java.util.LinkedHashMap<>();
+            attrs.put("origin", "test");
+            attrs.put(PRef.ISSUED_ATTR, "99999999999999:0:zEvil");
+            attrs.put(PRef.ISSUER_ATTR, "null".equals(shape) ? null : nonText(shape));
+            byte[] wire = rawHead(attrs);
+            PRef head = CBOR.fromDocument(wire, PRef.class);
+            assertThat(head.violation()).as("a %s attr", shape).isEmpty();
+            assertThat(head.attrs()).as("a %s attr", shape).containsKey(PRef.ISSUER_ATTR);
+            assertThat(head.attrs().get("origin")).isEqualTo("test");
+            assertThat(head.issuerAttr()).as("a %s attr", shape).isNull();
+            assertThat(head.issuedAttr()).isEqualTo("99999999999999:0:zEvil");
+            assertThat(CBOR.toBytes(head)).as("a %s attr re-encodes to its bytes", shape).isEqualTo(wire);
+        }
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R1): under any key but the two reserved ones an attr is
+     * text, and null or any other item makes the head undecodable, which every implementation
+     * counts in {@code headsIgnored}.
+     */
+    @Test
+    void aValueThatIsNoTextUnderAnOrdinaryAttrMakesTheHeadUndecodable() throws Exception {
+        String[] shapes = {"null", "bytes", "list", "map", "integer", "boolean", "float"};
+        for (String shape : shapes) {
+            java.util.Map<String, Object> attrs = new java.util.LinkedHashMap<>();
+            attrs.put("origin", "null".equals(shape) ? null : nonText(shape));
+            byte[] wire = rawHead(attrs);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> CBOR.fromDocument(wire, PRef.class))
+                    .as("a %s attr", shape).isInstanceOf(java.io.UncheckedIOException.class);
+        }
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (rulings R1 and R3): a signed ref-space entry of the name whose
+     * payload decodes to no {@code PRef} (an ordinary attr that is no text, or a payload that is
+     * no record at all) gives no head, and the reader counts it in {@code headsIgnored} once
+     * while it stays live, as Python, TypeScript and Ruby count it.
+     */
+    @Test
+    void anUndecodableHeadEntryIsIgnoredAndCountedOnceWhileItStaysLive() throws Exception {
+        RefFleet.Peer reader = fleet.newPeer("r", 1);
+        RefFleet.Peer writer = fleet.newPeer("w", 2, RefFleet.Spec.defaults()
+                .refSpace(b -> b.schemaRegistry(new HeadAlias(ForeignHead.class, String.class))), "r");
+        fleet.settle(6);
+        Ref<PMap<String, String>> onR = reader.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        String root = Cids.of(new byte[] {1}, Cids.DAG_CBOR);
+        java.util.Map<String, Object> attrs = new java.util.LinkedHashMap<>();
+        attrs.put("x", null);
+        java.util.Map<String, String> tags = java.util.Map.of(PRef.NAME_TAG, NAME, PRef.ROOT_TAG, root);
+        writer.refSpace().write(new ForeignHead(PRef.VERSION, NAME, PRef.KIND_MAP, root, List.of(), 1, 0,
+                PRef.MODE_MULTI, PRef.SEALING_NONE, attrs), Lease.of(Duration.ofMinutes(10)), tags);
+        writer.refSpace().write("no head", Lease.of(Duration.ofMinutes(10)), tags);
+        assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> reader.refSpace().knownEntries() == 2)).isTrue();
+
+        assertThat(onR.heads().isEmpty()).isTrue();
+        assertThat(reader.pdt().stats().headsIgnored()).isEqualTo(2);
+        fleet.settle(4);
+        assertThat(onR.heads().isEmpty()).isTrue();
+        assertThat(reader.pdt().stats().headsIgnored()).as("counted once while live").isEqualTo(2);
+    }
+
+    /** A head record with attrs of any value, written field by field in the order of {@link PRef}. */
+    record ForeignHead(int v, String name, String kind, String root, List<String> base, long seq, long size,
+                       String mode, String sealing, java.util.Map<String, Object> attrs) {
+    }
+
+    /** A schema registry that names the given types as {@link PRef}, so a peer writes foreign payloads as heads. */
+    private static final class HeadAlias implements ai.badmonkey.agentspaces.api.spi.SchemaRegistry {
+        private final ai.badmonkey.agentspaces.space.local.SimpleSchemaRegistry names =
+                new ai.badmonkey.agentspaces.space.local.SimpleSchemaRegistry();
+        private final java.util.Set<Class<?>> aliased;
+
+        HeadAlias(Class<?>... aliased) {
+            this.aliased = java.util.Set.of(aliased);
+        }
+
+        @Override
+        public String register(Class<?> entryType) {
+            return names.register(aliased.contains(entryType) ? PRef.class : entryType);
+        }
+
+        @Override
+        public String schemaNameOf(Class<?> entryType) {
+            return names.schemaNameOf(aliased.contains(entryType) ? PRef.class : entryType);
+        }
+
+        @Override
+        public java.util.Optional<Class<?>> classFor(String schemaName) {
+            return names.classFor(schemaName);
+        }
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R1): the 4 KiB attrs bound counts the UTF-8 bytes of the
+     * keys and of the text values, so "é" counts two bytes, and a value that is no text under a
+     * reserved key counts nothing. Every replica ignores a head one byte over the bound.
+     */
+    @Test
+    void theAttrsBoundCountsTheUtf8BytesOfKeysAndTextValues() throws Exception {
+        String reserved = PRef.ISSUER_ATTR;
+        int fits = PRef.MAX_ATTRS_BYTES - "a".length() - reserved.length();
+        Object[] reservedValues = {1_000_000, true, new byte[] {1, 2, 3}, List.of("x".repeat(64))};
+        for (Object value : reservedValues) {
+            java.util.Map<String, Object> atBound = new java.util.LinkedHashMap<>();
+            atBound.put("a", "é".repeat(fits / 2) + "x".repeat(fits % 2));
+            atBound.put(reserved, value);
+            assertThat(CBOR.fromDocument(rawHead(atBound), PRef.class).violation()).as("%s at the bound", value).isEmpty();
+            java.util.Map<String, Object> over = new java.util.LinkedHashMap<>();
+            over.put("a", "é".repeat(fits / 2) + "x".repeat(fits % 2 + 1));
+            over.put(reserved, value);
+            assertThat(CBOR.fromDocument(rawHead(over), PRef.class).violation()).as("%s one byte over the bound", value)
+                    .contains("attrs larger than " + PRef.MAX_ATTRS_BYTES + " bytes");
+        }
+    }
+
+    private static final ai.badmonkey.agentspaces.common.codec.CborCodec CBOR =
+            ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+
+    /** An application value of the given shape that is no text. */
+    private static Object nonText(String shape) {
+        return switch (shape) {
+            case "bytes" -> new byte[] {(byte) 0xcc, 0x4b, (byte) 0xe2, (byte) 0xfd, (byte) 0xaa, 0x69};
+            case "list" -> List.of("zEvil/app");
+            case "map" -> java.util.Map.of("zEvil", "app");
+            case "integer" -> 5;
+            case "boolean" -> true;
+            case "float" -> 1.5;
+            default -> throw new IllegalArgumentException(shape);
+        };
+    }
+
+    /** The fleet's wall time plus the lead, in milliseconds. */
+    private long ahead(Duration lead) {
+        return fleet.clock.millis() + lead.toMillis();
+    }
+
+    /** A canonical stamp the lead ahead of the fleet's wall time. */
+    private String aheadStamp(Duration lead) {
+        return new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(ahead(lead), 0, "zEvil").encoded();
+    }
+
+    /**
+     * The wire bytes of a head record with the given attrs, its fields in record order and its
+     * attrs in the order given, as a peer that writes any CBOR item would write them.
+     */
+    private static byte[] rawHead(java.util.Map<String, Object> attrs) throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper raw =
+                new com.fasterxml.jackson.databind.ObjectMapper(new com.fasterxml.jackson.dataformat.cbor.CBORFactory());
+        java.util.Map<String, Object> record = new java.util.LinkedHashMap<>();
+        record.put("v", PRef.VERSION);
+        record.put("name", NAME);
+        record.put("kind", PRef.KIND_MAP);
+        record.put("root", Cids.of(new byte[] {1}, Cids.DAG_CBOR));
+        record.put("base", List.of());
+        record.put("seq", 1);
+        record.put("size", 0);
+        record.put("mode", PRef.MODE_MULTI);
+        record.put("sealing", PRef.SEALING_NONE);
+        record.put("attrs", attrs);
+        return raw.writeValueAsBytes(record);
+    }
+
+    /** The peer named in the reserved attrs of the tests above. */
+    private static final ai.badmonkey.agentspaces.common.id.PeerId EVIL = ai.badmonkey.agentspaces.common.id.PeerId.of("zEvil");
+
+    /** A head written with the given reserved attrs orders by its entry's own stamp, so the later honest head wins. */
+    private void assertHeadOrdersByItsOwnStamp(java.util.Map<String, ?> attrs) throws Exception {
+        Fork fork = forkWithAttrs(attrs);
+        Ref<PMap<String, String>> onR = fork.reader().pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        Heads.Head first = onR.heads().heads().get(0);
+        assertThat(first.root()).as("the head with the refused attr orders by its own stamp").isEqualTo(fork.attributed());
+        assertThat(first.issuer().peer()).as("and keeps its entry's issuer").isEqualTo(fork.writer());
+        assertThat(onR.deref().get("kc")).as("the later honest head wins the key").contains("b");
+        assertThat(fork.reader().pdt().stats().headsIgnored()).as("the advisory attrs refuse and count nothing").isZero();
+    }
+
+    /** A head written with acceptable reserved attrs orders by them, after the later honest head, and wins the key. */
+    private void assertHeadOrdersByTheAttrs(java.util.Map<String, ?> attrs) throws Exception {
+        Fork fork = forkWithAttrs(attrs);
+        Ref<PMap<String, String>> onR = fork.reader().pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        Heads.Head last = onR.heads().heads().get(1);
+        assertThat(last.root()).as("the head orders by its attrs").isEqualTo(fork.attributed());
+        assertThat(last.issuer().peer()).as("and carries the attributed issuer").isEqualTo(EVIL);
+        assertThat(onR.deref().get("kc")).as("the head ordered by its attrs wins the key").contains("a");
+        assertThat(fork.reader().pdt().stats().headsIgnored()).isZero();
+    }
+
+    /** The reader of a fork, the root of the head written with attrs, and the peer that wrote it. */
+    private record Fork(RefFleet.Peer reader, String attributed, ai.badmonkey.agentspaces.common.id.PeerId writer) {
+    }
+
+    /**
+     * A fork on a reader r: a writes v2a with the given attrs, then b writes v2b, which both set
+     * the key kc; returns the fork once r holds both heads.
+     */
+    private Fork forkWithAttrs(java.util.Map<String, ?> attrs) throws Exception {
         RefFleet.Peer a = fleet.newPeer("a", 1);
         RefFleet.Peer b = fleet.newPeer("b", 2, "a");
         RefFleet.Peer r = fleet.newPeer("r", 3, "a");
@@ -279,15 +606,12 @@ class HeadLifecycleTest {
         fleet.settle(2);
         PMap<String, String> v2a = onA.at(v1.root()).assoc("kc", "a").assoc("ka", "a");
         RefFleet.writeHead(a, NAME, PRef.KIND_MAP, v2a.root(), v1.root(), 2, v2a.count(), Duration.ofMinutes(10),
-                java.util.Map.of(PRef.ISSUED_ATTR, hostile));
+                attrs);
         fleet.settle(1);
         PMap<String, String> v2b = onB.at(v1.root()).assoc("kc", "b").assoc("kb", "b");
         RefFleet.writeHead(b, NAME, PRef.KIND_MAP, v2b.root(), v1.root(), 2, v2b.count(), Duration.ofMinutes(10));
         assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> onR.heads().heads().size() == 2 && fleet.allHold(v2a.root()) && fleet.allHold(v2b.root()))).isTrue();
-
-        assertThat(onR.heads().heads().get(0).root()).as("the head with the refused attr orders by its own stamp")
-                .isEqualTo(v2a.root());
-        assertThat(onR.deref().get("kc")).as("the later honest head wins the key").contains("b");
+        return new Fork(r, v2a.root(), a.id());
     }
 
     @Test

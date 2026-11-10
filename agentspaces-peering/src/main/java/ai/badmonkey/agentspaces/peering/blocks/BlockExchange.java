@@ -360,7 +360,7 @@ public final class BlockExchange {
     private void onWant(PeerId from, byte[] body) {
         Want want;
         try {
-            want = codec.fromBytes(body, Want.class);
+            want = codec.fromWire(body, Want.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -377,7 +377,7 @@ public final class BlockExchange {
     private void onBlock(byte[] body) {
         Block block;
         try {
-            block = codec.fromBytes(body, Block.class);
+            block = codec.fromWire(body, Block.class);
         } catch (RuntimeException e) {
             return;
         }

@@ -125,6 +125,41 @@ class SemanticDiscoveryTest {
         peer.discovery().publish(signer.sign(orders, peer.identity()));
     }
 
+    /**
+     * ISSUE-AppCardOriginFormats FR-9 (SPEC §6.1a.2, v0.1.32; AppCard origin and formats, 2026-11-09): an AppCard is a
+     * candidate ranked by its name, kind, shape, owner, url, origin, and formats; a stub ranks by its inline text.
+     */
+    @Test
+    void anAppCardRanksByItsOriginAndFormatsAndAStubByItsInlineText() throws Exception {
+        Wired peer = newPeer("a", 1, Set.of());
+        ai.badmonkey.agentspaces.api.ad.AppCard map = new ai.badmonkey.agentspaces.api.ad.AppCard(
+                "aspace://" + groupId.value() + "/app/fleet-map", peer.identity().peerId(), groupId, clock.instant(),
+                Duration.ofMinutes(15), "fleet-map", "fed", "web", "dispatch", List.of(), List.of(), "",
+                "https://maps.example.org/fleet", "", "1", List.of("trucks"), null)
+                .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("com.example.catalog", "geo/trucks", "", null))
+                .withFormats(List.of("application/geo+json"));
+        ai.badmonkey.agentspaces.api.ad.AppCard ledger = new ai.badmonkey.agentspaces.api.ad.AppCard(
+                "aspace://" + groupId.value() + "/app/ledger", peer.identity().peerId(), groupId, clock.instant(),
+                Duration.ofMinutes(15), "ledger", "fed", "static", "finance", List.of(), List.of(), "",
+                "https://ledger.example.org/", "", "1", List.of(), null)
+                .withFormats(List.of("text/csv"));
+        peer.discovery().publish(signer.sign(map, peer.identity()));
+        peer.discovery().publish(signer.sign(ledger, peer.identity()));
+        List<SemanticDiscovery.Match> matches = peer.semantic().query("application/geo+json trucks catalog", 5);
+        assertThat(matches).isNotEmpty();
+        assertThat(matches.get(0).advertisement()).isEqualTo(map);
+        assertThat(SemanticDiscovery.textOf(map)).contains("fleet-map", "fed", "web", "dispatch", "https://maps.example.org/fleet",
+                "com.example.catalog", "geo/trucks", "application/geo+json");
+        byte[] cid = new byte[36];
+        cid[0] = 0x01;
+        cid[1] = 0x55;
+        cid[2] = 0x12;
+        cid[3] = 0x20;
+        ai.badmonkey.agentspaces.api.ad.AppCard stub = map.toStub(new ai.badmonkey.agentspaces.api.ad.CardSpill(
+                ai.badmonkey.agentspaces.common.codec.Multibase.base32(cid), 100, List.of("views")));
+        assertThat(SemanticDiscovery.textOf(stub)).isEqualTo(SemanticDiscovery.textOf(map));
+    }
+
     /** SPEC §6.1 v0.1.13 (TODO item 6): an action's own description is indexed, so a query matching one action ranks the card that declares it above a card that does not. */
     @Test
     void anActionsDescriptionRanksItsCard() throws Exception {

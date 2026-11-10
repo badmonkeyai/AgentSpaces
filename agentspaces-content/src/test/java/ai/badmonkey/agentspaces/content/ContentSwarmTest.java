@@ -71,7 +71,7 @@ class ContentSwarmTest {
             GroupAdvertisement.GossipParameters.defaults());
 
     private record Peer(String name, PeerNode node, GroupRuntime runtime, ReplicatedSpace space,
-                        BlockExchange blocks, Content content, PieceStore store) {
+                        BlockExchange blocks, Content content, PieceStore store, CapabilityPipes pipes) {
     }
 
     @AfterEach
@@ -101,11 +101,12 @@ class ContentSwarmTest {
         ReplicatedSpace space = ReplicatedSpace.builder(runtime, "content", identity, "content")
                 .clock(clock).settleWindow(Duration.ZERO).blocks(blocks).build();
         PieceStore pieceStore = store == null ? new MemoryPieceStore(clock, 0) : store;
-        Content content = customise.apply(Content.builder(new CapabilityPipes(runtime, codec), runtime, space, identity.peerId())
+        CapabilityPipes pipes = new CapabilityPipes(runtime, codec);
+        Content content = customise.apply(Content.builder(pipes, runtime, space, identity.peerId())
                 .codec(codec).clock(clock).store(pieceStore).blocks(blocks).random(new Random(seed))).build();
         runtime.onTick(content::tick);
         content.start();
-        Peer peer = new Peer(address, node, runtime, space, blocks, content, pieceStore);
+        Peer peer = new Peer(address, node, runtime, space, blocks, content, pieceStore, pipes);
         peers.add(peer);
         return peer;
     }
@@ -184,6 +185,112 @@ class ContentSwarmTest {
         assertThat(runUntil(Duration.ofSeconds(10), () -> a.content().describe(manifest.root())
                 .map(Content.Description::completeHolders).orElse(0) == 2)).isTrue();
         assertThat(a.content().stats().bytesServed()).isGreaterThanOrEqualTo(artifact.length);
+    }
+
+    /**
+     * PDT 2 phase 1, P2-X-09: a holder reads every content-swarm message under its wire schema. A
+     * piece message that breaks it, or names no root, bytes or record, counts in
+     * {@code pieceMessagesDropped}; a tree message that breaks it, and a payload with an unknown
+     * tag or none, count in {@code treeMessagesDropped};
+     * and none of them strikes the sender, so after more of them than the strike threshold the
+     * sender still fetches from the holder.
+     */
+    @Test
+    void relabelledAndUnknownMessagesAreDroppedCountedAndStrikeNobody() throws Exception {
+        Peer a = newPeer("a", 1, null);
+        Peer b = newPeer("b", 2, null, "a");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        byte[] artifact = randomBytes(2 * PIECE + 100, 5);
+        Manifest manifest = a.content().publish(artifact, options());
+        String node = ai.badmonkey.agentspaces.content.tree.Cids.of(new byte[]{(byte) 0xa0},
+                ai.badmonkey.agentspaces.content.tree.Cids.DAG_CBOR);
+        List<byte[]> pieceMessages = List.of(
+                withField(new Messages.PieceWant(manifest.root(), 0, 0, 1024, 7), "x", 1),
+                withField(new Messages.ManifestWant(manifest.root()), "x", "y"),
+                withField(new Messages.Have(manifest.root(), null, true), "extra", true),
+                nulled(new Messages.PieceWant(manifest.root(), 0, 0, 1024, 7), "root"),
+                nulled(new Messages.Piece(manifest.root(), 0, 0, new byte[]{1}, 7), "bytes"),
+                nulled(new Messages.Have(manifest.root(), null, true), "root"),
+                nulled(new Messages.Cancel(manifest.root(), 0, 7), "root"),
+                nulled(new Messages.Reject(manifest.root(), 0, Messages.REASON_NOT_HELD), "root"),
+                nulled(new Messages.ManifestWant(manifest.root()), "root"),
+                nulled(new Messages.ManifestReply(manifest.root(), new byte[]{(byte) 0xa0}), "record"));
+        List<byte[]> treeMessages = List.of(
+                withField(new Messages.NodeWant(8, List.of(node)), "x", 1),
+                withField(new Messages.TreeWant(9, node, List.of(), 1024), "x", 1),
+                codec.toBytes(java.util.Map.of("t", 13, "req", 1)),
+                new byte[]{(byte) 0xf6});
+        int rounds = 20;
+        for (int i = 0; i < rounds; i++) {
+            pieceMessages.forEach(m -> b.pipes().send(a.node().peerId(), Content.TYPE, m));
+            treeMessages.forEach(m -> b.pipes().send(a.node().peerId(), Content.TYPE, m));
+        }
+        assertThat(runUntil(Duration.ofSeconds(10), () -> a.content().stats().pieceMessagesDropped() == (long) rounds * pieceMessages.size()
+                && a.content().stats().treeMessagesDropped() == (long) rounds * treeMessages.size()))
+                .as("dropped %s", a.content().stats()).isTrue();
+        assertThat(a.content().stats().bytesServed()).as("no relabelled want was served").isZero();
+        Fetch fetch = b.content().fetch(manifest.root());
+        assertThat(runUntil(Duration.ofSeconds(20), fetch::complete)).as("the sender was struck by nobody: " + fetch.trace()).isTrue();
+        assertThat(readAll(fetch)).isEqualTo(artifact);
+    }
+
+    /**
+     * PDT 2 phase 1, P2-X-09: the {@code record} of a {@code MANIFEST} reply is a nested document
+     * and reads under the manifest's own schema. A record with one field the manifest does not name
+     * opens no fetch and counts in {@code pieceMessagesDropped}; the holder's honest reply then
+     * completes the fetch.
+     */
+    @Test
+    void aManifestRecordWithAFieldItsSchemaDoesNotNameOpensNoFetch() throws Exception {
+        Peer a = newPeer("a", 1, null);
+        Peer b = newPeer("b", 2, null, "a");
+        Peer c = newPeer("c", 3, null, "a", "b");
+        for (int i = 0; i < 6; i++) {
+            tickAll();
+        }
+        byte[] artifact = randomBytes(PIECE + 100, 6);
+        Manifest manifest = a.content().publish(artifact, options().withReplicate(false));
+        assertThat(runUntil(Duration.ofSeconds(10), () -> !b.content().spaces().holdings(manifest.root()).isEmpty()))
+                .as("the holding reached the fetcher").isTrue();
+        network.hold("a", "b");
+        Fetch fetch = b.content().fetch(manifest.root());
+        byte[] record = codec.toBytes(manifest);
+        // the manifest's own encoding with "x": 1 before the map's closing break
+        byte[] relabelled = java.util.Arrays.copyOf(record, record.length + 3);
+        System.arraycopy(new byte[]{0x61, 'x', 0x01, (byte) 0xff}, 0, relabelled, record.length - 1, 4);
+        c.pipes().send(b.node().peerId(), Content.TYPE, codec.toBytes(new Messages.ManifestReply(manifest.root(), relabelled)));
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (b.content().stats().pieceMessagesDropped() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(2);
+        }
+        assertThat(b.content().stats().pieceMessagesDropped()).as("the relabelled record was dropped").isEqualTo(1);
+        assertThat(b.content().store().manifest(manifest.root())).as("and opened no fetch").isEmpty();
+        network.release("a", "b", SimNetwork.Order.FIFO, 0);
+        assertThat(runUntil(Duration.ofSeconds(20), fetch::complete)).as(String.valueOf(fetch.trace())).isTrue();
+        assertThat(readAll(fetch)).isEqualTo(artifact);
+    }
+
+    /** The message's own encoding, its fields in their own order, with one of them null. */
+    private byte[] nulled(Object message, String key) {
+        java.util.Map<String, Object> fields = codec.fromBytes(codec.toBytes(message), java.util.LinkedHashMap.class);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        out.write(0xbf);
+        fields.forEach((name, value) -> {
+            out.writeBytes(codec.toBytes(name));
+            out.writeBytes(name.equals(key) || value == null ? new byte[]{(byte) 0xf6} : codec.toBytes(value));
+        });
+        out.write(0xff);
+        return out.toByteArray();
+    }
+
+    /** The message's own encoding with one more field after its own. */
+    private byte[] withField(Object message, String key, Object value) {
+        java.util.Map<String, Object> fields = new java.util.LinkedHashMap<>(
+                codec.fromBytes(codec.toBytes(message), java.util.LinkedHashMap.class));
+        fields.put(key, value);
+        return codec.toBytes(fields);
     }
 
     @Test
@@ -434,7 +541,7 @@ class ContentSwarmTest {
     }
 
     /** A holder whose every range is wrong by one byte. */
-    private static final class CorruptingStore implements PieceStore {
+    static final class CorruptingStore implements PieceStore {
         private final PieceStore inner;
         /** Off while the holder starts, so its sampled check (LB-T-10) passes and it lies only when serving. */
         volatile boolean armed;
@@ -668,6 +775,101 @@ class ContentSwarmTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> b.content().share(manifest.root(),
                         ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofHours(1))))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("re-seals");
+    }
+
+    /** Ten pieces; the first {@code shared} from seed 1, the rest from {@code seed}. */
+    private static byte[] sharingArtifact(int shared, long seed) {
+        byte[] bytes = randomBytes(10 * PIECE, seed);
+        System.arraycopy(randomBytes(10 * PIECE, 1), 0, bytes, 0, shared * PIECE);
+        return bytes;
+    }
+
+    /**
+     * PDT 2 phase 1, P2-H-02 (P2-Q-PRF-03): a fetcher over a hash-keyed store that holds one
+     * artifact fetches a second one, which shares six of its ten pieces, by asking for the other
+     * four alone; the table rides in a block above 64 pieces, so the 80-piece pair checks the seed
+     * through the verified table too.
+     */
+    @Test
+    void aHashStoreFetchesOnlyThePiecesASecondArtifactDoesNotShare(@TempDir Path dir) throws Exception {
+        Peer a = newPeer("a", 1, null);
+        Peer b = newPeer("b", 2, new HashPieceStore(dir, codec, clock, 0), "a");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        byte[] first = sharingArtifact(6, 2);
+        byte[] second = sharingArtifact(6, 3);
+        Manifest one = a.content().publish(first, options());
+        Manifest two = a.content().publish(second, options());
+        Fetch f1 = b.content().fetch(one.root());
+        assertThat(runUntil(Duration.ofSeconds(20), f1::complete)).as(f1.trace().toString()).isTrue();
+        Fetch f2 = b.content().fetch(two.root());
+        assertThat(runUntil(Duration.ofSeconds(20), f2::complete)).as(f2.trace().toString()).isTrue();
+        assertThat(fromSources(f2)).as("the 40 %% not shared").isEqualTo(4L * PIECE);
+        assertThat(readAll(f2)).isEqualTo(second);
+        assertThat(b.store().bytesUsed()).as("the shared pieces are held once").isEqualTo(14L * PIECE);
+
+        int small = 65_536;
+        byte[] big = randomBytes(80 * small, 4);
+        byte[] bigToo = big.clone();
+        System.arraycopy(randomBytes(32 * small, 5), 0, bigToo, 48 * small, 32 * small);
+        Manifest three = a.content().publish(big, PublishOptions.defaults().withPieceSize(small));
+        Manifest four = a.content().publish(bigToo, PublishOptions.defaults().withPieceSize(small));
+        assertThat(four.table()).as("the table rides in a block").isNull();
+        Fetch f3 = b.content().fetch(three.root());
+        assertThat(runUntil(Duration.ofSeconds(20), f3::complete)).as(f3.trace().toString()).isTrue();
+        Fetch f4 = b.content().fetch(four.root());
+        assertThat(runUntil(Duration.ofSeconds(20), f4::complete)).as(f4.trace().toString()).isTrue();
+        assertThat(fromSources(f4)).as("the 32 pieces not shared, through the block table").isEqualTo(32L * small);
+        assertThat(readAll(f4)).isEqualTo(bigToo);
+    }
+
+    /** The bytes a fetch took from its sources, without the pieces the store held at its start. */
+    private static long fromSources(Fetch fetch) {
+        return fetch.progress().bytesBySource().values().stream().mapToLong(Long::longValue).sum();
+    }
+
+    /**
+     * PDT 2 phase 1, P2-H-03: {@code share} over a hash-keyed store opens the root in the second
+     * group over the files the store already holds, writes no piece file, and a member of that
+     * group fetches the artifact from the sharer.
+     */
+    @Test
+    void sharingOverAHashStoreLinksTheHeldFiles(@TempDir Path dir) throws Exception {
+        HashPieceStore store = new HashPieceStore(dir, codec, clock, 0);
+        Peer bridge = newPeer("bridge", 1, store);
+        Peer other = newPeer("other", 2, null, "bridge");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        byte[] artifact = sharingArtifact(0, 7);
+        Manifest inFirst = bridge.content().publish(artifact, options());
+        long files;
+        try (java.util.stream.Stream<Path> walk = java.nio.file.Files.walk(dir.resolve(HashPieceStore.PIECES))) {
+            files = walk.filter(java.nio.file.Files::isRegularFile).count();
+        }
+        GroupAdvertisement mission = otherGroup("zHashMission");
+        Content bridgeInMission = joinOtherGroup(bridge, mission);
+        Content otherInMission = joinOtherGroup(other, mission, "bridge");
+        for (int i = 0; i < 6; i++) {
+            tickAll();
+        }
+        Manifest shared = bridgeInMission.share(inFirst.root(), ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofHours(1)));
+        assertThat(shared.root()).isEqualTo(inFirst.root());
+        try (java.util.stream.Stream<Path> walk = java.nio.file.Files.walk(dir.resolve(HashPieceStore.PIECES))) {
+            assertThat(walk.filter(java.nio.file.Files::isRegularFile).count()).as("no piece written twice").isEqualTo(files);
+        }
+        Fetch fetch = otherInMission.fetch(shared.root());
+        assertThat(runUntil(Duration.ofSeconds(20), fetch::complete)).as(fetch.trace().toString()).isTrue();
+        try (SeekableByteChannel channel = otherInMission.openPlain(shared.root())) {
+            ByteBuffer buffer = ByteBuffer.allocate((int) channel.size());
+            while (buffer.hasRemaining() && channel.read(buffer) >= 0) {
+                // drain
+            }
+            assertThat(buffer.array()).isEqualTo(artifact);
+        }
+        bridgeInMission.close();
+        otherInMission.close();
     }
 
     @Test

@@ -56,7 +56,8 @@ public final class SealedNodeStore extends NodeStore {
      * @param sealer  the sealer over the group's key ring
      */
     public SealedNodeStore(BlockStore backend, InstantSource clock, NodeSealer sealer) {
-        super(backend, clock);
+        // PDT 2 phase 4, P2-Z-02: a sealed chunk's CID names its envelope, which no frame over plaintext rebuilds
+        super(backend, clock, new ai.badmonkey.agentspaces.pdt.blob.ChunkDeltas(clock, false));
         this.sealer = Objects.requireNonNull(sealer, "sealer");
     }
 

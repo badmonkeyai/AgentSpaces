@@ -25,6 +25,7 @@ import ai.badmonkey.agentspaces.agent.annotation.OnDecision;
 import ai.badmonkey.agentspaces.agent.annotation.OnEstimate;
 import ai.badmonkey.agentspaces.agent.annotation.OrderedTake;
 import ai.badmonkey.agentspaces.agent.annotation.Part;
+import ai.badmonkey.agentspaces.agent.annotation.PdtRef;
 import ai.badmonkey.agentspaces.agent.annotation.Propose;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceJoin;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceReduce;
@@ -33,6 +34,7 @@ import ai.badmonkey.agentspaces.agent.capability.Contribution;
 import ai.badmonkey.agentspaces.agent.capability.Motion;
 import ai.badmonkey.agentspaces.agent.join.JoinBinding;
 import ai.badmonkey.agentspaces.agent.join.Joined;
+import ai.badmonkey.agentspaces.agent.pdt.RefResolver;
 import ai.badmonkey.agentspaces.agent.reduce.ReduceBinding;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.capabilities.orderedlog.OrderedTakes;
@@ -106,6 +108,8 @@ public final class AgentBinder implements AutoCloseable {
     /** Set by the first bind; the registry is fixed from then on. */
     private volatile boolean everBound;
     private final AdvertisementSigner signer = new AdvertisementSigner();
+    /** The binder's listener on the view's AppCard level, or null without discovery. */
+    private final AutoCloseable gateRegistration;
     private final Map<String, Space> spaces = new ConcurrentHashMap<>();
     /** Space name to the agent whose @BidFunction prices it (QA4 A4-8): one per space per peer. */
     private final Map<String, String> bidders = new ConcurrentHashMap<>();
@@ -118,6 +122,10 @@ public final class AgentBinder implements AutoCloseable {
     private final Map<Class<?>, Object> clients = new ConcurrentHashMap<>();
     /** A fallback resolver for {@code @CapabilityRef} types (the group's typed-client lookup), or null. */
     private volatile java.util.function.Function<Class<?>, Object> clientResolver;
+    /** Builds the handles of {@code @PdtRef} sites from the group's persistent trees, or null (PDT 2 phase 7, P2-X-03). */
+    private volatile RefResolver refResolver;
+    /** The {@code @PdtRef} handles a bound method's trailing parameters receive, resolved once at bind (P2-X-03). */
+    private final Map<Method, Object[]> refArguments = new ConcurrentHashMap<>();
     /** The peer's push-sum aggregate, the target of a {@link Contribution} return, or null. */
     private volatile PushSumAggregate aggregate;
     /**
@@ -182,6 +190,9 @@ public final class AgentBinder implements AutoCloseable {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.groupName = groupName;
         this.identities = identities != null ? identities : identity::agentIdentity;
+        // SPEC §6.1a.5 (v0.1.32; AppCard origin and formats, 2026-11-09): a card above the spill threshold travels as a
+        // stub only while the view reads it, so a change of the view's AppCard level reissues every such card
+        this.gateRegistration = discovery == null ? null : discovery.onAppCardGateChange(open -> reissueOversized());
     }
 
     /**
@@ -307,7 +318,7 @@ public final class AgentBinder implements AutoCloseable {
     /**
      * Tests whether a class declares any space binding at all: a
      * {@link SpaceTake}, {@link SpaceNotify}, or {@link BidFunction} method,
-     * or a {@link SpaceRef} field.
+     * or a {@link SpaceRef} or {@link PdtRef} field.
      *
      * @param type the candidate class
      * @return whether the class has bindings
@@ -317,10 +328,22 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     /**
+     * Tests whether a class takes {@link PdtRef} handles, in a field or a verb's parameter, which only a group with
+     * persistent trees can give (PDT 2 phase 7, P2-X-03).
+     *
+     * @param type the candidate class
+     * @return whether any binding of the class takes a ref
+     */
+    public static boolean takesRefs(Class<?> type) {
+        return declaredBindings(type).stream().anyMatch(Declared::refs);
+    }
+
+    /**
      * Tests whether this binder's group satisfies a class (spec §10.3, §10.4):
      * at least one of its bindings addresses this group, and every binding
      * that does names a space registered here (or, when it names none, this
-     * binder has exactly one space to infer). A class with no bindings is
+     * binder has exactly one space to infer), and a binding that takes
+     * {@link PdtRef} handles finds a resolver here. A class with no bindings is
      * trivially satisfied, since it needs no space.
      *
      * @param type the candidate class
@@ -337,6 +360,9 @@ public final class AgentBinder implements AutoCloseable {
                 continue;
             }
             any = true;
+            if (binding.refs() && refResolver == null) {
+                return false;
+            }
             for (String spaceName : binding.spaceNames()) {
                 if (spaceName.isEmpty() ? spaces.size() != 1 : !spaces.containsKey(spaceName)) {
                     return false;
@@ -424,6 +450,20 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     /**
+     * Sets what builds the handles of {@link PdtRef} fields and parameters (PDT 2 phase 7,
+     * P2-X-03, PD-R-11): the group's persistent-tree facade, which the hosts register when
+     * {@code agentspaces.pdt.enabled} is true. Without one, a class with a {@code @PdtRef}
+     * binding does not satisfy this binder and binding it fails, naming the site.
+     *
+     * @param resolver the resolver
+     * @return this binder
+     */
+    public AgentBinder refs(RefResolver resolver) {
+        this.refResolver = Objects.requireNonNull(resolver, "resolver");
+        return this;
+    }
+
+    /**
      * Binds an annotated object: wires bid functions, starts take loops and
      * notify subscriptions, and publishes the agent's card.
      *
@@ -488,6 +528,7 @@ public final class AgentBinder implements AutoCloseable {
 
         injectSpaceRefs(agent, type, agentIdentity);
         injectCapabilityRefs(agent, type);
+        injectPdtRefs(agent, type);
 
         Bound handle = new Bound(agentIdentity);
         Set<String> consumes = new LinkedHashSet<>();
@@ -733,25 +774,46 @@ public final class AgentBinder implements AutoCloseable {
     /** Re-publishes every bound agent's card with a fresh issue time (leased, P2). */
     public void refreshCards() {
         for (Bound handle : bound) {
-            AgentCard current = handle.card;
-            if (current == null) {
-                continue;
-            }
-            // SPEC §4.2 v0.1.13: an extra renewal driver; renewing identities
-            // also renew themselves lazily whenever they sign.
-            handle.identity.renewIfDue(clock.instant());
-            java.time.Instant issuedAt = clock.instant();
-            handle.card = new AgentCard(current.id(), identity.peerId(), group,
-                    issuedAt, current.ttl(), current.agent(), current.description(),
-                    current.goals(), current.consumes(), current.produces(),
-                    current.costHints(), current.spaceBindings(), current.agentPublicKey(),
-                    current.actions(),
-                    // the identity's current certificate, renewed above when due
-                    current.agentPublicKey() == null ? null
-                            : handle.identity.certificateCovering(issuedAt).orElse(null),
-                    current.ui());
-            publishCard(handle);
+            refresh(handle, false);
         }
+    }
+
+    /** Re-publishes the cards whose form follows the view's AppCard level: those above the spill threshold. */
+    private void reissueOversized() {
+        for (Bound handle : bound) {
+            AgentCard current = handle.card;
+            if (current != null && discovery.spiller().oversized(current)) {
+                refresh(handle, true);
+            }
+        }
+    }
+
+    /**
+     * Re-publishes one card with a fresh issue time; a reissue for the AppCard level is strictly newer than the card it
+     * replaces even on a clock that has not moved, so every cache takes it.
+     */
+    private void refresh(Bound handle, boolean strictlyNewer) {
+        AgentCard current = handle.card;
+        if (current == null) {
+            return;
+        }
+        // SPEC §4.2 v0.1.13: an extra renewal driver; renewing identities
+        // also renew themselves lazily whenever they sign.
+        handle.identity.renewIfDue(clock.instant());
+        java.time.Instant issuedAt = clock.instant();
+        if (strictlyNewer && !issuedAt.isAfter(current.issued())) {
+            issuedAt = current.issued().plusMillis(1);
+        }
+        handle.card = new AgentCard(current.id(), identity.peerId(), group,
+                issuedAt, current.ttl(), current.agent(), current.description(),
+                current.goals(), current.consumes(), current.produces(),
+                current.costHints(), current.spaceBindings(), current.agentPublicKey(),
+                current.actions(),
+                // the identity's current certificate, renewed above when due
+                current.agentPublicKey() == null ? null
+                        : handle.identity.certificateCovering(issuedAt).orElse(null),
+                current.ui());
+        publishCard(handle);
     }
 
     /**
@@ -779,6 +841,13 @@ public final class AgentBinder implements AutoCloseable {
     public void close() {
         bound.forEach(Bound::close);
         bound.clear();
+        if (gateRegistration != null) {
+            try {
+                gateRegistration.close();
+            } catch (Exception e) {
+                throw new IllegalStateException("failed leaving the AppCard gate", e);
+            }
+        }
     }
 
     /** A bound agent: closing stops its loops and subscriptions. */
@@ -840,6 +909,87 @@ public final class AgentBinder implements AutoCloseable {
 
     // ---------------------------------------------------------------- internals
 
+    /**
+     * How a take loop answers a failed poll, so a fault can neither spin the
+     * loop nor flood the log. A space closed under a still-bound agent ends
+     * the loop, because a closed space does not reopen. Any other fault pauses
+     * before the next poll (10 ms, doubling to 1 s) and warns on the first
+     * fault of a run, then at most once a minute with the count so far. A good
+     * poll resets the pause and starts a new run.
+     */
+    static final class TakeFailures {
+        static final long FIRST_PAUSE_MILLIS = 10;
+        static final long MAX_PAUSE_MILLIS = 1_000;
+        private static final long WARN_EVERY_NANOS = Duration.ofMinutes(1).toNanos();
+
+        private final String label;
+        private final boolean quietFirst;
+        private long pauseMillis;
+        private long run;
+        private long lastWarnNanos;
+
+        /**
+         * @param label      the loop's agent and method, for the log
+         * @param quietFirst log the first fault of a run at DEBUG (an expected
+         *                   refusal, such as a leader election in flight)
+         */
+        TakeFailures(String label, boolean quietFirst) {
+            this.label = label;
+            this.quietFirst = quietFirst;
+        }
+
+        /** Records a good poll: the next fault starts a new run with the shortest pause. */
+        void succeeded() {
+            if (run > 0) {
+                LOG.log(System.Logger.Level.DEBUG, label + ": take recovered after " + run + " failed polls");
+            }
+            run = 0;
+            pauseMillis = 0;
+        }
+
+        /**
+         * Records a failed poll and pauses before the next one.
+         *
+         * @return false when the loop should end: the space closed, or the
+         *         pause was interrupted
+         */
+        boolean failed(RuntimeException e) {
+            if (closedSpace(e)) {
+                LOG.log(System.Logger.Level.INFO, label + ": space closed; the take loop ends");
+                return false;
+            }
+            run++;
+            long now = System.nanoTime();
+            if (run == 1) {
+                LOG.log(quietFirst ? System.Logger.Level.DEBUG : System.Logger.Level.WARNING,
+                        label + ": take failed; retrying with backoff", e);
+                lastWarnNanos = now;
+            } else if (now - lastWarnNanos >= WARN_EVERY_NANOS) {
+                LOG.log(System.Logger.Level.WARNING,
+                        label + ": take still failing (" + run + " failed polls in a row)", e);
+                lastWarnNanos = now;
+            }
+            pauseMillis = pauseMillis == 0 ? FIRST_PAUSE_MILLIS : Math.min(MAX_PAUSE_MILLIS, pauseMillis * 2);
+            try {
+                Thread.sleep(pauseMillis);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            return true;
+        }
+
+        /** Whether the fault, or any cause under it, says the space is closed. */
+        static boolean closedSpace(Throwable e) {
+            for (Throwable t = e; t != null; t = t.getCause() == t ? null : t.getCause()) {
+                if (t instanceof ai.badmonkey.agentspaces.api.error.SpaceClosedException) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     /** Runs a worker method with its take bound to this thread (see {@link TakeContext}). */
     private Object invokeWithin(TakeContext context, Object agent, Method method, Object entry) {
         TakeContext.bind(context);
@@ -862,6 +1012,7 @@ public final class AgentBinder implements AutoCloseable {
         Template<?> template = templateFor(entryType, take.tags(), take.where(), method);
 
         return Thread.ofVirtual().name("space-take-" + label).start(() -> {
+            TakeFailures failures = new TakeFailures(label, false);
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
@@ -871,12 +1022,12 @@ public final class AgentBinder implements AutoCloseable {
                     }
                     taken = space.take(admitted.get(), takeLease, gatedPoll(pollTimeout));
                 } catch (RuntimeException e) {
-                    if (!handle.running) {
+                    if (!handle.running || !failures.failed(e)) {
                         return;
                     }
-                    LOG.log(System.Logger.Level.WARNING, label + ": take failed", e);
                     continue;
                 }
+                failures.succeeded();
                 if (taken.isEmpty()) {
                     continue;
                 }
@@ -1239,9 +1390,15 @@ public final class AgentBinder implements AutoCloseable {
                 ? agentIdentity.certificateCovering(issuedAt).orElse(null) : null);
     }
 
+    /**
+     * Signs and publishes a bound agent's card, or its stub when the card passes the spill threshold and the view reads
+     * stubs (SPEC §6.1a.5, v0.1.32); the handle keeps the full card, so a refresh never needs the stub.
+     */
     private void publishCard(Bound handle) {
-        if (discovery != null && handle.card != null) {
-            discovery.publish(signer.sign(handle.card, identity));
+        AgentCard card = handle.card;
+        if (discovery != null && card != null) {
+            discovery.spiller().prepare(card, discovery.appCardGateOpen())
+                    .thenAccept(prepared -> discovery.publish(signer.sign(prepared, identity)));
         }
     }
 
@@ -1446,6 +1603,46 @@ public final class AgentBinder implements AutoCloseable {
         }
     }
 
+    /** Wires every {@link PdtRef} field this group owns with the handle its resolver builds (PDT 2 phase 7, P2-X-03). */
+    private void injectPdtRefs(Object agent, Class<?> type) {
+        for (Class<?> at = type; at != null && at != Object.class; at = at.getSuperclass()) {
+            for (java.lang.reflect.Field field : at.getDeclaredFields()) {
+                PdtRef ref = field.getAnnotation(PdtRef.class);
+                if (ref == null || !owns(ref.group())) {
+                    continue;
+                }
+                Object handle = resolveRef(ref.value(), field.getType(), field.getGenericType(),
+                        at.getSimpleName() + "." + field.getName());
+                try {
+                    field.setAccessible(true);
+                    field.set(agent, handle);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException("cannot inject @PdtRef " + field, e);
+                }
+            }
+        }
+    }
+
+    /** The handle of one {@code @PdtRef} site, checked against the site's raw type; failures name the site. */
+    private Object resolveRef(String name, Class<?> raw, Type generic, String site) {
+        RefResolver resolver = refResolver;
+        if (resolver == null) {
+            throw new IllegalArgumentException("@PdtRef(\"" + name + "\") at " + site + " needs the group's persistent"
+                    + " trees: set agentspaces.pdt.enabled=true, or register a resolver with binder.refs(pdt::refFor)");
+        }
+        Object handle;
+        try {
+            handle = resolver.resolve(name, generic);
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            throw new IllegalArgumentException("@PdtRef(\"" + name + "\") at " + site + ": " + e.getMessage(), e);
+        }
+        if (!raw.isInstance(handle)) {
+            throw new IllegalArgumentException("@PdtRef(\"" + name + "\") at " + site + " is a " + raw.getName()
+                    + ", and the resolver built a " + (handle == null ? "null" : handle.getClass().getName()));
+        }
+        return handle;
+    }
+
     /** Resolves a vote-space name: empty means the sole registered vote; the space must have one. */
     private String resolveVoteSpaceName(String name, Object site) {
         if (name.isEmpty()) {
@@ -1590,6 +1787,9 @@ public final class AgentBinder implements AutoCloseable {
         String label = handle.agentId.localName() + "." + method.getName();
         Template<?> template = templateFor(entryType, take.tags(), take.where(), method);
         return Thread.ofVirtual().name("space-ordered-take-" + label).start(() -> {
+            // a leader election in flight refuses a take or two, so the first
+            // fault of a run is quiet here: the next poll resubmits
+            TakeFailures failures = new TakeFailures(label, true);
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
@@ -1599,11 +1799,12 @@ public final class AgentBinder implements AutoCloseable {
                     }
                     taken = coordinator.take(admitted.get(), takeLease, gatedPoll(pollTimeout));
                 } catch (RuntimeException e) {
-                    if (!handle.running) {
+                    if (!handle.running || !failures.failed(e)) {
                         return;
                     }
-                    continue; // a leader election in flight: the next poll resubmits
+                    continue;
                 }
+                failures.succeeded();
                 if (taken.isEmpty()) {
                     continue;
                 }
@@ -1687,13 +1888,18 @@ public final class AgentBinder implements AutoCloseable {
     }
 
     /** One binding annotation's group and the space names it references. */
-    private record Declared(String group, List<String> spaceNames) {
+    /** One binding: its group, the spaces it names, and whether it takes {@code @PdtRef} handles (P2-X-03). */
+    private record Declared(String group, List<String> spaceNames, boolean refs) {
+        Declared(String group, List<String> spaceNames) {
+            this(group, spaceNames, false);
+        }
     }
 
     /** Every binding annotation on a class, with its group and referenced spaces. */
     private static List<Declared> declaredBindings(Class<?> type) {
         List<Declared> declared = new ArrayList<>();
         for (Method method : type.getMethods()) {
+            int first = declared.size();
             // An empty resultSpace means "the take space", never an inferred
             // name, so only a named result space is a requirement of its own.
             SpaceTake take = annotationOf(method, SpaceTake.class);
@@ -1755,12 +1961,23 @@ public final class AgentBinder implements AutoCloseable {
                 // binding is a reduce has bindings too (found by the Micronaut enroller).
                 declared.add(new Declared(reduce.group(), List.of(reduce.space())));
             }
+            // PDT 2 phase 7, P2-X-03: a verb whose trailing parameters take @PdtRef handles needs the group's trees
+            if (method.getParameterCount() > 0 && pdtRefOf(method, method.getParameterCount() - 1) != null) {
+                for (int i = first; i < declared.size(); i++) {
+                    Declared verb = declared.get(i);
+                    declared.set(i, new Declared(verb.group(), verb.spaceNames(), true));
+                }
+            }
         }
         for (Class<?> at = type; at != null && at != Object.class; at = at.getSuperclass()) {
             for (java.lang.reflect.Field field : at.getDeclaredFields()) {
                 SpaceRef ref = field.getAnnotation(SpaceRef.class);
                 if (ref != null) {
                     declared.add(new Declared(ref.group(), List.of(ref.value())));
+                }
+                PdtRef pdtRef = field.getAnnotation(PdtRef.class);
+                if (pdtRef != null) {
+                    declared.add(new Declared(pdtRef.group(), List.of(), true));
                 }
             }
         }
@@ -2098,9 +2315,16 @@ public final class AgentBinder implements AutoCloseable {
         }
     }
 
-    private static Object invoke(Object agent, Method method, Object... arguments) {
+    /** Calls a bound method with its own arguments, then the {@code @PdtRef} handles its trailing parameters take. */
+    private Object invoke(Object agent, Method method, Object... arguments) {
+        Object[] refs = refArguments.get(method);
+        Object[] all = arguments;
+        if (refs != null) {
+            all = java.util.Arrays.copyOf(arguments, arguments.length + refs.length);
+            System.arraycopy(refs, 0, all, arguments.length, refs.length);
+        }
         try {
-            return method.invoke(agent, arguments);
+            return method.invoke(agent, all);
         } catch (IllegalAccessException e) {
             throw new IllegalStateException("inaccessible agent method: " + method, e);
         } catch (InvocationTargetException e) {
@@ -2111,10 +2335,59 @@ public final class AgentBinder implements AutoCloseable {
         }
     }
 
-    private static void requireSignature(Method method, int parameters, String message) {
-        if (method.getParameterCount() != parameters) {
+    /**
+     * Checks a verb method's own parameters and resolves the {@code @PdtRef} parameters that follow
+     * them, once, for every call (PDT 2 phase 7, P2-X-03).
+     */
+    private void requireSignature(Method method, int parameters, String message) {
+        java.lang.reflect.Parameter[] all = method.getParameters();
+        int own = 0;
+        while (own < all.length && pdtRefOf(method, own) == null) {
+            own++;
+        }
+        for (int i = own; i < all.length; i++) {
+            if (pdtRefOf(method, i) == null) {
+                throw new IllegalArgumentException("a @PdtRef parameter follows the method's own parameters,"
+                        + " and parameter " + i + " has none: " + method);
+            }
+        }
+        if (own != parameters) {
             throw new IllegalArgumentException(message + ": " + method);
         }
+        if (own == all.length) {
+            return;
+        }
+        Object[] handles = new Object[all.length - own];
+        for (int i = own; i < all.length; i++) {
+            PdtRef ref = pdtRefOf(method, i);
+            if (!ref.group().isEmpty()) {
+                throw new IllegalArgumentException("a @PdtRef parameter takes its group from the method's binding;"
+                        + " remove group = \"" + ref.group() + "\" from parameter " + i + " of " + method);
+            }
+            handles[i - own] = resolveRef(ref.value(), all[i].getType(), all[i].getParameterizedType(),
+                    method.getDeclaringClass().getSimpleName() + "." + method.getName() + " parameter " + i);
+        }
+        refArguments.put(method, handles);
+    }
+
+    /**
+     * A parameter's {@link PdtRef}, on the method or, as for the verb annotations, on the same
+     * method of a supertype, since Java does not inherit parameter annotations.
+     */
+    private static PdtRef pdtRefOf(Method method, int index) {
+        for (Class<?> candidate : supertypes(method.getDeclaringClass())) {
+            try {
+                Method declared = candidate == method.getDeclaringClass() ? method
+                        : candidate.getMethod(method.getName(), method.getParameterTypes());
+                PdtRef ref = declared.getParameters()[index].getAnnotation(PdtRef.class);
+                if (ref != null) {
+                    return ref;
+                }
+            } catch (NoSuchMethodException e) {
+                // the supertype declares no such method; keep looking
+            }
+        }
+        return null;
     }
 
     private static String decapitalize(String name) {

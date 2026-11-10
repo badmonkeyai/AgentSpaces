@@ -69,10 +69,25 @@ public final class HybridLogicalClock {
      *
      * @param wallClock the wall-clock source (inject a test clock in tests)
      * @param node      the node identifier stamped into every timestamp
+     * @throws IllegalArgumentException if the node is empty, holds a colon, a control character,
+     *         or a lone surrogate, or runs past {@link HlcTimestamp#MAX_NODE_UNITS}, so that no
+     *         stamp could carry it
      */
     public HybridLogicalClock(InstantSource wallClock, String node) {
         this.wallClock = Objects.requireNonNull(wallClock, "wallClock");
         this.node = Objects.requireNonNull(node, "node");
+        // HLC round four, 2026-11-08 (decision D6): a peer never emits a stamp whose node breaks
+        // the grammar, so a bad node fails here, where the clock is built, before any stamp.
+        if (!HlcTimestamp.canonicalNode(node)) {
+            throw new IllegalArgumentException(
+                    "node must be non-empty and contain no ':', no control character, and no lone surrogate: "
+                            + node);
+        }
+        // HLC round seven, 2026-11-08 (SPEC §9.1, S6): every stamp this clock issues stays one
+        // definite text, whatever its physical and logical parts grow to.
+        if (node.length() > HlcTimestamp.MAX_NODE_UNITS) {
+            throw new IllegalArgumentException("node holds at most " + HlcTimestamp.MAX_NODE_UNITS + " UTF-16 units");
+        }
     }
 
     /**

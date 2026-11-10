@@ -55,10 +55,11 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Deadline. Every bare batch carries the fetcher's deadline as the swarm's fetch
  * timeout, so a node with no reachable holder fails after it with an exception
- * naming the CID (PD-X-08), and the thread that waits on the batch gives up at the
- * same time. {@link StoreThenFetchLoader} bounds its own wait as well and cancels
- * the future it was given, which cancels the batch. Concurrent loads of one CID
- * share one batch.
+ * naming the CID (PD-X-08), and the future of the batch settles when the batch
+ * completes or fails. {@link StoreThenFetchLoader} bounds its caller's wait and
+ * leaves the batch running, so a node that is merely late still lands in the store
+ * (swarm retries, ROBUSTNESS.md §10.3 P3). Concurrent loads of one CID share one
+ * batch, and a load after a caller's deadline joins the batch still in flight.
  */
 public final class SwarmFetcher implements Fetcher {
 
@@ -232,7 +233,7 @@ public final class SwarmFetcher implements Fetcher {
             return;
         }
         fetches.put(cid, fetch);
-        // the loader cancels the future at its own deadline: forget the batch and cancel it
+        // a caller that cancels the future (an interrupted load) forgets the batch and cancels it
         future.whenComplete((bytes, failure) -> {
             forget(cid, fetch, future);
             if (!fetch.isDoneOrFailed()) {
@@ -245,9 +246,12 @@ public final class SwarmFetcher implements Fetcher {
         }
         Thread.ofVirtual().name("pdt-fetch-" + cid.substring(Math.max(0, cid.length() - 8))).start(() -> {
             try {
-                fetch.await(deadline);
+                fetch.await(Duration.ZERO); // until the batch completes or fails: its own timeout bounds it (PD-X-08)
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            } catch (java.util.concurrent.CancellationException cancelled) {
+                // a cancelled batch settles too, or its CID stays in flight and every later load joins a batch that
+                // never ends (swarm retries, the gate's adversarial review, ROBUSTNESS.md §10.6)
             }
             settle(cid, fetch, future);
         });
@@ -275,7 +279,7 @@ public final class SwarmFetcher implements Fetcher {
             return;
         }
         String why = fetch.cancelled() ? "fetch cancelled"
-                : "deadline of " + deadline.toMillis() + " ms passed (" + fetch.progress().requestsSent() + " requests sent)";
+                : "the wait was interrupted (" + fetch.progress().requestsSent() + " requests sent)";
         future.completeExceptionally(new NodeUnavailableException(cid, sources, why));
     }
 

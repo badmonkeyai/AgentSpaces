@@ -23,6 +23,7 @@ runs the live demo). The developer guide cuts its snippets from these sources.
 | 18 | `agentic-workflow` | A nine-stage claims flow: fan-out, a duplicate-safe join, an auction, a vote gate, an exactly-once payment, fleet sensing, and entries that mirror an ontology |
 | 29 | `content-swarm` | A large artifact across a fleet: holders complete each other after the publisher dies, and a bridge shares into a second group |
 | 33 | `persistent-values` | Values that change: map and blob refs that move by delta, concurrent swaps merged on read, a Python reader with the same roots, and a space that escalates a growing accumulator as a tree |
+| 34 | `store-and-graph` | A database on a ref and a store for the fleet: the superfriends graph on a `db` ref that two writers take turns on and a Python reader reads lazily, and a blob two content stores (one blind) hold after its writer leaves, prove under challenge, and reconcile after a restart |
 
 Example 15, a Spring AI orchestrator whose model calls fleet agents as tools,
 lives with the Spring AI integration in `agentspaces-springai/examples/springai-fleet`

@@ -112,9 +112,86 @@ public class AgentSpacesProperties {
     private ContentSwarm content = new ContentSwarm();
     /** Persistent data trees ({@code agentspaces.pdt.*}, srad/agentspaces-pdt.md appendix C). */
     private PersistentTrees pdt = new PersistentTrees();
+    /** The content store peer ({@code agentspaces.store.*}, srad/agentspaces-pdt2.md appendix C, PDT 2 phase 3). */
+    private StorePeer store = new StorePeer();
 
     /** The block exchange's store (SPEC §7.1, srad/large-networks-bulk-data.md LB-B-05). */
     private Blocks blocks = new Blocks();
+
+    /** The advertisement cache and the card spill ({@code agentspaces.discovery.*}, SPEC §6.3 and §6.1a.5, v0.1.32). */
+    private Discovery discovery = new Discovery();
+
+    /**
+     * {@code agentspaces.discovery.*} (SPEC §6.3 and §6.1a.5, v0.1.32; AppCard origin and formats, 2026-11-09): the
+     * two bounds of every group's advertisement cache and the largest parts document a stub's resolution fetches. An
+     * unset cache bound takes the default, times four on a RENDEZVOUS peer; a set one applies as given.
+     */
+    public static class Discovery {
+        private Cache cache = new Cache();
+        private Spill spill = new Spill();
+
+        /** {@code agentspaces.discovery.cache.*}: the entry bound and the byte budget. */
+        public static class Cache {
+            /** The most advertisements a group's cache holds; unset, 8,192 (times four for a rendezvous). */
+            private Integer maxEntries;
+            /** The most bytes of advertisement encodings a group's cache holds; unset, 33,554,432 (times four for a rendezvous). */
+            private Long maxBytes;
+
+            public Integer getMaxEntries() {
+                return maxEntries;
+            }
+
+            public void setMaxEntries(Integer maxEntries) {
+                this.maxEntries = maxEntries;
+            }
+
+            public Long getMaxBytes() {
+                return maxBytes;
+            }
+
+            public void setMaxBytes(Long maxBytes) {
+                this.maxBytes = maxBytes;
+            }
+        }
+
+        /** {@code agentspaces.discovery.spill.*}: the reader's side of the card spill. */
+        public static class Spill {
+            /** The largest parts document a stub's resolution fetches, in bytes. */
+            private long maxFetchBytes = ai.badmonkey.agentspaces.api.ad.CardSpill.DEFAULT_MAX_FETCH_BYTES;
+
+            public long getMaxFetchBytes() {
+                return maxFetchBytes;
+            }
+
+            public void setMaxFetchBytes(long maxFetchBytes) {
+                this.maxFetchBytes = maxFetchBytes;
+            }
+        }
+
+        public Cache getCache() {
+            return cache;
+        }
+
+        public void setCache(Cache cache) {
+            this.cache = cache;
+        }
+
+        public Spill getSpill() {
+            return spill;
+        }
+
+        public void setSpill(Spill spill) {
+            this.spill = spill;
+        }
+    }
+
+    public Discovery getDiscovery() {
+        return discovery;
+    }
+
+    public void setDiscovery(Discovery discovery) {
+        this.discovery = discovery;
+    }
 
     /** {@code agentspaces.content.*}: the content swarm (srad/large-networks-bulk-data.md appendix D). */
     public static class ContentSwarm {
@@ -140,7 +217,11 @@ public class AgentSpacesProperties {
 
         /** {@code agentspaces.content.store.*}. */
         public static class Store {
-            /** Backend kinds in read order: {@code file}, {@code memory}, {@code in-place}, or a bean's kind. */
+            /**
+             * Backend kinds in read order: {@code file}, {@code hash} (every piece once under its sha2-256 in
+             * {@code <path>/<group>.hash}, shared by every root that names it; PDT 2 P2-H-04), {@code memory},
+             * {@code in-place}, or a bean's kind.
+             */
             private java.util.List<String> backends = new java.util.ArrayList<>(java.util.List.of("file"));
             private String path = System.getProperty("user.home") + "/.agentspaces/content";
             private long quota = 10L * 1024 * 1024 * 1024;
@@ -360,6 +441,168 @@ public class AgentSpacesProperties {
         this.pdt = pdt;
     }
 
+    public StorePeer getStore() {
+        return store;
+    }
+
+    public void setStore(StorePeer store) {
+        this.store = store;
+    }
+
+    /**
+     * {@code agentspaces.store.*}: this peer as a content store (srad/agentspaces-pdt2.md §3.2, appendix C; PDT 2
+     * phase 3, P2-S-10). With {@code enabled} the starter builds one {@code ContentStore} per group over the group's
+     * {@code Pdt} facade and its content swarm, which then advertises the PDT feature level 2. A store needs
+     * {@code agentspaces.content.enabled} and {@code agentspaces.pdt.enabled} and refuses to start otherwise,
+     * naming the keys. Sizes take binary units ({@code 2TiB}, {@code 50GiB}); {@code reserve} also takes a
+     * percentage of the capacity. A {@code StorePolicy} bean replaces the policy these keys build.
+     */
+    public static class StorePeer {
+        /** This peer is a content store. */
+        private boolean enabled;
+        /** The card name; the peer id when blank. */
+        private String name;
+        /** The bytes the store holds; required. */
+        private String capacity;
+        /** The bytes kept free: a size or a percentage of the capacity. */
+        private String reserve = "5%";
+        /** The largest root accepted. */
+        private String maxObject = "64GiB";
+        /** The lease of a pin asked by invoke without one. */
+        private java.time.Duration leaseDefault = java.time.Duration.ofDays(30);
+        /** The longest lease honoured. */
+        private java.time.Duration leaseMax = java.time.Duration.ofDays(365);
+        /** The largest {@code copies} honoured. */
+        private int copiesMax = 3;
+        /** The pin kinds taken: {@code tree}, {@code artifact}. */
+        private java.util.List<String> acceptKinds = new java.util.ArrayList<>(java.util.List.of("tree", "artifact"));
+        /**
+         * {@code open}, or {@code grant}: the requester needs {@code CONTENT_FETCH} on the root. A {@code grant}
+         * store without an authorizer takes no pins and waits for one (PDT 2 follow-ups, 2026-11-09, F2).
+         */
+        private String acceptRequesters = "grant";
+        /** Hold sealed bytes only, without the content key. */
+        private boolean blind;
+        /** {@code hot} or {@code cold}. */
+        private String tier = "hot";
+        /** How long a challenged store has to answer this peer's challenges (P2-S-07). */
+        private java.time.Duration challengeDeadline = java.time.Duration.ofSeconds(2);
+        /** The price per GiB-month on the card's {@code costHints}; 0 for none. */
+        private long pricePerGibMonth;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public void setName(String name) {
+            this.name = name;
+        }
+
+        public String getCapacity() {
+            return capacity;
+        }
+
+        public void setCapacity(String capacity) {
+            this.capacity = capacity;
+        }
+
+        public String getReserve() {
+            return reserve;
+        }
+
+        public void setReserve(String reserve) {
+            this.reserve = reserve;
+        }
+
+        public String getMaxObject() {
+            return maxObject;
+        }
+
+        public void setMaxObject(String maxObject) {
+            this.maxObject = maxObject;
+        }
+
+        public java.time.Duration getLeaseDefault() {
+            return leaseDefault;
+        }
+
+        public void setLeaseDefault(java.time.Duration leaseDefault) {
+            this.leaseDefault = leaseDefault;
+        }
+
+        public java.time.Duration getLeaseMax() {
+            return leaseMax;
+        }
+
+        public void setLeaseMax(java.time.Duration leaseMax) {
+            this.leaseMax = leaseMax;
+        }
+
+        public int getCopiesMax() {
+            return copiesMax;
+        }
+
+        public void setCopiesMax(int copiesMax) {
+            this.copiesMax = copiesMax;
+        }
+
+        public java.util.List<String> getAcceptKinds() {
+            return acceptKinds;
+        }
+
+        public void setAcceptKinds(java.util.List<String> acceptKinds) {
+            this.acceptKinds = acceptKinds;
+        }
+
+        public String getAcceptRequesters() {
+            return acceptRequesters;
+        }
+
+        public void setAcceptRequesters(String acceptRequesters) {
+            this.acceptRequesters = acceptRequesters;
+        }
+
+        public boolean isBlind() {
+            return blind;
+        }
+
+        public void setBlind(boolean blind) {
+            this.blind = blind;
+        }
+
+        public String getTier() {
+            return tier;
+        }
+
+        public void setTier(String tier) {
+            this.tier = tier;
+        }
+
+        public java.time.Duration getChallengeDeadline() {
+            return challengeDeadline;
+        }
+
+        public void setChallengeDeadline(java.time.Duration challengeDeadline) {
+            this.challengeDeadline = challengeDeadline;
+        }
+
+        public long getPricePerGibMonth() {
+            return pricePerGibMonth;
+        }
+
+        public void setPricePerGibMonth(long pricePerGibMonth) {
+            this.pricePerGibMonth = pricePerGibMonth;
+        }
+    }
+
     /**
      * {@code agentspaces.pdt.*}: persistent data trees over the content swarm
      * (srad/agentspaces-pdt.md appendix C, PD-C-02). The starter builds one
@@ -403,7 +646,10 @@ public class AgentSpacesProperties {
             private String kind = "pack";
             /** The pack directory; blank with {@code kind=pack} falls back to memory with a warning, or refuses under {@code require}. */
             private String path = System.getProperty("user.home") + "/.agentspaces/pdt";
-            /** The store quota in bytes (PD-S-05); 0 is unbounded. */
+            /**
+             * The store quota in bytes (PD-S-05); 0 is unbounded. Every node the content swarm hands
+             * the store passes it (PDT 2 phase 7, P2-X-08).
+             */
             private long quota;
             /** Refuse to start without a durable store: a pack store with a path, or a bean (PD-Q-AVL-02). */
             private boolean require;
@@ -470,9 +716,8 @@ public class AgentSpacesProperties {
             /** {@code multi} (heads merge on read) or {@code linear} (a swap takes the head first) (PD-R-04). */
             private String mode;
             /**
-             * {@code full} or {@code lazy} for this ref alone (PD-X-10). The facade of this
-             * phase follows every ref in the global mode; a value here that differs from
-             * {@code agentspaces.pdt.follow} is logged and the global mode applies.
+             * {@code full} or {@code lazy} for this ref alone (PD-X-10), in place of
+             * {@code agentspaces.pdt.follow} (PDT 2 phase 7, P2-X-08).
              */
             private String follow;
 

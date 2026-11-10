@@ -87,6 +87,28 @@ class CredentialRevocationRegistryTest {
         assertThat(registry().accept(sign(founder, target, CredentialRevocation.RETIRED))).isPresent();
     }
 
+    /**
+     * HLC round six, 2026-11-08 (owner rulings F1 and F3): a credential revocation decodes only
+     * from its own wire encoding, so its issuer's signature over a relabelled form (a duration Java
+     * does not print, a field the revocation does not name) revokes nothing.
+     */
+    @Test
+    void aCredentialRevocationInAnyFormButItsOwnEncodingIsRefused() {
+        CredentialRevocationRegistry registry = registry();
+        SignedRevocation genuine = sign(host, CredentialRevocation.Target.agent(agent), CredentialRevocation.RETIRED);
+        String hex = java.util.HexFormat.of().formatHex(genuine.adBytes());
+        String ttl = "6374746c" + "66505437323048"; // "ttl": "PT720H"
+        assertThat(hex).contains(ttl);
+        for (String relabel : List.of(hex.replace(ttl, "6374746c" + "6450333044"), // "ttl": "P30D"
+                hex.replace(ttl, ttl + "6178f5"))) { // "x": true
+            byte[] adBytes = java.util.HexFormat.of().parseHex(relabel);
+            assertThat(registry.accept(new SignedRevocation(adBytes, host.rawPublicKey(), host.sign(adBytes))))
+                    .as(relabel).isEmpty();
+        }
+        assertThat(fired).isEmpty();
+        assertThat(registry.accept(genuine)).isPresent();
+    }
+
     @Test
     void joinCredentialsAndLeavesAreTheFoundersAlone() {
         CredentialRevocation.Target credential =

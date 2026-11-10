@@ -28,6 +28,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -86,10 +87,20 @@ import java.util.zip.CRC32;
  * a held CID return other bytes: the CRC refuses a damaged record, and
  * {@code NodeStore} recomputes the CID of every read (PD-N-06).
  *
+ * <p><b>Meta records.</b> The store also keeps small named records of its owner's state
+ * beside the nodes (PDT 2 phase 1, P2-V-03): the pins of {@code NodeStore} and the retained
+ * versions of {@link Retention}. A meta record uses the node framing with the key
+ * {@code meta:<name>} in the CID field, which no CID can be, since a CID's text is base32
+ * without a colon. The latest record of a name wins: {@link #putMeta} appends the new record
+ * and then marks the old one dead, so a crash between the two leaves both live and the rebuild
+ * keeps the later. Meta records are no nodes: {@link #cids}, {@link #size}, and
+ * {@link #bytesUsed} leave them out, so a collector never sweeps one, and compaction carries
+ * the live ones like any record.
+ *
  * <p>Thread safety: reads share a read lock and use positional channel reads; puts,
  * removals, and compaction take the write lock.
  */
-public final class PackNodeStore implements BlockStore, AutoCloseable {
+public final class PackNodeStore implements BlockStore, MetaStore, AutoCloseable {
 
     /** The default pack size: a pack closes once an append would carry it past 256 MiB. */
     public static final long DEFAULT_MAX_PACK_BYTES = 256L * 1024 * 1024;
@@ -103,6 +114,10 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
     private static final int INDEX_VERSION = 1;
     private static final byte LIVE = 1;
     private static final byte DEAD = 0;
+    /** The key prefix of a meta record, which no CID's base32 text contains. */
+    private static final String META_PREFIX = "meta:";
+    /** The names a meta record may take. */
+    private static final java.util.regex.Pattern META_NAME = java.util.regex.Pattern.compile("[A-Za-z0-9._:-]{1,200}");
     /** Length prefix (4), flag (1), CID length (2), last-served (8), CRC (4). */
     private static final int FIXED_OVERHEAD = 4 + 1 + 2 + 8 + 4;
 
@@ -213,6 +228,8 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private final SortedMap<Long, Pack> packs = new TreeMap<>();
     private final Map<String, Entry> index = new HashMap<>();
+    /** The live meta records by name (P2-V-03). */
+    private final Map<String, Entry> metaIndex = new HashMap<>();
     private long bytesUsed;
     private Pack current;
     private boolean rebuiltOnOpen;
@@ -391,6 +408,64 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
     }
 
     @Override
+    public Optional<byte[]> meta(String name) {
+        Objects.requireNonNull(name, "name");
+        lock.readLock().lock();
+        try {
+            checkOpen();
+            Entry entry = metaIndex.get(name);
+            if (entry == null) {
+                return Optional.empty();
+            }
+            byte[] bytes = new byte[entry.length];
+            readFully(packs.get(entry.pack).channel, ByteBuffer.wrap(bytes), entry.payloadPosition());
+            return Optional.of(bytes);
+        } catch (IOException e) {
+            throw new UncheckedIOException("reading meta " + name, e);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    @Override
+    public void putMeta(String name, byte[] value) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(value, "value");
+        if (!META_NAME.matcher(name).matches()) {
+            throw new IllegalArgumentException("a meta name is 1 to 200 of [A-Za-z0-9._:-], got " + name);
+        }
+        lock.writeLock().lock();
+        try {
+            checkOpen();
+            Entry entry = append(META_PREFIX + name, value, 0);
+            if (options.syncEveryPut) {
+                current.channel.force(false);
+            }
+            Entry previous = metaIndex.put(name, entry);
+            if (previous != null) {
+                Pack pack = packs.get(previous.pack);
+                markDead(pack, previous.offset);
+                pack.dead += previous.recordBytes();
+                compactIfNeeded(pack);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("writing meta " + name, e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public Set<String> metaNames() {
+        lock.readLock().lock();
+        try {
+            return Set.copyOf(metaIndex.keySet());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    @Override
     public long lastAccessMillis(String cid) {
         lock.readLock().lock();
         try {
@@ -546,6 +621,7 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
         Files.deleteIfExists(indexFile);
         if (!loaded) {
             index.clear();
+            metaIndex.clear();
             bytesUsed = 0;
             for (Pack pack : packs.values()) {
                 pack.dead = 0;
@@ -596,11 +672,19 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
                 String cid = new String(body.array(), 3, cidLength, StandardCharsets.US_ASCII);
                 long lastAccess = body.getLong(3 + cidLength);
                 Entry entry = new Entry(pack.id, offset, cidLength, payloadLength, lastAccess);
-                Entry previous = index.put(cid, entry);
-                if (previous != null) {
-                    packs.get(previous.pack).dead += previous.recordBytes();
+                if (cid.startsWith(META_PREFIX)) {
+                    // the later record of a name wins; a crash may have left the earlier one live
+                    Entry previous = metaIndex.put(cid.substring(META_PREFIX.length()), entry);
+                    if (previous != null) {
+                        packs.get(previous.pack).dead += previous.recordBytes();
+                    }
                 } else {
-                    bytesUsed += payloadLength;
+                    Entry previous = index.put(cid, entry);
+                    if (previous != null) {
+                        packs.get(previous.pack).dead += previous.recordBytes();
+                    } else {
+                        bytesUsed += payloadLength;
+                    }
                 }
             }
             offset += recordBytes;
@@ -642,6 +726,7 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
         }
         int entryCount = in.getInt();
         Map<String, Entry> loaded = new HashMap<>(entryCount * 2);
+        Map<String, Entry> loadedMeta = new HashMap<>();
         long used = 0;
         for (int i = 0; i < entryCount; i++) {
             int cidLength = in.getShort() & 0xFFFF;
@@ -654,10 +739,17 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
             if (!packs.containsKey(pack)) {
                 return false;
             }
-            loaded.put(new String(cidBytes, StandardCharsets.US_ASCII), new Entry(pack, offset, cidLength, length, lastAccess));
+            String key = new String(cidBytes, StandardCharsets.US_ASCII);
+            Entry entry = new Entry(pack, offset, cidLength, length, lastAccess);
+            if (key.startsWith(META_PREFIX)) {
+                loadedMeta.put(key.substring(META_PREFIX.length()), entry);
+                continue;
+            }
+            loaded.put(key, entry);
             used += length;
         }
         index.putAll(loaded);
+        metaIndex.putAll(loadedMeta);
         bytesUsed = used;
         for (Pack pack : packs.values()) {
             pack.dead = deadByPack.get(pack.id);
@@ -666,8 +758,11 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
     }
 
     private void writeIndex() throws IOException {
+        // the meta records ride as entries under their record keys, which no CID can be
+        Map<String, Entry> entries = new LinkedHashMap<>(index);
+        metaIndex.forEach((name, entry) -> entries.put(META_PREFIX + name, entry));
         int size = 4 + 2 + 4 + packs.size() * 24 + 4;
-        for (Map.Entry<String, Entry> e : index.entrySet()) {
+        for (Map.Entry<String, Entry> e : entries.entrySet()) {
             size += 2 + e.getValue().cidLength + 8 + 8 + 4 + 8;
         }
         size += 4;
@@ -676,8 +771,8 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
         for (Pack pack : packs.values()) {
             out.putLong(pack.id).putLong(pack.length).putLong(pack.dead);
         }
-        out.putInt(index.size());
-        for (Map.Entry<String, Entry> e : index.entrySet()) {
+        out.putInt(entries.size());
+        for (Map.Entry<String, Entry> e : entries.entrySet()) {
             Entry entry = e.getValue();
             out.putShort((short) entry.cidLength);
             out.put(e.getKey().getBytes(StandardCharsets.US_ASCII));
@@ -783,12 +878,15 @@ public final class PackNodeStore implements BlockStore, AutoCloseable {
             }
             if (flag == LIVE) {
                 String cid = new String(body.array(), 3, cidLength, StandardCharsets.US_ASCII);
-                Entry entry = index.get(cid);
+                boolean meta = cid.startsWith(META_PREFIX);
+                Map<String, Entry> map = meta ? metaIndex : index;
+                String key = meta ? cid.substring(META_PREFIX.length()) : cid;
+                Entry entry = map.get(key);
                 if (entry != null && entry.pack == source.id && entry.offset == offset) {
                     byte[] payload = new byte[payloadLength];
                     System.arraycopy(body.array(), 3 + cidLength + 8, payload, 0, payloadLength);
                     Entry moved = append(cid, payload, entry.lastAccess);
-                    index.put(cid, moved);
+                    map.put(key, moved);
                     hook.reached("compact.copied");
                 }
             }

@@ -151,6 +151,8 @@ public final class GossipBus {
     private final CborCodec codec;
     private final int fanout;
     private final int defaultHops;
+    private final java.util.function.LongSupplier clock;
+    private final java.util.random.RandomGenerator random;
     private final Map<String, RumorHandler> handlers = new ConcurrentHashMap<>();
     /** Optional per-stream forward filters (ASF-012): an item is re-forwarded
      * only when its payload passes the stream's filter, so an honest node never
@@ -187,7 +189,11 @@ public final class GossipBus {
 
     // ---- Lazy push (PERF2 §3.4) ----
 
-    /** Announced items this node waits for before it grafts (bounded against a hostile announcer). */
+    /**
+     * Announced items this node waits for before it grafts (bounded against a hostile announcer). Each announcer's items
+     * count in its own share of this memory, so a flood of announcements pushes out the flooder's own items (swarm
+     * retries, flood shares, ROBUSTNESS.md §10.7).
+     */
     static final int MISSING_CAPACITY = 256;
     /** Items announced per round at most; older ones are left to anti-entropy. */
     static final int HAVE_CAPACITY = 256;
@@ -197,12 +203,32 @@ public final class GossipBus {
     static final int HAVE_ITEMS_MAX = 256;
     /** GRAFTs sent per tick at most, so an announcer cannot make this node sign thousands of asks. */
     static final int GRAFTS_PER_TICK = 16;
-    /** Ticks between a HAVE for an unseen item and the first GRAFT for it: more than the eager
-     * push takes, batching included, or a graft would fetch a copy already on its way and the
-     * duplicate would prune a sound edge (Plumtree's timer rule). */
-    static final int GRAFT_AFTER_TICKS = 2;
-    /** Ticks between one GRAFT and the next announcer being asked. */
-    static final int GRAFT_RETRY_TICKS = 4;
+    /*
+     * Swarm retries (ROBUSTNESS.md §10.2, sites A1 to A3 of §10.3): the asks for an announced item wait in time, never
+     * in ticks, since the scheduler runs missed ticks back to back after a stall. The first ask waits more than an
+     * eager push takes, or it would fetch a copy already on its way and the duplicate would prune a sound edge
+     * (Plumtree's timer rule); a uniform spread keeps the members that heard one announcement from asking together;
+     * later asks back off with the same spread and go round the announcers again while members still announce the item.
+     */
+    /** The base of the wait between the first HAVE for an unseen item and its first GRAFT. */
+    static final long GRAFT_BASE_MILLIS = 500;
+    /** The narrowest window the first GRAFT is spread over, uniformly, past the base; it widens to twice the p90 graft round trip. */
+    static final long GRAFT_SPREAD_MIN_MILLIS = 1_000;
+    /** The widest spread window, however slow the observed graft round trips. */
+    static final long GRAFT_SPREAD_MAX_MILLIS = 4_000;
+    /** The wait after the first GRAFT; each later ask doubles it up to {@link #GRAFT_BACKOFF_MAX_MILLIS}. */
+    static final long GRAFT_BACKOFF_MILLIS = 1_000;
+    /** The longest wait between two asks for one item. */
+    static final long GRAFT_BACKOFF_MAX_MILLIS = 8_000;
+    /** How long an item stays wanted after its last announcement; a member's probes announce what it forwarded lately. */
+    static final long MISSING_HORIZON_MILLIS = 15_000;
+    /** Graft round trips kept for the p90 that sizes the spread. */
+    static final int GRAFT_RTT_SAMPLES = 64;
+    /**
+     * Asks in a row an announcer leaves unanswered before a member asks the other announcers first: three, so the rare
+     * honest answer that a faster copy overtakes changes nothing.
+     */
+    static final int UNANSWERED_STRIKES = 3;
     /**
      * A duplicate replaces the first copy's edge only when it travelled this many hops fewer
      * (Plumtree's path optimisation, with its threshold): a one-hop difference is what every
@@ -211,17 +237,66 @@ public final class GossipBus {
      */
     static final int PATH_SWAP_THRESHOLD = 2;
 
+    /** An announced item this node lacks, with what its asks need (swarm retries). */
     private static final class Missing {
         final String streamId;
         final byte[] hash;
-        final java.util.ArrayDeque<PeerId> announcers = new java.util.ArrayDeque<>();
-        long askAtTick;
+        /**
+         * The first announcer heard: almost always the item's origin, whose announcement reaches every member first. The
+         * item counts in this announcer's share of {@link #MISSING_CAPACITY} (flood shares).
+         */
+        final PeerId firstHeard;
+        /** Every member that announced the item, in the order heard. */
+        final List<PeerId> announcers = new ArrayList<>();
+        /** The announcers asked in the current round; a round ends once each was asked. */
+        final java.util.Set<PeerId> asked = new java.util.HashSet<>();
+        long askAtMillis;
+        long announcedAtMillis;
+        int asks;
 
-        Missing(String streamId, byte[] hash, long askAtTick) {
+        Missing(String streamId, byte[] hash, PeerId firstHeard, long askAtMillis) {
             this.streamId = streamId;
             this.hash = hash;
-            this.askAtTick = askAtTick;
+            this.firstHeard = firstHeard;
+            this.askAtMillis = askAtMillis;
         }
+
+        /**
+         * The announcer to ask next: one not yet asked in this round, never the first heard while another is left, so
+         * the members that lack an item spread their asks over its holders instead of all asking its origin; among
+         * those, at random, one that has not left {@link #UNANSWERED_STRIKES} asks in a row unanswered while another
+         * has not, so an announcer that never answers is asked last (the gate's adversarial review, ROBUSTNESS.md §10.6).
+         */
+        PeerId next(java.util.random.RandomGenerator random, Map<PeerId, Integer> unanswered) {
+            List<PeerId> fresh = new ArrayList<>();
+            for (PeerId announcer : announcers) {
+                if (!asked.contains(announcer)) {
+                    fresh.add(announcer);
+                }
+            }
+            if (fresh.isEmpty()) {
+                asked.clear();
+                fresh.addAll(announcers);
+            }
+            if (fresh.size() > 1) {
+                fresh.remove(firstHeard);
+            }
+            List<PeerId> answering = new ArrayList<>();
+            for (PeerId announcer : fresh) {
+                if (unanswered.getOrDefault(announcer, 0) < UNANSWERED_STRIKES) {
+                    answering.add(announcer);
+                }
+            }
+            List<PeerId> pool = answering.isEmpty() ? fresh : answering;
+            PeerId target = pool.get(random.nextInt(pool.size()));
+            asked.add(target);
+            return target;
+        }
+    }
+
+    /** The asks in flight for an item, by announcer and the clock time each went, until a copy comes (swarm retries). */
+    private static final class Grafted {
+        final Map<PeerId, Long> sentAtMillis = new HashMap<>();
     }
 
     /** Whether a member understands HAVE, GRAFT and PRUNE; the owning node judges it from the wire hint. */
@@ -263,13 +338,47 @@ public final class GossipBus {
                     return size() > HAVE_CAPACITY;
                 }
             });
-    private final Map<String, Missing> missing = Collections.synchronizedMap(
+    private final Map<String, Missing> missing = Collections.synchronizedMap(new LinkedHashMap<>());
+    /**
+     * The items each announcer's share of {@link #MISSING_CAPACITY} holds, guarded by {@code missing} (swarm retries,
+     * flood shares, ROBUSTNESS.md §10.7): a flood of announcements pushes out the flooder's own items.
+     */
+    private final Map<PeerId, Share> shares = new LinkedHashMap<>();
+
+    /**
+     * One announcer's share: the items it alone named, and the items another member named too, each oldest first. The
+     * share gives up the second kind last, so a flooder that names an honest member's items cannot carry them out with
+     * its flood (the gate of flood shares, ROBUSTNESS.md §10.7).
+     */
+    private static final class Share {
+        final java.util.LinkedHashSet<String> alone = new java.util.LinkedHashSet<>();
+        final java.util.LinkedHashSet<String> named = new java.util.LinkedHashSet<>();
+
+        int size() {
+            return alone.size() + named.size();
+        }
+
+        /** The item the share gives up first: its oldest that no other member named, else its oldest. */
+        String first() {
+            return (alone.isEmpty() ? named : alone).iterator().next();
+        }
+    }
+
+    /**
+     * The asks in a row each announcer left unanswered, another member's copy coming first, counted up to
+     * {@link #UNANSWERED_STRIKES} (swarm retries, the gate's adversarial review, ROBUSTNESS.md §10.6).
+     */
+    private final Map<PeerId, Integer> unanswered = new ConcurrentHashMap<>();
+    private final Map<String, Grafted> grafted = Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, false) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Missing> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<String, Grafted> eldest) {
                     return size() > MISSING_CAPACITY;
                 }
             });
+    /** The latest graft round trips in milliseconds, a ring, guarded by itself; the count is a long so it never wraps. */
+    private final long[] graftRtts = new long[GRAFT_RTT_SAMPLES];
+    private long graftRttCount;
     private final Map<String, Bodies.Rumor> recent = Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, false) {
                 @Override
@@ -335,6 +444,7 @@ public final class GossipBus {
         for (PeerId peer : sampler.members()) {
             if (!peer.equals(lost) && capable.test(peer)) {
                 count("GRAFT");
+                count("GRAFT_RESET");
                 sender.sendGraft(peer, new Bodies.Graft(null, null));
             }
         }
@@ -464,9 +574,29 @@ public final class GossipBus {
      */
     public GossipBus(PeerSampler sampler, FrameSender sender, CborCodec codec,
                      int fanout, int defaultHops) {
+        this(sampler, sender, codec, fanout, defaultHops, System::currentTimeMillis, new java.util.Random());
+    }
+
+    /**
+     * Creates the bus with the node's clock and random source, which time and spread the asks for announced items
+     * (swarm retries, ROBUSTNESS.md §10.2): a wait reads the clock, never a count of ticks.
+     *
+     * @param sampler     the group's peer sampler
+     * @param sender      the frame sender
+     * @param codec       the CBOR codec
+     * @param fanout      peers contacted per rumor round
+     * @param defaultHops default forward budget for published items
+     * @param clock       the node's clock in milliseconds
+     * @param random      the node's random source
+     */
+    public GossipBus(PeerSampler sampler, FrameSender sender, CborCodec codec,
+                     int fanout, int defaultHops, java.util.function.LongSupplier clock,
+                     java.util.random.RandomGenerator random) {
         this.sampler = Objects.requireNonNull(sampler, "sampler");
         this.sender = Objects.requireNonNull(sender, "sender");
         this.codec = Objects.requireNonNull(codec, "codec");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.random = Objects.requireNonNull(random, "random");
         if (fanout <= 0 || defaultHops <= 0) {
             throw new IllegalArgumentException("fanout and defaultHops must be positive");
         }
@@ -812,8 +942,9 @@ public final class GossipBus {
                 return; // a small group: the fan-out reaches everyone in one hop, and the tree would only add fragility
             }
             // A duplicate over a tree edge means an edge is redundant (Plumtree PRUNE). A copy
-            // delivered point to point (hop budget 1: an introduction, a GRAFT answer) and a
-            // stream the node also delivers directly are not evidence about the tree. Which
+            // delivered point to point (hop budget 1: an introduction, a refresh) and a stream the
+            // node also delivers directly are not evidence about the tree; a GRAFT answer carries
+            // the budget its rumor was cached with, so it counts as a tree push. Which
             // edge goes: the duplicate's, unless it travelled markedly fewer hops than the first
             // copy (PATH_SWAP_THRESHOLD), in which case the first sender's edge is the longer
             // path and is pruned instead. The partition is shared by every source, so a node
@@ -850,10 +981,17 @@ public final class GossipBus {
         if (!directStreams.contains(rumor.streamId())) {
             activity = true;
         }
-        missing.remove(key);
+        synchronized (missing) {
+            Missing arrived = missing.remove(key);
+            if (arrived != null) {
+                leaveShare(key, arrived);
+            }
+        }
+        noteCopy(key, from);
         // A first copy over a pruned edge restores it, when it was a tree push: a copy delivered
-        // point to point (hop budget one: a refresh, an introduction, a graft answer) or on a
-        // direct stream says nothing about the tree, just as such a duplicate never prunes.
+        // point to point (hop budget one: a refresh, an introduction) or on a direct stream says
+        // nothing about the tree, just as such a duplicate never prunes. A graft answer carries
+        // the budget its rumor was cached with, so it restores the edge as a tree push does.
         if (rumor.hopsRemaining() > 1 && !directStreams.contains(rumor.streamId())) {
             lazy.remove(from);
         }
@@ -927,18 +1065,46 @@ public final class GossipBus {
         return counter == null ? 0 : counter.get();
     }
 
+    /** The counters of the asks for announced items (swarm retries, ROBUSTNESS.md §10.2), by name. */
+    static final List<String> REPAIR_COUNTERS = List.of("GRAFT_FIRST_HEARD", "GRAFT_RETRY", "GRAFT_PREMATURE",
+            "GRAFT_RESET", "GRAFT_DROPPED", "GRAFT_EVICTED", "GRAFT_EVICTED_OWN", "GRAFT_EVICTED_OTHER");
+
+    /**
+     * How this node asked for announced items it lacked, a snapshot (swarm retries, ROBUSTNESS.md §10.2):
+     * {@code GRAFT_FIRST_HEARD} asks sent to the first announcer heard, almost always the item's origin;
+     * {@code GRAFT_RETRY} asks after the first; {@code GRAFT_PREMATURE} asks whose item came from another member
+     * anyway; {@code GRAFT_RESET} the GRAFTs naming no item that a lost forwarder sent; {@code GRAFT_DROPPED} items
+     * given up once no member announced them any more; {@code GRAFT_EVICTED} items given up because newer
+     * announcements filled the {@link #MISSING_CAPACITY} items this node tracks, by cause: {@code GRAFT_EVICTED_OWN}
+     * when an item of the same share took the place, {@code GRAFT_EVICTED_OTHER} when an announcer with a smaller share
+     * took it (flood shares, ROBUSTNESS.md §10.7).
+     *
+     * @return every counter, zero included
+     */
+    public Map<String, Long> repairCounters() {
+        Map<String, Long> out = new LinkedHashMap<>();
+        for (String name : REPAIR_COUNTERS) {
+            java.util.concurrent.atomic.AtomicLong counter = lazyCounters.get(name);
+            out.put(name, counter == null ? 0 : counter.get());
+        }
+        return out;
+    }
+
     private void count(String kind) {
         lazyCounters.computeIfAbsent(kind, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
     }
 
     /**
      * Handles an inbound HAVE: items this node has seen are ignored; the rest are noted with
-     * their announcer and asked for on a later tick if they are still missing then.
+     * their announcer and asked for once the spread wait of swarm retries ends, if they are
+     * still missing then (ROBUSTNESS.md §10.2). Each announcement keeps its item wanted for
+     * {@link #MISSING_HORIZON_MILLIS} more.
      *
      * @param from the announcing member
      * @param have the announced items
      */
     public void onHave(PeerId from, Bodies.Have have) {
+        long now = clock.getAsLong();
         int taken = 0;
         for (Bodies.HaveItem item : have.items()) {
             if (++taken > HAVE_ITEMS_MAX || item.streamId() == null || item.hash() == null) {
@@ -949,12 +1115,143 @@ public final class GossipBus {
                 continue;
             }
             synchronized (missing) {
-                Missing entry = missing.computeIfAbsent(key,
-                        k -> new Missing(item.streamId(), item.hash(), ticks + GRAFT_AFTER_TICKS));
+                Missing entry = missing.get(key);
+                if (entry == null) {
+                    if (missing.size() >= MISSING_CAPACITY) {
+                        makeRoom(from);
+                    }
+                    entry = new Missing(item.streamId(), item.hash(), from, now + GRAFT_BASE_MILLIS + spread());
+                    missing.put(key, entry);
+                    joinShare(key, entry);
+                } else if (!entry.announcers.contains(from) && shares.get(entry.firstHeard).alone.remove(key)) {
+                    shares.get(entry.firstHeard).named.add(key); // another member named it: its share gives it up last
+                }
+                entry.announcedAtMillis = now;
                 if (!entry.announcers.contains(from)) {
                     entry.announcers.add(from);
                 }
             }
+        }
+    }
+
+    /**
+     * Makes room for one more item from {@code announcer} in the full memory of announced items (swarm retries, flood
+     * shares, ROBUSTNESS.md §10.7). An announcer that would then hold more than an even split of
+     * {@link #MISSING_CAPACITY} among the announcers holding items gives up an item of its own share. Any other
+     * announcer takes the room from the largest share. Either share gives up its oldest item that no other member named,
+     * and its oldest item only when another member named every one. A flood of announcements then pushes out the
+     * flooder's own items, one announcer alone may fill the whole memory, and every announcer may grow to an even split
+     * whoever else floods. The caller holds the lock of {@code missing}.
+     */
+    private void makeRoom(PeerId announcer) {
+        int announcers = shares.size() + (shares.containsKey(announcer) ? 0 : 1);
+        PeerId giver = announcer;
+        if (held(announcer) == 0 || (long) (held(announcer) + 1) * announcers <= MISSING_CAPACITY) {
+            int most = 0;
+            for (Map.Entry<PeerId, Share> share : shares.entrySet()) {
+                if (!share.getKey().equals(announcer) && share.getValue().size() > most) {
+                    giver = share.getKey();
+                    most = share.getValue().size();
+                }
+            }
+        }
+        String given = shares.get(giver).first();
+        leaveShare(given, missing.remove(given));
+        count("GRAFT_EVICTED");
+        count(giver.equals(announcer) ? "GRAFT_EVICTED_OWN" : "GRAFT_EVICTED_OTHER");
+    }
+
+    /** How many items an announcer's share holds; the caller holds the lock of {@code missing}. */
+    private int held(PeerId announcer) {
+        Share share = shares.get(announcer);
+        return share == null ? 0 : share.size();
+    }
+
+    /** Counts an item in its first announcer's share, as its newest; the caller holds the lock of {@code missing}. */
+    private void joinShare(String key, Missing entry) {
+        shares.computeIfAbsent(entry.firstHeard, a -> new Share()).alone.add(key);
+    }
+
+    /** Takes an item out of its share; the caller holds the lock of {@code missing}. */
+    private void leaveShare(String key, Missing entry) {
+        Share share = shares.get(entry.firstHeard);
+        if (!share.alone.remove(key)) {
+            share.named.remove(key);
+        }
+        if (share.size() == 0) {
+            shares.remove(entry.firstHeard);
+        }
+    }
+
+    /** A uniform random wait over the spread window. */
+    private long spread() {
+        return random.nextLong(spreadWindow() + 1);
+    }
+
+    /** The spread window: twice the p90 graft round trip this node observes, between its floor and ceiling. */
+    private long spreadWindow() {
+        return Math.max(GRAFT_SPREAD_MIN_MILLIS, Math.min(GRAFT_SPREAD_MAX_MILLIS, 2 * graftRttP90()));
+    }
+
+    /**
+     * How long a member that lacks an announced item may take before it has asked two announcers (swarm retries,
+     * ROBUSTNESS.md §10.2): the base, a spread window, the first backoff, and a second spread window. A stream with a
+     * fallback of its own (a pushed delta's {@code TREE_WANT}) waits at least this long before it gives up on the bus.
+     *
+     * @return the window in milliseconds
+     */
+    public long repairWindowMillis() {
+        long window = spreadWindow();
+        return GRAFT_BASE_MILLIS + window + GRAFT_BACKOFF_MILLIS + window;
+    }
+
+    /** The p90 of the latest graft round trips, or zero before the first. */
+    private long graftRttP90() {
+        long[] samples;
+        synchronized (graftRtts) {
+            samples = java.util.Arrays.copyOf(graftRtts, (int) Math.min(graftRttCount, GRAFT_RTT_SAMPLES));
+        }
+        if (samples.length == 0) {
+            return 0;
+        }
+        java.util.Arrays.sort(samples);
+        return samples[Math.min(samples.length - 1, (int) Math.ceil(samples.length * 0.9) - 1)];
+    }
+
+    /** The wait after an item's {@code asks}-th ask: 1, 2, 4, 8 s, then 8 s. */
+    private static long backoff(int asks) {
+        return Math.min(GRAFT_BACKOFF_MAX_MILLIS, GRAFT_BACKOFF_MILLIS << Math.min(asks - 1, 16));
+    }
+
+    /**
+     * Notes the first copy of an item this node grafted (swarm retries): a copy from a member asked gives a round trip
+     * for the spread and clears that member's unanswered asks, a copy from any other member makes the asks premature,
+     * counted once, and each member asked whose copy did not come first has one more unanswered ask. A later copy, a late
+     * answer among them, repaired nothing, so it neither widens the spread nor counts (the gate's adversarial review,
+     * ROBUSTNESS.md §10.6).
+     */
+    private void noteCopy(String key, PeerId from) {
+        Long sentAt;
+        synchronized (grafted) {
+            Grafted asks = grafted.remove(key);
+            if (asks == null) {
+                return;
+            }
+            sentAt = asks.sentAtMillis.get(from);
+            for (PeerId asked : asks.sentAtMillis.keySet()) {
+                if (asked.equals(from)) {
+                    unanswered.remove(asked);
+                } else {
+                    unanswered.merge(asked, 1, (held, one) -> Math.min(UNANSWERED_STRIKES, held + one));
+                }
+            }
+        }
+        if (sentAt == null) {
+            count("GRAFT_PREMATURE");
+            return;
+        }
+        synchronized (graftRtts) {
+            graftRtts[(int) (graftRttCount++ % GRAFT_RTT_SAMPLES)] = Math.max(0, clock.getAsLong() - sentAt);
         }
     }
 
@@ -992,10 +1289,11 @@ public final class GossipBus {
 
     /**
      * One lazy-push tick, driven by the owning node on every peer tick: forgets members that
-     * left the view, grafts announced items that never arrived (a bounded number per tick,
-     * each from the next announcer), and tells up to {@code fanout} random lazy members what
-     * this node forwarded since the last tick, so a member cut off from the tree is grafted
-     * back within two ticks. An idle group announces nothing.
+     * left the view, grafts announced items that never arrived once their wait ends (a bounded
+     * number per tick, each from the next announcer by the rule of swarm retries), and tells
+     * the lazy members what this node forwarded since the last tick, so a member cut off from
+     * the tree is grafted back within the spread wait. An idle group announces nothing. The
+     * waits read {@code nowMillis}, so the catch-up ticks after a stall shorten none of them.
      *
      * @param nowMillis the node's clock
      */
@@ -1011,26 +1309,49 @@ public final class GossipBus {
         }
         List<Missing> asks = new ArrayList<>();
         List<PeerId> askers = new ArrayList<>();
+        List<String> keys = new ArrayList<>();
+        java.util.Set<PeerId> view = new java.util.HashSet<>(members);
+        unanswered.keySet().retainAll(view);
         synchronized (missing) {
-            java.util.Iterator<Missing> it = missing.values().iterator();
-            while (it.hasNext() && asks.size() < GRAFTS_PER_TICK) {
-                Missing entry = it.next();
-                if (entry.askAtTick > now) {
-                    continue;
+            // first asks before retries (swarm retries, the gate's adversarial review): the retries of items a flood
+            // of announcements named and nobody serves must not spend the budget a newly announced item needs
+            for (int pass = 0; pass < 2 && asks.size() < GRAFTS_PER_TICK; pass++) {
+                boolean firstAsks = pass == 0;
+                java.util.Iterator<Map.Entry<String, Missing>> it = missing.entrySet().iterator();
+                while (it.hasNext() && asks.size() < GRAFTS_PER_TICK) {
+                    Map.Entry<String, Missing> next = it.next();
+                    Missing entry = next.getValue();
+                    if (entry.askAtMillis > nowMillis || firstAsks != (entry.asks == 0)) {
+                        continue;
+                    }
+                    entry.announcers.retainAll(view);
+                    if (entry.announcers.isEmpty() || nowMillis - entry.announcedAtMillis > MISSING_HORIZON_MILLIS) {
+                        it.remove(); // no member announces it any more: anti-entropy, or the stream's own fallback, has it
+                        leaveShare(next.getKey(), entry);
+                        count("GRAFT_DROPPED");
+                        continue;
+                    }
+                    PeerId announcer = entry.next(random, unanswered);
+                    entry.asks++;
+                    entry.askAtMillis = nowMillis + backoff(entry.asks) + spread();
+                    if (entry.asks > 1) {
+                        count("GRAFT_RETRY");
+                    }
+                    if (announcer.equals(entry.firstHeard)) {
+                        count("GRAFT_FIRST_HEARD");
+                    }
+                    asks.add(entry);
+                    askers.add(announcer);
+                    keys.add(next.getKey());
                 }
-                PeerId announcer = entry.announcers.poll();
-                if (announcer == null) {
-                    it.remove();
-                    continue;
-                }
-                entry.askAtTick = now + GRAFT_RETRY_TICKS;
-                asks.add(entry);
-                askers.add(announcer);
             }
         }
         for (int i = 0; i < asks.size(); i++) {
             if (lazy.remove(askers.get(i))) {
                 topologyChanged();
+            }
+            synchronized (grafted) {
+                grafted.computeIfAbsent(keys.get(i), k -> new Grafted()).sentAtMillis.put(askers.get(i), nowMillis);
             }
             count("GRAFT");
             sender.sendGraft(askers.get(i), new Bodies.Graft(asks.get(i).streamId, asks.get(i).hash));

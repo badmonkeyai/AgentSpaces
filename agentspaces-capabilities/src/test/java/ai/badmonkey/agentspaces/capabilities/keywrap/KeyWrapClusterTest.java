@@ -483,7 +483,10 @@ class KeyWrapClusterTest {
     private record EpochRequest(long nonce, byte[] encryptionPublicKey, List<Long> epochs) {
     }
 
-    private record OfferedKey(long epoch, String rotator, String cutover, byte[] proof,
+    /** Mirrors GroupKeyDistributor.EpochKey, its proof omitted when null (HLC round six, 2026-11-08, P1). */
+    private record OfferedKey(long epoch, String rotator, String cutover,
+                              @com.fasterxml.jackson.annotation.JsonInclude(
+                                      com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL) byte[] proof,
                               byte[] ephemeralPublicKey, byte[] sealed) {
     }
 

@@ -134,4 +134,25 @@ class IdsTest {
         assertThatThrownBy(() -> new AspaceUri(GroupId.of("z"), "bad/space", null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    /**
+     * HLC round six, 2026-11-08 (ruling R5): an agent id is {@code <peerId>/<localName>} with
+     * non-empty parts and a local name holding neither a slash nor a colon, in every
+     * implementation, and one that breaks it is undecodable on the wire.
+     */
+    @Test
+    void aLocalNameHoldsNeitherASlashNorAColon() {
+        assertThatThrownBy(() -> new AgentId(PeerId.of("zPeer"), "planner:1"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> AgentId.parse("zPeer/planner:1")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> AgentId.parse("zPeer/a/b")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> AgentId.parse("/name")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> AgentId.parse("zPeer/")).isInstanceOf(IllegalArgumentException.class);
+        assertThat(AgentId.parse("zPeer/planner-1.v2_x").localName()).isEqualTo("planner-1.v2_x");
+        record Holder(AgentId holder) {
+        }
+        ai.badmonkey.agentspaces.common.codec.CborCodec codec = ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+        byte[] bytes = codec.toBytes(java.util.Map.of("holder", "zPeer/planner:1"));
+        assertThatThrownBy(() -> codec.fromWire(bytes, Holder.class)).isInstanceOf(java.io.UncheckedIOException.class);
+    }
 }

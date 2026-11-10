@@ -21,7 +21,7 @@
 
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces-dependencies</artifactId>
-  <version>0.5.0</version>
+  <version>0.6.0</version>
   <packaging>pom</packaging>
 
   <name>AgentSpaces :: Dependencies (BOM)</name>
@@ -86,6 +86,8 @@
     <caffeine.version>3.2.0</caffeine.version>
     <nimbus-jose-jwt.version>10.3</nimbus-jose-jwt.version>
     <bouncycastle.version>1.86</bouncycastle.version>
+    <!-- PDT 2 phase 4, P2-Z-04 (decision 12): zstd for the dcz frames of intra-chunk deltas; BSD 2-Clause. -->
+    <zstd-jni.version>1.5.7-16</zstd-jni.version>
   </properties>
 
   <dependencyManagement>
@@ -167,6 +169,11 @@
       </dependency>
       <dependency>
         <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-store</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-a2a</artifactId>
         <version>${project.version}</version>
       </dependency>
@@ -238,6 +245,11 @@
         <groupId>com.nimbusds</groupId>
         <artifactId>nimbus-jose-jwt</artifactId>
         <version>${nimbus-jose-jwt.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.github.luben</groupId>
+        <artifactId>zstd-jni</artifactId>
+        <version>${zstd-jni.version}</version>
       </dependency>
       <dependency>
         <groupId>org.bouncycastle</groupId>

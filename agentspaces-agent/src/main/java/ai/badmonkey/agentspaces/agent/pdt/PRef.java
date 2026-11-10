@@ -15,11 +15,21 @@
  */
 package ai.badmonkey.agentspaces.agent.pdt;
 
+import ai.badmonkey.agentspaces.common.codec.CanonicalMaps;
+import ai.badmonkey.agentspaces.common.codec.WireRecord;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -39,9 +49,10 @@ import java.util.Set;
  * <p>The three optional fields ({@link #nodes}, {@link #keyEpoch}, {@link #attrs})
  * leave the wire when null, so a head without them is the minimal form.
  *
- * @param v        schema version, 1
+ * @param v        schema version: 1, or {@link #VERSION_2} for a head whose tree holds a level-2 kind
  * @param name     the ref name, at most {@link #MAX_NAME_BYTES} bytes; a tag
- * @param kind     {@link #KIND_MAP}, {@link #KIND_SET}, {@link #KIND_VECTOR}, {@link #KIND_BLOB}, or {@link #KIND_TREE}
+ * @param kind     {@link #KIND_MAP}, {@link #KIND_SET}, {@link #KIND_VECTOR}, {@link #KIND_BLOB}, {@link #KIND_TREE},
+ *                 or {@link #KIND_DB}
  * @param root     the root CID of this version
  * @param base     the roots this version was computed from, 0 to {@link #MAX_BASE}
  * @param seq      one more than the largest {@code seq} of the bases; 1 for a first version
@@ -50,16 +61,28 @@ import java.util.Set;
  * @param mode     {@link #MODE_MULTI} or {@link #MODE_LINEAR}; an open set, a reader keeps an unknown mode
  * @param sealing  {@link #SEALING_NONE}, {@link #SEALING_GROUP_KEY}, or {@link #SEALING_SEALED_NODES}; an open set
  * @param keyEpoch the content-key epoch the nodes are sealed under, or null
- * @param attrs    user attributes, at most {@link #MAX_ATTRS} entries and {@link #MAX_ATTRS_BYTES} bytes, or null
+ * @param attrs    user attributes, at most {@link #MAX_ATTRS} entries and {@link #MAX_ATTRS_BYTES} bytes, or null:
+ *                 text under every key, and under {@link #ISSUED_ATTR} and {@link #ISSUER_ATTR} any
+ *                 application value, null included, which reads as absent when it is no text (HLC
+ *                 round six, 2026-11-08, ruling R1)
  */
+@WireRecord
 public record PRef(int v, String name, String kind, String root, List<String> base, long seq, long size,
                    @JsonInclude(JsonInclude.Include.NON_NULL) List<byte[]> nodes,
                    String mode, String sealing,
                    @JsonInclude(JsonInclude.Include.NON_NULL) Long keyEpoch,
-                   @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, String> attrs) {
+                   @JsonInclude(JsonInclude.Include.NON_NULL)
+                   @JsonDeserialize(using = PRef.Attrs.class) Map<String, ?> attrs) {
 
     /** Schema version this record carries. */
     public static final int VERSION = 1;
+
+    /**
+     * PDT 2 phase 2, P2-D-03 and P2-F-06 (srad/agentspaces-pdt2.md §6.10.3, rule 8): the version of a head
+     * whose tree holds a node of a level-2 kind. The schema keeps its twelve fields; a level-1 reader refuses
+     * the version and ignores the head, and a level-2 reader accepts versions 1 and 2.
+     */
+    public static final int VERSION_2 = 2;
 
     /** Tag every head carries: the ref name. */
     public static final String NAME_TAG = "name";
@@ -73,8 +96,11 @@ public record PRef(int v, String name, String kind, String root, List<String> ba
     public static final String KIND_BLOB = "blob";
     public static final String KIND_TREE = "tree";
 
+    /** PDT 2 phase 2, P2-D-03: a DataScript database, a {@code db} root over {@code dn} nodes; always {@link #VERSION_2}. */
+    public static final String KIND_DB = "db";
+
     /** The kinds a head may name. */
-    public static final Set<String> KINDS = Set.of(KIND_MAP, KIND_SET, KIND_VECTOR, KIND_BLOB, KIND_TREE);
+    public static final Set<String> KINDS = Set.of(KIND_MAP, KIND_SET, KIND_VECTOR, KIND_BLOB, KIND_TREE, KIND_DB);
 
     /** Several heads may coexist and readers merge them (§3.6.1). */
     public static final String MODE_MULTI = "multi";
@@ -128,7 +154,79 @@ public record PRef(int v, String name, String kind, String root, List<String> ba
         Objects.requireNonNull(sealing, "sealing");
         base = base == null ? List.of() : List.copyOf(base);
         nodes = nodes == null ? null : List.copyOf(nodes);
-        attrs = attrs == null ? null : Map.copyOf(attrs);
+        attrs = attrs == null ? null : copyOf(attrs);
+    }
+
+    /** The two reserved attrs, whose value is an application value (HLC round six, 2026-11-08, ruling R1). */
+    private static final Set<String> RESERVED_ATTRS = Set.of(ISSUED_ATTR, ISSUER_ATTR);
+
+    /**
+     * A read-only copy of the attrs that keeps a null value (HLC round five, 2026-11-08, decision
+     * E10): a reader keeps a head whose attr is present and null, and its reserved pair then falls
+     * back to the entry's own stamp and issuer. A null key is refused.
+     */
+    private static Map<String, ?> copyOf(Map<String, ?> attrs) {
+        Map<String, Object> copy = new LinkedHashMap<>();
+        for (Map.Entry<String, ?> e : attrs.entrySet()) {
+            copy.put(Objects.requireNonNull(e.getKey(), "attr key"), e.getValue());
+        }
+        return Collections.unmodifiableMap(copy);
+    }
+
+    /**
+     * Reads the attrs (HLC round six, 2026-11-08, ruling R1): text under every key but the two
+     * reserved ones, where any item reads as the application value it is, null included, so the
+     * head re-encodes to the bytes it arrived as. A null or any other item under another key
+     * makes the head undecodable, which every implementation counts in {@code headsIgnored}; a
+     * byte string never reads as base64 text, so it can never pass for an agent id.
+     */
+    static final class Attrs extends StdDeserializer<Map<String, ?>> {
+        private static final long serialVersionUID = 1L;
+
+        Attrs() {
+            super(Map.class);
+        }
+
+        @Override
+        public Map<String, ?> deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+            if (p.currentToken() != JsonToken.START_OBJECT) {
+                return mismatch(ctxt, "attrs are a map, got " + p.currentToken());
+            }
+            Map<String, Object> attrs = new LinkedHashMap<>();
+            for (String key = p.nextFieldName(); key != null; key = p.nextFieldName()) {
+                JsonToken token = p.nextToken();
+                if (RESERVED_ATTRS.contains(key)) {
+                    attrs.put(key, token == JsonToken.VALUE_NULL ? null : inOrder(ctxt.readValue(p, Object.class)));
+                } else if (token == JsonToken.VALUE_STRING) {
+                    attrs.put(key, p.getText());
+                } else {
+                    return mismatch(ctxt, "the attr " + key + " holds " + token + "; only "
+                            + ISSUED_ATTR + " and " + ISSUER_ATTR + " hold anything but text");
+                }
+            }
+            return attrs;
+        }
+
+        private Map<String, ?> mismatch(DeserializationContext ctxt, String message) throws IOException {
+            @SuppressWarnings("unchecked")
+            Map<String, ?> refused = (Map<String, ?>) ctxt.reportInputMismatch(this, "%s", message);
+            return refused;
+        }
+
+        /** An application value with every map in its arrival order, which is part of its value. */
+        private static Object inOrder(Object value) {
+            if (value instanceof Map<?, ?> map) {
+                CanonicalMaps.Verbatim ordered = new CanonicalMaps.Verbatim();
+                map.forEach((k, v) -> ordered.put((String) k, inOrder(v)));
+                return ordered;
+            }
+            if (value instanceof List<?> list) {
+                List<Object> ordered = new ArrayList<>(list.size());
+                list.forEach(element -> ordered.add(inOrder(element)));
+                return ordered;
+            }
+            return value;
+        }
     }
 
     /** The tags a head entry is written with: the name and the root. */
@@ -159,18 +257,22 @@ public record PRef(int v, String name, String kind, String root, List<String> ba
     }
 
     /** This head with other attrs (null removes them). */
-    public PRef withAttrs(Map<String, String> attrs) {
+    public PRef withAttrs(Map<String, ?> attrs) {
         return new PRef(v, name, kind, root, base, seq, size, nodes, mode, sealing, keyEpoch, attrs);
     }
 
-    /** The reserved {@link #ISSUED_ATTR}, or null when the head carries none. */
+    /** The reserved {@link #ISSUED_ATTR}, or null when the head carries none or carries it as no text. */
     public String issuedAttr() {
-        return attrs == null ? null : attrs.get(ISSUED_ATTR);
+        return textAttr(ISSUED_ATTR);
     }
 
-    /** The reserved {@link #ISSUER_ATTR}, or null when the head carries none. */
+    /** The reserved {@link #ISSUER_ATTR}, or null when the head carries none or carries it as no text. */
     public String issuerAttr() {
-        return attrs == null ? null : attrs.get(ISSUER_ATTR);
+        return textAttr(ISSUER_ATTR);
+    }
+
+    private String textAttr(String key) {
+        return attrs != null && attrs.get(key) instanceof String text ? text : null;
     }
 
     /**
@@ -213,6 +315,18 @@ public record PRef(int v, String name, String kind, String root, List<String> ba
     }
 
     /**
+     * The version a writer puts on a head of a kind (PDT 2 phase 2, P2-D-03; rule 8 of
+     * srad/agentspaces-pdt2.md §6.10.3): {@link #VERSION_2} for {@link #KIND_DB}, whose tree holds the
+     * level-2 kinds {@code db} and {@code dn}, and {@link #VERSION} for every other kind.
+     *
+     * @param kind the head's kind
+     * @return the version to write
+     */
+    public static int versionFor(String kind) {
+        return KIND_DB.equals(kind) ? VERSION_2 : VERSION;
+    }
+
+    /**
      * Checks the bounds of §3.6: the version, the name length, the kind, the CID
      * grammar of the root and every base, the base count, the range of {@code seq}
      * (0 to {@link #MAX_SEQ}) and the sign of {@code size}, the inline delta
@@ -222,8 +336,11 @@ public record PRef(int v, String name, String kind, String root, List<String> ba
      * @return the first violated rule, or empty when the head is well formed
      */
     public Optional<String> violation() {
-        if (v != VERSION) {
+        if (v != VERSION && v != VERSION_2) {
             return Optional.of("unsupported PRef version " + v);
+        }
+        if (KIND_DB.equals(kind) && v != VERSION_2) {
+            return Optional.of("a db head is version " + VERSION_2 + ", found " + v);
         }
         if (name.isEmpty()) {
             return Optional.of("empty name");
@@ -289,10 +406,11 @@ public record PRef(int v, String name, String kind, String root, List<String> ba
             if (attrs.size() > MAX_ATTRS) {
                 return Optional.of("more than " + MAX_ATTRS + " attrs");
             }
+            // HLC round six, 2026-11-08 (ruling R1): the UTF-8 bytes of the keys and the text values
             int bytes = 0;
-            for (Map.Entry<String, String> e : attrs.entrySet()) {
+            for (Map.Entry<String, ?> e : attrs.entrySet()) {
                 bytes += e.getKey().getBytes(StandardCharsets.UTF_8).length
-                        + e.getValue().getBytes(StandardCharsets.UTF_8).length;
+                        + (e.getValue() instanceof String text ? text.getBytes(StandardCharsets.UTF_8).length : 0);
             }
             if (bytes > MAX_ATTRS_BYTES) {
                 return Optional.of("attrs larger than " + MAX_ATTRS_BYTES + " bytes");

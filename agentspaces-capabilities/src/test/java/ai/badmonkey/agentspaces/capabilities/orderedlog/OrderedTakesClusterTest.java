@@ -380,6 +380,67 @@ class OrderedTakesClusterTest {
                 .isEqualTo(committed.holder());
     }
 
+    /**
+     * HLC round six, 2026-11-08 (owner rulings F1 and F3): a committed command decodes only from
+     * its own wire encoding. The holder's genuine signature inside a command whose claim fields
+     * arrive in another order installs nothing at an applier, and the command as committed does.
+     */
+    @Test
+    @Timeout(60)
+    void aCommandInAnyFormButItsOwnEncodingInstallsNothing() throws Exception {
+        List<Member> members = cluster();
+        awaitLeader(members);
+        Member a = members.get(0);
+        Member b = members.get(1);
+        a.space().write(new TaskEntry("relabelled command", 1), MINUTES_30);
+        assertThat(b.space().read(Template.of(TaskEntry.class))).isPresent();
+        EntryId entry = a.space().entryIdOf(new TaskEntry("relabelled command", 1)).orElseThrow();
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byB = CompletableFuture.supplyAsync(
+                () -> b.ordered().take(Template.of(TaskEntry.class), MINUTES_10, Duration.ofSeconds(20)));
+        tickUntilDone(members, 1500, byB);
+        assertThat(byB.get()).isPresent();
+        for (int i = 0; i < 60 && a.space().currentClaim(entry).isEmpty(); i++) {
+            members.forEach(m -> m.raft().tick()); // the first member applies, and records, the command
+        }
+        TakeClaim committed = a.space().currentClaim(entry).orElseThrow();
+        byte[] claim = codec.toBytes(committed);
+        int at = -1;
+        byte[] honest = null;
+        for (int i = 0; i < committedCommands.size() && honest == null; i++) {
+            at = indexOf(committedCommands.get(i), claim);
+            honest = at < 0 ? null : committedCommands.get(i);
+        }
+        assertThat(honest).as("the committed command").isNotNull();
+        ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim reordered =
+                new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        reordered.put("spaceId", committed.spaceId().value());
+        reordered.put("entryId", committed.entryId().value());
+        reordered.put("epoch", committed.epoch());
+        reordered.put("stamp", committed.stamp().encoded());
+        reordered.put("holder", committed.holder().encoded());
+        reordered.put("bid", committed.bid());
+        reordered.put("expiresAtMillis", committed.expiresAtMillis());
+        byte[] moved = codec.toBytes(reordered);
+        assertThat(moved).hasSameSizeAs(claim).isNotEqualTo(claim);
+        byte[] relabelled = honest.clone();
+        System.arraycopy(moved, 0, relabelled, at, moved.length);
+
+        OrderedTakes replay = freshApplier();
+        replay.onCommand(relabelled, 1);
+        assertThat(replayApplierSpace.currentClaim(entry)).as("the relabelled command installs nothing").isEmpty();
+        replay.onCommand(honest, 1);
+        assertThat(replayApplierSpace.currentClaim(entry)).map(TakeClaim::holder).contains(committed.holder());
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle) {
+        for (int i = 0; i + needle.length <= haystack.length; i++) {
+            if (java.util.Arrays.equals(haystack, i, i + needle.length, needle, 0, needle.length)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     private ReplicatedSpace replayApplierSpace;
 
     /**

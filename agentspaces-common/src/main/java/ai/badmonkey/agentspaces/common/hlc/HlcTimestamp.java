@@ -44,6 +44,20 @@ public record HlcTimestamp(long physical, int logical, String node)
      * through it and truncated a fractional counter (HLC logical counter, 2026-11-08, Rust
      * team report), so Jackson now decodes a stamp through {@link #parse(String)} alone.
      */
+    /**
+     * The longest stamp text, in UTF-16 code units (HLC round seven, 2026-11-08; SPEC §9.1, S6): a
+     * stamp travels as one definite text, and Jackson writes a text past this length in chunks,
+     * which no reader takes for a stamp.
+     */
+    public static final int MAX_STAMP_UNITS = 3996;
+
+    /**
+     * The longest node a clock stamps with, in UTF-16 code units (HLC round seven, 2026-11-08):
+     * {@link #MAX_STAMP_UNITS} less the longest physical part (19 digits), the longest logical
+     * part (10 digits) and their two colons, so every stamp the clock issues fits.
+     */
+    public static final int MAX_NODE_UNITS = MAX_STAMP_UNITS - 31;
+
     @JsonCreator(mode = JsonCreator.Mode.DISABLED)
     public HlcTimestamp {
         Objects.requireNonNull(node, "node");
@@ -55,16 +69,24 @@ public record HlcTimestamp(long physical, int logical, String node)
         }
         if (!canonicalNode(node)) {
             throw new IllegalArgumentException(
-                    "node must be non-empty and contain no ':' and no control character: " + node);
+                    "node must be non-empty and contain no ':', no control character, and no lone surrogate: "
+                            + node);
+        }
+        // HLC round seven, 2026-11-08: a longer text travels only in chunks and is no stamp
+        if (Long.toString(physical).length() + Integer.toString(logical).length() + 2 + node.length()
+                > MAX_STAMP_UNITS) {
+            throw new IllegalArgumentException("a stamp holds at most " + MAX_STAMP_UNITS + " UTF-16 units");
         }
     }
 
     /**
      * Whether a node is non-empty and holds no colon and no control character, U+0000 to U+001F
      * or U+007F (HLC canonical stamps, 2026-11-08). The constructor demands it, so every stamp
-     * this process builds encodes to text that {@link #parse(String)} accepts.
+     * this process builds encodes to text that {@link #parse(String)} accepts. HLC round five,
+     * 2026-11-08 (decision E11): a lone surrogate, U+D800 to U+DFFF without its pair, is refused
+     * as well, since it has no UTF-8 form and no peer can send it.
      */
-    private static boolean canonicalNode(String node) {
+    static boolean canonicalNode(String node) {
         if (node.isEmpty()) {
             return false;
         }
@@ -72,6 +94,13 @@ public record HlcTimestamp(long physical, int logical, String node)
             char c = node.charAt(i);
             if (c == ':' || c < 0x20 || c == 0x7f) {
                 return false;
+            }
+            if (Character.isSurrogate(c)) {
+                if (!Character.isHighSurrogate(c) || i + 1 == node.length()
+                        || !Character.isLowSurrogate(node.charAt(i + 1))) {
+                    return false;
+                }
+                i++; // the pair is one code point
             }
         }
         return true;

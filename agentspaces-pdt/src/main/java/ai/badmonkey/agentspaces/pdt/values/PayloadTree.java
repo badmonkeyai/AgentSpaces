@@ -90,7 +90,8 @@ public final class PayloadTree {
         if (cbor.length == 0) {
             throw new IllegalArgumentException("an empty payload is not a CBOR item");
         }
-        Ctx ctx = new Ctx(NodeLoader.of(store), KeyHasher.SHA256, null);
+        // PDT 2 phase 6 (rule 7): every member of an escalating space reads the payload, so it holds level-1 kinds only
+        Ctx ctx = new Ctx(NodeLoader.of(store), KeyHasher.SHA256, null, true);
         Object spilled = Spill.spill(cbor, ctx);
         TreeNode root;
         Map<String, byte[]> nodes;
@@ -130,7 +131,7 @@ public final class PayloadTree {
         if (Cids.parse(root).codec() != Cids.DAG_CBOR) {
             throw new NodeFormatException(root, "a payload root is a dag-cbor node");
         }
-        Ctx ctx = new Ctx(loader, KeyHasher.SHA256, null);
+        Ctx ctx = new Ctx(loader, KeyHasher.SHA256, null, true);
         String kind = NodeCodec.kindOf(loader.load(root));
         if (Kind.X.equals(kind) || Kind.M.equals(kind) || Kind.VR.equals(kind) || Kind.B.equals(kind)) {
             return Spill.resolve(root, ctx);

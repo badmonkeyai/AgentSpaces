@@ -29,6 +29,10 @@ import java.util.Optional;
  * A key changed on both sides to different outcomes goes to the {@link Resolver}
  * once; the ref layer supplies the HLC rule of §3.6.1 and records the conflict.
  * The merge policy lives here only.
+ *
+ * <p>PDT 2 phase 6 (P2-T-03; srad/agentspaces-pdt2.md §3.9): the built-in merge of kind
+ * {@code t}. A key changed on both sides to two texts takes their union, which raises no
+ * conflict, since a text is a CRDT; when the two disagree on a character the resolver decides.
  */
 public final class Merge {
 
@@ -113,10 +117,15 @@ public final class Merge {
             if (sameOutcome(myChange.after(), theirChange.after())) {
                 continue;
             }
-            byte[] kept = resolver.resolve(key,
-                    resolve(myChange.before(), baseCtx),
-                    resolve(myChange.after(), mineCtx),
-                    resolve(theirChange.after(), theirCtx));
+            byte[] mineValue = resolve(myChange.after(), mineCtx);
+            byte[] theirValue = resolve(theirChange.after(), theirCtx);
+            byte[] union = mineValue != null && theirValue != null && PText.isText(mineValue) && PText.isText(theirValue)
+                    ? PText.union(mineValue, theirValue) : null;
+            if (union != null) {
+                editor.assoc(key, union);
+                continue;
+            }
+            byte[] kept = resolver.resolve(key, resolve(myChange.before(), baseCtx), mineValue, theirValue);
             if (kept == null) {
                 editor.dissoc(key);
             } else {

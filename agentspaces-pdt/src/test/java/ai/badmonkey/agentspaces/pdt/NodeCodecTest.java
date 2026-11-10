@@ -17,17 +17,26 @@ package ai.badmonkey.agentspaces.pdt;
 
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.content.tree.Cids;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -154,19 +163,110 @@ class NodeCodecTest {
         assertThat(recovered).containsEntry("name", "pdt").containsEntry("ratio", 1.5d);
     }
 
+    /** The skipper walks every CBOR form, indefinite ones, half floats, and any tag included; the codec decides what a node may hold. */
     @Test
-    void skipperHandlesIndefiniteFormsFloatsAndTagsInsideEmbeddedItems() {
+    void skipperHandlesIndefiniteFormsFloatsAndTags() {
         byte[] indefiniteMap = bytes(0xbf, 0x61, 0x61, 0x01, 0x61, 0x62, 0x9f, 0x01, 0x02, 0xff, 0xff);
         byte[] indefiniteText = bytes(0x7f, 0x62, 0x61, 0x62, 0x61, 0x63, 0xff);
         byte[] halfFloat = bytes(0xf9, 0x3c, 0x00);
         byte[] tagged = bytes(0xc1, 0x1a, 0x51, 0x4b, 0x67, 0xb0);
         byte[] bigUint = bytes(0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
-        List<Object> items = List.of(new Embedded(indefiniteMap), new Embedded(indefiniteText),
-                new Embedded(halfFloat), new Embedded(tagged), new Embedded(bigUint));
-        byte[] encoded = NodeCodec.encode(Map.of("k", "mc", "e", items));
-        assertThat(NodeCodec.decode(encoded).get("e")).isEqualTo(items);
-        assertThat(NodeCodec.skip(indefiniteMap, 0)).isEqualTo(indefiniteMap.length);
-        assertThat(NodeCodec.skip(concat(halfFloat, bytes(0x00)), 0)).isEqualTo(3);
+        for (byte[] item : List.of(indefiniteMap, indefiniteText, halfFloat, tagged, bigUint)) {
+            assertThat(NodeCodec.skip(concat(item, bytes(0x00)), 0)).isEqualTo(item.length);
+        }
+        // a tag is no nesting level (rule S2), and a long chain of tags costs no stack
+        byte[] chain = new byte[100_001];
+        Arrays.fill(chain, (byte) 0xc1);
+        chain[chain.length - 1] = 0x01;
+        assertThat(NodeCodec.skip(chain, 0)).isEqualTo(chain.length);
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (owner ruling F2, change JD-4): every embedded item is a document
+     * in the wire encoding, tags 2, 3 and 4 included, so each document vector embeds in a node,
+     * encoded and decoded, exactly when the wire encoding accepts it. A node therefore never
+     * carries an item that no other implementation reads to the same value.
+     */
+    @TestFactory
+    Stream<DynamicTest> everyDocumentVectorEmbedsInANodeExactlyWhenTheWireEncodingAcceptsIt() throws Exception {
+        Path vectors = Path.of("..", "tools", "wire-encoding", "vectors.json");
+        assertThat(vectors).as("the wire-encoding vectors ship with the repository").exists();
+        JsonNode all = new ObjectMapper().readTree(Files.readAllBytes(vectors)).get("vectors");
+        return StreamSupport.stream(all.spliterator(), false)
+                .filter(v -> v.get("carrier").asText().equals("document"))
+                .map(v -> DynamicTest.dynamicTest(v.get("id").asText() + " " + v.get("verdict").asText() + ": "
+                        + v.get("why").asText(), () -> {
+                    byte[] item = HexFormat.of().parseHex(v.get("hex").asText());
+                    // the hand-assembled node {k: "x", v: item}, as a peer that writes any item would send it
+                    byte[] raw = concat(bytes(0xa2, 0x61, 0x6b, 0x61, 0x78, 0x61, 0x76), item);
+                    if (v.get("verdict").asText().equals("accept")) {
+                        assertThat(NodeCodec.encode(Map.of("k", "x", "v", new Embedded(item)))).isEqualTo(raw);
+                        assertThat(NodeCodec.decode(raw).get("v")).isEqualTo(new Embedded(item));
+                    } else {
+                        assertThatThrownBy(() -> NodeCodec.encode(Map.of("k", "x", "v", new Embedded(item))))
+                                .isInstanceOf(NodeFormatException.class);
+                        assertThatThrownBy(() -> NodeCodec.decode(raw)).isInstanceOf(NodeFormatException.class);
+                    }
+                }));
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (change JD-4, wire encoding 2.4): the item rules judge an embedded
+     * item by its own bytes in every slot, so the node's own map and entry list add no nesting
+     * level. Each document vector embeds as a map node's key, as its value, and as a vector
+     * node's element exactly when the wire encoding accepts it, and the codec reads every node it
+     * writes. The decoder once counted the entry list as a level and refused the 64-level vectors
+     * {@code doc-44} and {@code doc-53} in a list slot that the encoder had written.
+     */
+    @TestFactory
+    Stream<DynamicTest> everyDocumentVectorEmbedsInEveryListSlotExactlyWhenTheWireEncodingAcceptsIt() throws Exception {
+        Path vectors = Path.of("..", "tools", "wire-encoding", "vectors.json");
+        JsonNode all = new ObjectMapper().readTree(Files.readAllBytes(vectors)).get("vectors");
+        byte[] text = CBOR.toBytes("kk");
+        return StreamSupport.stream(all.spliterator(), false)
+                .filter(v -> v.get("carrier").asText().equals("document"))
+                .map(v -> DynamicTest.dynamicTest(v.get("id").asText() + " " + v.get("verdict").asText() + ": "
+                        + v.get("why").asText(), () -> {
+                    byte[] item = HexFormat.of().parseHex(v.get("hex").asText());
+                    // the hand-assembled nodes {e: [kk, item], k: "mc"}, {e: [item, kk], k: "mc"} and {c: [], e: [item], k: "v"}
+                    Map<String, byte[]> raws = new LinkedHashMap<>();
+                    raws.put("as a map value", concat(bytes(0xa2, 0x61, 0x65, 0x82), text, item, bytes(0x61, 0x6b, 0x62, 0x6d, 0x63)));
+                    raws.put("as a map key", concat(bytes(0xa2, 0x61, 0x65, 0x82), item, text, bytes(0x61, 0x6b, 0x62, 0x6d, 0x63)));
+                    raws.put("as a vector element", concat(bytes(0xa3, 0x61, 0x63, 0x80, 0x61, 0x65, 0x81), item, bytes(0x61, 0x6b, 0x61, 0x76)));
+                    Map<String, Map<String, Object>> nodes = Map.of(
+                            "as a map value", Map.of("k", "mc", "e", List.of(new Embedded(text), new Embedded(item))),
+                            "as a map key", Map.of("k", "mc", "e", List.of(new Embedded(item), new Embedded(text))),
+                            "as a vector element", Map.of("k", "v", "c", List.of(), "e", List.of(new Embedded(item))));
+                    for (Map.Entry<String, byte[]> raw : raws.entrySet()) {
+                        Map<String, Object> node = nodes.get(raw.getKey());
+                        if (v.get("verdict").asText().equals("accept")) {
+                            assertThat(NodeCodec.encode(node)).as(raw.getKey()).isEqualTo(raw.getValue());
+                            assertThat(NodeCodec.decode(raw.getValue())).as(raw.getKey()).isEqualTo(node);
+                            assertThat(NodeCodec.links(raw.getValue())).as(raw.getKey()).isEmpty();
+                        } else {
+                            assertThatThrownBy(() -> NodeCodec.encode(node)).as(raw.getKey())
+                                    .isInstanceOf(NodeFormatException.class);
+                            assertThatThrownBy(() -> NodeCodec.decode(raw.getValue())).as(raw.getKey())
+                                    .isInstanceOf(NodeFormatException.class);
+                            assertThatThrownBy(() -> NodeCodec.links(raw.getValue())).as(raw.getKey())
+                                    .isInstanceOf(NodeFormatException.class);
+                        }
+                    }
+                }));
+    }
+
+    /** HLC round six, 2026-11-08 (owner ruling F2): Java's big numbers embed and recover as the values they are. */
+    @Test
+    void bigNumbersEmbedUnderTheirTagsAndRecoverThroughCborCodec() {
+        java.math.BigInteger big = java.math.BigInteger.TWO.pow(70).negate();
+        java.math.BigDecimal decimal = new java.math.BigDecimal("-12.5");
+        List<Object> items = List.of(embed(big), embed(decimal));
+        assertThat(items.get(0)).extracting(e -> ((Embedded) e).bytes()[0]).isEqualTo((byte) 0xc3);
+        assertThat(items.get(1)).extracting(e -> ((Embedded) e).bytes()[0]).isEqualTo((byte) 0xc4);
+        List<?> decoded = (List<?>) NodeCodec.decode(NodeCodec.encode(Map.of("k", "v", "e", items))).get("e");
+        assertThat(decoded).isEqualTo(items);
+        assertThat(CBOR.fromBytes(((Embedded) decoded.get(0)).bytes(), java.math.BigInteger.class)).isEqualTo(big);
+        assertThat(CBOR.fromBytes(((Embedded) decoded.get(1)).bytes(), java.math.BigDecimal.class)).isEqualTo(decimal);
     }
 
     @Test
@@ -257,13 +357,16 @@ class NodeCodecTest {
 
     @Test
     void refusesAReservedKindByName() {
+        // PDT 2 phase 0 (P2-F-04): s stays reserved for PSortedMap, tm and ec join it; rr has a schema now
         assertThat(Kind.reserved("s")).isTrue();
-        assertThat(Kind.reserved("rr")).isTrue();
+        assertThat(Kind.reserved("tm")).isTrue();
+        assertThat(Kind.reserved("ec")).isTrue();
+        assertThat(Kind.reserved("rr")).isFalse();
         assertThat(Kind.known("s")).isFalse();
         assertThat(Kind.known("m")).isTrue();
-        assertThatThrownBy(() -> NodeCodec.decode(bytes(0xa1, 0x61, 0x6b, 0x62, 0x72, 0x72)))
+        assertThatThrownBy(() -> NodeCodec.decode(bytes(0xa1, 0x61, 0x6b, 0x62, 0x74, 0x6d)))
                 .isInstanceOf(NodeFormatException.class)
-                .hasMessageContaining("kind 'rr' is reserved");
+                .hasMessageContaining("kind 'tm' is reserved");
     }
 
     @Test
@@ -421,7 +524,16 @@ class NodeCodecTest {
         assertThat(NodeCodec.schemaKeys("vr")).containsExactlyInAnyOrder("n", "s", "r", "t");
         assertThat(NodeCodec.schemaKeys("b")).containsExactlyInAnyOrder("h", "c", "z");
         assertThat(NodeCodec.schemaKeys("x")).containsExactly("v");
-        assertThat(Kind.all()).containsExactlyInAnyOrder("m", "mc", "v", "vr", "b", "x", "sn");
+        // PDT 2 phase 0 (P2-D-01, P2-R-01, P2-T-01, P2-V-01, P2-B-02): the seven level-2 kinds
+        assertThat(NodeCodec.schemaKeys("db")).containsExactlyInAnyOrder("v", "s", "me", "mt", "bf", "i", "t");
+        assertThat(NodeCodec.schemaKeys("dn")).containsExactlyInAnyOrder("l", "x", "e", "c");
+        assertThat(NodeCodec.schemaKeys("rr")).containsExactlyInAnyOrder("n", "s", "r", "t");
+        assertThat(NodeCodec.schemaKeys("rv")).containsExactlyInAnyOrder("c", "z");
+        assertThat(NodeCodec.schemaKeys("t")).containsExactlyInAnyOrder("r", "v");
+        assertThat(NodeCodec.schemaKeys("vg")).containsExactlyInAnyOrder("r", "b", "i", "t", "p");
+        assertThat(NodeCodec.schemaKeys("bo")).containsExactlyInAnyOrder("g", "n", "p", "c");
+        assertThat(Kind.all()).containsExactlyInAnyOrder("m", "mc", "v", "vr", "b", "x", "sn",
+                "db", "dn", "rr", "rv", "t", "vg", "bo");
     }
 
     /** PD-N-04: a spilled-value link in an embedded slot is a link of the node and counts against the bound. */
@@ -456,10 +568,41 @@ class NodeCodecTest {
     void linksReadsValueSlotsOnlyOnMapNodes() {
         byte[] linkItem = concat(bytes(0xd8, 0x2a, 0x58, 0x25, 0x00), linkTo("spilled").binary());
         byte[] node = NodeCodec.encode(Map.of("k", "m", "d", 1, "n", 0,
-                "e", List.of(new Embedded(linkItem), embed("plain"), embed("key"), new Embedded(linkItem)), "c", List.of()));
+                "e", List.of(embed("plain"), new Embedded(linkItem), embed("key"), embed("value")), "c", List.of()));
         assertThat(NodeCodec.links(node)).containsExactly(linkTo("spilled").cid());
         byte[] leaf = NodeCodec.encode(Map.of("k", "v", "e", List.of(new Embedded(linkItem), embed(1), new Embedded(linkItem))));
         assertThat(NodeCodec.links(leaf)).hasSize(2);
+    }
+
+    /**
+     * HLC round six, 2026-11-08 (owner ruling F2): tag 42 stands only as a bare link item in a
+     * value slot (PD-N-05). A key never spills, so the codec refuses a link item in a key slot of
+     * a map node in both directions, as every reader refuses tag 42 in any other document.
+     */
+    @Test
+    void refusesALinkItemInAKeySlotOfAMapNode() {
+        byte[] linkItem = concat(bytes(0xd8, 0x2a, 0x58, 0x25, 0x00), linkTo("spilled").binary());
+        for (String kind : List.of("m", "mc")) {
+            Map<String, Object> node = new HashMap<>();
+            node.put("k", kind);
+            node.put("e", List.of(new Embedded(linkItem), embed("value")));
+            if (kind.equals("m")) {
+                node.putAll(Map.of("d", 1, "n", 0, "c", List.of()));
+            }
+            assertThatThrownBy(() -> NodeCodec.encode(node)).as(kind).isInstanceOf(NodeFormatException.class)
+                    .hasMessageContaining("key");
+            Map<String, Object> keyedByText = new HashMap<>(node);
+            keyedByText.put("e", List.of(embed("ke"), embed("value")));
+            byte[] honest = NodeCodec.encode(keyedByText);
+            // the same node with the link item spliced into the key slot in place of the text "ke"
+            byte[] key = CBOR.toBytes("ke");
+            int at = indexOf(honest, key);
+            byte[] forged = concat(Arrays.copyOfRange(honest, 0, at), linkItem,
+                    Arrays.copyOfRange(honest, at + key.length, honest.length));
+            assertThatThrownBy(() -> NodeCodec.decode(forged)).as(kind).isInstanceOf(NodeFormatException.class)
+                    .hasMessageContaining("key");
+            assertThatThrownBy(() -> NodeCodec.links(forged)).as(kind).isInstanceOf(NodeFormatException.class);
+        }
     }
 
     private static int indexOf(byte[] haystack, byte[] needle) {

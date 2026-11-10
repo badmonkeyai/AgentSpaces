@@ -35,6 +35,25 @@ class CidsTest {
     /** The IPFS CID of the empty DAG-CBOR map ({@code 0xa0}). */
     private static final String EMPTY_DAG_CBOR_MAP = "bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua";
 
+    /**
+     * PDT 2 phase 1, P2-X-09 (phase 0 gate finding G2, srad/agentspaces-pdt2.md §10.5): a CID's
+     * text is its one canonical base32 form. 36 bytes take 58 base32 characters with two padding
+     * bits in the last; text whose padding bits are set decodes to the same bytes, and every port
+     * refuses it, so the content swarm's strict reads refuse it too.
+     */
+    @Test
+    void aCidWithPaddingBitsSetIsNoCid() {
+        String canonical = Cids.of(new byte[]{1, 2, 3}, Cids.RAW);
+        String alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+        char last = canonical.charAt(canonical.length() - 1);
+        String padded = canonical.substring(0, canonical.length() - 1) + alphabet.charAt(alphabet.indexOf(last) | 1);
+        assertThat(padded).isNotEqualTo(canonical);
+        assertThat(Cids.parse(padded).digest()).as("the same bytes").isEqualTo(Cids.parse(canonical).digest());
+        assertThat(Cids.isCid(canonical)).isTrue();
+        assertThat(Cids.isCid(padded)).isFalse();
+        assertThat(Cids.isCid(canonical.toUpperCase(java.util.Locale.ROOT))).isFalse();
+    }
+
     @Test
     void emptyRawChunkMatchesTheKnownVector() {
         assertThat(Cids.of(new byte[0], Cids.RAW)).isEqualTo(EMPTY_RAW);
@@ -143,6 +162,31 @@ class CidsTest {
         assertThat(Cids.codecName(Cids.DAG_CBOR)).isEqualTo("dag-cbor");
         assertThat(Cids.codecName(Cids.RAW)).isEqualTo("raw");
         assertThatThrownBy(() -> Cids.codecName(0x00)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aBlobIdentityIsARawCidOverBlake3ThatParseLeavesToItsOwnReader() {
+        // PDT 2 phase 4, P2-B-01: Cids names a blob's identity by multihash 0x1e beside the sha2-256 node CIDs
+        byte[] digest = new byte[32];
+        new Random(3).nextBytes(digest);
+        String identity = Cids.identity(digest);
+        assertThat(identity).startsWith("bafkr4i");
+        assertThat(Cids.isIdentity(identity)).isTrue();
+        assertThat(Cids.identityDigest(identity)).isEqualTo(digest);
+        assertThat(Cids.isCid(identity)).as("a node CID names sha2-256 (decision 9)").isFalse();
+        assertThatThrownBy(() -> Cids.parse(identity)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("BLAKE3 identity").hasMessageContaining("identityDigest");
+        assertThat(Cids.isIdentity(EMPTY_RAW)).as("a sha2-256 CID is no identity").isFalse();
+        assertThat(Cids.isIdentity(withBytes(1, Cids.DAG_CBOR, Cids.BLAKE3, 32))).as("an identity names raw bytes").isFalse();
+        assertThat(Cids.isIdentity(null)).isFalse();
+        assertThat(Cids.isIdentity("bnope")).isFalse();
+        String alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+        int last = alphabet.indexOf(identity.charAt(identity.length() - 1));
+        String padded = identity.substring(0, identity.length() - 1) + alphabet.charAt(last ^ 1);
+        assertThat(Cids.isIdentity(padded)).as("a padding bit set: only the canonical text").isFalse();
+        assertThatThrownBy(() -> Cids.identityDigest(EMPTY_RAW)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("BLAKE3 identity");
+        assertThatThrownBy(() -> Cids.identity(new byte[31])).isInstanceOf(IllegalArgumentException.class);
     }
 
     private static String withBytes(int version, int codec, int multihash, int length) {

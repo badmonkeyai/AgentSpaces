@@ -498,7 +498,7 @@ public final class RaftLog implements CapabilityProvider {
     private void onFrame(PeerId from, byte[] payload) {
         Frame frame;
         try {
-            frame = codec.fromBytes(payload, Frame.class);
+            frame = codec.fromWire(payload, Frame.class);
         } catch (RuntimeException e) {
             return;
         }

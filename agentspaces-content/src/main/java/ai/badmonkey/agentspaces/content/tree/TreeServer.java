@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.content.tree;
 
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.content.Messages;
+import ai.badmonkey.agentspaces.content.tree.sync.SketchServer;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -71,6 +72,30 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code NODE_WANT} the nodes that fit go out and a {@code REJECT} reason
  * {@link Messages#REASON_OVER_BUDGET} follows, so the asker reassigns the rest at
  * once.
+ *
+ * <p>Level 2 (srad/agentspaces-pdt2.md §6.10, PDT 2 phase 3). A host that advertises the PDT feature
+ * level 2 ({@link Host#levelTwo}) answers tag 12 {@code CHALLENGE} (P2-S-07): the grant is checked as
+ * for a {@code NODE_WANT}, the held picks go back in {@code NODES} under the challenge's {@code req}
+ * with the rest in {@code missing}, and a holder of no pick refuses the root with {@code REJECT}
+ * reason {@link Messages#REASON_NOT_HELD}. An artifact root's picks name its pieces by the raw CID of
+ * their table digests and come from {@link Host#piece}; a chunk-group pick waits for the BLAKE3
+ * identity of phase 4 and is answered missing. A level-1 host drops both forms and counts them.
+ *
+ * <p>Reconciliation (PDT 2 phase 5, P2-K-02, rule 12). A level-2 host answers a sketch {@code TREE_WANT}
+ * ({@code root ""}) through its {@link SketchServer} ({@link Host#sketches}) with a {@code TREE_END} of
+ * reason {@link Messages#END_SKETCH}, an empty frontier, and the reply in {@code sketch}, after it spends
+ * the reply's bytes from the upload budget. A host without one does not reconcile and refuses with
+ * {@code REJECT} reason {@link Messages#REASON_POLICY}, as it refuses an asker whose advertisement it reads
+ * at level 1 ({@link Host#readsLevelTwo}, P2-F-05); a sketch outside its grammar is dropped and
+ * counted, and a session past its rounds is refused with reason {@link Messages#REASON_OVER_BUDGET}.
+ *
+ * <p>Intra-chunk deltas (PDT 2 phase 4, P2-Z-01, P2-Z-02, srad/agentspaces-pdt2.md §3.8). When this holder and the
+ * asker are both at level 2 ({@link Host#levelTwo}, {@link Host#readsLevelTwo}) and the answer travels in
+ * plaintext, a {@code TREE_WANT} walk sends a raw chunk as the {@code dcz} frame the store keeps for it
+ * ({@link TreeStore#deltas}) in the appended {@code NODES.deltas}, when the frame's base lies under a haves root
+ * the asker holds and the frame is under half the chunk. Budgets and packing count the frame's bytes, and a
+ * {@code NODES} carries at most {@link Messages#MAX_WANT_CIDS} frames. Every other answer carries the chunk whole,
+ * and a {@code NODES} without deltas keeps its level-1 bytes.
  */
 public final class TreeServer {
 
@@ -84,6 +109,8 @@ public final class TreeServer {
     static final int NODE_FRAMING_BYTES = 5;
     /** The CBOR framing of the list itself plus the seal's nonce and tag (12 + 16 bytes). */
     static final int MESSAGE_FRAMING_BYTES = 5 + 12 + 16;
+    /** The CBOR framing one delta may add: the map, its three keys, two CID texts, and the frame's header (P2-Z-01). */
+    static final int DELTA_FRAMING_BYTES = 160;
 
     /** What the server needs from the capability. */
     public interface Host {
@@ -129,6 +156,43 @@ public final class TreeServer {
         default long nowMillis() {
             return System.currentTimeMillis();
         }
+
+        /** Whether this holder advertises the PDT feature level 2, so it reads the level-2 forms (P2-F-05). */
+        default boolean levelTwo() {
+            return false;
+        }
+
+        /**
+         * Whether a member's advertisement carries the PDT feature level 2 (P2-F-05), so this holder may send it
+         * a level-2 form such as {@code NODES.deltas} (PDT 2 phase 4, P2-Z-01).
+         *
+         * @param peer the asker
+         * @return true when the asker reads the level-2 forms
+         */
+        default boolean readsLevelTwo(PeerId peer) {
+            return false;
+        }
+
+        /**
+         * The piece of an artifact root this holder holds whose table digest the raw CID names, for a
+         * challenge pick (P2-S-07).
+         *
+         * @param root the artifact root
+         * @param cid  the raw CID of the piece's sha2-256 digest
+         * @return the whole piece, or empty when the root does not list it or this holder lacks it
+         */
+        default Optional<byte[]> piece(String root, String cid) {
+            return Optional.empty();
+        }
+
+        /** A challenge of a root was answered with every pick it named (P2-S-13 counts them). */
+        default void challengeAnswered(String root) {
+        }
+
+        /** The holder's side of a reconciliation (P2-K-02), or empty when this holder does not reconcile. */
+        default Optional<SketchServer> sketches() {
+            return Optional.empty();
+        }
     }
 
     private record Reachable(long atMillis, Set<String> cids) {
@@ -141,6 +205,7 @@ public final class TreeServer {
     private final AtomicLong dropped = new AtomicLong();
     private final AtomicLong nodesServed = new AtomicLong();
     private final AtomicLong nodesWalked = new AtomicLong();
+    private final AtomicLong deltasServed = new AtomicLong();
     private final Map<String, Reachable> pruneCache = new LinkedHashMap<>(16, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, Reachable> eldest) {
@@ -193,6 +258,11 @@ public final class TreeServer {
     /** Nodes visited by send walks and prune walks together (PD-P-02). */
     public long nodesWalked() {
         return nodesWalked.get();
+    }
+
+    /** Chunks sent as a {@code dcz} frame in {@code NODES.deltas} (PDT 2 phase 4, P2-Z-02). */
+    public long deltasServed() {
+        return deltasServed.get();
     }
 
     /**
@@ -266,8 +336,12 @@ public final class TreeServer {
      * @param want the request
      */
     public void serve(PeerId from, Messages.TreeWant want) {
-        if (want.violation().isPresent()) {
+        if (want.violation().isPresent() || (want.reconciles() && !host.levelTwo())) {
             dropped.incrementAndGet();
+            return;
+        }
+        if (want.reconciles()) {
+            reconcile(from, want);
             return;
         }
         String root = want.root();
@@ -279,10 +353,13 @@ public final class TreeServer {
             reject(from, root, Messages.REASON_NOT_HELD);
             return;
         }
-        if (!canSeal(from, want.req())) {
+        Optional<Messages.Nodes> probe = host.seal(from, want.req(), List.of(), null);
+        if (probe.isEmpty()) {
             reject(from, root, Messages.REASON_POLICY);
             return;
         }
+        // PDT 2 phase 4, P2-Z-01 and P2-F-05: frames go from a level-2 holder to a level-2 asker, in plaintext only
+        boolean sendDeltas = probe.get().plaintext() && host.levelTwo() && host.readsLevelTwo(from);
         List<String> haves = want.haves() == null ? List.of() : want.haves();
         Set<String> prune = new HashSet<>();
         boolean anyHaveHeld = false;
@@ -309,6 +386,7 @@ public final class TreeServer {
         depths.add(0);
         visited.add(root);
         List<byte[]> batch = new ArrayList<>();
+        List<Messages.NodeDelta> deltas = new ArrayList<>();
         List<String> missing = new ArrayList<>();
         long packed = MESSAGE_FRAMING_BYTES;
         long sent = 0;
@@ -337,12 +415,15 @@ public final class TreeServer {
                 continue;
             }
             byte[] bytes = node.get();
-            if (sent + bytes.length > want.budget()) {
+            Messages.NodeDelta delta = sendDeltas ? deltaFor(cid, bytes.length, prune) : null;
+            int cost = delta == null ? bytes.length : delta.dcz().length;
+            int framing = delta == null ? NODE_FRAMING_BYTES : DELTA_FRAMING_BYTES;
+            if (sent + cost > want.budget()) {
                 reason = Messages.END_BUDGET;
                 break;
             }
-            if (!host.withinUploadBudget(bytes.length)) {
-                if (!sentAnything && batch.isEmpty()) {
+            if (!host.withinUploadBudget(cost)) {
+                if (!sentAnything && batch.isEmpty() && deltas.isEmpty()) {
                     reject(from, root, Messages.REASON_OVER_BUDGET);
                     return;
                 }
@@ -353,18 +434,26 @@ public final class TreeServer {
             depths.pollFirst();
             walked++;
             nodesWalked.incrementAndGet();
-            if (packed + bytes.length + NODE_FRAMING_BYTES > Messages.MAX_NODES_BYTES && !batch.isEmpty()) {
-                if (!flush(from, want.req(), root, batch, missing)) {
+            // PDT 2 phase 4, P2-Z-01: a NODES also carries at most MAX_WANT_CIDS deltas, or its receiver drops it
+            boolean full = packed + cost + framing > Messages.MAX_NODES_BYTES
+                    || (delta != null && deltas.size() == Messages.MAX_WANT_CIDS);
+            if (full && !(batch.isEmpty() && deltas.isEmpty())) {
+                if (!flush(from, want.req(), root, batch, missing, deltas)) {
                     return;
                 }
                 sentAnything = true;
                 batch = new ArrayList<>();
+                deltas = new ArrayList<>();
                 missing = new ArrayList<>();
                 packed = MESSAGE_FRAMING_BYTES;
             }
-            batch.add(bytes);
-            packed += bytes.length + NODE_FRAMING_BYTES;
-            sent += bytes.length;
+            if (delta == null) {
+                batch.add(bytes);
+            } else {
+                deltas.add(delta);
+            }
+            packed += cost + framing;
+            sent += cost;
             List<String> links;
             try {
                 links = store.links(cid, bytes);
@@ -378,8 +467,8 @@ public final class TreeServer {
                 }
             }
         }
-        if (!batch.isEmpty() || !missing.isEmpty()) {
-            if (!flush(from, want.req(), root, batch, missing)) {
+        if (!batch.isEmpty() || !missing.isEmpty() || !deltas.isEmpty()) {
+            if (!flush(from, want.req(), root, batch, missing, deltas)) {
                 return;
             }
         }
@@ -393,6 +482,103 @@ public final class TreeServer {
             reason = Messages.END_BUDGET;
         }
         host.send(from, new Messages.TreeEnd(want.req(), frontier, reason));
+    }
+
+    /** Answers a sketch {@code TREE_WANT} (P2-K-02) as the class comment describes. */
+    private void reconcile(PeerId from, Messages.TreeWant want) {
+        Optional<SketchServer> sketches = host.sketches();
+        if (sketches.isEmpty() || !host.readsLevelTwo(from)) {
+            // rule 12: this holder does not reconcile; P2-F-05: a sketch TREE_END is a level-2 form, so a member this
+            // holder reads at level 1 gets the level-1 refusal instead (PDT 2 phase 5 adversary)
+            reject(from, want.root(), Messages.REASON_POLICY);
+            return;
+        }
+        switch (sketches.get().answer(from, want.req(), want.sketch(), want.budget())) {
+            case SketchServer.Reply reply -> {
+                if (!host.withinUploadBudget(reply.sketch().length)) {
+                    reject(from, want.root(), Messages.REASON_OVER_BUDGET);
+                    return;
+                }
+                host.send(from, new Messages.TreeEnd(Messages.TREE_END, want.req(), List.of(), Messages.END_SKETCH, reply.sketch()));
+            }
+            case SketchServer.Refusal refusal -> reject(from, want.root(), refusal.reason());
+            case SketchServer.Dropped ignored -> dropped.incrementAndGet();
+        }
+    }
+
+    /**
+     * Answers a {@code CHALLENGE} (P2-S-07) as the class comment describes. A tree root's picks are
+     * granted one by one as a {@code NODE_WANT}'s CIDs are; an artifact root's picks are its own pieces,
+     * so the root's grant covers them.
+     *
+     * @param from      the challenger
+     * @param challenge the challenge
+     */
+    public void serve(PeerId from, Messages.Challenge challenge) {
+        if (!host.levelTwo() || challenge.violation().isPresent()) {
+            dropped.incrementAndGet();
+            return;
+        }
+        String root = challenge.root();
+        // an artifact root is the raw CID of its piece table; a tree root names a dag-cbor node
+        boolean artifact = Cids.parse(root).codec() == Cids.RAW;
+        if (!host.mayServe(from, root)) {
+            reject(from, root, Messages.REASON_POLICY);
+            return;
+        }
+        for (Messages.Pick pick : challenge.picks()) {
+            if (!artifact && !host.mayServe(from, pick.cid())) {
+                reject(from, root, Messages.REASON_POLICY);
+                return;
+            }
+        }
+        if (!canSeal(from, challenge.req())) {
+            reject(from, root, Messages.REASON_POLICY);
+            return;
+        }
+        List<byte[]> held = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        long total = 0;
+        for (Messages.Pick pick : challenge.picks()) {
+            Optional<byte[]> bytes = Optional.empty();
+            if (Messages.Pick.NODE.equals(pick.names())) {
+                bytes = store == null ? Optional.empty() : store.get(pick.cid());
+                if (bytes.isEmpty() && artifact) {
+                    bytes = host.piece(root, pick.cid());
+                }
+            }
+            if (bytes.isPresent()) {
+                held.add(bytes.get());
+                total += bytes.get().length;
+            } else {
+                missing.add(pick.cid());
+            }
+        }
+        if (held.isEmpty()) {
+            reject(from, root, Messages.REASON_NOT_HELD);
+            return;
+        }
+        if (total > Integer.MAX_VALUE || !host.withinUploadBudget((int) total)) {
+            reject(from, root, Messages.REASON_OVER_BUDGET);
+            return;
+        }
+        List<byte[]> batch = new ArrayList<>();
+        long packed = MESSAGE_FRAMING_BYTES;
+        for (byte[] bytes : held) {
+            if (packed + bytes.length + NODE_FRAMING_BYTES > Messages.MAX_NODES_BYTES && !batch.isEmpty()) {
+                if (!flush(from, challenge.req(), root, batch, List.of())) {
+                    return;
+                }
+                batch = new ArrayList<>();
+                packed = MESSAGE_FRAMING_BYTES;
+            }
+            batch.add(bytes);
+            packed += bytes.length + NODE_FRAMING_BYTES;
+        }
+        // only an answer that holds every pick counts as passed in the ledger rows (P2-S-13)
+        if (flush(from, challenge.req(), root, batch, missing) && missing.isEmpty()) {
+            host.challengeAnswered(root);
+        }
     }
 
     /**
@@ -451,19 +637,49 @@ public final class TreeServer {
         return host.seal(to, req, List.of(), null).isPresent();
     }
 
+    /**
+     * The kept frame of a raw chunk that this answer may send in its place (P2-Z-02): its base lies under a haves
+     * root the asker holds, and it is under half the chunk. Null when there is none.
+     */
+    private Messages.NodeDelta deltaFor(String cid, int chunkBytes, Set<String> prune) {
+        if (prune.isEmpty() || Cids.parse(cid).codec() != Cids.RAW) {
+            return null;
+        }
+        for (Messages.NodeDelta delta : store.deltas(cid)) {
+            if (prune.contains(delta.base()) && 2L * delta.dcz().length < chunkBytes) {
+                return delta;
+            }
+        }
+        return null;
+    }
+
     private boolean flush(PeerId to, int req, String root, List<byte[]> batch, List<String> missing) {
+        return flush(to, req, root, batch, missing, List.of());
+    }
+
+    private boolean flush(PeerId to, int req, String root, List<byte[]> batch, List<String> missing,
+                          List<Messages.NodeDelta> deltas) {
         Optional<Messages.Nodes> message = host.seal(to, req, batch, missing.isEmpty() ? null : List.copyOf(missing));
-        if (message.isEmpty()) {
+        if (message.isEmpty() || (!deltas.isEmpty() && !message.get().plaintext())) {
             reject(to, root, Messages.REASON_POLICY);
             return false;
         }
+        Messages.Nodes out = message.get();
         long bytes = 0;
         for (byte[] node : batch) {
             bytes += node.length;
         }
+        if (!deltas.isEmpty()) {
+            // rule 14 of §6.10.3: the frames ride in the appended field beside the plaintext nodes
+            out = new Messages.Nodes(Messages.NODES, out.req(), out.nodes(), null, null, out.missing(), List.copyOf(deltas));
+            for (Messages.NodeDelta delta : deltas) {
+                bytes += delta.dcz().length;
+            }
+            deltasServed.addAndGet(deltas.size());
+        }
         nodesServed.addAndGet(batch.size());
-        host.served(batch.size(), bytes);
-        host.send(to, message.get());
+        host.served(batch.size() + deltas.size(), bytes);
+        host.send(to, out);
         return true;
     }
 

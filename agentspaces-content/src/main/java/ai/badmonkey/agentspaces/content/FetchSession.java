@@ -351,12 +351,19 @@ final class FetchSession implements Fetch {
             }
             this.manifest = manifest;
             this.table = table;
+            if (options.expectedSize() > 0 && manifest.size() != options.expectedSize()) {
+                note("the manifest states " + manifest.size() + " bytes where " + options.expectedSize() + " were expected");
+                done.completeExceptionally(new IllegalArgumentException("the artifact " + root + " is " + manifest.size()
+                        + " bytes; the fetch expects " + options.expectedSize()));
+                return;
+            }
             if (!fabric.canOpen(manifest)) {
                 note("sealed root and this peer holds no content key; the fetch cannot proceed");
                 done.completeExceptionally(new IllegalStateException("root " + root + " is sealed under a content key this peer does not hold"));
                 return;
             }
-            store.open(manifest);
+            // a hash-keyed store marks the pieces it holds under other roots (PDT 2 phase 1, P2-H-02)
+            store.open(manifest, table);
             verified = store.have(root);
             verified.clear(manifest.pieces(), Integer.MAX_VALUE);
             for (int i = verified.nextSetBit(0); i >= 0; i = verified.nextSetBit(i + 1)) {
@@ -484,7 +491,7 @@ final class FetchSession implements Fetch {
             }
             Outstanding out = outstanding.remove(piece.req());
             if (out == null || !out.source().id.equals(from) || out.index() != piece.index()
-                    || out.offset() != piece.offset() || piece.bytes() == null) {
+                    || out.offset() != piece.offset()) {
                 return; // unsolicited or mismatched (LB-X-02)
             }
             Source source = out.source();

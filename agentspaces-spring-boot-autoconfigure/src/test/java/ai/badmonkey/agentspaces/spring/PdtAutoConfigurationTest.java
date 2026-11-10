@@ -405,10 +405,10 @@ class PdtAutoConfigurationTest {
         // the bean method of the starter carries both beans into the holder through the providers
         NodeStore mine = NodeStore.inMemory();
         PdtMergeFunction bean = PdtMergeFunction.of("log", PRef.KIND_VECTOR, append);
-        Pdts fromBeans = autoConfig.agentSpacesPdts(provider(mine), provider(bean));
+        Pdts fromBeans = autoConfig.agentSpacesPdts(provider(mine), provider(bean), provider(null));
         assertThat(fromBeans.userStore()).contains(mine);
         assertThat(fromBeans.mergeFunctions()).containsExactly(bean);
-        assertThat(autoConfig.agentSpacesPdts(provider(null), provider(null)).mergeFunctions()).isEmpty();
+        assertThat(autoConfig.agentSpacesPdts(provider(null), provider(null), provider(null)).mergeFunctions()).isEmpty();
     }
 
     private static <T> ObjectProvider<T> provider(T value) {
@@ -458,6 +458,61 @@ class PdtAutoConfigurationTest {
         assertThat(heads).hasSize(1);
         assertThat(heads.get(0).value().sealing()).isEqualTo(pdt.refs().config().sealing());
         assertThat(heads.get(0).value().inlineBytes()).isLessThanOrEqualTo(1024);
+    }
+
+    /** A note a task carries, for the verb whose trailing parameter takes a ref. */
+    public record Note(String id, String text) {
+    }
+
+    /** A bean with a {@code @PdtRef} field and a verb whose trailing parameter is one (PDT 2 phase 7, P2-X-03). */
+    @ai.badmonkey.agentspaces.agent.annotation.AgentSpec(name = "noter", description = "Notes facts", goals = {"note"})
+    public static class Noter {
+        @ai.badmonkey.agentspaces.agent.annotation.PdtRef("facts")
+        Ref<PMap<String, String>> facts;
+
+        @ai.badmonkey.agentspaces.agent.annotation.SpaceTake(space = "tasks", pollTimeout = "PT0.2S")
+        public void note(Note note,
+                         @ai.badmonkey.agentspaces.agent.annotation.PdtRef("notes") Ref<PMap<String, String>> notes) {
+            notes.swap(m -> m.assoc(note.id(), note.text()));
+        }
+    }
+
+    @Test
+    void aBoundBeanGetsTheGroupFacadesRefsInAFieldAndAVerbParameter(@TempDir Path dir) throws Exception {
+        Wired wired = wire(properties(freePort(), 0, dir.resolve("x")));
+        wired.lifecycle().start();
+        Noter noter = new Noter();
+
+        wired.spaces().bind(noter);
+        noter.facts.swap(m -> m.assoc("claim-1", "the sky is blue"));
+        wired.spaces().group("fleet").space("tasks").write(new Note("n-1", "water is wet"), Lease.of(Duration.ofMinutes(5)));
+
+        assertThat(wired.facts().deref().get("claim-1")).as("the field is the facade's ref").contains("the sky is blue");
+        Ref<PMap<String, String>> notes = wired.pdt().mapRef("notes", STR, STR);
+        assertThat(await(Duration.ofSeconds(10), () -> notes.deref().get("n-1").isPresent())).isTrue();
+
+        AgentSpacesProperties off = properties(freePort(), 0, dir.resolve("y"));
+        off.getPdt().setEnabled(false);
+        Wired plain = wire(off);
+        assertThatThrownBy(() -> plain.spaces().bind(new Noter())).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("agentspaces.pdt.enabled");
+    }
+
+    @Test
+    void aRefsFollowAndTheStoreQuotaApplyToTheFacade(@TempDir Path dir) throws Exception {
+        AgentSpacesProperties properties = properties(freePort(), 0, dir.resolve("x"));
+        AgentSpacesProperties.PersistentTrees.RefDef cold = new AgentSpacesProperties.PersistentTrees.RefDef();
+        cold.setFollow("lazy");
+        properties.getPdt().getRefs().put("archive", cold);
+        properties.getPdt().getStore().setQuota(1024 * 1024);
+        Wired wired = wire(properties);
+
+        // PDT 2 phase 7, P2-X-08: the per-ref follow and the quota behind the bridge, in place of the logged notes
+        assertThat(wired.pdt().refs().config().followsFully("archive")).isFalse();
+        assertThat(wired.pdt().refs().config().followsFully("facts")).isTrue();
+        assertThat(wired.content().treeStore()).hasValue(wired.pdt().treeStore());
+        assertThat(((ai.badmonkey.agentspaces.pdt.swarm.NodeStoreTreeStore) wired.pdt().treeStore()).quota())
+                .isEqualTo(1024 * 1024);
     }
 
     @Test

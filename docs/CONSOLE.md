@@ -1,5 +1,7 @@
 # The Fleet Console
 
+Written for: operators of a fleet.
+
 The console (`agentspaces-console`) is observability derived entirely from
 coordination state. Membership answers "who is alive", discovery answers "who
 can do what", and the replicated space answers "what is the fleet working

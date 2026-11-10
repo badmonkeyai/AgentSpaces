@@ -267,7 +267,7 @@ public final class OrderedTakes {
     public void onCommand(byte[] command, long logIndex) {
         ClaimCommand parsed;
         try {
-            parsed = codec.fromBytes(command, ClaimCommand.class);
+            parsed = codec.fromWire(command, ClaimCommand.class);
         } catch (RuntimeException e) {
             return;
         }

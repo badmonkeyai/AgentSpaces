@@ -18,6 +18,8 @@
  * §3.6, PD-R-01): a {@link ai.badmonkey.agentspaces.agent.pdt.PRef} names one
  * version of a ref by its root and the roots it was computed from. A plain
  * record named {@code ai.badmonkey.agentspaces.agent.pdt.PRef#v1} on the wire,
- * as the content records are, and pinned by golden vectors. Stability: API.
+ * as the content records are, and pinned by golden vectors. A
+ * {@link ai.badmonkey.agentspaces.agent.pdt.RefResolver} builds the handles the binder
+ * injects into {@code @PdtRef} sites (PDT 2 phase 7, P2-X-03). Stability: API.
  */
 package ai.badmonkey.agentspaces.agent.pdt;

@@ -24,7 +24,7 @@ import ai.badmonkey.agentspaces.content.Messages;
  * {@link #reason()} carries. The store evicts nothing to make room: a quota is a
  * ceiling on new bytes, and collection alone frees space.
  */
-public final class QuotaExceededException extends RuntimeException {
+public final class QuotaExceededException extends ai.badmonkey.agentspaces.content.tree.StoreRefusedException {
 
     private static final long serialVersionUID = 1L;
 
@@ -43,7 +43,7 @@ public final class QuotaExceededException extends RuntimeException {
      */
     public QuotaExceededException(String cid, long requested, long bytesUsed, long quota) {
         super("quota of " + quota + " bytes refuses " + requested + " more bytes with " + bytesUsed
-                + " held" + (cid == null ? "" : " for node " + cid));
+                + " held" + (cid == null ? "" : " for node " + cid), Messages.REASON_OVER_BUDGET);
         this.cid = cid;
         this.requested = requested;
         this.bytesUsed = bytesUsed;
@@ -68,10 +68,5 @@ public final class QuotaExceededException extends RuntimeException {
     /** The quota. */
     public long quota() {
         return quota;
-    }
-
-    /** The swarm's reject reason for this refusal: {@link Messages#REASON_OVER_BUDGET}. */
-    public int reason() {
-        return Messages.REASON_OVER_BUDGET;
     }
 }

@@ -94,6 +94,14 @@ public final class CompositeStore implements PieceStore {
     }
 
     @Override
+    public void open(Manifest manifest, byte[] table) {
+        if (writable == null) {
+            throw new IllegalStateException("no writable backend");
+        }
+        writable.open(manifest, table);
+    }
+
+    @Override
     public BitSet have(String root) {
         BitSet union = new BitSet();
         backends.forEach(b -> union.or(b.have(root)));

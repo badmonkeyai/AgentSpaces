@@ -86,6 +86,77 @@ class CborCodecTest {
         }
     }
 
+    /**
+     * HLC round four, 2026-11-08 (decision D3): a stamp on the wire is a definite-length,
+     * untagged CBOR text string whose bytes are shortest-form UTF-8 under the shortest length
+     * header. Jackson's CBOR parser decoded overlong UTF-8, unwrapped tags, and joined
+     * indefinite-length chunks silently, so each of these items decoded to the canonical stamp
+     * and a signature over the re-encoding verified. The codec now refuses every one of them.
+     */
+    @Test
+    void aStampDecodesOnlyFromADefiniteUntaggedShortestFormTextString() {
+        CborCodec codec = CborCodec.defaultCodec();
+        byte[] honest = codec.toBytes(new Stamped(new HlcTimestamp(5, 0, "nA")));
+        byte[] item = cat(new byte[]{0x66}, ascii("5:0:nA"));
+        assertThat(codec.fromBytes(honest, Stamped.class).stamp()).isEqualTo(new HlcTimestamp(5, 0, "nA"));
+        Map<String, byte[]> hostile = new java.util.LinkedHashMap<>();
+        hostile.put("overlong C1 81 for 'A' in the node", cat(new byte[]{0x67}, ascii("5:0:n"),
+                new byte[]{(byte) 0xC1, (byte) 0x81}));
+        hostile.put("a UTF-8 encoded surrogate in the node", cat(new byte[]{0x68}, ascii("5:0:n"),
+                new byte[]{(byte) 0xED, (byte) 0xA0, (byte) 0x80}));
+        hostile.put("indefinite-length text, one chunk", cat(new byte[]{0x7F}, item, new byte[]{(byte) 0xFF}));
+        hostile.put("indefinite-length text, two chunks", cat(new byte[]{0x7F, 0x63}, ascii("5:0"),
+                new byte[]{0x63}, ascii(":nA"), new byte[]{(byte) 0xFF}));
+        hostile.put("tag 0", cat(new byte[]{(byte) 0xC0}, item));
+        hostile.put("tag 32", cat(new byte[]{(byte) 0xD8, 0x20}, item));
+        hostile.put("a byte string", cat(new byte[]{0x46}, ascii("5:0:nA")));
+        hostile.put("a non-shortest length header", cat(new byte[]{0x78, 0x06}, ascii("5:0:nA")));
+        for (Map.Entry<String, byte[]> e : hostile.entrySet()) {
+            byte[] bytes = splice(honest, item, e.getValue());
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> codec.fromBytes(bytes, Stamped.class))
+                    .as(e.getKey()).isInstanceOf(java.io.UncheckedIOException.class);
+        }
+    }
+
+    /** The same rule holds for a stamp inside a list and a map, where Jackson reads it from a nested token. */
+    @Test
+    void aNestedStampIsJudgedOnItsOwnBytes() {
+        CborCodec codec = CborCodec.defaultCodec();
+        record Nested(java.util.List<HlcTimestamp> stamps, Map<String, HlcTimestamp> byName) {
+        }
+        Nested value = new Nested(java.util.List.of(new HlcTimestamp(7, 1, "nA")),
+                Map.of("k", new HlcTimestamp(7, 1, "nA")));
+        byte[] honest = codec.toBytes(value);
+        assertThat(codec.fromBytes(honest, Nested.class)).isEqualTo(value);
+        byte[] item = cat(new byte[]{0x66}, ascii("7:1:nA"));
+        byte[] tagged = splice(honest, item, cat(new byte[]{(byte) 0xC0}, item));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> codec.fromBytes(tagged, Nested.class))
+                .isInstanceOf(java.io.UncheckedIOException.class);
+    }
+
+    private static byte[] ascii(String text) {
+        return text.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
+    private static byte[] cat(byte[]... parts) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (byte[] part : parts) {
+            out.writeBytes(part);
+        }
+        return out.toByteArray();
+    }
+
+    /** Replaces the first occurrence of {@code from} in {@code bytes}, which must hold it. */
+    private static byte[] splice(byte[] bytes, byte[] from, byte[] to) {
+        for (int i = 0; i + from.length <= bytes.length; i++) {
+            if (java.util.Arrays.equals(bytes, i, i + from.length, from, 0, from.length)) {
+                return cat(java.util.Arrays.copyOfRange(bytes, 0, i), to,
+                        java.util.Arrays.copyOfRange(bytes, i + from.length, bytes.length));
+            }
+        }
+        throw new AssertionError("the stamp item was not found");
+    }
+
     @Test
     void unknownFieldsAreIgnoredOnRead() {
         CborCodec codec = CborCodec.defaultCodec();

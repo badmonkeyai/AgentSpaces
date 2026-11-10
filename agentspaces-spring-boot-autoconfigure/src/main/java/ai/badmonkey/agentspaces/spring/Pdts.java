@@ -57,8 +57,40 @@ import java.util.Set;
  * ({@link #register}): its tick joins the group's tick and its close, with the
  * pack store's, joins the group's close (PD-S-02: the pack index is written on
  * close).
+ *
+ * <p>A host that builds its facades after the shared wiring (the Micronaut factory) hands the holder a
+ * {@link Hosted} instead (PDT 2 phase 7, P2-X-04): each group's swarm takes the host's tree store, the spaces
+ * under {@code agentspaces.pdt.spaces} escalate through a deferred seam ({@link #payloadsFor}), and the host
+ * hands each facade it builds to {@link #adopt}. In both cases every group with trees gives its binder
+ * {@link #refsFor}, so {@code @PdtRef} sites resolve through the group's facade (P2-X-03).
  */
 public final class Pdts {
+
+    /**
+     * What a host that builds its own facades after the shared wiring hands the holder (the Micronaut factory,
+     * PD-C-03; PDT 2 phase 7, P2-X-04, P2-X-08).
+     */
+    public interface Hosted {
+
+        /**
+         * The tree store a group's content swarm is built with: the bridge over the group's node store, which is
+         * sealed under the ring in the {@code sealed-nodes} mode and admits received nodes through the store's quota.
+         * The host builds the group's facade over the same node store later.
+         *
+         * @param groupName the group
+         * @param ring      the group's content-key ring, or null when the group has no content key
+         * @return the tree store
+         */
+        ai.badmonkey.agentspaces.content.tree.TreeStore treeStore(String groupName, GroupKeyRing ring);
+
+        /**
+         * The escalation of each space named under {@code agentspaces.pdt.spaces}, which the shared wiring
+         * builds over {@link #payloadsFor} before the host's facade exists.
+         *
+         * @return the escalations by space name
+         */
+        Map<String, AgentSpacesProperties.PersistentTrees.SpaceEscalation> spaces();
+    }
 
     private static final System.Logger LOG = System.getLogger(Pdts.class.getName());
 
@@ -67,9 +99,11 @@ public final class Pdts {
     }
 
     private final NodeStore userStore;
-    private final java.util.function.Function<String, NodeStore> storesByGroup;
+    private final Hosted hosted;
     private final List<PdtMergeFunction> mergeFunctions;
     private final Map<String, Pdt> byGroup = new LinkedHashMap<>();
+    /** The content stores of the groups, filled when {@code agentspaces.store.enabled} is true (PDT 2 phase 3). */
+    private final ContentStores stores = new ContentStores();
     /** The pack backends this holder opened, closed with their group. */
     private final Map<Pdt, AutoCloseable> backends = new java.util.IdentityHashMap<>();
 
@@ -89,21 +123,20 @@ public final class Pdts {
     }
 
     /**
-     * A holder whose node stores another host builds per group (the Micronaut
-     * factory's {@code PdtStores}, PD-C-03): the resolver answers every group's
-     * store and the {@code store.*} keys are read by that host, so this holder
-     * opens no store of its own.
+     * A holder for a host that builds its facades after the shared wiring (the Micronaut factory, PD-C-03; PDT 2
+     * phase 7, P2-X-04): the host reads the {@code agentspaces.pdt.*} keys, so this holder opens no store of its
+     * own, and it hands each facade to {@link #adopt} once built.
      *
-     * @param storesByGroup  the store per group name
+     * @param hosted         the host's tree stores and space escalations
      * @param mergeFunctions the {@code PdtMergeFunction} beans, in order
      */
-    public Pdts(java.util.function.Function<String, NodeStore> storesByGroup, List<PdtMergeFunction> mergeFunctions) {
-        this(null, Objects.requireNonNull(storesByGroup, "storesByGroup"), mergeFunctions);
+    public Pdts(Hosted hosted, List<PdtMergeFunction> mergeFunctions) {
+        this(null, Objects.requireNonNull(hosted, "hosted"), mergeFunctions);
     }
 
-    private Pdts(NodeStore userStore, java.util.function.Function<String, NodeStore> storesByGroup, List<PdtMergeFunction> mergeFunctions) {
+    private Pdts(NodeStore userStore, Hosted hosted, List<PdtMergeFunction> mergeFunctions) {
         this.userStore = userStore;
-        this.storesByGroup = storesByGroup;
+        this.hosted = hosted;
         this.mergeFunctions = List.copyOf(Objects.requireNonNull(mergeFunctions, "mergeFunctions"));
     }
 
@@ -114,21 +147,86 @@ public final class Pdts {
 
     /**
      * The tree store a group's content swarm is built with when another host
-     * builds the facade itself (PD-C-03): the adapter of {@code PdtSwarm.treeStore}
-     * over the resolver's store for the group, so the facade that host attaches
-     * later finds the swarm over its own node store. Empty for a holder without
-     * a resolver; the starter's own facades give the swarm their tree store.
+     * builds the facade itself (PD-C-03, P2-X-04): the host's, so the facade that
+     * host attaches later finds the swarm over its own node store, sealed when its
+     * sealing is {@code sealed-nodes}. Empty for a holder without a {@link Hosted};
+     * the starter's own facades give the swarm their tree store.
      *
      * @param groupName the group
+     * @param ring      the group's content-key ring, or null when it has no content key
      * @return the tree store, or empty
      */
-    public Optional<ai.badmonkey.agentspaces.content.tree.TreeStore> treeStoreFor(String groupName) {
-        if (storesByGroup == null) {
+    public Optional<ai.badmonkey.agentspaces.content.tree.TreeStore> treeStoreFor(String groupName, GroupKeyRing ring) {
+        if (hosted == null) {
             return Optional.empty();
         }
-        NodeStore store = Objects.requireNonNull(storesByGroup.apply(groupName),
-                "the store resolver answered null for group " + groupName);
-        return Optional.of(ai.badmonkey.agentspaces.pdt.swarm.PdtSwarm.treeStore(store));
+        return Optional.of(Objects.requireNonNull(hosted.treeStore(groupName, ring),
+                "the host answered no tree store for group " + groupName));
+    }
+
+    /**
+     * The escalation of each space named under {@code agentspaces.pdt.spaces}: the host's for a holder with a
+     * {@link Hosted} (P2-X-04), else the starter's block.
+     *
+     * @param config the starter's block
+     * @return the escalations by space name
+     */
+    Map<String, AgentSpacesProperties.PersistentTrees.SpaceEscalation> escalations(AgentSpacesProperties.PersistentTrees config) {
+        return hosted != null ? hosted.spaces() : config.getSpaces();
+    }
+
+    /**
+     * The seam a space under {@code agentspaces.pdt.spaces} escalates through when its group's facade is built after
+     * the space (PDT 2 phase 7, P2-X-04): it forwards to the facade's {@code payloads()} once {@link #adopt} has it.
+     * Before then a write finds every member unable, so the space falls back to the flat swarm or refuses by name
+     * under {@code require}, and a read reports its fetch failed, so the space retries it with its back-off.
+     *
+     * @param groupName the group
+     * @return the deferred seam
+     */
+    ai.badmonkey.agentspaces.api.spi.BulkPayloads payloadsFor(String groupName) {
+        return new DeferredPayloads(() -> find(groupName).map(Pdt::payloads));
+    }
+
+    /**
+     * What builds the handles of a group's {@code @PdtRef} sites (PDT 2 phase 7, P2-X-03): the group's facade, found
+     * when a bean binds, so a host that adopts its facade later still serves them.
+     *
+     * @param groupName the group
+     * @return the resolver
+     */
+    ai.badmonkey.agentspaces.agent.pdt.RefResolver refsFor(String groupName) {
+        Objects.requireNonNull(groupName, "groupName");
+        return (name, type) -> forGroup(groupName).refFor(name, type);
+    }
+
+    /**
+     * Takes a facade the host built and attached itself (PDT 2 phase 7, P2-X-04), so the deferred seams of
+     * {@link #payloadsFor} and {@link #refsFor} reach it and {@link #forGroup} finds it. The host starts, ticks,
+     * and closes it.
+     *
+     * @param groupName the group
+     * @param pdt       the facade, attached to the group's swarm
+     * @throws IllegalStateException for a holder without a {@link Hosted}, whose facades the starter registers
+     */
+    public synchronized void adopt(String groupName, Pdt pdt) {
+        Objects.requireNonNull(groupName, "groupName");
+        Objects.requireNonNull(pdt, "pdt");
+        if (hosted == null) {
+            throw new IllegalStateException("the starter registers this holder's facades itself; adopt is for a host"
+                    + " that builds its own (Pdts(Hosted, mergeFunctions))");
+        }
+        byGroup.put(groupName, pdt);
+    }
+
+    /** The groups' content stores (PDT 2 phase 3, P2-S-10). */
+    public ContentStores stores() {
+        return stores;
+    }
+
+    /** Whether another host builds the facades after the shared wiring (the Micronaut factory, PD-C-03, P2-X-04). */
+    boolean resolvesStores() {
+        return hosted != null;
     }
 
     /** The application's merge functions. */
@@ -205,9 +303,6 @@ public final class Pdts {
     private Built open(AgentSpacesProperties.PersistentTrees config, String groupName, InstantSource clock) {
         AgentSpacesProperties.PersistentTrees.Store store = config.getStore();
         String kind = store.getKind() == null ? "" : store.getKind().trim().toLowerCase(java.util.Locale.ROOT);
-        if (storesByGroup != null) {
-            return new Built(Objects.requireNonNull(storesByGroup.apply(groupName), "the store resolver answered null for group " + groupName), null);
-        }
         if (userStore != null) {
             if (!"bean".equals(kind)) {
                 LOG.log(System.Logger.Level.INFO, "group ''{0}'': a NodeStore bean replaces agentspaces.pdt.store.kind={1}",
@@ -280,6 +375,18 @@ public final class Pdts {
      */
     public Pdt build(AgentSpacesProperties.PersistentTrees config, String groupName, Space refSpace,
                      InstantSource clock, GroupKeyRing ring) {
+        return build(config, groupName, refSpace, clock, ring, null, null, null);
+    }
+
+    /**
+     * As {@link #build(AgentSpacesProperties.PersistentTrees, String, Space, InstantSource, GroupKeyRing)} with the
+     * group's discovery, where {@code Pdt.storeFor} finds the content stores, and the challenge deadline of
+     * {@code agentspaces.store.challenge-deadline} (PDT 2 phase 3, P2-S-07, P2-S-11), and this peer's identity,
+     * which signs the pins {@code Pdt.storeFor} writes (PDT 2 follow-ups, 2026-11-09, F1).
+     */
+    public Pdt build(AgentSpacesProperties.PersistentTrees config, String groupName, Space refSpace,
+                     InstantSource clock, GroupKeyRing ring, ai.badmonkey.agentspaces.discovery.DiscoveryService discovery,
+                     java.time.Duration challengeDeadline, ai.badmonkey.agentspaces.identity.PeerIdentity identity) {
         boolean groupSeals = ring != null && !ring.epochs().isEmpty();
         Built built = open(config, groupName, clock);
         if (config.getInlineDelta() < 0 || config.getInlineDelta() > PRef.INLINE_DELTA_BYTES) {
@@ -304,16 +411,25 @@ public final class Pdts {
                     + " content-key, so its heads name sealing=none", groupName, sealing);
             sealing = PRef.SEALING_NONE;
         }
-        if (config.getStore().getQuota() > 0) {
-            LOG.log(System.Logger.Level.INFO, "group ''{0}'': agentspaces.pdt.store.quota={1} is recorded; the facade"
-                    + " of this phase applies no quota to the node store", groupName, config.getStore().getQuota());
-        }
         Pdt.Builder builder = Pdt.builder(refSpace).store(built.store()).clock(clock)
                 .retain(config.getRetain().getVersions(), config.getRetain().getAge())
                 .loadTimeout(config.getLoadTimeout()).inlineDelta(config.getInlineDelta())
                 .follow(follow).sealing(sealing);
         if (groupSeals) {
             builder.keyRing(ring);
+        }
+        if (config.getStore().getQuota() > 0) {
+            // PDT 2 phase 7, P2-X-08: received nodes pass the quota behind the bridge the swarm is built with
+            builder.quota(config.getStore().getQuota());
+        }
+        if (discovery != null) {
+            builder.discovery(discovery);
+        }
+        if (challengeDeadline != null) {
+            builder.challengeDeadline(challengeDeadline);
+        }
+        if (identity != null) {
+            builder.identity(identity);
         }
         for (Map.Entry<String, AgentSpacesProperties.PersistentTrees.RefDef> ref : config.getRefs().entrySet()) {
             AgentSpacesProperties.PersistentTrees.RefDef def = ref.getValue();
@@ -334,11 +450,7 @@ public final class Pdts {
                     throw new IllegalStateException("agentspaces.pdt.refs." + ref.getKey() + ".follow: '"
                             + def.getFollow() + "' is not full or lazy");
                 }
-                if (!refFollow.equals(follow)) {
-                    LOG.log(System.Logger.Level.WARNING, "group ''{0}'': agentspaces.pdt.refs.{1}.follow={2} differs"
-                            + " from agentspaces.pdt.follow={3}; the facade of this phase follows every ref in the"
-                            + " global mode", groupName, ref.getKey(), refFollow, follow);
-                }
+                builder.follow(ref.getKey(), refFollow); // PDT 2 phase 7, P2-X-08
             }
         }
         Pdt pdt = builder.build();

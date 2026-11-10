@@ -40,6 +40,11 @@ import java.util.function.Predicate;
  * {@code ConnectorRuntime} on the group's data space. Roots published with
  * {@code replicate: false} are reachable only this way, and a fetcher gets their
  * manifest with {@code MANIFEST_WANT}.
+ *
+ * <p>Tree roots (PDT 2 follow-ups, 2026-11-09, F3; P2-X-01, PD-X-09): a root this holder's tree store holds
+ * complete and publishes a holding for, whose manifest in the content space has {@code layout: tree}, is listed
+ * beside the flat roots, with {@code layout} {@code tree} and its {@code nodes}; a flat row says {@code layout}
+ * {@code pieces} and {@code nodes} 0.
  */
 public final class CollectionAssetProvider implements AssetProvider {
 
@@ -155,7 +160,7 @@ public final class CollectionAssetProvider implements AssetProvider {
                     assetName(c.name()),
                     "aspace://" + group.value() + "/content/" + c.name(),
                     describe(c),
-                    "rows(root,name,mediaType,size,pieces,created,origin,attrs,holders)",
+                    "rows(root,name,mediaType,size,pieces,created,origin,attrs,holders,layout,nodes)",
                     c.freshness().toString(),
                     Map.of(),
                     access));
@@ -224,24 +229,34 @@ public final class CollectionAssetProvider implements AssetProvider {
     }
 
     /**
-     * The roots this group's swarm serves, in root order, after {@code after} when it is given.
-     * LB-K-06: only roots this group's swarm serves; a store shared with another group holds more.
+     * The roots this group's swarm serves, flat and tree, in root order, after {@code after} when it is given.
+     * LB-K-06: only roots this group's swarm serves; a store shared with another group holds more, and the tree
+     * roots are those this swarm publishes holdings for.
      */
     private List<String> servedRoots(String after) {
         java.util.Set<String> held = content.store().roots();
         java.util.Set<String> here = content.rootsServedHere(held);
-        return held.stream()
-                .filter(here::contains)
+        return java.util.stream.Stream.concat(held.stream().filter(here::contains), content.treeRoots().stream())
                 .filter(root -> after == null || root.compareTo(after) > 0)
+                .distinct()
                 .sorted()
                 .toList();
     }
 
-    /** A root's manifest when the root is complete here and the collection includes it. */
+    /**
+     * A root's manifest when the root is complete here and the collection includes it: a flat root's from the
+     * piece store, a tree root's from the content space, where its {@code layout: tree} manifest lives.
+     */
     private Optional<Manifest> listable(Collection c, String root) {
-        return content.store().manifest(root)
-                .filter(m -> content.store().have(m.root()).cardinality() >= m.pieces())
-                .filter(c.includes());
+        Optional<Manifest> flat = content.store().manifest(root)
+                .filter(m -> content.store().have(m.root()).cardinality() >= m.pieces());
+        if (flat.isPresent()) {
+            return flat.filter(c.includes());
+        }
+        return content.treeRoots().contains(root) ? content.spaces().manifest(root)
+                .filter(Manifest::treeLayout)
+                .filter(m -> content.treeStore().map(t -> t.complete(root)).orElse(false))
+                .filter(c.includes()) : Optional.empty();
     }
 
     private java.util.stream.Stream<Manifest> rootsOf(Collection c) {
@@ -261,6 +276,8 @@ public final class CollectionAssetProvider implements AssetProvider {
         row.put("origin", m.origin().value());
         row.put("attrs", m.attrs() == null ? "" : attrsOf(m.attrs()));
         row.put("holders", String.valueOf(Math.max(1, completeHolders)));
+        row.put("layout", m.treeLayout() ? Manifest.LAYOUT_TREE : Manifest.LAYOUT_PIECES);
+        row.put("nodes", String.valueOf(m.treeLayout() ? content.treeStore().map(t -> t.reachable(m.root()).size()).orElse(0) : 0));
         return row;
     }
 

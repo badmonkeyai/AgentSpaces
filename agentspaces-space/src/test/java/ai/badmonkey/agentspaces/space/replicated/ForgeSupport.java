@@ -19,6 +19,8 @@ import ai.badmonkey.agentspaces.api.entry.EntryId;
 import ai.badmonkey.agentspaces.api.entry.EntryRecord;
 import ai.badmonkey.agentspaces.api.entry.LeaseInfo;
 import ai.badmonkey.agentspaces.api.entry.LeaseKind;
+import ai.badmonkey.agentspaces.api.security.AgentCertificate;
+import ai.badmonkey.agentspaces.api.spi.AgentIdentity;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
 import ai.badmonkey.agentspaces.common.id.AgentId;
@@ -71,12 +73,24 @@ final class ForgeSupport {
 
     /** Signs a record's immutable identity under {@code signer}, as a writer would. */
     static EntryRecord signRecord(PeerIdentity signer, EntryRecord unsigned) {
-        byte[] canonical = CODEC.toBytes(new SignView(unsigned.entryId(), unsigned.spaceId(),
+        return withSignature(unsigned, signer.sign(signViewBytes(unsigned)));
+    }
+
+    /** Signs a record's immutable identity under an agent's own key (TECH-SPEC §7.2). */
+    static EntryRecord signRecord(AgentIdentity signer, EntryRecord unsigned) {
+        return withSignature(unsigned, signer.sign(signViewBytes(unsigned)));
+    }
+
+    private static byte[] signViewBytes(EntryRecord unsigned) {
+        return CODEC.toBytes(new SignView(unsigned.entryId(), unsigned.spaceId(),
                 unsigned.type(), unsigned.payload(), unsigned.payloadRef(), unsigned.issuer(),
                 unsigned.issued(), unsigned.tags(), unsigned.keyEpoch()));
+    }
+
+    private static EntryRecord withSignature(EntryRecord unsigned, byte[] sig) {
         return new EntryRecord(unsigned.entryId(), unsigned.spaceId(), unsigned.type(),
                 unsigned.payload(), unsigned.payloadRef(), unsigned.issuer(), unsigned.issued(),
-                unsigned.lease(), unsigned.tags(), signer.sign(canonical), unsigned.keyEpoch());
+                unsigned.lease(), unsigned.tags(), sig, unsigned.keyEpoch());
     }
 
     /** The canonical bytes the state signature covers (SPEC §11a.4). */
@@ -108,6 +122,31 @@ final class ForgeSupport {
                 author.rawPublicKey(), List.of(new Dot(author.peerId().value(), 1)), List.of(),
                 issued, lease, false, null);
         return signState(author, unsigned);
+    }
+
+    /**
+     * Builds a complete write by a subordinate agent of {@code author} (SPEC §11a.4, v0.1.13):
+     * the agent signs the record under its certificate, and signs the state too, at
+     * {@code signedAt}, as an agent-attested party's transitions must be.
+     */
+    static SpaceWire.EntryStateDto agentWrite(PeerIdentity author, AgentIdentity agent, SpaceId spaceId,
+                                              Object entry, HlcTimestamp issued, HlcTimestamp signedAt,
+                                              long expiresAtMillis) {
+        AgentCertificate certificate = agent.certificate().orElseThrow();
+        LeaseInfo lease = new LeaseInfo(agent.id(), expiresAtMillis, LeaseKind.WRITE);
+        EntryRecord record = signRecord(agent, new EntryRecord(EntryId.newId(), spaceId,
+                schemaNameOf(entry.getClass()), CODEC.toBytes(entry), null, agent.id(), issued,
+                lease, Map.of(), null));
+        SpaceWire.EntryStateDto unsigned = new SpaceWire.EntryStateDto(record, author.rawPublicKey(),
+                List.of(new Dot(author.peerId().value(), 1)), List.of(), issued, lease, false, null, certificate)
+                .withAgentSigner(agent.id().encoded(), signedAt, certificate);
+        return unsigned.withStateSig(agent.sign(stateSignBytes(unsigned)));
+    }
+
+    /** Signs a take claim under a subordinate agent's key, its certificate beside the proof (QA4 A4-7 phase 3). */
+    static SpaceWire.SignedClaim signClaim(PeerIdentity peer, AgentIdentity agent, TakeClaim claim) {
+        return new SpaceWire.SignedClaim(claim, peer.rawPublicKey(), agent.sign(CODEC.toBytes(claim)),
+                agent.certificate().orElseThrow());
     }
 
     /** Signs a take claim under {@code holder}, as a claimant would. */

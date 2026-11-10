@@ -1,5 +1,7 @@
 # Build Environments
 
+Written for: contributors and release engineers.
+
 The reference for the Java build itself. `BUILD.md` at the workspace root is the
 companion runbook: the commands for all four suites, the environment gaps, and
 the test-writing notes.

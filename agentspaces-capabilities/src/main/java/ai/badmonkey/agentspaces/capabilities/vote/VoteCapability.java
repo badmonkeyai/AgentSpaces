@@ -25,6 +25,7 @@ import ai.badmonkey.agentspaces.api.space.Template;
 import java.util.function.Consumer;
 import ai.badmonkey.agentspaces.api.space.Subscription;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
+import ai.badmonkey.agentspaces.common.codec.WireRecord;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
@@ -75,6 +76,9 @@ public final class VoteCapability implements CapabilityProvider {
      * @param options    the allowed options
      * @param quorum     how many distinct voters close the decision
      */
+    // HLC round six, 2026-11-08 (owner ruling F1): a protocol record carried as an entry payload,
+    // read without coercion and only from its own encoding
+    @WireRecord
     public record Proposal(String proposalId, String question, List<String> options, int quorum) {
     }
 
@@ -85,6 +89,7 @@ public final class VoteCapability implements CapabilityProvider {
      * @param option     the chosen option
      * @param voter      the voting agent's encoded id
      */
+    @WireRecord // HLC round six, 2026-11-08 (owner ruling F1), as a proposal
     public record Ballot(String proposalId, String option, String voter) {
     }
 

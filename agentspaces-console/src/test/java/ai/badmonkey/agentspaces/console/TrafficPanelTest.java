@@ -201,6 +201,48 @@ class TrafficPanelTest {
         assertThat(after.get("framesFarFuture")).isEqualTo(1L);
     }
 
+    /**
+     * HLC round four, 2026-11-08 (decisions D3 and D5): a frame whose stamp is a tagged text
+     * string is undecodable, so the panel counts it as unverifiable, the counter of frames that
+     * name no verified sender, and never among the refusals a signer earned.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void showsAFrameWhoseStampIsNoCanonicalTextAsUnverifiable() throws Exception {
+        TrafficPanel panel = TrafficPanel.of(b, clock);
+        Map<String, Object> before = (Map<String, Object>) read(panel).get("totals");
+        long unverifiable = (Long) before.get("droppedUnverifiable");
+
+        ai.badmonkey.agentspaces.api.spi.TransportConnection injector = network.register("injector").dial("b");
+        String stamp = clock.millis() + ":0:" + a.peerId().value();
+        byte[] text = stamp.getBytes(StandardCharsets.US_ASCII);
+        byte[] item = new byte[text.length + 2];
+        item[0] = 0x78;
+        item[1] = (byte) text.length;
+        System.arraycopy(text, 0, item, 2, text.length);
+        byte[] frame = rumorFromA(clock.millis(), "tagged");
+        injector.send(tagFirst(frame, item));
+
+        Map<String, Object> after = (Map<String, Object>) read(panel).get("totals");
+        assertThat(after.get("droppedUnverifiable")).isEqualTo(unverifiable + 1);
+        assertThat(after.get("framesLogicalRefused")).isEqualTo(0L);
+        assertThat(after.get("framesFarFuture")).isEqualTo(0L);
+    }
+
+    /** Puts CBOR tag 0 before the first occurrence of {@code item} in {@code frame}. */
+    private static byte[] tagFirst(byte[] frame, byte[] item) {
+        for (int i = 0; i + item.length <= frame.length; i++) {
+            if (java.util.Arrays.equals(frame, i, i + item.length, item, 0, item.length)) {
+                byte[] out = new byte[frame.length + 1];
+                System.arraycopy(frame, 0, out, 0, i);
+                out[i] = (byte) 0xC0;
+                System.arraycopy(frame, i, out, i + 1, frame.length - i);
+                return out;
+            }
+        }
+        throw new AssertionError("the stamp item was not found");
+    }
+
     /** A signed RUMOR from A to B stamped at the given physical time. */
     private byte[] rumorFromA(long physical, String text) {
         ai.badmonkey.agentspaces.common.codec.CborCodec codec =

@@ -35,14 +35,17 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** ISSUE-AppCard FR-1 to FR-4: the card round-trips, keeps its limits, omits ui when absent, and matches the golden vector. */
+/**
+ * ISSUE-AppCard FR-1 to FR-4: the card round-trips, keeps its limits, omits ui when absent, and matches its module pin
+ * (neutral vectors, 2026-11-09: no card has a size cap, SPEC §6.1a.5).
+ */
 class AppCardTest {
 
     static AppCard card() {
         return new AppCard("aspace://zApps/app/zPeerA/adjuster-desk", PeerId.of("zPeerA"), GroupId.of("zApps"), Instant.parse("2026-11-04T10:00:00Z"),
                 Duration.ofMinutes(15), "adjuster-desk", "fed", "web", "claims-ops", List.of("claims-fleet/intake", "claims-fleet/views"),
-                List.of("approve", "escalate"), "bma-app-adjuster-desk", "https://desk.example/", "bma-example-desk", "1.2",
-                List.of("claims", "claim-detail"), new AppCard.Ui("a2ui", "v0.9.1", List.of("https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json", "bma"),
+                List.of("approve", "escalate"), "adjuster-desk-client", "https://desk.example/", "example-desk", "1.2",
+                List.of("claims", "claim-detail"), new AppCard.Ui("a2ui", "v0.9.1", List.of("https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json", "example-widgets"),
                         "claim-panel", "views", List.of("claim-77", "claim-78")));
     }
 
@@ -52,7 +55,6 @@ class AppCardTest {
         AppCard card = card();
         byte[] bytes = codec.toBytes(card);
         assertThat(codec.fromBytes(bytes, AppCard.class)).isEqualTo(card);
-        assertThat(bytes.length).as("under 4 KiB").isLessThan(4096);
         Path vector = Path.of("src/test/resources/vectors/app_card_cbor.hex");
         String hex = HexFormat.of().formatHex(bytes);
         if (!Files.exists(vector)) {

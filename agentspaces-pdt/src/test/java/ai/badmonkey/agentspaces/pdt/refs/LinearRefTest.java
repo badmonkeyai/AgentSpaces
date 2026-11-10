@@ -59,11 +59,27 @@ class LinearRefTest {
                 .take(Duration.ofSeconds(5), Duration.ofMillis(300), 100));
     }
 
+    /**
+     * The linear spec for two writers that take on two replicas at once (HLC round four,
+     * 2026-11-08). A take is exclusive only after its settle window, and the fleet's ref space
+     * settles in zero time, so both writers took the head, one complete failed with "take lease
+     * lapsed or lost", and a poll saw two live head entries. The test thread also ticks the
+     * clock 250 ms per poll, about one millisecond of wall time, so a 5 s take lapsed while its
+     * writer still worked. Three or four runs in twenty failed that way with the stamp rules of
+     * the day and with the clock of 2026-11-07 alike; with a 30 ms settle window and a 120 s
+     * take lease twenty runs in twenty passed.
+     */
+    private static RefFleet.Spec contended() {
+        return RefFleet.Spec.defaults().pdt(b -> b.mode(NAME, PRef.MODE_LINEAR)
+                        .take(Duration.ofSeconds(120), Duration.ofMillis(300), 100))
+                .refSpace(b -> b.settleWindow(Duration.ofMillis(30)));
+    }
+
     @Test
     void twoWritersOnALinearRefNeverProduceTwoHeads() throws Exception {
-        RefFleet.Peer a = fleet.newPeer("a", 1, linear());
-        RefFleet.Peer b = fleet.newPeer("b", 2, linear(), "a");
-        RefFleet.Peer c = fleet.newPeer("c", 3, linear(), "a");
+        RefFleet.Peer a = fleet.newPeer("a", 1, contended());
+        RefFleet.Peer b = fleet.newPeer("b", 2, contended(), "a");
+        RefFleet.Peer c = fleet.newPeer("c", 3, contended(), "a");
         fleet.settle(6);
         Ref<PMap<String, String>> onA = a.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
         Ref<PMap<String, String>> onB = b.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);

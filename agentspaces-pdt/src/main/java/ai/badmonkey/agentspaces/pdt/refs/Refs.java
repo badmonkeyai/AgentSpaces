@@ -30,17 +30,21 @@ import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
 import ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.agent.content.Holding;
 import ai.badmonkey.agentspaces.content.FetchOptions;
 import ai.badmonkey.agentspaces.content.tree.TreeFetch;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
 import ai.badmonkey.agentspaces.pdt.NodeUnavailableException;
+import ai.badmonkey.agentspaces.pdt.blob.BlobIdentity;
 import ai.badmonkey.agentspaces.pdt.blob.FileEntry;
 import ai.badmonkey.agentspaces.pdt.blob.PBlob;
+import ai.badmonkey.agentspaces.pdt.kinds.VgNode;
 import ai.badmonkey.agentspaces.pdt.store.Retention;
 import ai.badmonkey.agentspaces.pdt.swarm.PdtSwarm;
 import ai.badmonkey.agentspaces.pdt.values.Codec;
 import ai.badmonkey.agentspaces.pdt.values.Merge;
 import ai.badmonkey.agentspaces.pdt.values.NodeLoader;
+import ai.badmonkey.agentspaces.pdt.values.PDb;
 import ai.badmonkey.agentspaces.pdt.values.PMap;
 import ai.badmonkey.agentspaces.pdt.values.PSet;
 import ai.badmonkey.agentspaces.pdt.values.PVector;
@@ -89,9 +93,11 @@ import java.util.function.UnaryOperator;
  * <p>Reading. {@code deref} loads the single head, or merges several: maps,
  * sets, and trees key-wise and three-way against the lowest common base found by
  * walking base links over held versions for at most {@value #MAX_BASE_STEPS}
- * steps, both-side conflicts to the head with the later issued HLC (ties by the
- * issuer's PeerId bytes); vectors and blobs to the later head whole, unless
- * {@link #mergeFor} registered a function for the name (PD-R-05, PD-R-06). A
+ * steps (the empty value when the walks share no version and all end at first
+ * versions within the bound), both-side conflicts to the head with the later
+ * issued HLC (ties by the issuer's PeerId bytes); vectors and blobs to the
+ * later head whole, unless {@link #mergeFor} registered a function for the name
+ * (PD-R-05, PD-R-06). A
  * reader merges on read and never writes; every member computes the same result
  * from the same heads. A deref with several heads to fetch starts every fetch
  * first and waits for them together against one load timeout, so N unloadable
@@ -125,7 +131,32 @@ import java.util.function.UnaryOperator;
  * complete rewrites it with the same root, base, and seq under its own signature
  * (PD-R-08), carrying the original issue stamp and issuer in the reserved attrs
  * {@code pdt.issued} and {@code pdt.issuer}, so the merge order of the version
- * does not move with the rewrite.
+ * does not move with the rewrite. The pair is advisory: a head whose
+ * {@code pdt.issued} is absent, null, not text, or no acceptable canonical
+ * stamp, or whose {@code pdt.issuer} is present and null, not text, or no agent
+ * id, orders by its entry's own stamp and issuer together, and nothing is
+ * refused or counted for it (HLC round five, 2026-11-08, decision E10).
+ *
+ * <p>Version graph (PDT 2 phase 1, P2-V-01, P2-V-02; srad/agentspaces-pdt2.md §3.10). Every head
+ * a writer publishes names its {@code vg} node in the reserved attribute {@code pdt.ancestry}:
+ * the version's root, its bases, the issuer, a stamp, and a link to the {@code vg} node of each
+ * base the writer knows one for. The writer stores the node beside the delta, never inline, and
+ * keeps it while the version is live, and the collector keeps the chain below it through the
+ * links; the writer also fetches and holds each node it links, so the writer named in a chain
+ * node holds the next one, and a reader fetches nothing for the chain until a walk needs it. A base walk reads a version from the live entries when it can and from the chain
+ * otherwise, so a version whose entry left every replica still has its bases: the merge fetches
+ * the chain nodes it lacks by {@code NODE_WANT} from the heads' issuers and their holders, and
+ * the cancellation rule reads the chain nodes the store holds. A head whose {@code pdt.ancestry}
+ * is absent, no canonical dag-cbor CID, or names no {@code vg} node of its own root is a head
+ * without ancestry, read from the memory of the versions seen, as before. A sealed store writes
+ * no chain, because a keyless member could not read it.
+ *
+ * <p>Eager push (PDT 2 phase 5, group P; srad/agentspaces-pdt2.md §3.4). With push on, a writer whose delta does
+ * not ride inline announces the push on its head ({@link PushPublisher#ATTR}) and publishes the delta's nodes as
+ * {@link PushBundle} rumours on the ref's stream {@code pdt:<space>:<name>} ({@link PushPublisher}); a full follower
+ * with push on follows the stream ({@link PushReceiver}), stores the nodes the announced root reaches, and sends no
+ * request when they complete it. A follower whose announced push is still incomplete after the grace fetches what is
+ * missing by {@code TREE_WANT}, and a head without the attribute is fetched at once.
  *
  * <p>Threading. Space events arrive on the space's delivery thread; deref and
  * swap run on the caller's thread; the tick runs on the host's scheduler. State
@@ -143,16 +174,65 @@ public final class Refs implements AutoCloseable {
     /** The most base links a common-base walk follows (PD-R-06). */
     public static final int MAX_BASE_STEPS = 64;
 
+    /**
+     * The skew margin past {@code wall + MAX_DRIFT} within which a {@code pdt.issued} attr still
+     * orders a head (HLC round six, 2026-11-08, ruling R2): the five seconds of the far-future
+     * margin a frame's stamp is judged by ({@code PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS}, which
+     * this module names without importing the peer node).
+     */
+    static final long ISSUED_SKEW_MARGIN_MILLIS = 5_000L;
+
     /** The most entries of one name read at once; a read that fills it counts in {@link #entriesTruncated}. */
     public static final int MAX_ENTRIES = 4096;
 
     /** The most roots whose completeness is remembered (§6.7 row 4). */
     static final int COMPLETE_CAPACITY = 4096;
 
-    /** How long a root whose fetch failed is left alone before a deref starts its fetch again, as a multiple of the load timeout. */
+    /** The longest wait before a root whose fetch failed is fetched again, as a multiple of the load timeout (swarm retries). */
     static final int UNLOADABLE_BACKOFF = 4;
 
-    /** The common base of heads that are all first versions: the empty value. */
+    /**
+     * The first wait before a root whose fetch failed is fetched again; each later failure doubles it up to
+     * {@link #UNLOADABLE_BACKOFF} load timeouts, with a random spread of up to half (swarm retries, ROBUSTNESS.md §10.3 P2).
+     */
+    static final long RETRY_BASE_MILLIS = 1_000;
+
+    /** Why a live head was left out of a read while its root was still loading (swarm retries, ROBUSTNESS.md §10.3 P1). */
+    enum Late {
+        /** A deref waited the load timeout and the fetch was still running. */
+        TIMEOUT,
+        /** The fetch failed; the tick fetches the root again after a backoff. */
+        FAILED_FETCH,
+        /** The lazy load of the root node did not finish within the load timeout; the batch runs on. */
+        LAZY_LOAD
+    }
+
+    /**
+     * The heads left out of reads while their roots were still loading, by cause, each live entry counted once per
+     * cause (swarm retries, ROBUSTNESS.md §10.3 P1). Heads ignored for a fault count in {@link #headsIgnored} instead.
+     *
+     * @param timeout     a deref's wait ended with the fetch still running
+     * @param failedFetch the fetch failed and a retry is due
+     * @param lazyLoad    the lazy load of the root node ran past the load timeout
+     */
+    public record LateHeads(long timeout, long failedFetch, long lazyLoad) {
+        /** Every late head. */
+        public long total() {
+            return timeout + failedFetch + lazyLoad;
+        }
+    }
+
+    /** A root whose fetch failed: its failures so far and the clock time its next fetch is due (swarm retries). */
+    private static final class Retry {
+        int failures;
+        long dueMillis;
+    }
+
+    /** One count of a late head, so a live entry counts once per cause. */
+    private record LateNote(EntryId entry, Late cause) {
+    }
+
+    /** The common base of heads that are all first versions, or whose walks all end at first versions: the empty value. */
     private static final String EMPTY_BASE = "";
 
     /** The most haves a delta fetch names: the wire bound of PD-X-02. */
@@ -176,12 +256,14 @@ public final class Refs implements AutoCloseable {
      * @param takeTimeout how long a linear swap waits for the head
      * @param takeRetries how many takes a linear swap attempts after a timeout
      * @param modes       the configured mode per ref name; absent names follow their first head, else multi
+     * @param follows     the configured follow per ref name, true for full and false for lazy; absent names take
+     *                    {@code followFull} (PDT 2 phase 7, P2-X-08)
      * @param cancelGrace how long a writer keeps a superseded own head before cancelling it: two gossip
      *                    rounds, at least {@value #CANCEL_GRACE_MILLIS} ms (PD-R-03)
      */
     public record Config(Duration loadTimeout, int inlineDelta, boolean followFull, String sealing, Duration headLease,
                          Duration takeLease, Duration takeTimeout, int takeRetries, Map<String, String> modes,
-                         Duration cancelGrace) {
+                         Map<String, Boolean> follows, Duration cancelGrace) {
 
         public Config {
             Objects.requireNonNull(loadTimeout, "loadTimeout");
@@ -200,12 +282,24 @@ public final class Refs implements AutoCloseable {
                 throw new IllegalArgumentException("takeRetries must not be negative");
             }
             modes = modes == null ? Map.of() : Map.copyOf(modes);
+            follows = follows == null ? Map.of() : Map.copyOf(follows);
+        }
+
+        /**
+         * Whether a reader fetches each new head's tree of a ref at once: the ref's configured follow, else
+         * {@link #followFull} (PDT 2 phase 7, P2-X-08). A kind that never loads lazily is fetched either way.
+         *
+         * @param name the ref name
+         * @return true for full, false for lazy
+         */
+        public boolean followsFully(String name) {
+            return follows.getOrDefault(name, followFull);
         }
 
         /** The defaults of §7.2. */
         public static Config defaults() {
             return new Config(Duration.ofSeconds(10), PRef.INLINE_DELTA_BYTES, true, PRef.SEALING_NONE,
-                    DEFAULT_HEAD_LEASE, Duration.ofSeconds(30), Duration.ofSeconds(5), 3, Map.of(),
+                    DEFAULT_HEAD_LEASE, Duration.ofSeconds(30), Duration.ofSeconds(5), 3, Map.of(), Map.of(),
                     Duration.ofMillis(CANCEL_GRACE_MILLIS));
         }
     }
@@ -238,7 +332,10 @@ public final class Refs implements AutoCloseable {
         final TreeFetch fetch;
         final Heads.Head head;
         final long startedMillis;
-        /** Set once a deref waited the load timeout in vain; later derefs skip the head until the tick settles it. */
+        /**
+         * Set once a deref waited the load timeout in vain, and from the start for a retry; later derefs skip the head
+         * until the tick settles it.
+         */
         volatile boolean timedOut;
         /** A base of a head fetched so the version graph stays held (PD-R-06); not a head, so no watcher hears it. */
         final boolean base;
@@ -257,10 +354,10 @@ public final class Refs implements AutoCloseable {
         final Set<EntryId> takenEntries = ConcurrentHashMap.newKeySet();
         /** The ids of every entry of the name read last, well formed or not, so ignored entries are pruned against them. */
         volatile Set<EntryId> liveIds = Set.of();
-        /** Roots whose fetch failed, with the clock time, so a deref does not start and wait for the same fetch again at once. */
-        final Map<String, Long> unloadable = new LinkedHashMap<>(16, 0.75f, false) {
+        /** Roots whose fetch failed, with when the next fetch is due, so neither a deref nor the tick starts it again at once. */
+        final Map<String, Retry> unloadable = new LinkedHashMap<>(16, 0.75f, false) {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<String, Retry> eldest) {
                 return size() > MAX_HAVES;
             }
         };
@@ -275,14 +372,53 @@ public final class Refs implements AutoCloseable {
                 return size() > KNOWN_CAPACITY;
             }
         };
+        /** The {@code vg} node each version names, by root, from a head's {@code pdt.ancestry} or a chain link (P2-V-01); under {@code known}'s lock. */
+        final Map<String, String> ancestry = new LinkedHashMap<>(64, 0.75f, false) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                return size() > KNOWN_CAPACITY;
+            }
+        };
+        /** The identity each version of a blob ref claims, by root, from its head's {@code pdt.blake3} and {@code pdt.bao} (P2-B-01); under {@code known}'s lock. */
+        final Map<String, BlobIdentity> identities = new LinkedHashMap<>(16, 0.75f, false) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, BlobIdentity> eldest) {
+                return size() > KNOWN_CAPACITY;
+            }
+        };
+        /** The chain nodes this writer linked and lacks, with their heads' issuers, fetched in one batch per tick (P2-V-01). */
+        final Map<String, PeerId> chainWanted = new ConcurrentHashMap<>();
+        /**
+         * The chain nodes a walk could not get, with when the next ask is due, so a read during the backoff leaves the
+         * link out at once (P2-V-02; swarm retries, ROBUSTNESS.md §10.2).
+         */
+        final Map<String, Retry> chainMisses = new LinkedHashMap<>(16, 0.75f, false) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, Retry> eldest) {
+                return size() > KNOWN_CAPACITY;
+            }
+        };
+        /** The batch of {@link #chainWanted} in flight, at most one per ref. */
+        volatile TreeFetch chainBatch;
+        /** The chain nodes read, by the root they describe (P2-V-02); under {@code known}'s lock. */
+        final Map<String, VgNode> chain = new LinkedHashMap<>(64, 0.75f, false) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, VgNode> eldest) {
+                return size() > KNOWN_CAPACITY;
+            }
+        };
         /** The head entries this peer wrote, by entry id; a revert within the grace gives one root two entries. */
         final Map<EntryId, Own> own = new LinkedHashMap<>();
         final Set<EntryId> ownEntries = ConcurrentHashMap.newKeySet();
         /** Roots this peer wrote heads for, recorded before the write so the inline event of an own head is known as own. */
         final Set<String> ownRoots = ConcurrentHashMap.newKeySet();
+        /** The handle on the ref's push stream while this peer follows it (P2-P-02), else null. */
+        volatile AutoCloseable pushFollow;
         /** The roots live at the previous tick, so a head that lapsed since is a rewrite candidate. */
         volatile Set<String> previousLive = Set.of();
         final Set<EntryId> ignoredEntries = ConcurrentHashMap.newKeySet();
+        /** The late heads counted, by entry and cause, while the entries are live (swarm retries). */
+        final Set<LateNote> lateNoted = ConcurrentHashMap.newKeySet();
         final Map<String, Pending> pending = new ConcurrentHashMap<>();
         /**
          * Heads whose root was not complete when their event fired: a gossip batch may deliver a head before its
@@ -363,6 +499,10 @@ public final class Refs implements AutoCloseable {
     private final Retention retention;
     private final InstantSource clock;
     private final Config config;
+    /** The writer's side of eager push, or null with push off (P2-P-01). */
+    private final PushPublisher pusher;
+    /** The follower's side of eager push, or null with push off (P2-P-02). */
+    private final PushReceiver receiver;
     private final Map<String, State<?>> states = new ConcurrentHashMap<>();
     private final Map<String, MergeFunction<?>> mergeFunctions = new ConcurrentHashMap<>();
     private final AtomicLong deltasInline = new AtomicLong();
@@ -370,11 +510,14 @@ public final class Refs implements AutoCloseable {
     private final AtomicLong conflicts = new AtomicLong();
     private final AtomicLong bytesReceived = new AtomicLong();
     private final AtomicLong headsIgnored = new AtomicLong();
+    private final Map<Late, AtomicLong> headsLate = Map.of(Late.TIMEOUT, new AtomicLong(), Late.FAILED_FETCH, new AtomicLong(),
+            Late.LAZY_LOAD, new AtomicLong());
     private final AtomicLong nodesDropped = new AtomicLong();
     private final AtomicLong headsRewritten = new AtomicLong();
     private final AtomicLong basesFetched = new AtomicLong();
     private final AtomicLong entriesTruncated = new AtomicLong();
     private final AtomicLong mergeFunctionFailures = new AtomicLong();
+    private final AtomicLong chainNodesMissed = new AtomicLong();
     /** The kind a registered merge function was declared for, by name; absent when registered without one. */
     private final Map<String, String> mergeKinds = new ConcurrentHashMap<>();
     /**
@@ -397,8 +540,9 @@ public final class Refs implements AutoCloseable {
      * @param retention the retained versions, fed on every version seen
      * @param clock     the clock of leases and grace periods
      * @param config    the settings
+     * @param push      the settings of eager push (P2-P-01)
      */
-    public Refs(Space space, PdtSwarm swarm, Retention retention, InstantSource clock, Config config) {
+    public Refs(Space space, PdtSwarm swarm, Retention retention, InstantSource clock, Config config, PushPublisher.Config push) {
         this.space = Objects.requireNonNull(space, "space");
         this.swarm = Objects.requireNonNull(swarm, "swarm");
         this.store = swarm.store();
@@ -406,6 +550,9 @@ public final class Refs implements AutoCloseable {
         this.retention = Objects.requireNonNull(retention, "retention");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.config = Objects.requireNonNull(config, "config");
+        boolean pushing = Objects.requireNonNull(push, "push").enabled();
+        this.pusher = pushing ? new PushPublisher(swarm.content(), clock, push) : null;
+        this.receiver = pushing ? new PushReceiver(store, swarm.content(), clock, push) : null;
     }
 
     /**
@@ -475,12 +622,36 @@ public final class Refs implements AutoCloseable {
 
     /** A blob ref. */
     public Ref<PBlob> blobRef(String name) {
-        return ref(name, RefKind.blob());
+        return ref(name, RefKind.blob(root -> claimOf(name, root)));
+    }
+
+    /** The identity a head of a blob ref claims for a root (PDT 2 phase 4, P2-B-01), from the heads this engine read or wrote. */
+    private Optional<BlobIdentity> claimOf(String name, String root) {
+        State<?> state = states.get(name);
+        if (state == null) {
+            return Optional.empty();
+        }
+        synchronized (state.known) {
+            return Optional.ofNullable(state.identities.get(root));
+        }
     }
 
     /** A tree ref: the map from relative path to file entry of PD-B-05. */
     public Ref<PMap<String, FileEntry>> treeRef(String name) {
         return ref(name, RefKind.tree());
+    }
+
+    /**
+     * A DataScript database ref (PDT 2 phase 2, P2-D-03): heads of kind {@code db} at version 2,
+     * linear unless the facade configures the name's mode, merged by datoms through {@code merge}
+     * when two heads meet (P2-D-06).
+     *
+     * @param name  the ref name
+     * @param merge the datom merge, or null for the later head whole
+     * @return the handle
+     */
+    public Ref<PDb> dbRef(String name, DbMerge merge) {
+        return ref(name, RefKind.db(merge));
     }
 
     @SuppressWarnings("unchecked")
@@ -500,10 +671,15 @@ public final class Refs implements AutoCloseable {
         if (mergeKind != null && !mergeKind.equals(kind.name())) {
             throw new IllegalArgumentException("ref " + name + " is a " + kind.name() + ", but its merge function was registered for a " + mergeKind);
         }
-        State<T> state = new State<>(name, kind, config.modes().get(name));
+        String mode = config.modes().get(name);
+        // PDT 2 phase 2, P2-D-03 (decision 4): a db ref has one writer at a time unless configured otherwise
+        State<T> state = new State<>(name, kind, mode == null && PRef.KIND_DB.equals(kind.name()) ? PRef.MODE_LINEAR : mode);
         State<?> raced = states.putIfAbsent(name, state);
         if (raced != null) {
             return new Ref<>(this, (State<T>) raced);
+        }
+        if (receiver != null && (config.followsFully(name) || !kind.lazy())) {
+            state.pushFollow = receiver.follow(PushReceiver.stream(space.name(), name));
         }
         subscribe(state);
         return new Ref<>(this, state);
@@ -615,6 +791,47 @@ public final class Refs implements AutoCloseable {
         return Set.copyOf(states.keySet());
     }
 
+    /**
+     * Shares a ref's current version into a second group (PDT 2 phase 1, P2-X-02; PD-R-10): the
+     * target engine writes a head of the same name with the same root over its own heads, so the
+     * members of both groups read the version and the bridge serves its nodes to both. The bridge
+     * pattern keeps one node store under both groups and the nodes do not move; over two plain
+     * stores the nodes are copied once into the target's store. The target's head carries no
+     * inline delta, so its writer holds the root in the second group's swarm.
+     *
+     * @param ref    the handle in this engine
+     * @param target the engine of the second group
+     * @param <T>    the value type
+     * @return the handle of the same ref in the target engine
+     * @throws IllegalStateException when the stores differ and either is sealed
+     */
+    public <T> Ref<T> share(Ref<T> ref, Refs target) {
+        Objects.requireNonNull(ref, "ref");
+        Objects.requireNonNull(target, "target");
+        @SuppressWarnings("unchecked")
+        State<T> state = (State<T>) states.get(ref.name());
+        if (state == null) {
+            throw new IllegalArgumentException("no handle for " + ref.name() + " in this engine");
+        }
+        T value = deref(state).value();
+        String root = state.kind.root(value);
+        if (target.store != store) {
+            if (store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore
+                    || target.store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore) {
+                throw new IllegalStateException("sharing between two stores re-seals the nodes, which a share does not do;"
+                        + " keep one store under both groups");
+            }
+            for (String cid : store.reachable(root)) {
+                if (!target.store.has(cid)) {
+                    target.store.putVerified(cid, store.stored(cid).orElseThrow());
+                }
+            }
+        }
+        Ref<T> shared = target.ref(ref.name(), state.kind);
+        shared.swap(current -> shared.at(root));
+        return shared;
+    }
+
     // ------------------------------------------------------------ reading
 
     /**
@@ -653,8 +870,19 @@ public final class Refs implements AutoCloseable {
                 pending.timedOut = true;
             }
             boolean settled = pending == null || pending.timedOut || pending.fetch.isDoneOrFailed();
-            if (settled && state.ignoredEntries.add(head.entryId())) {
-                headsIgnored.incrementAndGet();
+            if (!settled) {
+                continue;
+            }
+            if (!PRef.isCid(head.root())) {
+                if (state.ignoredEntries.add(head.entryId())) {
+                    headsIgnored.incrementAndGet(); // a fault: no fetch can ever load it
+                }
+            } else if (pending != null && !pending.fetch.isDoneOrFailed()) {
+                late(state, head, Late.TIMEOUT); // the fetch outlives this read (swarm retries)
+            } else if (pending == null && !config.followsFully(state.name) && state.kind.lazy()) {
+                late(state, head, Late.LAZY_LOAD);
+            } else {
+                late(state, head, Late.FAILED_FETCH); // the tick fetches it again after its backoff
             }
         }
         return new Heads(state.name, headsAmong(loadable));
@@ -703,6 +931,13 @@ public final class Refs implements AutoCloseable {
                 Heads.Head latest = latestHeldVersion(state);
                 if (latest != null) {
                     heads = new Heads(state.name, List.of(latest));
+                } else {
+                    // PDT 2 phase 2, P2-D-05: a restarted writer whose head lapsed reads the version it retained,
+                    // the one its next swap continues from
+                    String retained = revivable(state);
+                    if (retained != null) {
+                        return new Result<>(state.kind.load(store, loader, retained), heads);
+                    }
                 }
             }
         }
@@ -802,15 +1037,16 @@ public final class Refs implements AutoCloseable {
     }
 
     private static boolean mergesByKey(State<?> state) {
-        String kind = state.kind.name();
-        return PRef.KIND_MAP.equals(kind) || PRef.KIND_SET.equals(kind) || PRef.KIND_TREE.equals(kind);
+        return state.kind.mergesByKey();
     }
 
     /**
      * The lowest common base of the heads (PD-R-06): the first root in the
      * breadth-first base walk of the latest head, at most {@value #MAX_BASE_STEPS}
      * steps deep, that every other head's walk reaches and the store holds
-     * complete; null when there is none.
+     * complete. When the walks share no root and every walk ends at first
+     * versions within the bound, the empty value ({@link #EMPTY_BASE}); null
+     * when there is none.
      */
     private String commonBase(State<?> state, List<Heads.Head> heads) {
         boolean allFirst = true;
@@ -822,8 +1058,13 @@ public final class Refs implements AutoCloseable {
             return EMPTY_BASE;
         }
         List<Set<String>> walks = new ArrayList<>();
+        boolean allEndAtFirst = true;
+        // the merge may wait, so the chain nodes the store lacks come from the heads' issuers (P2-V-02)
+        ChainReader reader = new ChainReader(state, issuersOf(heads));
         for (Heads.Head head : heads) {
-            walks.add(ancestors(state, head.root()));
+            Walk walk = walk(state, head.root(), reader);
+            walks.add(walk.roots());
+            allEndAtFirst &= walk.endsAtFirstVersions();
         }
         Set<String> latest = walks.get(walks.size() - 1);
         for (String candidate : latest) {
@@ -843,10 +1084,22 @@ public final class Refs implements AutoCloseable {
             synchronized (state.known) {
                 version = state.known.get(candidate);
             }
+            List<PeerId> sources = issuersOf(heads);
             if (version == null) {
                 // the heads list the base but this engine never saw its record (a late joiner, or a restart):
-                // fetch it by root from the heads' issuers, who retain it (PD-R-06)
+                // fetch it by root from the heads' issuers, who retain it (PD-R-06), and from its own
+                // issuer when the chain names one (P2-V-02)
                 version = syntheticVersion(state, candidate, heads);
+                VgNode node;
+                synchronized (state.known) {
+                    node = state.chain.get(candidate);
+                }
+                if (node != null) {
+                    PeerId writer = AgentId.parse(node.issuer()).peer();
+                    if (!sources.contains(writer)) {
+                        sources.add(writer);
+                    }
+                }
             }
             List<String> haves = new ArrayList<>();
             for (Heads.Head head : heads) {
@@ -854,7 +1107,7 @@ public final class Refs implements AutoCloseable {
                     haves.add(head.root());
                 }
             }
-            Pending pending = startFetch(state, version, haves, true, issuersOf(heads));
+            Pending pending = startFetch(state, version, haves, true, sources);
             if (pending != null) {
                 awaitFetch(pending);
             }
@@ -864,7 +1117,10 @@ public final class Refs implements AutoCloseable {
             }
             return null;
         }
-        return null;
+        // HLC round five, 2026-11-08 (decision E16): writers whose histories each start from the empty value
+        // and share no version have the empty value as their base, so the merge keeps every key of both; a walk
+        // that stops at the bound or at a version this reader never saw leaves the heads without a base
+        return allEndAtFirst ? EMPTY_BASE : null;
     }
 
     /** A version record for a root the heads list as a base and this engine never saw a head of: the latest head's stamp and issuer. */
@@ -884,9 +1140,34 @@ public final class Refs implements AutoCloseable {
         return peers;
     }
 
-    /** The roots reachable from a root over base links, breadth first, the root itself first. */
+    /**
+     * The roots reachable from a root over base links, breadth first, the root itself first, over
+     * the chain nodes the store holds; the tick never waits on the network.
+     */
     private Set<String> ancestors(State<?> state, String root) {
+        return walk(state, root, new ChainReader(state, null)).roots();
+    }
+
+    /**
+     * A base walk: the roots it reached, and whether it ends at first versions
+     * within the bound, that is, every root it reached is a version this engine
+     * knows and every version it reached at step {@value #MAX_BASE_STEPS} has no
+     * base (HLC round five, 2026-11-08, decision E16).
+     */
+    private record Walk(Set<String> roots, boolean endsAtFirstVersions) {
+    }
+
+    /**
+     * The breadth-first walk over base links from a root, at most
+     * {@value #MAX_BASE_STEPS} steps deep: a root first reached at that step
+     * joins the walk and its bases are not followed. A version reads its bases
+     * from the live entries seen and, when no entry of it was seen, from its
+     * chain node (P2-V-02); a version none of the two describes ends the walk
+     * there.
+     */
+    private Walk walk(State<?> state, String root, ChainReader reader) {
         Set<String> seen = new LinkedHashSet<>();
+        boolean endsAtFirst = true;
         Deque<String> frontier = new ArrayDeque<>();
         Deque<Integer> depths = new ArrayDeque<>();
         frontier.add(root);
@@ -894,24 +1175,187 @@ public final class Refs implements AutoCloseable {
         while (!frontier.isEmpty()) {
             String cid = frontier.poll();
             int depth = depths.poll();
-            if (!seen.add(cid) || depth >= MAX_BASE_STEPS) {
+            if (!seen.add(cid)) {
                 continue;
             }
-            Heads.Head version;
-            synchronized (state.known) {
-                version = state.known.get(cid);
-            }
-            if (version == null) {
+            List<String> bases = bases(state, cid, reader);
+            if (bases == null) {
+                endsAtFirst = false;
                 continue;
             }
-            for (String base : version.base()) {
+            if (depth >= MAX_BASE_STEPS) {
+                endsAtFirst &= bases.isEmpty();
+                continue;
+            }
+            learnParents(state, cid, bases, reader);
+            for (String base : bases) {
                 if (!seen.contains(base)) {
                     frontier.add(base);
                     depths.add(depth + 1);
                 }
             }
         }
-        return seen;
+        return new Walk(seen, endsAtFirst);
+    }
+
+    /** The bases of a version: from the entries seen, else from its chain node; null when neither describes it. */
+    private List<String> bases(State<?> state, String root, ChainReader reader) {
+        synchronized (state.known) {
+            Heads.Head version = state.known.get(root);
+            if (version != null) {
+                return version.base();
+            }
+        }
+        VgNode node = chainNode(state, root, reader);
+        return node == null ? null : node.bases();
+    }
+
+    /** The chain node of a version: read before, or read now through the {@code vg} CID its head or a child names. */
+    private VgNode chainNode(State<?> state, String root, ChainReader reader) {
+        String cid;
+        synchronized (state.known) {
+            VgNode node = state.chain.get(root);
+            if (node != null) {
+                return node;
+            }
+            cid = state.ancestry.get(root);
+        }
+        if (cid == null) {
+            return null;
+        }
+        reader.prefetch(List.of(cid));
+        Optional<VgNode> node = store.get(cid).flatMap(bytes -> Ancestry.read(cid, root, bytes));
+        synchronized (state.known) {
+            if (node.isEmpty()) {
+                // a head without a usable ancestry: its version reads from the memory of the versions seen
+                state.ancestry.remove(root, cid);
+                return null;
+            }
+            state.chain.put(root, node.get());
+        }
+        reader.read(node.get());
+        return node.get();
+    }
+
+    /**
+     * Learns which chain node describes each base of a version that neither the entries seen nor
+     * an earlier link describe: the version's chain node links one per base, so the links are
+     * read, at most {@link PRef#MAX_BASE}, and each is kept under the base it describes.
+     */
+    private void learnParents(State<?> state, String root, List<String> bases, ChainReader reader) {
+        boolean unknown = false;
+        synchronized (state.known) {
+            for (String base : bases) {
+                unknown |= !state.known.containsKey(base) && !state.ancestry.containsKey(base) && !state.chain.containsKey(base);
+            }
+        }
+        if (!unknown) {
+            return;
+        }
+        VgNode child = chainNode(state, root, reader);
+        if (child == null) {
+            return;
+        }
+        List<String> links = new ArrayList<>();
+        for (ai.badmonkey.agentspaces.pdt.Link link : child.previous()) {
+            links.add(link.cid());
+        }
+        reader.prefetch(links);
+        for (String cid : links) {
+            Optional<VgNode> parent = store.get(cid).flatMap(bytes -> Ancestry.read(cid, null, bytes));
+            if (parent.isPresent() && bases.contains(parent.get().root())) {
+                synchronized (state.known) {
+                    state.ancestry.putIfAbsent(parent.get().root(), cid);
+                    state.chain.putIfAbsent(parent.get().root(), parent.get());
+                }
+                reader.read(parent.get());
+            }
+        }
+    }
+
+    /**
+     * Where a walk's chain nodes come from: the store alone (no sources, for the tick), or the
+     * store and then one bare batch per call to the peers named, bounded by the load timeout, until
+     * the first batch that fails ends the fetching for the walk, so a walk with no reachable holder
+     * costs one timeout at most (P2-V-02). A node the walk could not get, since a batch did not
+     * bring it or the walk met it after the batch that failed, waits out a backoff of its own by
+     * the rule of a failed head fetch, and a walk during the backoff leaves the link out at once
+     * and counts it (PDT 2 phase 7 gate; swarm retries, ROBUSTNESS.md §10.2).
+     */
+    private final class ChainReader {
+        private final State<?> state;
+        /** The peers a batch prefers; null for a reader of the store alone. */
+        private final List<PeerId> sources;
+        /** The chain nodes this walk left out, each counted once. */
+        private final Set<String> missed = new HashSet<>();
+        private boolean failed;
+
+        ChainReader(State<?> state, List<PeerId> sources) {
+            this.state = state;
+            this.sources = sources == null ? null : new ArrayList<>(sources);
+        }
+
+        /** A chain node read names its writer, who holds the chain nodes it linked: a source for the rest of the walk. */
+        void read(VgNode node) {
+            if (sources == null) {
+                return;
+            }
+            PeerId writer = AgentId.parse(node.issuer()).peer();
+            if (!sources.contains(writer)) {
+                sources.add(writer);
+            }
+        }
+
+        void prefetch(List<String> cids) {
+            if (sources == null) {
+                return;
+            }
+            List<String> missing = new ArrayList<>();
+            for (String cid : cids) {
+                if (store.has(cid)) {
+                    continue;
+                }
+                if (failed) {
+                    miss(cid, true);
+                } else if (backingOff(state.chainMisses, cid)) {
+                    miss(cid, false);
+                } else if (missing.size() < ai.badmonkey.agentspaces.content.Messages.MAX_WANT_CIDS) {
+                    missing.add(cid);
+                }
+            }
+            if (missing.isEmpty()) {
+                return;
+            }
+            FetchOptions options = new FetchOptions(config.loadTimeout(), Set.copyOf(sources), Set.of());
+            try {
+                TreeFetch batch = swarm.content().fetchNodes(missing, options);
+                failed = !batch.await(config.loadTimeout()) || !batch.complete();
+            } catch (IllegalArgumentException | IllegalStateException refused) {
+                failed = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failed = true;
+            }
+            for (String cid : missing) {
+                if (store.has(cid)) {
+                    synchronized (state.chainMisses) {
+                        state.chainMisses.remove(cid);
+                    }
+                } else {
+                    miss(cid, true);
+                }
+            }
+        }
+
+        /** Leaves a chain node out of this walk, counted once; a node that failed now starts or doubles its backoff. */
+        private void miss(String cid, boolean failedNow) {
+            if (missed.add(cid)) {
+                chainNodesMissed.incrementAndGet();
+                if (failedNow) {
+                    backOff(state.chainMisses, cid);
+                }
+            }
+        }
     }
 
     private void conflict(State<?> state, PConflict event) {
@@ -940,6 +1384,10 @@ public final class Refs implements AutoCloseable {
         for (Heads.Head head : heads.heads()) {
             frontier.add(head.root());
         }
+        // PDT 2 phase 2, P2-V-05: a version no entry described here reads from its chain node, which the
+        // store holds after a restart and a lazy follower fetches from the heads' issuers
+        ChainReader reader = new ChainReader(state, issuersOf(heads.heads()));
+        boolean lazyFollower = !config.followsFully(state.name) && state.kind.lazy();
         while (!frontier.isEmpty() && out.size() < n) {
             String cid = frontier.poll();
             if (!seen.add(cid)) {
@@ -950,14 +1398,28 @@ public final class Refs implements AutoCloseable {
                 version = state.known.get(cid);
             }
             if (version == null) {
-                continue;
+                VgNode node = chainNode(state, cid, reader);
+                if (node == null) {
+                    continue;
+                }
+                version = chainVersion(state, node);
             }
-            if (!exclude.contains(cid) && held(cid)) {
+            learnParents(state, cid, version.base(), reader);
+            if (!exclude.contains(cid) && (held(cid) || lazyFollower)) {
                 out.add(version);
             }
             frontier.addAll(version.base());
         }
         return out;
+    }
+
+    /**
+     * The version a chain node describes (P2-V-05): its root, bases, writer, and stamp; the seq,
+     * size, entry, and lease stay unknown (0 and null), since only a head entry carries them.
+     */
+    private static Heads.Head chainVersion(State<?> state, VgNode node) {
+        return new Heads.Head(node.root(), node.bases(), 0, 0, state.kind.name(), state.mode(), AgentId.parse(node.issuer()),
+                HlcTimestamp.parse(node.issued()), null, 0);
     }
 
     <T> T at(State<T> state, String root) {
@@ -989,6 +1451,14 @@ public final class Refs implements AutoCloseable {
             live.add(head);
             roots.add(head.root());
         }
+        // HLC round six, 2026-11-08 (rulings R1 and R3): an entry of the name whose payload is no PRef
+        // gives no head, and counts once while it stays live, as an entry that breaks a bound counts
+        for (EntryId undecodable : space.undecodableEntries(state.template, MAX_ENTRIES)) {
+            ids.add(undecodable);
+            if (state.ignoredEntries.add(undecodable)) {
+                headsIgnored.incrementAndGet();
+            }
+        }
         state.liveRoots = roots;
         state.liveIds = ids;
         return live;
@@ -1019,13 +1489,17 @@ public final class Refs implements AutoCloseable {
         if (state.observedMode == null && state.configuredMode == null) {
             state.observedMode = record.mode();
         }
-        // a rewrite carries the original head's stamp and issuer (PD-R-08), so the merge order stays put
-        if (record.issuedAttr() != null) {
+        // a rewrite carries the original head's stamp and issuer (PD-R-08), so the merge order stays put; HLC round
+        // five, 2026-11-08 (decision E10): a pdt.issuer that is present but null leaves the entry's own stamp and
+        // issuer together, as one that is no agent id does; HLC round six, 2026-11-08 (ruling R1): any value that is
+        // no text under pdt.issued or pdt.issuer reads as no text and falls back the same way, and (ruling R2) so
+        // does a pdt.issued beyond the far-future margin
+        boolean issuerPresentButNull = record.attrs() != null && record.attrs().containsKey(PRef.ISSUER_ATTR)
+                && record.issuerAttr() == null;
+        if (record.issuedAttr() != null && !issuerPresentButNull) {
             try {
                 HlcTimestamp original = HlcTimestamp.parse(record.issuedAttr());
-                // HLC canonical stamps, 2026-11-08: a counter above the limit orders nothing, like any
-                // stamp a merge point refuses; parse already refuses text that is not canonical
-                if (HybridLogicalClock.isAcceptable(original)) {
+                if (issuedAttrAcceptable(original, clock.millis())) {
                     AgentId originalIssuer = record.issuerAttr() == null ? issuer : AgentId.parse(record.issuerAttr());
                     issued = original;
                     issuer = originalIssuer;
@@ -1036,7 +1510,13 @@ public final class Refs implements AutoCloseable {
         }
         Heads.Head head = new Heads.Head(record.root(), record.base(), record.seq(), record.size(), record.kind(),
                 record.mode(), issuer, issued, entryId, expiresAtMillis);
+        Optional<String> vg = Ancestry.cid(record);
+        Optional<BlobIdentity> claim = PRef.KIND_BLOB.equals(record.kind()) ? BlobIdentity.read(record.attrs()) : Optional.empty();
         synchronized (state.known) {
+            // P2-V-01: the head names its chain node; a walk reads it once the version's entry is gone
+            vg.ifPresent(cid -> state.ancestry.putIfAbsent(head.root(), cid));
+            // P2-B-01: a blob head names its identity and outboard, which a verified window reads
+            claim.ifPresent(c -> state.identities.putIfAbsent(head.root(), c));
             Heads.Head known = state.known.get(head.root());
             if (onlyIfAbsent) {
                 if (known == null) {
@@ -1056,13 +1536,34 @@ public final class Refs implements AutoCloseable {
                     }
                 }
                 boolean sameEntry = known.entryId().equals(entryId) && known.expiresAtMillis() == expiresAtMillis;
-                if (newer || !sameEntry || bases.size() != known.base().size()) {
-                    Heads.Head kept = newer ? head : known.seenAs(entryId, expiresAtMillis);
+                // HLC round six, 2026-11-08 (ruling R2): the reader judges pdt.issued against its wall at each
+                // read, so the same entry orders by its attrs once the wall comes within the bound; the version
+                // follows, so a rewrite of the lapsed head carries the order the head has
+                boolean reordered = known.entryId().equals(entryId)
+                        && (!known.issued().equals(head.issued()) || !known.issuer().equals(head.issuer()));
+                if (newer || reordered || !sameEntry || bases.size() != known.base().size()) {
+                    Heads.Head kept = newer || reordered ? head : known.seenAs(entryId, expiresAtMillis);
                     state.known.put(head.root(), bases.equals(kept.base()) ? kept : kept.withBase(bases));
                 }
             }
         }
         return head;
+    }
+
+    /**
+     * Whether a {@code pdt.issued} attr may order a head on a reader whose wall reads {@code wallMillis}.
+     * HLC canonical stamps, 2026-11-08: a counter above the limit orders nothing, like any stamp a
+     * merge point refuses; parse already refuses text that is not canonical. HLC round six,
+     * 2026-11-08 (ruling R2): a physical time beyond {@code wall + MAX_DRIFT} plus the skew margin
+     * orders nothing either, so a head can no longer win every conflict by stamping ahead.
+     *
+     * @param issued     the parsed attr
+     * @param wallMillis the reader's wall time
+     * @return whether the attr orders the head; otherwise the entry's own stamp and issuer do
+     */
+    static boolean issuedAttrAcceptable(HlcTimestamp issued, long wallMillis) {
+        return HybridLogicalClock.isAcceptable(issued)
+                && issued.physical() <= wallMillis + HybridLogicalClock.MAX_DRIFT_MILLIS + ISSUED_SKEW_MARGIN_MILLIS;
     }
 
     /**
@@ -1081,7 +1582,7 @@ public final class Refs implements AutoCloseable {
             return false;
         }
         Pending pending = state.pending.get(root);
-        if (pending == null && (config.followFull() || !state.kind.lazy()) && !backingOff(state, root)) {
+        if (pending == null && (config.followsFully(state.name) || !state.kind.lazy()) && !backingOff(state, root)) {
             state.recheck.remove(root);
             pending = startFetch(state, head);
         }
@@ -1107,19 +1608,68 @@ public final class Refs implements AutoCloseable {
         }
     }
 
-    /** Whether a root's fetch failed recently enough that no new fetch starts for it yet. */
+    /** Whether a root's fetch failed and its next fetch is not due yet. */
     private boolean backingOff(State<?> state, String root) {
-        Long failedAt;
-        synchronized (state.unloadable) {
-            failedAt = state.unloadable.get(root);
-        }
-        return failedAt != null && clock.millis() - failedAt < config.loadTimeout().toMillis() * UNLOADABLE_BACKOFF;
+        return backingOff(state.unloadable, root);
     }
 
-    private void markUnloadable(State<?> state, String root) {
-        synchronized (state.unloadable) {
-            state.unloadable.put(root, clock.millis());
+    /** Whether a key's fetch failed and its next ask is not due yet. */
+    private boolean backingOff(Map<String, Retry> retries, String key) {
+        synchronized (retries) {
+            Retry retry = retries.get(key);
+            return retry != null && clock.millis() < retry.dueMillis;
         }
+    }
+
+    /** Whether a root's fetch failed and its next fetch is due. */
+    private boolean retryDue(State<?> state, String root, long now) {
+        synchronized (state.unloadable) {
+            Retry retry = state.unloadable.get(root);
+            return retry != null && now >= retry.dueMillis;
+        }
+    }
+
+    /**
+     * Notes a failed fetch of a root (swarm retries, ROBUSTNESS.md §10.3 P2): the next is due after a backoff that
+     * doubles with each failure, from {@link #RETRY_BASE_MILLIS} up to {@link #UNLOADABLE_BACKOFF} load timeouts, with a
+     * random spread of up to half, so the members that missed one root do not all ask again together.
+     */
+    private void markUnloadable(State<?> state, String root) {
+        backOff(state.unloadable, root);
+    }
+
+    /** Notes a failed fetch of a key, a head's root or a chain node, by the rule of {@link #markUnloadable}. */
+    private void backOff(Map<String, Retry> retries, String key) {
+        long cap = Math.max(RETRY_BASE_MILLIS, config.loadTimeout().toMillis() * UNLOADABLE_BACKOFF);
+        synchronized (retries) {
+            Retry retry = retries.computeIfAbsent(key, k -> new Retry());
+            retry.failures++;
+            long wait = Math.min(cap, RETRY_BASE_MILLIS << Math.min(retry.failures - 1, 20));
+            retry.dueMillis = clock.millis() + wait + java.util.concurrent.ThreadLocalRandom.current().nextLong(wait / 2 + 1);
+        }
+    }
+
+    /** Counts a live head as late for a cause, once per entry and cause (swarm retries, ROBUSTNESS.md §10.3 P1). */
+    private void late(State<?> state, Heads.Head head, Late cause) {
+        if (state.lateNoted.add(new LateNote(head.entryId(), cause))) {
+            headsLate.get(cause).incrementAndGet();
+        }
+    }
+
+    /**
+     * The sources a retry or a fallback prefers (swarm retries, ROBUSTNESS.md §10.3 P6): the holders of the head's root
+     * other than its issuer, so a later fetch spreads over the members that hold the version now and the issuer, a
+     * holder too, ranks behind them; the issuer alone while no other member holds the root.
+     */
+    private List<PeerId> otherHolders(Heads.Head head) {
+        PeerId issuer = head.issuer().peer();
+        List<PeerId> others = new ArrayList<>();
+        for (Holding holding : swarm.content().spaces().holdings(head.root())) {
+            if (!holding.holder().equals(issuer) && !others.contains(holding.holder())) {
+                others.add(holding.holder());
+            }
+        }
+        return others.isEmpty() ? List.of(issuer) : others;
     }
 
     /** Waits for the fetches of several heads together, against one load timeout; heads already timed out are not waited for. */
@@ -1170,8 +1720,23 @@ public final class Refs implements AutoCloseable {
         }
     }
 
+    /**
+     * Starts a head's fetch: a first one prefers the issuer, a retry after a failure the other holders (P6). A read
+     * waits the load timeout for a first fetch alone; a retry runs in the background, so a head that stays late costs
+     * each later read nothing, and the head joins the reads once its root lands (swarm retries, the gate's adversarial
+     * review, ROBUSTNESS.md §10.6).
+     */
     private <T> Pending startFetch(State<T> state, Heads.Head head) {
-        return startFetch(state, head, haves(state, head), false, List.of(head.issuer().peer()));
+        boolean retry;
+        synchronized (state.unloadable) {
+            retry = state.unloadable.containsKey(head.root());
+        }
+        Pending pending = startFetch(state, head, haves(state, head), false,
+                retry ? otherHolders(head) : List.of(head.issuer().peer()));
+        if (retry && pending != null) {
+            pending.timedOut = true;
+        }
+        return pending;
     }
 
     /**
@@ -1358,7 +1923,16 @@ public final class Refs implements AutoCloseable {
             arrived(state, head, own);
             return;
         }
-        if (config.followFull() || !state.kind.lazy()) {
+        if (config.followsFully(state.name) || !state.kind.lazy()) {
+            int parts = receiver == null ? 0 : PushPublisher.announced(record);
+            if (parts > 0) {
+                // P2-P-02: the bundles that came first are stored now, and a push that completes the root needs no fetch
+                receiver.expect(PushReceiver.stream(space.name(), state.name), record.root(), parts);
+                if (held(record.root())) {
+                    arrived(state, head, own);
+                    return;
+                }
+            }
             state.recheck.put(record.root(), head);
             return;
         }
@@ -1399,7 +1973,9 @@ public final class Refs implements AutoCloseable {
             return next;
         }
         PRef head = head(state, newRoot, next, heads, recording, state.mode());
-        write(state, head, heads);
+        Optional<PushPublisher.Plan> push = pushPlan(state, head, recording);
+        write(state, push.map(PushPublisher.Plan::head).orElse(head), heads);
+        push.ifPresent(plan -> pusher.send(plan));
         return next;
     }
 
@@ -1427,8 +2003,14 @@ public final class Refs implements AutoCloseable {
             if (taken.isEmpty()) {
                 // a take may be outstanding elsewhere (the taken entry is hidden): a first head is written only when
                 // nothing of the name was ever seen here, else the take is tried again and the swap fails past the retries
-                if (attempt >= Math.min(1, config.takeRetries()) && neverVersioned(state)) {
-                    return swapFirstLinear(state, f);
+                if (attempt >= Math.min(1, config.takeRetries())) {
+                    if (neverVersioned(state)) {
+                        return swapFirstLinear(state, f, null);
+                    }
+                    String retained = revivable(state);
+                    if (retained != null) {
+                        return swapFirstLinear(state, f, retained);
+                    }
                 }
                 continue;
             }
@@ -1471,13 +2053,16 @@ public final class Refs implements AutoCloseable {
             T current = materialize(state, heads, recording.store());
             T next = Objects.requireNonNull(f.apply(current), "the swap function returned null");
             String newRoot = state.kind.root(next);
-            PRef head = newRoot.equals(takenHead.root()) && heads.heads().size() == 1
+            PRef built = newRoot.equals(takenHead.root()) && heads.heads().size() == 1
                     ? record.withoutNodes()
                     : head(state, newRoot, next, heads, recording, PRef.MODE_LINEAR);
+            Optional<PushPublisher.Plan> push = pushPlan(state, built, recording);
+            PRef head = push.map(PushPublisher.Plan::head).orElse(built);
             checkOwn(state, head);
             pin(state, head);
             state.ownRoots.add(newRoot);
             EntryHandle handle = space.complete(take, head, Lease.of(config.headLease()), head.tags());
+            push.ifPresent(plan -> pusher.send(plan));
             state.ownEntries.add(handle.entryId());
             state.ownEntries.remove(take.entryId());
             long now = clock.millis();
@@ -1501,15 +2086,58 @@ public final class Refs implements AutoCloseable {
                 + (config.takeRetries() + 1) + " attempts of " + config.takeTimeout().toMillis() + " ms");
     }
 
-    /** The first version of a linear ref, when no head exists to take. */
-    private <T> T swapFirstLinear(State<T> state, UnaryOperator<T> f) {
+    /**
+     * The newest retained version a restarted linear writer continues from (PDT 2 phase 2, P2-D-05):
+     * nothing of the name is live or was seen in this run, and the persisted retention of P2-V-03
+     * holds a version whose tree the store holds whole. Null otherwise.
+     */
+    private String revivable(State<?> state) {
+        if (!liveEntries(state).isEmpty() || !state.takenEntries.isEmpty()) {
+            return null;
+        }
+        Heads last = state.lastHeads;
+        synchronized (state.known) {
+            if ((last != null && !last.isEmpty()) || !state.known.isEmpty()) {
+                return null;
+            }
+        }
+        List<Retention.Version> versions = retention.versions(state.name);
+        for (int i = versions.size() - 1; i >= 0; i--) {
+            if (store.complete(versions.get(i).root())) {
+                return versions.get(i).root();
+            }
+        }
+        return null;
+    }
+
+    /** The first head of a linear ref when no head exists to take: over the empty value, or over a retained version. */
+    private <T> T swapFirstLinear(State<T> state, UnaryOperator<T> f, String retained) {
         InlineDelta.Recording recording = InlineDelta.recording(store);
-        T next = Objects.requireNonNull(f.apply(state.kind.empty(recording.store(), loader)), "the swap function returned null");
+        T current = retained == null ? state.kind.empty(recording.store(), loader) : state.kind.load(recording.store(), loader, retained);
+        T next = Objects.requireNonNull(f.apply(current), "the swap function returned null");
         String newRoot = state.kind.root(next);
-        Heads none = new Heads(state.name, List.of());
-        PRef head = head(state, newRoot, next, none, recording, PRef.MODE_LINEAR);
-        write(state, head, none);
+        Heads base = retained == null ? new Heads(state.name, List.of())
+                : new Heads(state.name, List.of(revivedVersion(state, retained)));
+        PRef head = head(state, newRoot, next, base, recording, PRef.MODE_LINEAR);
+        Optional<PushPublisher.Plan> push = pushPlan(state, head, recording);
+        write(state, push.map(PushPublisher.Plan::head).orElse(head), base);
+        push.ifPresent(plan -> pusher.send(plan));
         return next;
+    }
+
+    /** The push of a new version whose delta does not ride inline, when this writer pushes (P2-P-01). */
+    private <T> Optional<PushPublisher.Plan> pushPlan(State<T> state, PRef head, InlineDelta.Recording recording) {
+        if (pusher == null || head.nodes() != null) {
+            return Optional.empty();
+        }
+        return pusher.plan(PushReceiver.stream(space.name(), state.name), head, recording.delta(head.root()));
+    }
+
+    /** The version record of a retained root no entry describes in this run: this writer, now, seq 0. */
+    private Heads.Head revivedVersion(State<?> state, String root) {
+        AgentId writer = space.writer().orElseThrow(() -> new IllegalStateException("a space that names no writer writes no head"));
+        return new Heads.Head(root, List.of(), 0, 0, state.kind.name(), PRef.MODE_LINEAR, writer,
+                new HlcTimestamp(clock.millis(), 0, writer.encoded()), null, 0);
     }
 
     /** The head record of a new version, with its delta inline when it fits (PD-X-07). */
@@ -1528,8 +2156,67 @@ public final class Refs implements AutoCloseable {
         }
         // seq is advisory and saturates at PRef.MAX_SEQ, so a head at the ceiling never makes its successors negative
         long seq = Math.min(heads.maxSeq(), PRef.MAX_SEQ - 1) + 1;
-        return new PRef(PRef.VERSION, state.name, state.kind.name(), newRoot, base, seq,
-                state.kind.size(next), nodes, mode, config.sealing(), keyEpoch(), null);
+        // PDT 2 phase 2, P2-D-03, and phase 6, P2-R-01 and P2-T-01 (rule 8): a head whose tree holds a level-2 kind is version 2
+        PRef record = new PRef(state.kind.version(next), state.name, state.kind.name(), newRoot, base, seq,
+                state.kind.size(next), nodes, mode, config.sealing(), keyEpoch(), withIdentity(state, next, null));
+        String vg = writeAncestry(state, newRoot, base);
+        return vg == null ? record : Ancestry.with(record, vg);
+    }
+
+    /**
+     * The attrs of a head with the identity of a blob value added (PDT 2 phase 4, P2-B-01, rule 10 of §6.10.3):
+     * {@code pdt.blake3} and {@code pdt.bao}, with the outboard written to the store beside the delta, never inline,
+     * and kept by {@link #liveRoots}. A value of another kind, or one over a sealed store, whose identity would name
+     * plaintext the group seals, keeps the attrs it has.
+     */
+    private Map<String, String> withIdentity(State<?> state, Object value, Map<String, String> attrs) {
+        if (!(value instanceof PBlob blob) || store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore) {
+            return attrs;
+        }
+        BlobIdentity claim = BlobIdentity.of(blob.outboard());
+        synchronized (state.known) {
+            state.identities.put(blob.root(), claim);
+        }
+        Map<String, String> out = attrs == null ? new LinkedHashMap<>() : new LinkedHashMap<>(attrs);
+        out.putAll(claim.attrs());
+        return out;
+    }
+
+    /**
+     * Writes the {@code vg} node of a new version into the store beside its delta and returns its
+     * CID for {@code pdt.ancestry} (PDT 2 phase 1, P2-V-01): the root, the bases, this writer, a
+     * stamp of now, and a link to the {@code vg} node of each base that has one, in the order of
+     * the bases. The node rides on no head and no value root links it; the collector keeps it
+     * through {@link #liveRoots}. Null, and no chain, over a sealed store or a space that names
+     * no writer.
+     */
+    private String writeAncestry(State<?> state, String root, List<String> base) {
+        Optional<AgentId> writer = space.writer();
+        if (writer.isEmpty() || store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore) {
+            return null;
+        }
+        List<ai.badmonkey.agentspaces.pdt.Link> previous = new ArrayList<>();
+        synchronized (state.known) {
+            for (String b : base) {
+                String link = state.ancestry.get(b);
+                if (link != null) {
+                    previous.add(new ai.badmonkey.agentspaces.pdt.Link(link));
+                    // a writer holds the nodes it links, so a walk that reads this node finds the next one here
+                    Heads.Head version = state.known.get(b);
+                    if (version != null && !store.has(link)) {
+                        state.chainWanted.putIfAbsent(link, version.issuer().peer());
+                    }
+                }
+            }
+        }
+        String issuer = writer.get().encoded();
+        VgNode node = new VgNode(root, base, issuer, new HlcTimestamp(clock.millis(), 0, issuer).encoded(), previous);
+        String cid = store.put(node.encode(), ai.badmonkey.agentspaces.content.tree.Cids.DAG_CBOR);
+        synchronized (state.known) {
+            state.ancestry.putIfAbsent(root, cid);
+            state.chain.putIfAbsent(root, node);
+        }
+        return cid;
     }
 
     /**
@@ -1651,12 +2338,16 @@ public final class Refs implements AutoCloseable {
             return;
         }
         long now = clock.millis();
+        if (receiver != null) {
+            receiver.expire(now);
+        }
         for (State<?> state : states.values()) {
             tick(state, now);
         }
     }
 
     private <T> void tick(State<T> state, long now) {
+        fetchChainNodes(state);
         List<Heads.Head> live = liveEntries(state);
         Set<String> liveRoots = new HashSet<>();
         Set<EntryId> liveIds = state.liveIds;
@@ -1673,7 +2364,18 @@ public final class Refs implements AutoCloseable {
             if (held(root)) {
                 arrived(state, head, state.ownRoots.contains(root));
             } else if (liveIds.contains(head.entryId())) {
-                startFetch(state, head);
+                PushReceiver.Wait push = receiver == null ? PushReceiver.Wait.NONE
+                        : receiver.check(PushReceiver.stream(space.name(), state.name), root, now);
+                if (push == PushReceiver.Wait.WAIT) {
+                    state.recheck.putIfAbsent(root, head); // the announced push has its grace (P2-P-02)
+                    continue;
+                }
+                if (push == PushReceiver.Wait.LATE) {
+                    // swarm retries (P4, P6): what the push left missing comes from the other holders before the writer
+                    startFetch(state, head, haves(state, head), false, otherHolders(head));
+                } else {
+                    startFetch(state, head);
+                }
             }
         }
         for (String root : List.copyOf(state.pending.keySet())) {
@@ -1686,8 +2388,8 @@ public final class Refs implements AutoCloseable {
             } else if (pending.fetch.isDoneOrFailed() && !pending.fetch.complete()) {
                 state.pending.remove(root, pending);
                 markUnloadable(state, root);
-                if (!pending.base && state.ignoredEntries.add(pending.head.entryId())) {
-                    headsIgnored.incrementAndGet();
+                if (!pending.base) {
+                    late(state, pending.head, Late.FAILED_FETCH);
                 }
             } else if (!pending.base && !liveIds.contains(pending.head.entryId()) && !basesInUse.contains(root)) {
                 // the head that asked for this fetch is gone: the session is cancelled rather than kept alive forever
@@ -1695,8 +2397,20 @@ public final class Refs implements AutoCloseable {
                 pending.fetch.cancel();
             }
         }
+        // swarm retries (ROBUSTNESS.md §10.3 P2): a live head whose fetch failed is fetched again once its backoff ends,
+        // with no deref needed; the nodes stored before stay, so the fetch asks only for what is missing
+        if (config.followsFully(state.name) || !state.kind.lazy()) {
+            for (Heads.Head head : live) {
+                String root = head.root();
+                if (!state.pending.containsKey(root) && !state.recheck.containsKey(root) && retryDue(state, root, now)
+                        && !held(root)) {
+                    startFetch(state, head);
+                }
+            }
+        }
         // ignored entries and failed roots are remembered only while they are live, so both are bounded by the live entries
         state.ignoredEntries.retainAll(liveIds);
+        state.lateNoted.removeIf(note -> !liveIds.contains(note.entry()));
         state.takenEntries.removeIf(liveIds::contains);
         synchronized (state.unloadable) {
             state.unloadable.keySet().removeIf(root -> !liveRoots.contains(root) && !basesInUse.contains(root));
@@ -1798,6 +2512,42 @@ public final class Refs implements AutoCloseable {
     }
 
     /**
+     * Fetches the chain nodes this writer linked from its new versions and does not hold, at most
+     * one batch per ref in flight, from the issuers of the heads that named them (P2-V-01). Every
+     * writer then holds the nodes it links, and a chain node names its writer, so a walk finds each
+     * next node at the writer of the node before it. A node the batch did not bring is dropped from
+     * the list: a walk that needs it later asks again.
+     */
+    private void fetchChainNodes(State<?> state) {
+        TreeFetch batch = state.chainBatch;
+        if (batch != null) {
+            if (!batch.isDoneOrFailed()) {
+                return;
+            }
+            state.chainBatch = null;
+        }
+        state.chainWanted.keySet().removeIf(store::has);
+        if (state.chainWanted.isEmpty()) {
+            return;
+        }
+        List<String> cids = new ArrayList<>();
+        Set<PeerId> sources = new HashSet<>();
+        for (Map.Entry<String, PeerId> wanted : state.chainWanted.entrySet()) {
+            if (cids.size() >= ai.badmonkey.agentspaces.content.Messages.MAX_WANT_CIDS) {
+                break;
+            }
+            cids.add(wanted.getKey());
+            sources.add(wanted.getValue());
+        }
+        cids.forEach(state.chainWanted::remove);
+        try {
+            state.chainBatch = swarm.content().fetchNodes(cids, new FetchOptions(config.loadTimeout(), sources, Set.of()));
+        } catch (IllegalArgumentException | IllegalStateException refused) {
+            // a store without a tree exchange keeps no chain from others; walks fall back to the versions seen
+        }
+    }
+
+    /**
      * The roots a writer may cancel: the strict ancestors of the lowest common
      * base of the held heads (the base the merge of PD-R-06 picks). Every
      * version on a path from a head to that base stays live, so a reader that
@@ -1817,7 +2567,7 @@ public final class Refs implements AutoCloseable {
         for (Heads.Head head : live) {
             // the tick may read an entry before its event delivered the inline delta, so it starts no fetch here:
             // a head counts once it is held, or once its root node is present under the lazy follow
-            if (held(head.root()) || (state.kind.lazy() && !config.followFull() && store.has(head.root()))) {
+            if (held(head.root()) || (state.kind.lazy() && !config.followsFully(state.name) && store.has(head.root()))) {
                 loadable.add(head);
             } else if (mayStillLoad(state, head.root())) {
                 arriving.add(head);
@@ -1865,7 +2615,7 @@ public final class Refs implements AutoCloseable {
      * phantom head cannot hold a writer's superseded versions live forever.
      */
     private boolean mayStillLoad(State<?> state, String root) {
-        if (!PRef.isCid(root) || (!config.followFull() && state.kind.lazy())) {
+        if (!PRef.isCid(root) || (!config.followsFully(state.name) && state.kind.lazy())) {
             return false;
         }
         synchronized (state.unloadable) {
@@ -1879,9 +2629,28 @@ public final class Refs implements AutoCloseable {
      * attrs so every reader keeps the merge order of the original head.
      */
     private <T> void rewrite(State<T> state, Heads.Head head) {
-        Map<String, String> stamp = Map.of(PRef.ISSUED_ATTR, head.issued().encoded(), PRef.ISSUER_ATTR, head.issuer().encoded());
-        PRef record = new PRef(PRef.VERSION, state.name, state.kind.name(), head.root(), head.base(), head.seq(),
-                head.size(), null, head.mode(), config.sealing(), keyEpoch(), stamp);
+        Map<String, String> stamp = new LinkedHashMap<>();
+        stamp.put(PRef.ISSUED_ATTR, head.issued().encoded());
+        stamp.put(PRef.ISSUER_ATTR, head.issuer().encoded());
+        // the rewrite names the version's own chain node, so the chain outlives the original entry (P2-V-01)
+        BlobIdentity claim;
+        synchronized (state.known) {
+            String vg = state.ancestry.get(head.root());
+            if (vg != null) {
+                stamp.put(Ancestry.ATTR, vg);
+            }
+            claim = state.identities.get(head.root());
+        }
+        // the member holds the root complete, so its value reads the version the original head wrote (rule 8)
+        T value = state.kind.load(store, loader, head.root());
+        int version = state.kind.version(value);
+        // and a blob version's identity, so a verified window outlives it too (P2-B-01)
+        claim = claim == null ? null : heldClaim(state, head.root(), claim, value);
+        if (claim != null) {
+            stamp.putAll(claim.attrs());
+        }
+        PRef record = new PRef(version, state.name, state.kind.name(), head.root(), head.base(),
+                head.seq(), head.size(), null, head.mode(), config.sealing(), keyEpoch(), stamp);
         if (record.violation().isPresent()) {
             return;
         }
@@ -1906,9 +2675,36 @@ public final class Refs implements AutoCloseable {
         liveEntries(state);
     }
 
+    /**
+     * The identity a rewrite of a blob version names (PDT 2 phase 4 gate, P2-B-01 with PD-R-08): the claim read when
+     * this member holds its whole outboard, so the rewritten head names only nodes its signer serves; otherwise, over
+     * a plaintext store, the outboard this member builds from the value it holds complete, which also replaces a claim
+     * that names other bytes (one outboard pass per version and rewriter); otherwise none.
+     */
+    private BlobIdentity heldClaim(State<?> state, String root, BlobIdentity claim, Object value) {
+        try {
+            if (store.complete(claim.bao())) {
+                return claim;
+            }
+        } catch (ai.badmonkey.agentspaces.pdt.NodeFormatException malformed) {
+            // an outboard node that does not read is no outboard this member holds
+        }
+        if (!(value instanceof PBlob blob) || store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore) {
+            return null;
+        }
+        BlobIdentity built = BlobIdentity.of(blob.outboard());
+        synchronized (state.known) {
+            state.identities.put(root, built);
+        }
+        return built;
+    }
+
     // ------------------------------------------------------------ collection and stats
 
-    /** The roots a collector must keep: live heads, own heads, pending fetches, and the last heads read, of every ref. */
+    /**
+     * The roots a collector must keep: live heads, own heads, pending fetches, and the last heads
+     * read, of every ref, with the chain node of each of them and of each retained version.
+     */
     public Set<String> liveRoots() {
         Set<String> roots = new HashSet<>();
         for (State<?> state : states.values()) {
@@ -1923,6 +2719,24 @@ public final class Refs implements AutoCloseable {
             Heads last = state.lastHeads;
             if (last != null) {
                 roots.addAll(last.roots());
+            }
+        }
+        // the chain node of every version kept, which links the chain below it (P2-V-01)
+        Set<String> versions = new HashSet<>(roots);
+        versions.addAll(retention.retainedRoots());
+        for (State<?> state : states.values()) {
+            synchronized (state.known) {
+                for (String root : versions) {
+                    String vg = state.ancestry.get(root);
+                    if (vg != null) {
+                        roots.add(vg);
+                    }
+                    // and the outboard a blob version names (P2-B-01), which no blob node links
+                    BlobIdentity claim = state.identities.get(root);
+                    if (claim != null) {
+                        roots.add(claim.bao());
+                    }
+                }
             }
         }
         return roots;
@@ -1963,9 +2777,15 @@ public final class Refs implements AutoCloseable {
         return bytesReceived.get();
     }
 
-    /** Heads ignored: malformed, of another kind, or whose root failed to load (S7, PD-P-04). */
+    /** Heads ignored for a fault: malformed, of another kind, or no ref at all (S7, PD-P-04). */
     public long headsIgnored() {
         return headsIgnored.get();
+    }
+
+    /** Heads left out of reads while their roots were still loading, by cause (swarm retries, ROBUSTNESS.md §10.3 P1). */
+    public LateHeads headsLate() {
+        return new LateHeads(headsLate.get(Late.TIMEOUT).get(), headsLate.get(Late.FAILED_FETCH).get(),
+                headsLate.get(Late.LAZY_LOAD).get());
     }
 
     /** Inline nodes dropped because no link from the root reached them or their bytes did not hash to their CID (PD-X-07). */
@@ -1993,10 +2813,41 @@ public final class Refs implements AutoCloseable {
         return mergeFunctionFailures.get();
     }
 
+    /**
+     * Chain nodes that base walks left out, each once per walk, since no holder served them in time or their backoff
+     * still ran (P2-V-02; swarm retries, ROBUSTNESS.md §10.2).
+     */
+    public long chainNodesMissed() {
+        return chainNodesMissed.get();
+    }
+
+    /** What this peer pushed and received (P2-P-05); all zeros with push off. */
+    public PushPublisher.Stats pushStats() {
+        if (pusher == null) {
+            return new PushPublisher.Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+        return new PushPublisher.Stats(pusher.deltasPushed(), pusher.deltasPullOnly(), pusher.bundlesSent(), pusher.bytesPushed(),
+                receiver.bundlesReceived(), receiver.bundlesDropped(), receiver.nodesStored(), receiver.bytesStored(),
+                receiver.nodesDropped(), receiver.fallbacks());
+    }
+
+    /** The follower's side of push, for a host's instrumentation; null with push off. */
+    PushReceiver pushReceiver() {
+        return receiver;
+    }
+
     @Override
     public void close() {
         closed = true;
         for (State<?> state : states.values()) {
+            AutoCloseable follow = state.pushFollow;
+            if (follow != null) {
+                try {
+                    follow.close();
+                } catch (Exception ignored) {
+                    // the bus is closing as well
+                }
+            }
             Subscription subscription = state.subscription;
             if (subscription != null) {
                 try {

@@ -412,7 +412,7 @@ public final class GossipLearner<M> implements CapabilityProvider {
     private void onExchange(PeerId from, byte[] payload) {
         Exchange exchange;
         try {
-            exchange = codec.fromBytes(payload, Exchange.class);
+            exchange = codec.fromWire(payload, Exchange.class);
         } catch (RuntimeException e) {
             return;
         }

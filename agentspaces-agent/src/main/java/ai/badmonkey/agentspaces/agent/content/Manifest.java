@@ -32,12 +32,13 @@ import java.util.Objects;
  * on the wire.
  *
  * @param v         schema version, 1
- * @param root      CIDv1 (multibase base32, codec raw, multihash sha2-256) over the concatenated piece hashes
+ * @param root      CIDv1 (multibase base32, codec raw, multihash sha2-256) over the concatenated piece hashes;
+ *                  for {@link #LAYOUT_TREE}, the blob tree's root, a dag-cbor CIDv1 over sha2-256
  * @param size      artifact bytes
  * @param pieceSize piece bytes, a power of two from 64 KiB to 4 MiB; the last piece may be shorter
  * @param pieces    {@code ceil(size / pieceSize)}
  * @param table     the piece hashes, 32 bytes each in order, when {@code pieces <= INLINE_TABLE_PIECES}; else null
- * @param tableRef  legacy block CID of the table when it is not inline; else null
+ * @param tableRef  legacy block CID of the table when it is not inline; else null (both null on a tree manifest without a table, P2-X-01)
  * @param tableRefs reserved for artifacts above one table block (LB-F-12); null
  * @param name      display name, at most 256 bytes, or null
  * @param mediaType RFC 6838 media type, or null
@@ -98,6 +99,27 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
     /** A blob tree (srad/agentspaces-pdt.md §3.3) whose root the tree exchange fetches (PD-X-09). */
     public static final String LAYOUT_TREE = "tree";
 
+    /**
+     * Reserved attr (PDT 2 phase 0, P2-H-05; srad/agentspaces-pdt2.md §6.10.3, rule 11): the
+     * artifact's BLAKE3 identity, a CIDv1 of codec {@code raw} over multihash 0x1e. It rides in
+     * {@link #attrs} because no writer can gate a field of a record every member reads, and it
+     * rides as a tag too, so a template finds every manifest of one file.
+     */
+    public static final String BLAKE3_ATTR = "pdt.blake3";
+
+    /**
+     * Reserved attr (PDT 2 phase 0, P2-B-06; rule 11): the root of the artifact's Bao outboard, a
+     * CIDv1 of codec {@code dag-cbor} over sha2-256 naming a {@code bo} node.
+     */
+    public static final String BAO_ATTR = "pdt.bao";
+
+    private static final int CID_VERSION = 0x01;
+    private static final int CODEC_RAW = 0x55;
+    private static final int CODEC_DAG_CBOR = 0x71;
+    private static final int MULTIHASH_SHA2_256 = 0x12;
+    private static final int MULTIHASH_BLAKE3 = 0x1e;
+    private static final int DIGEST_BYTES = 32;
+
     public Manifest {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(sealing, "sealing");
@@ -135,8 +157,12 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
      * Checks the invariants a validator enforces on write and on read: the
      * version, the piece-size bounds, the piece count, exactly one of the inline
      * table and the table reference, the table length, the size bounds on
-     * name and attributes, and the layout name (PD-X-09). The root itself is
-     * checked against the table by the content module, which holds the hashing code.
+     * name and attributes, and the layout name (PD-X-09). A {@link #LAYOUT_TREE}
+     * manifest may omit both table fields, because its root names every piece, and its
+     * root is a dag-cbor CID over sha2-256, the root of a blob tree (PDT 2 phase 2,
+     * P2-X-01, as the owner ruled in the PDT 2 follow-ups of 2026-11-09, F3), so a tree
+     * manifest never stands for a flat root. A flat root itself is checked against the
+     * table by the content module, which holds the hashing code.
      *
      * @return the first violated rule, or empty when the manifest is well formed
      */
@@ -154,7 +180,13 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
         if (pieces != expectedPieces) {
             return java.util.Optional.of("pieces " + pieces + " does not match ceil(size / pieceSize) = " + expectedPieces);
         }
-        if ((table == null) == (tableRef == null)) {
+        if (table != null && tableRef != null) {
+            return java.util.Optional.of(LAYOUT_TREE.equals(layout) ? "at most one of table and tableRef may be present"
+                    : "exactly one of table and tableRef must be present");
+        }
+        // PDT 2 phase 2, P2-X-01, the owner's ruling of 2026-11-09 (F3): a tree manifest's root names every
+        // piece, so it is exempt from the piece table; a flat manifest still carries one
+        if (table == null && tableRef == null && !LAYOUT_TREE.equals(layout)) {
             return java.util.Optional.of("exactly one of table and tableRef must be present");
         }
         if (table != null) {
@@ -190,7 +222,50 @@ public record Manifest(int v, String root, long size, int pieceSize, int pieces,
         if (layout != null && !LAYOUT_PIECES.equals(layout) && !LAYOUT_TREE.equals(layout)) {
             return java.util.Optional.of("unknown layout " + layout);
         }
+        if (LAYOUT_TREE.equals(layout) && !isCid(root, CODEC_DAG_CBOR, MULTIHASH_SHA2_256)) {
+            return java.util.Optional.of("a tree manifest's root is a dag-cbor CID");
+        }
         return java.util.Optional.empty();
+    }
+
+    /**
+     * The BLAKE3 identity under {@link #BLAKE3_ATTR}, when its text is a well-formed CID of codec
+     * {@code raw} over multihash 0x1e; advisory, so any other text reads as absent and the
+     * manifest stays valid (PDT 2 phase 0, rule 11). Named without a {@code get} prefix so
+     * Jackson never treats it as a property of the wire record.
+     */
+    public java.util.Optional<String> blake3() {
+        return cidAttr(BLAKE3_ATTR, CODEC_RAW, MULTIHASH_BLAKE3);
+    }
+
+    /**
+     * The Bao outboard root under {@link #BAO_ATTR}, when its text is a well-formed CID of codec
+     * {@code dag-cbor} over sha2-256; advisory as {@link #blake3()} (PDT 2 phase 0, rule 11).
+     */
+    public java.util.Optional<String> bao() {
+        return cidAttr(BAO_ATTR, CODEC_DAG_CBOR, MULTIHASH_SHA2_256);
+    }
+
+    /** A CIDv1 attr in its one base32 text: a 32-byte digest under the given codec and multihash. */
+    private java.util.Optional<String> cidAttr(String key, int codec, int multihash) {
+        String text = attrs == null ? null : attrs.get(key);
+        return isCid(text, codec, multihash) ? java.util.Optional.of(text) : java.util.Optional.empty();
+    }
+
+    /** Whether a text is a CIDv1 in its one base32 text: a 32-byte digest under the given codec and multihash. */
+    private static boolean isCid(String text, int codec, int multihash) {
+        if (text == null || text.isEmpty() || text.charAt(0) != ai.badmonkey.agentspaces.common.codec.Multibase.BASE32_PREFIX) {
+            return false;
+        }
+        byte[] binary;
+        try {
+            binary = ai.badmonkey.agentspaces.common.codec.Multibase.decode(text);
+        } catch (IllegalArgumentException malformed) {
+            return false;
+        }
+        return binary.length == 4 + DIGEST_BYTES && binary[0] == CID_VERSION && (binary[1] & 0xff) == codec
+                && (binary[2] & 0xff) == multihash && binary[3] == DIGEST_BYTES
+                && ai.badmonkey.agentspaces.common.codec.Multibase.base32(binary).equals(text);
     }
 
     /** The length of piece {@code index}, which is shorter only for the last piece. */

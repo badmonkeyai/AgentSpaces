@@ -111,7 +111,10 @@ public final class Ref<T> {
 
     /**
      * Up to {@code n} earlier versions, newest first, found by walking base links
-     * from the current heads over the versions this peer holds (PD-R-09).
+     * from the current heads over the versions this peer holds (PD-R-09). A version
+     * whose entry this peer never saw reads from its {@code vg} chain node, so the
+     * history survives a restart, and a lazy follower lists the versions it can load
+     * on demand (PDT 2 phase 2, P2-V-05); such a version carries seq and size 0.
      *
      * @param n the most versions to return
      * @return the versions

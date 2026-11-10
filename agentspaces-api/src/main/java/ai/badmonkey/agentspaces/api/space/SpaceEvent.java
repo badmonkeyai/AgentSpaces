@@ -79,7 +79,10 @@ public record SpaceEvent<T>(Kind kind, EntryId entryId, T entry, AgentId issuer,
         TAKEN,
         /** A matching entry was completed (consumed permanently). */
         COMPLETED,
-        /** A matching entry's write lease lapsed and the entry vanished. */
+        /**
+         * A matching entry vanished: its write lease lapsed, or its writer cancelled it (SPEC §7.2, core cancel
+         * events, 2026-11-09). A space raises it once per entry, whichever comes first.
+         */
         EXPIRED,
         /** A taken entry's TAKE lease lapsed and the entry reappeared. */
         REAPPEARED

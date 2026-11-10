@@ -101,6 +101,16 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     /** The value of {@link #TREES_PARAMETER} this build advertises. */
     public static final String TREES_VERSION = "1";
 
+    /**
+     * The advertisement parameter that carries the PDT feature level (srad/agentspaces-pdt2.md §6.10.2,
+     * P2-F-05): a member sends a level-N form only to a member whose current advertisement carries this
+     * parameter as the canonical decimal text of N or above, and reads a member without it as level 1.
+     */
+    public static final String PDT_PARAMETER = "pdt";
+
+    /** The highest feature level this build reads, the one a content store advertises (P2-S-01). */
+    public static final int PDT_LEVEL = 2;
+
     /** Advertisement TTL, as every shipped capability uses. */
     static final Duration ADVERTISEMENT_TTL = Duration.ofMinutes(15);
 
@@ -160,16 +170,21 @@ public final class Content implements CapabilityProvider, AutoCloseable {
      * @param nodesServed          nodes served to {@code NODE_WANT} and {@code TREE_WANT}
      * @param nodesReceived        nodes received and verified by tree fetches
      * @param treeRequestsRejected tree requests refused with a {@code REJECT}
-     * @param treeMessagesDropped  tree messages dropped for a violated bound or an unknown request (PD-X-02, PD-X-04)
+     * @param treeMessagesDropped  tree messages dropped for a violated bound, an unknown request, or a broken wire
+     *                             schema, and payloads with an unknown tag or none (PD-X-02, PD-X-04; PDT 2
+     *                             phase 1, P2-X-09)
+     * @param pieceMessagesDropped piece messages (tags 1 to 7) and manifest records dropped for a broken wire
+     *                             schema (PDT 2 phase 1, P2-X-09)
      */
     public record Stats(int fetchesActive, int rootsHeld, long bytesServed, long bytesReceived,
                         long wantsRefused, long piecesStruck, int treeFetchesActive, long nodesServed,
-                        long nodesReceived, long treeRequestsRejected, long treeMessagesDropped) {
+                        long nodesReceived, long treeRequestsRejected, long treeMessagesDropped,
+                        long pieceMessagesDropped) {
 
         /** The form of 0.5.0, before the tree exchange. */
         public Stats(int fetchesActive, int rootsHeld, long bytesServed, long bytesReceived,
                      long wantsRefused, long piecesStruck) {
-            this(fetchesActive, rootsHeld, bytesServed, bytesReceived, wantsRefused, piecesStruck, 0, 0, 0, 0, 0);
+            this(fetchesActive, rootsHeld, bytesServed, bytesReceived, wantsRefused, piecesStruck, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -243,13 +258,70 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     }
 
-    /** What {@link #describe(String)} answers. */
+    /**
+     * The outcome of one possession challenge (PDT 2 phase 3, P2-S-07).
+     *
+     * @param holder  the challenged member
+     * @param root    the root it claims to hold
+     * @param picks   the picks named
+     * @param proven  the picks whose bytes arrived and verified by CID
+     * @param passed  whether every pick verified within the deadline
+     * @param reason  why the challenge failed, or null when it passed
+     * @param elapsed milliseconds from the send to the outcome
+     */
+    public record ChallengeResult(PeerId holder, String root, int picks, int proven, boolean passed, String reason,
+                                  long elapsed) {
+    }
+
+    /** One challenge awaiting its answer: the picks not yet proven, by CID. */
+    private static final class PendingChallenge {
+        final PeerId holder;
+        final String root;
+        final int picks;
+        final java.util.Set<String> outstanding;
+        final long sentAtMillis;
+        final long deadlineMillis;
+        final java.util.concurrent.CompletableFuture<ChallengeResult> result = new java.util.concurrent.CompletableFuture<>();
+
+        PendingChallenge(PeerId holder, String root, List<Messages.Pick> picks, long sentAtMillis, long deadlineMillis) {
+            this.holder = holder;
+            this.root = root;
+            this.picks = picks.size();
+            this.outstanding = new java.util.HashSet<>();
+            picks.forEach(p -> outstanding.add(p.cid()));
+            this.sentAtMillis = sentAtMillis;
+            this.deadlineMillis = deadlineMillis;
+        }
+
+        synchronized void settle(boolean passed, String reason, long now) {
+            result.complete(new ChallengeResult(holder, root, picks, picks - outstanding.size(), passed, reason, now - sentAtMillis));
+        }
+    }
+
+    /**
+     * What {@link #describe(String)} answers.
+     *
+     * @param manifest        the manifest
+     * @param completeHolders members whose holding says complete
+     * @param partialHolders  members holding part of the root
+     * @param held            the pieces this peer holds; empty for a tree root, whose nodes the tree store holds
+     * @param replicated      whether the manifest is in the content space
+     * @param advertised      whether a collection here lists the root
+     * @param nodes           for a {@code layout: tree} manifest, the nodes of the tree as a complete holding
+     *                        states them (P2-X-01), 0 while no complete holder is known; 0 for a flat manifest
+     */
     public record Description(Manifest manifest, int completeHolders, int partialHolders,
-                              BitSet held, boolean replicated, boolean advertised) {
+                              BitSet held, boolean replicated, boolean advertised, long nodes) {
 
         /** The form without the collection flag. */
         public Description(Manifest manifest, int completeHolders, int partialHolders, BitSet held, boolean replicated) {
-            this(manifest, completeHolders, partialHolders, held, replicated, false);
+            this(manifest, completeHolders, partialHolders, held, replicated, false, 0);
+        }
+
+        /** The form without the node count, which a flat manifest leaves at 0. */
+        public Description(Manifest manifest, int completeHolders, int partialHolders, BitSet held, boolean replicated,
+                           boolean advertised) {
+            this(manifest, completeHolders, partialHolders, held, replicated, advertised, 0);
         }
     }
 
@@ -296,7 +368,24 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     private final java.util.Set<String> treeRoots = ConcurrentHashMap.newKeySet();
     private final AtomicLong nodesReceived = new AtomicLong();
     private final AtomicLong treeMessagesDropped = new AtomicLong();
+    private final AtomicLong pieceMessagesDropped = new AtomicLong();
     private final AtomicInteger batchIds = new AtomicInteger();
+    /** The PDT feature level this peer advertises (P2-F-05). */
+    private final int pdtLevel;
+    /** The CIDs this peer reconciles (P2-K-03). */
+    private final java.util.function.Supplier<? extends java.util.Collection<String>> reconcileSet;
+    /** The holder's side of reconciliations, at level 2 (P2-K-02). */
+    private final ai.badmonkey.agentspaces.content.tree.sync.SketchServer sketchServer;
+    /** The reconciliations this peer asked for and awaits, by request id (P2-K-02). */
+    private final Map<Integer, ai.badmonkey.agentspaces.content.tree.sync.SketchSession> sketchSessions = new ConcurrentHashMap<>();
+    /** The source of RIBLT session keys (P2-K-05). */
+    private final java.security.SecureRandom sketchKeys = new java.security.SecureRandom();
+    /** Roots whose answered challenges this peer counts at most. */
+    static final int MAX_CHALLENGED_ROOTS = 4096;
+    /** Challenges this peer answered with every pick held, by root (P2-S-13). */
+    private final Map<String, AtomicLong> challengesAnswered = new ConcurrentHashMap<>();
+    /** Possession challenges this peer sent and awaits, by request id (P2-S-07). */
+    private final Map<Integer, PendingChallenge> challenges = new ConcurrentHashMap<>();
     /**
      * One serial, bounded queue per peer for tags 8 to 11, so a holder's
      * breadth-first stream is verified in order (a parent before its children, a
@@ -343,6 +432,9 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         this.advertisements = b.advertisements != null ? b.advertisements
                 : b.discovery == null ? null : advertisementsIn(b.discovery, this.clock);
         this.treeStore = b.treeStore;
+        this.pdtLevel = b.pdtLevel;
+        this.reconcileSet = b.reconcileSet != null ? b.reconcileSet : this::heldRoots;
+        this.sketchServer = new ai.badmonkey.agentspaces.content.tree.sync.SketchServer(this.reconcileSet, this.clock::millis);
         this.groupSealsLookup = b.groupSeals != null ? b.groupSeals
                 : b.discovery == null ? null : groupSealsIn(b.discovery, this.clock);
         this.treeServer = new TreeServer(this.treeStore, treeHost);
@@ -390,6 +482,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         private DiscoveryService discovery;
         private java.util.function.BooleanSupplier groupSeals;
         private TreeStore treeStore;
+        private int pdtLevel = 1;
+        private java.util.function.Supplier<? extends java.util.Collection<String>> reconcileSet;
 
         private Builder(PipeChannel pipes, GroupRuntime runtime, Space space, PeerId self) {
             this.pipes = pipes;
@@ -510,6 +604,36 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             return this;
         }
 
+        /**
+         * The PDT feature level this peer advertises ({@link #PDT_PARAMETER}, P2-F-05): 1 by default, which
+         * adds no parameter; {@link #PDT_LEVEL} makes this peer read the level-2 forms of §6.10.4 and answer
+         * tag 12 {@code CHALLENGE}, as a content store does (PDT 2 phase 3, P2-S-01).
+         *
+         * @param value 1 or {@link #PDT_LEVEL}
+         * @return this builder
+         */
+        public Builder pdtLevel(int value) {
+            if (value < 1 || value > PDT_LEVEL) {
+                throw new IllegalArgumentException("the pdt level is 1 or " + PDT_LEVEL + ", got " + value);
+            }
+            this.pdtLevel = value;
+            return this;
+        }
+
+        /**
+         * The CIDs this peer reconciles (the {@code sketch} seam of P2-Q-MNT-01; PDT 2 phase 5, P2-K-02, P2-K-03): the
+         * roots it holds complete ({@link Content#heldRoots}) by default. A host that reconciles another set, its pins
+         * or the version-graph nodes of a ref (§3.6), gives it here; both sides of a session should name the same
+         * kind of set.
+         *
+         * @param value the set, read once per session and at most every ten seconds when this peer answers
+         * @return this builder
+         */
+        public Builder reconcileSet(java.util.function.Supplier<? extends java.util.Collection<String>> value) {
+            this.reconcileSet = Objects.requireNonNull(value, "reconcileSet");
+            return this;
+        }
+
         public Content build() {
             return new Content(this);
         }
@@ -524,14 +648,63 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
     @Override
     public CapabilityAdvertisement describe(GroupId group) {
+        Map<String, String> parameters = new java.util.HashMap<>(Map.of(
+                "pieceSizes", Manifest.MIN_PIECE_SIZE + "-" + Manifest.MAX_PIECE_SIZE,
+                "sealing", keyRing == null ? Manifest.SEALING_NONE : Manifest.SEALING_GROUP_KEY,
+                "seedMode", policy.seedMode().name().toLowerCase(java.util.Locale.ROOT),
+                TREES_PARAMETER, TREES_VERSION));
+        if (pdtLevel >= PDT_LEVEL) {
+            parameters.put(PDT_PARAMETER, Integer.toString(pdtLevel));
+        }
         return new CapabilityAdvertisement(
                 "aspace://" + group.value() + "/cap/content-swarm/" + self.value(),
                 self, group, clock.instant(), ADVERTISEMENT_TTL, TYPE, "0.1", "pipe",
-                Map.of("pieceSizes", Manifest.MIN_PIECE_SIZE + "-" + Manifest.MAX_PIECE_SIZE,
-                        "sealing", keyRing == null ? Manifest.SEALING_NONE : Manifest.SEALING_GROUP_KEY,
-                        "seedMode", policy.seedMode().name().toLowerCase(java.util.Locale.ROOT),
-                        TREES_PARAMETER, TREES_VERSION),
-                Map.of());
+                Map.copyOf(parameters), Map.of());
+    }
+
+    /** The PDT feature level this peer advertises (P2-F-05). */
+    public int pdtLevel() {
+        return pdtLevel;
+    }
+
+    /**
+     * The PDT feature level of a member (§6.10.2, P2-F-05): the canonical decimal text of the {@code pdt}
+     * parameter on its newest unexpired content-swarm advertisement; 1 for a member without one, without
+     * the parameter, or with any other text.
+     *
+     * @param peer the member
+     * @return the level, at least 1
+     */
+    public int pdtLevel(PeerId peer) {
+        Objects.requireNonNull(peer, "peer");
+        if (advertisements == null) {
+            return 1;
+        }
+        String text = advertisements.apply(peer).map(ad -> ad.parameters().get(PDT_PARAMETER)).orElse(null);
+        if (text == null || !text.matches("[1-9][0-9]{0,8}")) {
+            return 1;
+        }
+        return Integer.parseInt(text);
+    }
+
+    /**
+     * Whether an intra-chunk delta frame this peer keeps could reach a member now (PDT 2 phase 4 measures, owner
+     * default of 2026-11-09, srad/agentspaces-pdt2.md §10.14): this peer answers in plaintext at level 2, and some
+     * other member of the view advertises level 2, the pair {@link TreeServer} sends frames between (P2-Z-01,
+     * P2-F-05). A writer keeps frames only while this holds, so a fleet of level-1 members never compresses one.
+     *
+     * @return true when some member could receive a frame
+     */
+    public boolean framesReachAMember() {
+        if (pdtLevel < PDT_LEVEL || keyRing != null) {
+            return false;
+        }
+        for (var member : runtime.membership().allMembers()) {
+            if (pdtLevel(member.id()) >= PDT_LEVEL) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -618,6 +791,13 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             }
         }
         treeQueues.values().removeIf(q -> q.idle(now));
+        expireChallenges(now);
+        for (ai.badmonkey.agentspaces.content.tree.sync.SketchSession session : List.copyOf(sketchSessions.values())) {
+            session.tick(now);
+            if (session.outcome().isDone()) {
+                sketchSessions.remove(session.req(), session);
+            }
+        }
         if (groupSealsLookup != null && now - groupSealsReadAtMillis >= GROUP_SEALS_REREAD_MILLIS) {
             groupSealsReadAtMillis = now;
             groupSeals = groupSealsLookup.getAsBoolean();
@@ -661,6 +841,10 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             pending.holdings.close();
         }
         treeFetches.clear();
+        for (ai.badmonkey.agentspaces.content.tree.sync.SketchSession session : sketchSessions.values()) {
+            session.outcome().completeExceptionally(new IllegalStateException("the content swarm closed"));
+        }
+        sketchSessions.clear();
         try {
             store.flush(); // the file store persists what it batched (LB-T-01)
         } catch (RuntimeException e) {
@@ -669,6 +853,11 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     }
 
     // ------------------------------------------------------------ API
+
+    /** This peer. */
+    public PeerId self() {
+        return self;
+    }
 
     /** The store. */
     public PieceStore store() {
@@ -688,7 +877,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
         return new Stats(fetches.size(), store.roots().size(), bytesServed.get(), received,
                 wantsRefused.get(), piecesStruck.get(), treeFetches.size(), treeServer.nodesServed(),
-                nodesReceived.get(), treeServer.rejected(), treeServer.dropped() + treeMessagesDropped.get());
+                nodesReceived.get(), treeServer.rejected(), treeServer.dropped() + treeMessagesDropped.get(),
+                pieceMessagesDropped.get());
     }
 
     /** The node store this peer serves trees from, when it has one. */
@@ -751,6 +941,9 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         ContentRoots.Hashed hashed;
         try (FileChannel in = FileChannel.open(file, StandardOpenOption.READ)) {
             hashed = ContentRoots.hash(in, options.pieceSize());
+        }
+        try (java.io.InputStream in = java.nio.file.Files.newInputStream(file)) {
+            options = withIdentity(options, in);
         }
         Manifest manifest = manifestOf(hashed, options, true);
         if (options.inPlace()) {
@@ -851,6 +1044,11 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             }
         }
         ContentRoots.Hashed hashed = ContentRoots.hash(bytes, options.pieceSize());
+        try {
+            options = withIdentity(options, new java.io.ByteArrayInputStream(bytes));
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
         Manifest manifest = manifestOf(hashed, options, true);
         store.open(manifest);
         for (int i = 0; i < manifest.pieces(); i++) {
@@ -858,6 +1056,48 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             store.write(manifest.root(), i, java.util.Arrays.copyOfRange(bytes, start, start + manifest.pieceLength(i)));
         }
         return published(manifest, options);
+    }
+
+    /**
+     * The options with a plaintext artifact's identity in their attrs (PDT 2 phase 4, P2-B-06, P2-H-05; rule 11 of
+     * srad/agentspaces-pdt2.md §6.10.3): {@code pdt.blake3} and {@code pdt.bao} from the tree store, which keeps and
+     * serves the outboard, so identical files published at other piece sizes name one identity. A swarm without a tree
+     * store names none, and neither does one that seals with the group key, since the identity would name plaintext.
+     * The identity is advisory, so a publish whose own attrs leave no room for it within the manifest's bounds names
+     * none and publishes as before (PDT 2 phase 4 gate, P2-Q-REL-08).
+     */
+    private PublishOptions withIdentity(PublishOptions options, java.io.InputStream content) throws IOException {
+        Map<String, String> attrs = new java.util.LinkedHashMap<>(options.attrs() == null ? Map.of() : options.attrs());
+        if (treeStore == null || keyRing != null || !identityFits(attrs)) {
+            return options;
+        }
+        Map<String, String> identity = treeStore.outboard(content);
+        if (identity.isEmpty()) {
+            return options;
+        }
+        attrs.putAll(identity);
+        return options.withAttrs(attrs);
+    }
+
+    /**
+     * Whether {@code pdt.blake3} and {@code pdt.bao} fit beside a publish's own attrs within the manifest's bounds
+     * ({@link Manifest#MAX_ATTRS}, {@link Manifest#MAX_ATTRS_BYTES}); both values are CID texts of a fixed length.
+     */
+    private static boolean identityFits(Map<String, String> attrs) {
+        Map<String, String> probe = new java.util.LinkedHashMap<>(attrs);
+        int digest = ai.badmonkey.agentspaces.content.tree.Cids.DIGEST_LENGTH;
+        probe.put(Manifest.BLAKE3_ATTR, ai.badmonkey.agentspaces.content.tree.Cids.identity(new byte[digest]));
+        probe.put(Manifest.BAO_ATTR, ai.badmonkey.agentspaces.content.tree.Cids.ofDigest(new byte[digest],
+                ai.badmonkey.agentspaces.content.tree.Cids.DAG_CBOR));
+        if (probe.size() > Manifest.MAX_ATTRS) {
+            return false;
+        }
+        long bytes = 0;
+        for (Map.Entry<String, String> e : probe.entrySet()) {
+            bytes += e.getKey().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                    + e.getValue().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        }
+        return bytes <= Manifest.MAX_ATTRS_BYTES;
     }
 
     /**
@@ -1017,6 +1257,34 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     }
 
     /**
+     * Shares a tree root this peer holds complete into this capability's group for a lease (PDT 2
+     * phase 1, P2-X-02; PD-R-10): the tree counterpart of {@link #share(String, Lease)}. A member of
+     * two groups keeps one node store under both swarms, so the second group's swarm serves the
+     * nodes the first one fetched without a second transfer; this writes one holding naming this
+     * peer as a complete holder, which lapses with the lease unless {@link #holdTree} keeps it.
+     *
+     * @param root  the root CID, complete in the tree store
+     * @param lease the holding's lease in this group
+     * @return the holding written
+     * @throws IllegalStateException when this peer has no tree store or does not hold the root complete
+     */
+    public Holding shareTree(String root, Lease lease) {
+        Objects.requireNonNull(root, "root");
+        Objects.requireNonNull(lease, "lease");
+        if (treeStore == null) {
+            throw new IllegalStateException("this peer has no tree store");
+        }
+        if (!treeStore.complete(root)) {
+            throw new IllegalStateException("tree root " + root + " is not complete in this peer's store");
+        }
+        List<PeerId> via = runtime.viaRelays();
+        Holding holding = new Holding(Holding.VERSION, root, self, true, null, treeStore.reachable(root).size(),
+                via.isEmpty() ? null : via, null);
+        spaces.writeHolding(holding, lease);
+        return holding;
+    }
+
+    /**
      * Withdraws this peer's holding for a tree root.
      *
      * @param root the root CID
@@ -1072,6 +1340,283 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     }
 
+    // ------------------------------------------------------------ reconciliation (P2-K-02, P2-K-03)
+
+    /**
+     * The outcome of one reconciliation with a member (PDT 2 phase 5, P2-K-03).
+     *
+     * @param peer     the member
+     * @param have     CIDs this peer reconciles and the member lacks
+     * @param need     CIDs the member holds and this peer lacks: an artifact root as the raw CID whose manifest the
+     *                 content space holds, every other as a dag-cbor CID
+     * @param rounds   the rounds the session took
+     * @param bytes    the bytes of every want and answer of the session
+     * @param encoding {@code negentropy}, {@code riblt}, or {@code riblt,negentropy}
+     */
+    public record Reconciliation(PeerId peer, List<String> have, List<String> need, int rounds, long bytes, String encoding) {
+    }
+
+    /**
+     * The roots this peer holds complete and advertises: every root whose last holding here says complete, trees and
+     * artifacts alike (P2-K-03). The holdings tick walks a tree at most every ten seconds, so a node lost since then
+     * shows at the next walk.
+     *
+     * @return the roots, a snapshot
+     */
+    public java.util.Set<String> heldRoots() {
+        java.util.Set<String> held = new java.util.HashSet<>();
+        holders.forEach((root, holder) -> {
+            Holding last = holder.last;
+            if (last != null && last.complete()) {
+                held.add(root);
+            }
+        });
+        return held;
+    }
+
+    /**
+     * Reconciles this peer's set (by default {@link #heldRoots}) with a member's by negentropy (PDT 2 phase 5, P2-K-02,
+     * S4 of §6.4): rounds of a {@code TREE_WANT} with {@code root ""} and the sketch, each answered by a
+     * {@code TREE_END} of reason 5, under one request id, until a reply names no range. Only a member at feature
+     * level 2 receives the form (rule 12); the session fails at once against a level-1 member and sends nothing.
+     *
+     * @param peer the member
+     * @return the outcome; fails on a refusal, a timeout of a round, 64 rounds, or an answer outside its grammar
+     */
+    public java.util.concurrent.CompletableFuture<Reconciliation> reconcileHeld(PeerId peer) {
+        return reconcileHeld(peer, 0);
+    }
+
+    /**
+     * As {@link #reconcileHeld(PeerId)}, by RIBLT first when the expected difference is above 0 (P2-K-05): coded
+     * symbols stream until the member decodes, up to twice the expected difference (at least 64), and the session
+     * continues by negentropy past that.
+     *
+     * @param peer     the member
+     * @param expected the expected size of the difference, or 0 for negentropy alone
+     * @return the outcome
+     */
+    public java.util.concurrent.CompletableFuture<Reconciliation> reconcileHeld(PeerId peer, int expected) {
+        Objects.requireNonNull(peer, "peer");
+        if (pdtLevel(peer) < PDT_LEVEL) {
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException(
+                    peer.display() + " is at pdt level 1 and reads no sketch"));
+        }
+        int req = requestIds.incrementAndGet();
+        ai.badmonkey.agentspaces.content.tree.sync.SketchSession session = new ai.badmonkey.agentspaces.content.tree.sync.SketchSession(
+                peer, req, ai.badmonkey.agentspaces.content.tree.sync.SketchSet.of(reconcileSet.get()), expected, sketchKeys,
+                new ai.badmonkey.agentspaces.content.tree.sync.SketchSession.Fabric() {
+                    @Override
+                    public long nowMillis() {
+                        return clock.millis();
+                    }
+
+                    @Override
+                    public int send(PeerId to, Messages.TreeWant want) {
+                        byte[] bytes = codec.toBytes(want);
+                        pipes.send(to, TYPE, bytes);
+                        return bytes.length;
+                    }
+                });
+        sketchSessions.put(req, session);
+        session.start();
+        return session.outcome().thenApply(o -> new Reconciliation(peer, o.have(), o.need().stream().map(this::resolveRoot).toList(),
+                o.rounds(), o.bytesSent() + o.bytesReceived(), o.encoding()));
+    }
+
+    /** A needed root that came back as a digest: the raw CID when the content space holds its manifest, else dag-cbor. */
+    private String resolveRoot(String dagCbor) {
+        String raw = ai.badmonkey.agentspaces.content.tree.Cids.ofDigest(
+                ai.badmonkey.agentspaces.content.tree.Cids.parse(dagCbor).digest(), ai.badmonkey.agentspaces.content.tree.Cids.RAW);
+        return spaces.manifest(raw).isPresent() ? raw : dagCbor;
+    }
+
+    private boolean onSketchEnd(PeerId from, Messages.TreeEnd end, int bytes) {
+        ai.badmonkey.agentspaces.content.tree.sync.SketchSession session = sketchSessions.get(end.req());
+        if (session == null || !session.onEnd(from, end, bytes)) {
+            return false;
+        }
+        if (session.outcome().isDone()) {
+            sketchSessions.remove(end.req(), session);
+        }
+        return true;
+    }
+
+    private boolean onSketchRefused(PeerId from, Messages.Reject reject) {
+        for (ai.badmonkey.agentspaces.content.tree.sync.SketchSession session : sketchSessions.values()) {
+            if (session.onReject(from, reject)) {
+                sketchSessions.remove(session.req(), session);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------ eager push (P2-P-01, P2-P-04)
+
+    /** The group's gossip bus, on which the PDT layer pushes a ref's deltas down the ref's stream (PDT 2 phase 5, P2-P-01). */
+    public ai.badmonkey.agentspaces.peering.gossip.GossipBus gossip() {
+        return runtime.gossip();
+    }
+
+    /**
+     * Spends download budget on bytes that arrive outside a fetch, as a pushed bundle does (PDT 2 phase 5, P2-P-04).
+     *
+     * @param bytes the bytes
+     * @return false, spending nothing, when the day's budget cannot take them
+     */
+    public boolean chargeDownload(int bytes) {
+        return withinDownloadBudget(bytes);
+    }
+
+    /**
+     * Spends upload budget on bytes this peer forwards outside a fetch, as a relayed bundle is (PDT 2 phase 5, P2-P-04).
+     *
+     * @param bytes the bytes
+     * @return false, spending nothing, when the day's budget cannot take them
+     */
+    public boolean chargeUpload(int bytes) {
+        return withinUploadBudget(bytes);
+    }
+
+    // ------------------------------------------------------------ possession challenges (P2-S-07)
+
+    /**
+     * Challenges a member to prove it holds a root (PDT 2 phase 3, P2-S-07; srad/agentspaces-pdt2.md
+     * §3.2.4): sends tag 12 {@code CHALLENGE} with the picks and completes with the outcome. Every pick must
+     * come back within the deadline and hash to its CID, so a holder that lost a node, holds none of the
+     * picks, or must fetch them first fails. The message goes only to a member at feature level 2 (rule
+     * 15); a challenge of a level-1 member fails at once and sends nothing. The deadline runs on this
+     * peer's clock and the tick settles it.
+     *
+     * @param holder   the member that claims to hold the root
+     * @param root     a tree root (picks name its nodes) or an artifact root (picks name its pieces by the
+     *                 raw CID of their table digests, as {@link #pieceCids} lists them)
+     * @param picks    1 to {@link Messages#MAX_PICKS} picks
+     * @param deadline how long the holder has to answer
+     * @return the outcome
+     */
+    public java.util.concurrent.CompletableFuture<ChallengeResult> challenge(PeerId holder, String root,
+                                                                             List<Messages.Pick> picks, Duration deadline) {
+        Objects.requireNonNull(holder, "holder");
+        Objects.requireNonNull(deadline, "deadline");
+        int req = requestIds.incrementAndGet();
+        Messages.Challenge message = new Messages.Challenge(req, root, List.copyOf(picks));
+        message.violation().ifPresent(v -> {
+            throw new IllegalArgumentException(v);
+        });
+        long now = clock.millis();
+        PendingChallenge pending = new PendingChallenge(holder, root, message.picks(), now, now + deadline.toMillis());
+        if (pdtLevel(holder) < PDT_LEVEL) {
+            pending.settle(false, holder.display() + " is at pdt level 1 and reads no CHALLENGE", now);
+            return pending.result;
+        }
+        challenges.put(req, pending);
+        pipes.send(holder, TYPE, codec.toBytes(message));
+        return pending.result;
+    }
+
+    /**
+     * The pieces of an artifact as challenge picks name them (P2-S-07): the raw CID of each piece's
+     * sha2-256 digest in the manifest's table, in piece order.
+     *
+     * @param root the artifact root, whose manifest and table this peer knows
+     * @return the piece CIDs, empty when the manifest or its table is not here
+     */
+    public List<String> pieceCids(String root) {
+        Optional<byte[]> table = store.manifest(root).or(() -> spaces.manifest(root)).flatMap(this::tableHere);
+        if (table.isEmpty()) {
+            return List.of();
+        }
+        List<String> cids = new ArrayList<>();
+        for (int at = 0; at + 32 <= table.get().length; at += 32) {
+            cids.add(ai.badmonkey.agentspaces.content.tree.Cids.ofDigest(
+                    java.util.Arrays.copyOfRange(table.get(), at, at + 32), ai.badmonkey.agentspaces.content.tree.Cids.RAW));
+        }
+        return cids;
+    }
+
+    /**
+     * How many challenges of a root this peer answered with every pick held (P2-S-13), counted for at most
+     * {@link #MAX_CHALLENGED_ROOTS} roots.
+     *
+     * @param root the root
+     * @return the count
+     */
+    public long challengesAnswered(String root) {
+        AtomicLong count = challengesAnswered.get(root);
+        return count == null ? 0 : count.get();
+    }
+
+    /** Takes the answer to a challenge this peer sent; false when the request is no challenge of this peer's. */
+    private boolean onChallengeAnswer(PeerId from, Messages.Nodes nodes) {
+        PendingChallenge pending = challenges.get(nodes.req());
+        if (pending == null || !pending.holder.equals(from)) {
+            return false;
+        }
+        long now = clock.millis();
+        if (now > pending.deadlineMillis) {
+            // the tick settles a lapsed challenge only on its next run; an answer in between is still late
+            finishChallenge(nodes.req(), pending, false, "no complete answer before the deadline", now);
+            return true;
+        }
+        Optional<List<byte[]>> opened = nodes.violation().isPresent() ? Optional.empty() : treeFabric.open(from, nodes.req(), nodes);
+        synchronized (pending) {
+            if (opened.isEmpty()) {
+                finishChallenge(nodes.req(), pending, false, "an answer that does not open or breaks its bounds", now);
+                return true;
+            }
+            for (byte[] bytes : opened.get()) {
+                String matched = null;
+                for (String cid : pending.outstanding) {
+                    int codecOf = ai.badmonkey.agentspaces.content.tree.Cids.parse(cid).codec();
+                    if (cid.equals(ai.badmonkey.agentspaces.content.tree.Cids.of(bytes, codecOf))) {
+                        matched = cid;
+                        break;
+                    }
+                }
+                if (matched == null) {
+                    finishChallenge(nodes.req(), pending, false, "bytes that match no pick", now);
+                    return true;
+                }
+                pending.outstanding.remove(matched);
+            }
+            if (nodes.missing() != null && nodes.missing().stream().anyMatch(pending.outstanding::contains)) {
+                finishChallenge(nodes.req(), pending, false, nodes.missing().size() + " picks not held", now);
+            } else if (pending.outstanding.isEmpty()) {
+                finishChallenge(nodes.req(), pending, true, null, now);
+            }
+        }
+        return true;
+    }
+
+    /** Takes a refusal of a challenge; false when no challenge to that member names the root. */
+    private boolean onChallengeRefused(PeerId from, Messages.Reject reject) {
+        for (Map.Entry<Integer, PendingChallenge> e : challenges.entrySet()) {
+            PendingChallenge pending = e.getValue();
+            if (pending.holder.equals(from) && pending.root.equals(reject.root())) {
+                finishChallenge(e.getKey(), pending, false, "REJECT reason " + reject.reason(), clock.millis());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void finishChallenge(int req, PendingChallenge pending, boolean passed, String reason, long now) {
+        if (challenges.remove(req, pending)) {
+            pending.settle(passed, reason, now);
+        }
+    }
+
+    /** Settles every challenge whose deadline passed (the tick). */
+    private void expireChallenges(long now) {
+        for (Map.Entry<Integer, PendingChallenge> e : challenges.entrySet()) {
+            if (now > e.getValue().deadlineMillis) {
+                finishChallenge(e.getKey(), e.getValue(), false, "no complete answer before the deadline", now);
+            }
+        }
+    }
+
     /** Whether a member's current advertisement says its group content travels sealed. */
     private boolean advertisesSealing(PeerId peer) {
         if (advertisements == null) {
@@ -1088,17 +1633,41 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     }
 
     /**
-     * Fetches an artifact from every reachable holder.
+     * Reads the opened plaintext of a sealed {@code NODES}: the wire encoding of the nodes list, a
+     * nested document read through {@link CborCodec#fromWire} (PDT 2 phase 1, P2-X-09).
+     *
+     * @return the node bytes, or empty when the plaintext is not the list's own encoding
+     */
+    static Optional<List<byte[]>> sealedNodesList(CborCodec codec, byte[] plain) {
+        try {
+            return Optional.of(List.of(codec.fromWire(plain, byte[][].class)));
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Fetches an artifact from every reachable holder. A flat root (a raw CID over its piece table) fetches by the
+     * piece swarm. A blob tree's root, the dag-cbor CID a {@code layout: tree} manifest names, fetches by the tree
+     * exchange, as {@link #fetchTree(String, List, FetchOptions)} with no haves does, and never by a piece table,
+     * which a tree manifest does not carry (PDT 2 follow-ups, 2026-11-09, F3; P2-X-01). The handle of a tree
+     * reports its nodes, reads the manifest once a member writes it, and does not {@link Fetch#open open}: the
+     * persistent-tree layer reads the blob from the tree store.
      *
      * @param root    the root
      * @param options the options
-     * @return the fetch handle; complete at once when the store already holds the artifact
+     * @return the fetch handle; complete at once when the store already holds the artifact or the tree
+     * @throws IllegalStateException when the root names a tree and this peer has no tree store
      */
     public Fetch fetch(String root, FetchOptions options) {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(options, "options");
         if (!ContentRoots.isRoot(root)) {
             throw new IllegalArgumentException("not a content root: " + root);
+        }
+        if (ai.badmonkey.agentspaces.content.tree.Cids.isCid(root)
+                && ai.badmonkey.agentspaces.content.tree.Cids.parse(root).codec() == ai.badmonkey.agentspaces.content.tree.Cids.DAG_CBOR) {
+            return new TreeLayoutFetch(fetchTree(root, List.of(), options), () -> spaces.manifest(root));
         }
         Pending existing = fetches.get(root);
         if (existing != null) {
@@ -1571,7 +2140,10 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         return runtime.id();
     }
 
-    /** Describes a root without starting a fetch (LB-M-07). */
+    /**
+     * Describes a root without starting a fetch (LB-M-07). A {@code layout: tree} manifest's root counts its
+     * holders from the tree holdings and its nodes from the most nodes a complete holding states (P2-X-01).
+     */
     public Optional<Description> describe(String root) {
         Optional<Manifest> replicated = spaces.manifest(root);
         Optional<Manifest> manifest = replicated.or(() -> store.manifest(root));
@@ -1580,16 +2152,18 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
         int complete = 0;
         int partial = 0;
+        long nodes = 0;
         for (Holding h : spaces.holdings(root)) {
             if (h.complete()) {
                 complete++;
+                nodes = Math.max(nodes, h.count());
             } else {
                 partial++;
             }
         }
         boolean advertised = collections.stream().anyMatch(c -> c.advertises(manifest.get()));
         return Optional.of(new Description(manifest.get(), complete, partial, store.have(root), replicated.isPresent(),
-                advertised));
+                advertised, manifest.get().treeLayout() ? nodes : 0));
     }
 
     /** Every manifest the replica shows (LB-K-01). */
@@ -2130,6 +2704,42 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         public void served(int nodes, long bytes) {
             bytesServed.addAndGet(bytes);
         }
+
+        @Override
+        public boolean levelTwo() {
+            return pdtLevel >= PDT_LEVEL;
+        }
+
+        @Override
+        public boolean readsLevelTwo(PeerId peer) {
+            return pdtLevel(peer) >= PDT_LEVEL; // PDT 2 phase 4, P2-Z-01 and P2-F-05
+        }
+
+        @Override
+        public void challengeAnswered(String root) {
+            if (challengesAnswered.size() < MAX_CHALLENGED_ROOTS || challengesAnswered.containsKey(root)) {
+                challengesAnswered.computeIfAbsent(root, r -> new AtomicLong()).incrementAndGet();
+            }
+        }
+
+        @Override
+        public Optional<byte[]> piece(String root, String cid) {
+            Optional<Manifest> manifest = store.manifest(root);
+            if (manifest.isEmpty()) {
+                return Optional.empty(); // the server checked the asker's grant on the root
+            }
+            List<String> pieces = pieceCids(root);
+            int index = pieces.indexOf(cid);
+            if (index < 0 || !store.have(root).get(index)) {
+                return Optional.empty();
+            }
+            return store.read(root, index, 0, manifest.get().pieceLength(index));
+        }
+
+        @Override
+        public Optional<ai.badmonkey.agentspaces.content.tree.sync.SketchServer> sketches() {
+            return Optional.of(sketchServer); // a level-2 holder reconciles; a level-1 one never gets here
+        }
     };
 
     /** What a tree fetch needs from this capability (PD-X-04 to PD-X-08). */
@@ -2187,12 +2797,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             for (GroupKey key : keyRing.openingKeys(nodes.epoch())) {
                 Optional<byte[]> plain = key.decrypt(nodes.sealed(), aad);
                 if (plain.isPresent()) {
-                    try {
-                        byte[][] list = codec.fromBytes(plain.get(), byte[][].class);
-                        return Optional.of(list == null ? List.of() : List.of(list));
-                    } catch (RuntimeException e) {
-                        return Optional.empty();
-                    }
+                    return sealedNodesList(codec, plain.get());
                 }
             }
             return Optional.empty();
@@ -2201,6 +2806,11 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         @Override
         public void onNodesVerified(int count, long bytes) {
             nodesReceived.addAndGet(count);
+        }
+
+        @Override
+        public boolean readsDeltas() {
+            return pdtLevel >= PDT_LEVEL; // PDT 2 phase 4, P2-Z-01: a level-1 peer reads no NODES.deltas
         }
 
         @Override
@@ -2220,46 +2830,54 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
     // ------------------------------------------------------------ the holder side
 
+    /**
+     * Dispatches one content-swarm message. Every message reads through {@link Messages#decode}
+     * under its wire schema (PDT 2 phase 1, P2-X-09): a piece message (tags 1 to 7) that breaks it
+     * counts in {@code pieceMessagesDropped}; a tree message (tags 8 to 11) that breaks it, and a
+     * payload with an unknown tag or none, count in {@code treeMessagesDropped}, as the TypeScript
+     * port counts them. None of them strikes the sender, since a relabel or a newer tag proves no
+     * hostility.
+     */
     private void onFrame(PeerId from, byte[] payload) {
         if (closed) {
             return;
         }
         Optional<Integer> tag = Messages.tagOf(codec, payload);
         if (tag.isEmpty()) {
+            treeMessagesDropped.incrementAndGet();
             return;
         }
         switch (tag.get()) {
-            case Messages.PIECE_WANT -> Messages.decode(codec, payload, Messages.PieceWant.class)
-                    .ifPresent(want -> serve(from, want));
-            case Messages.PIECE -> Messages.decode(codec, payload, Messages.Piece.class)
-                    .ifPresent(piece -> {
-                        Pending pending = fetches.get(piece.root());
-                        if (pending != null) {
-                            pending.session.onPiece(from, piece);
-                            if (pending.session.isDone()) {
-                                finish(pending);
-                            }
+            case Messages.PIECE_WANT -> piece(payload, Messages.PieceWant.class, want -> serve(from, want));
+            case Messages.PIECE -> piece(payload, Messages.Piece.class, piece -> {
+                Pending pending = fetches.get(piece.root());
+                if (pending != null) {
+                    pending.session.onPiece(from, piece);
+                    if (pending.session.isDone()) {
+                        finish(pending);
+                    }
+                }
+            });
+            case Messages.REJECT -> piece(payload, Messages.Reject.class, reject -> {
+                if (reject.index() == Messages.TREE_INDEX) {
+                    if (onChallengeRefused(from, reject) || ("".equals(reject.root()) && onSketchRefused(from, reject))) {
+                        return;
+                    }
+                    for (TreePending pending : treeFetches.values()) {
+                        if (pending.session.onReject(from, reject)) {
+                            break;
                         }
-                    });
-            case Messages.REJECT -> Messages.decode(codec, payload, Messages.Reject.class)
-                    .ifPresent(reject -> {
-                        if (reject.index() == Messages.TREE_INDEX) {
-                            for (TreePending pending : treeFetches.values()) {
-                                if (pending.session.onReject(from, reject)) {
-                                    break;
-                                }
-                            }
-                            return;
-                        }
-                        Pending pending = fetches.get(reject.root());
-                        if (pending != null) {
-                            pending.session.onReject(from, reject);
-                        }
-                    });
-            case Messages.CANCEL -> {
-                // a holder answers wants one at a time, so a cancel has nothing to withdraw
-            }
-            case Messages.HAVE -> Messages.decode(codec, payload, Messages.Have.class).ifPresent(have -> {
+                    }
+                    return;
+                }
+                Pending pending = fetches.get(reject.root());
+                if (pending != null) {
+                    pending.session.onReject(from, reject);
+                }
+            });
+            // a holder answers wants one at a time, so a cancel has nothing to withdraw; it is still read
+            case Messages.CANCEL -> piece(payload, Messages.Cancel.class, cancel -> { });
+            case Messages.HAVE -> piece(payload, Messages.Have.class, have -> {
                 // LB-H-08: advisory; the pieces a source verified since its holding, folded into the fetch
                 Pending pending = fetches.get(have.root());
                 Manifest m = pending == null ? null : store.manifest(have.root()).orElse(null);
@@ -2269,17 +2887,19 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                     pending.session.onHave(from, bits);
                 }
             });
-            case Messages.MANIFEST_WANT -> Messages.decode(codec, payload, Messages.ManifestWant.class)
-                    .ifPresent(want -> store.manifest(want.root()).ifPresent(m ->
+            case Messages.MANIFEST_WANT -> piece(payload, Messages.ManifestWant.class, want ->
+                    store.manifest(want.root()).ifPresent(m ->
                             pipes.send(from, TYPE, codec.toBytes(new Messages.ManifestReply(want.root(), codec.toBytes(m))))));
-            case Messages.MANIFEST -> Messages.decode(codec, payload, Messages.ManifestReply.class)
-                    .ifPresent(reply -> onManifest(from, reply));
+            case Messages.MANIFEST -> piece(payload, Messages.ManifestReply.class, reply -> onManifest(from, reply));
             case Messages.NODE_WANT -> Messages.decode(codec, payload, Messages.NodeWant.class)
                     .ifPresentOrElse(want -> treeServer.serve(from, want), treeMessagesDropped::incrementAndGet);
             case Messages.TREE_WANT -> Messages.decode(codec, payload, Messages.TreeWant.class)
                     .ifPresentOrElse(want -> treeServer.serve(from, want), treeMessagesDropped::incrementAndGet);
             case Messages.NODES -> Messages.decode(codec, payload, Messages.Nodes.class)
                     .ifPresentOrElse(nodes -> {
+                        if (onChallengeAnswer(from, nodes)) {
+                            return;
+                        }
                         if (nodes.violation().isPresent()) {
                             treeMessagesDropped.incrementAndGet();
                             // the request it answered is released, so the rest of its stream strikes nobody
@@ -2310,6 +2930,12 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                             treeMessagesDropped.incrementAndGet();
                             return;
                         }
+                        if (end.reason() == Messages.END_SKETCH) {
+                            if (!onSketchEnd(from, end, payload.length)) {
+                                treeMessagesDropped.incrementAndGet();
+                            }
+                            return;
+                        }
                         boolean taken = false;
                         for (TreePending pending : treeFetches.values()) {
                             if (pending.session.onTreeEnd(from, end)) {
@@ -2324,9 +2950,16 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                             treeMessagesDropped.incrementAndGet();
                         }
                     }, treeMessagesDropped::incrementAndGet);
-            default -> {
-            }
+            // P2-S-07: a level-1 peer reads no level-2 form, so the server drops and counts tag 12 there
+            case Messages.CHALLENGE -> Messages.decode(codec, payload, Messages.Challenge.class)
+                    .ifPresentOrElse(challenge -> treeServer.serve(from, challenge), treeMessagesDropped::incrementAndGet);
+            default -> treeMessagesDropped.incrementAndGet();
         }
+    }
+
+    /** Reads a piece message (tags 1 to 7) under its wire schema and acts on it, or counts it dropped (P2-X-09). */
+    private <T> void piece(byte[] payload, Class<T> type, java.util.function.Consumer<T> action) {
+        Messages.decode(codec, payload, type).ifPresentOrElse(action, pieceMessagesDropped::incrementAndGet);
     }
 
     private void serve(PeerId from, Messages.PieceWant want) {
@@ -2407,8 +3040,12 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         return authorizer == null || authorizer.permits(from, Authorizer.Operation.CONTENT_FETCH, root);
     }
 
-    /** Whether the group's content travels sealed, as the tick last read it (PD-P-03). */
-    private boolean groupSeals() {
+    /**
+     * Whether the group's content travels sealed, as the tick last read it (PD-P-03): any member's current
+     * advertisement carries {@code sealing = group-key}. A blind content store refuses a tree pin while this
+     * holds, since it could open nothing it fetched (PDT 2 phase 3, P2-S-08).
+     */
+    public boolean groupSeals() {
         if (groupSealsLookup != null && groupSealsReadAtMillis == NEVER) {
             groupSealsReadAtMillis = clock.millis();
             groupSeals = groupSealsLookup.getAsBoolean();
@@ -2440,13 +3077,15 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
     private void onManifest(PeerId from, Messages.ManifestReply reply) {
         Pending pending = fetches.get(reply.root());
-        if (pending == null || pending.session.hasManifest() || reply.record() == null) {
+        if (pending == null || pending.session.hasManifest()) {
             return;
         }
         Manifest manifest;
         try {
-            manifest = codec.fromBytes(reply.record(), Manifest.class);
+            // the record travels as the manifest's own wire encoding (P2-X-09)
+            manifest = codec.fromWire(reply.record(), Manifest.class);
         } catch (RuntimeException e) {
+            pieceMessagesDropped.incrementAndGet();
             return;
         }
         if (manifest == null || !reply.root().equals(manifest.root()) || manifest.violation().isPresent()) {

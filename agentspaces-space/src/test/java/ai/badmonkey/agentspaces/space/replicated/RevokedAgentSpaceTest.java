@@ -25,6 +25,8 @@ import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.AgentIdentity;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
+import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
+import ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
@@ -68,7 +70,7 @@ class RevokedAgentSpaceTest {
             GroupAdvertisement.MembershipPolicy.OPEN, ConflictStrategyType.LEASE_RACE,
             GroupAdvertisement.GossipParameters.defaults());
 
-    private record Peer(PeerIdentity identity, GroupRuntime runtime, ReplicatedSpace space) {
+    private record Peer(PeerIdentity identity, PeerNode node, GroupRuntime runtime, ReplicatedSpace space) {
     }
 
     @AfterEach
@@ -88,7 +90,7 @@ class RevokedAgentSpaceTest {
         ReplicatedSpace space = ReplicatedSpace.builder(runtime, "tasks", identity, "worker")
                 .clock(clock).settleWindow(Duration.ZERO).build();
         nodes.add(node);
-        return new Peer(identity, runtime, space);
+        return new Peer(identity, node, runtime, space);
     }
 
     private void tickAll(int rounds) {
@@ -249,6 +251,72 @@ class RevokedAgentSpaceTest {
         assertThat(new String(founder.space().digest(), java.nio.charset.StandardCharsets.UTF_8))
                 .as("an unverified state earns no refused-and-acknowledged line").doesNotContain("a:");
         assertThat(titles(founder.space())).containsExactly("held");
+    }
+
+    /**
+     * HLC round five, 2026-11-08 (decision E6): a state or a claim is judged in one order, its
+     * signatures and certificate first, then revocation, then its stamps (the logical limit,
+     * then the far-future margin). A revoked agent's state with a hostile stamp is refused for
+     * the revocation and acknowledged; like a revoked holder's claim, it counts in no stamp
+     * counter and strikes nobody.
+     */
+    @Test
+    void aRevokedActorsHostileStampsCountInNoStampCounter() throws Exception {
+        Peer founder = peer(founderId, "f", 1);
+        Peer host = peer(hostId, "h", 2, "f");
+        tickAll(6);
+        ai.badmonkey.agentspaces.api.entry.EntryId held =
+                host.space().write(new TaskEntry("held", 1), HOUR).entryId();
+        tickAll(4);
+        assertThat(founder.runtime().revoke(CredentialRevocation.Target.agent(hostId.agent("mallory")),
+                CredentialRevocation.RETIRED, clock.instant())).isPresent();
+        tickAll(2);
+
+        String node = hostId.peerId().value();
+        long hours = clock.millis() + Duration.ofHours(2).toMillis();
+        long hourOn = clock.millis() + Duration.ofHours(1).toMillis();
+        SpaceWire.EntryStateDto farAhead = ForgeSupport.authoredWrite(hostId, "mallory", founder.space().id(),
+                new TaskEntry("hours ahead", 2), new HlcTimestamp(hours, 0, node), hours + 60_000);
+        SpaceWire.EntryStateDto overLimit = ForgeSupport.authoredWrite(hostId, "mallory", founder.space().id(),
+                new TaskEntry("over the limit", 3),
+                new HlcTimestamp(clock.millis(), HybridLogicalClock.LOGICAL_LIMIT + 1, node), hourOn);
+        SpaceWire.SignedClaim farClaim = ForgeSupport.signClaim(hostId, new TakeClaim(held, founder.space().id(),
+                1, new HlcTimestamp(hours, 0, node), hostId.agent("mallory"), 0.0, clock.millis() + 60_000));
+        SpaceWire.SignedClaim limitClaim = ForgeSupport.signClaim(hostId, new TakeClaim(held, founder.space().id(),
+                1, new HlcTimestamp(clock.millis(), HybridLogicalClock.LOGICAL_LIMIT + 1, node),
+                hostId.agent("mallory"), 0.0, clock.millis() + 60_000));
+        CborCodec codec = CborCodec.defaultCodec();
+        host.runtime().gossip().publish("space:tasks", "far-state",
+                codec.toBytes(new SpaceWire.Delta(farAhead, null, null)));
+        host.runtime().gossip().publish("space:tasks", "limit-state",
+                codec.toBytes(new SpaceWire.Delta(overLimit, null, null)));
+        host.runtime().gossip().publish("space:tasks", "far-claim",
+                codec.toBytes(new SpaceWire.Delta(null, held, farClaim)));
+        host.runtime().gossip().publish("space:tasks", "limit-claim",
+                codec.toBytes(new SpaceWire.Delta(null, held, limitClaim)));
+        tickAll(4);
+
+        assertThat(founder.space().stampsFarFutureRefused()).isZero();
+        assertThat(founder.space().stampsFarFutureDeferred()).isZero();
+        assertThat(founder.space().stampsLogicalRefused()).isZero();
+        assertThat(strikes(founder.node(), hostId.peerId())).as("revocation strikes nobody").isZero();
+        assertThat(titles(founder.space())).containsExactly("held");
+        assertThat(founder.space().currentClaim(held)).as("the revoked holder takes nothing").isEmpty();
+        assertThat(new String(founder.space().digest(), java.nio.charset.StandardCharsets.UTF_8))
+                .as("both states are refused for the revocation and acknowledged")
+                .contains("a:e:" + farAhead.record().entryId().value() + "=")
+                .contains("a:e:" + overLimit.record().entryId().value() + "=")
+                // HLC round six, 2026-11-08 (ruling R7): a revoked holder's claim is acknowledged too
+                .as("the revoked holder's claims are acknowledged with a c: line")
+                .contains("a:c:" + held.value() + "=");
+    }
+
+    /** Witnessed-violation strikes {@code node} holds against {@code peer} (PeerNode's test accessor). */
+    private static int strikes(PeerNode node, ai.badmonkey.agentspaces.common.id.PeerId peer) throws Exception {
+        java.lang.reflect.Method strikes = PeerNode.class.getDeclaredMethod("strikes",
+                ai.badmonkey.agentspaces.common.id.PeerId.class);
+        strikes.setAccessible(true);
+        return (int) strikes.invoke(node, peer);
     }
 
     /** SPEC §6.1 v0.1.13: the ordered-log path refuses a revoked holder's committed claim, as gossip does. */

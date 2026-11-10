@@ -226,6 +226,17 @@ public final class PdtPayloads implements BulkPayloads {
 
     @Override
     public boolean accepts(String ref) {
+        return isPayloadRoot(ref);
+    }
+
+    /**
+     * Whether a reference is a payload root this seam publishes, a dag-cbor CID: the rule of {@link #accepts}, which a
+     * seam that stands in for this one before its facade exists answers by too (PDT 2 phase 7, P2-X-04).
+     *
+     * @param ref the reference
+     * @return true for a dag-cbor root
+     */
+    public static boolean isPayloadRoot(String ref) {
         if (!BulkPayloads.isBulk(ref)) {
             return false;
         }

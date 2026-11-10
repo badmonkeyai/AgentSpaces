@@ -81,11 +81,29 @@ public final class DiscoveryService implements AutoCloseable {
     private record QueryHits(String queryId, List<AdCache.StoredAd> hits) {
     }
 
+    /**
+     * The {@code fieldEquals} keys an AppCard query may carry beside its record fields (SPEC §6.1a.2, v0.1.32;
+     * ISSUE-AppCardOriginFormats FR-8b): {@code origin.system}, {@code origin.ref} (a ref ending in {@code /*} matches
+     * every ref under it), and {@code formats} (membership, {@code type/*} matching every media type of that type).
+     */
+    public static final java.util.Set<String> APP_CARD_QUERY_KEYS = java.util.Set.of("origin.system", "origin.ref", "formats");
+
     private final GroupRuntime runtime;
     private final AdCache cache;
     private final CborCodec codec;
     private final PeerId self;
     private final Map<String, CountDownLatch> pendingQueries = new ConcurrentHashMap<>();
+    /** The publisher's half of the card spill (SPEC §6.1a.5, v0.1.32). */
+    private final CardSpiller spiller;
+    /** The largest parts document {@link #resolve} fetches. */
+    private volatile long maxSpillFetchBytes = ai.badmonkey.agentspaces.api.ad.CardSpill.DEFAULT_MAX_FETCH_BYTES;
+    private final java.util.concurrent.atomic.AtomicLong spillsRefused = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong spillsOverLimit = new java.util.concurrent.atomic.AtomicLong();
+    private final List<java.util.function.Consumer<Boolean>> gateListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** The AppCard gate as the last tick saw it. */
+    private volatile boolean gateOpen;
+    /** The tick work that watches the gate and sweeps the spill holds, registered once something needs it. */
+    private AutoCloseable tickRegistration;
 
     /**
      * Wires discovery into a group runtime.
@@ -100,6 +118,7 @@ public final class DiscoveryService implements AutoCloseable {
         this.cache = Objects.requireNonNull(cache, "cache");
         this.codec = Objects.requireNonNull(codec, "codec");
         this.self = Objects.requireNonNull(self, "self");
+        this.spiller = new CardSpiller(codec, cache.clock());
         // ASF-047: a revoked peer's advertisements leave the cache and stay out.
         cache.refuseIssuers(runtime.revocations()::revoked);
         runtime.revocations().addListener(revocation -> cache.purgeIssuer(revocation.revoked()));
@@ -161,7 +180,21 @@ public final class DiscoveryService implements AutoCloseable {
                                           InstantSource clock,
                                           Set<PeerAdvertisement.PeerRole> localRoles) {
         return new DiscoveryService(runtime,
-                new AdCache(codec, clock, cacheBoundFor(localRoles)), codec, self);
+                new AdCache(codec, clock, cacheBoundFor(localRoles), cacheBytesFor(localRoles)), codec, self);
+    }
+
+    /**
+     * The ad-cache byte budget for a peer advertising the given roles (SPEC §6.3, v0.1.32; AppCard origin and formats,
+     * 2026-11-09).
+     *
+     * @param localRoles the roles the local node advertises
+     * @return {@link AdCache#DEFAULT_MAX_BYTES}, multiplied by {@link #RENDEZVOUS_CACHE_MULTIPLIER} for a rendezvous
+     */
+    public static long cacheBytesFor(Set<PeerAdvertisement.PeerRole> localRoles) {
+        Objects.requireNonNull(localRoles, "localRoles");
+        return localRoles.contains(PeerAdvertisement.PeerRole.RENDEZVOUS)
+                ? AdCache.DEFAULT_MAX_BYTES * RENDEZVOUS_CACHE_MULTIPLIER
+                : AdCache.DEFAULT_MAX_BYTES;
     }
 
     /**
@@ -181,6 +214,147 @@ public final class DiscoveryService implements AutoCloseable {
     /** Returns the underlying cache. */
     public AdCache cache() {
         return cache;
+    }
+
+    /**
+     * Installs the content swarm that serves this group's parts documents (SPEC §6.1a.5, v0.1.32): with it a card
+     * above the spill threshold travels as a stub, and {@link #resolve} completes a stub; null removes it.
+     *
+     * @param store the store
+     * @return this service
+     */
+    public DiscoveryService spillStore(SpillStore store) {
+        spiller.store(store);
+        if (store != null) {
+            tick();
+        }
+        return this;
+    }
+
+    /**
+     * Sets the largest parts document {@link #resolve} fetches ({@code CardSpill.DEFAULT_MAX_FETCH_BYTES} by default).
+     *
+     * @param bytes the bound
+     * @return this service
+     */
+    public DiscoveryService maxSpillFetchBytes(long bytes) {
+        if (bytes <= 0) {
+            throw new IllegalArgumentException("the spill fetch bound must be positive: " + bytes);
+        }
+        this.maxSpillFetchBytes = bytes;
+        return this;
+    }
+
+    /** The largest parts document {@link #resolve} fetches. */
+    public long maxSpillFetchBytes() {
+        return maxSpillFetchBytes;
+    }
+
+    /** The publisher's half of the card spill, which every card publisher of this group passes its cards through. */
+    public CardSpiller spiller() {
+        return spiller;
+    }
+
+    /** Whether this node and every member of the group's current view read the AppCard level's gated fields. */
+    public boolean appCardGateOpen() {
+        return AppCards.gateOpen(runtime);
+    }
+
+    /**
+     * Calls a listener with the new state each time the view's AppCard level changes (SPEC §6.1a.2, v0.1.32), checked
+     * on every tick of the group.
+     *
+     * @param listener receives true when the gate opens and false when it closes
+     * @return closing it removes the listener
+     */
+    public AutoCloseable onAppCardGateChange(java.util.function.Consumer<Boolean> listener) {
+        Objects.requireNonNull(listener, "listener");
+        gateListeners.add(listener);
+        tick();
+        return () -> gateListeners.remove(listener);
+    }
+
+    /**
+     * The full card of a stub (SPEC §6.1a.5, v0.1.32; ISSUE-AppCardOriginFormats FR-15): a card without {@code spill}
+     * as it is, and otherwise the stub with its parts document's values in place. A {@code size} above
+     * {@link #maxSpillFetchBytes()} fails before any fetch ({@code spillsOverLimit}); a document of the wrong length
+     * (found by this service, or by the store before it fetches, see {@link SpillStore#get}), one that does not decode
+     * as the kind's parts record, or one whose non-empty fields are not exactly {@code spill.parts} fails the
+     * resolution ({@code spillsRefused}). A document no holder serves in time fails it uncounted. No failure strikes
+     * anyone or evicts the stub.
+     *
+     * @param card a card, often from {@link #find}
+     * @param <C>  the card kind
+     * @return the full card
+     */
+    public <C extends Advertisement> java.util.concurrent.CompletableFuture<C> resolve(C card) {
+        Objects.requireNonNull(card, "card");
+        ai.badmonkey.agentspaces.api.ad.CardSpill spill = Spills.spillOf(card);
+        if (spill == null) {
+            return java.util.concurrent.CompletableFuture.completedFuture(card);
+        }
+        if (spill.size() > maxSpillFetchBytes) {
+            spillsOverLimit.incrementAndGet();
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("the parts document of "
+                    + card.id() + " is " + spill.size() + " bytes, above the fetch bound of " + maxSpillFetchBytes));
+        }
+        SpillStore store = spiller.store();
+        if (store == null) {
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException(
+                    "no content swarm serves this group, so the stub " + card.id() + " stays a stub"));
+        }
+        return store.get(spill.root(), spill.size()).handle((document, failure) -> {
+            Throwable cause = failure instanceof java.util.concurrent.CompletionException wrapped && wrapped.getCause() != null
+                    ? wrapped.getCause() : failure;
+            if (cause != null && !(cause instanceof IllegalArgumentException)) {
+                // no holder served the document in time, or the fetch failed: no check failed, so nothing counts
+                throw cause instanceof RuntimeException runtime ? runtime : new java.util.concurrent.CompletionException(cause);
+            }
+            try {
+                if (cause != null) {
+                    throw (IllegalArgumentException) cause; // the store refused the artifact for its length (SpillStore#get)
+                }
+                if (document.length != spill.size()) {
+                    throw new IllegalArgumentException("the parts document is " + document.length + " bytes; the stub states "
+                            + spill.size());
+                }
+                return Spills.complete(card, document, codec);
+            } catch (RuntimeException refused) {
+                spillsRefused.incrementAndGet();
+                throw new IllegalStateException("the parts document of " + card.id() + " does not complete its stub", refused);
+            }
+        });
+    }
+
+    /** Resolutions that failed a check of the parts document (SPEC §6.1a.5). */
+    public long spillsRefused() {
+        return spillsRefused.get();
+    }
+
+    /** Resolutions refused because the stub's {@code size} passed the fetch bound. */
+    public long spillsOverLimit() {
+        return spillsOverLimit.get();
+    }
+
+    /**
+     * Joins the group's tick once a listener watches the AppCard gate or a store takes spill documents (SPEC §6.1a.2
+     * and §6.1a.5, v0.1.32): a change of the view's level reissues the cards it shapes, and the spill holds lapse one
+     * ttl after the last card that named them. A service that needs neither adds no tick work.
+     */
+    private synchronized void tick() {
+        if (tickRegistration == null) {
+            gateOpen = AppCards.gateOpen(runtime);
+            tickRegistration = runtime.onTick(this::onTick);
+        }
+    }
+
+    private void onTick() {
+        boolean open = AppCards.gateOpen(runtime);
+        if (open != gateOpen) {
+            gateOpen = open;
+            gateListeners.forEach(listener -> listener.accept(open));
+        }
+        spiller.sweep();
     }
 
     /**
@@ -298,7 +472,7 @@ public final class DiscoveryService implements AutoCloseable {
     private void answerQuery(byte[] payload) {
         AdQuery query;
         try {
-            query = codec.fromBytes(payload, AdQuery.class);
+            query = codec.fromWire(payload, AdQuery.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -327,7 +501,7 @@ public final class DiscoveryService implements AutoCloseable {
     private void onQueryHit(byte[] body) {
         QueryHits hits;
         try {
-            hits = codec.fromBytes(body, QueryHits.class);
+            hits = codec.fromWire(body, QueryHits.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -344,7 +518,7 @@ public final class DiscoveryService implements AutoCloseable {
     private java.util.Optional<AdCache.StoredAd> decodeStored(byte[] payload) {
         try {
             return java.util.Optional.ofNullable(
-                    codec.fromBytes(payload, AdCache.StoredAd.class));
+                    codec.fromWire(payload, AdCache.StoredAd.class));
         } catch (RuntimeException e) {
             return java.util.Optional.empty();
         }
@@ -356,12 +530,18 @@ public final class DiscoveryService implements AutoCloseable {
             return ad -> true;
         }
         Template<A> template = Template.of(type);
+        Predicate<A> keys = ad -> true;
         for (Map.Entry<String, String> e : fieldEquals.entrySet()) {
+            if (type == ai.badmonkey.agentspaces.api.ad.AppCard.class && APP_CARD_QUERY_KEYS.contains(e.getKey())) {
+                Predicate<ai.badmonkey.agentspaces.api.ad.AppCard> key = appCardKey(e.getKey(), e.getValue());
+                keys = keys.and(ad -> key.test((ai.badmonkey.agentspaces.api.ad.AppCard) ad));
+                continue;
+            }
             template = template.where(e.getKey(),
                     Matchers.predicate(v -> String.valueOf(v).equals(e.getValue())));
         }
         Template<A> built = template;
-        return built::matches;
+        return keys.and(built::matches);
     }
 
     private static boolean matchesFields(Advertisement ad, Map<String, String> fieldEquals) {
@@ -370,16 +550,20 @@ public final class DiscoveryService implements AutoCloseable {
         }
         @SuppressWarnings("unchecked")
         Class<Advertisement> type = (Class<Advertisement>) ad.getClass();
-        Template<Advertisement> template = Template.of(type);
         try {
-            for (Map.Entry<String, String> e : fieldEquals.entrySet()) {
-                template = template.where(e.getKey(),
-                        Matchers.predicate(v -> String.valueOf(v).equals(e.getValue())));
-            }
+            return matcher(type, fieldEquals).test(ad);
         } catch (IllegalArgumentException unknownField) {
             return false;
         }
-        return template.matches(ad);
+    }
+
+    /** One of {@link #APP_CARD_QUERY_KEYS} as a predicate on the card's inline fields, which a stub keeps. */
+    private static Predicate<ai.badmonkey.agentspaces.api.ad.AppCard> appCardKey(String key, String value) {
+        return switch (key) {
+            case "origin.system" -> card -> card.fromOrigin(value);
+            case "origin.ref" -> card -> card.origin() != null && card.fromOrigin(card.origin().system(), value);
+            default -> card -> card.handles(value);
+        };
     }
 
     /**
@@ -393,6 +577,12 @@ public final class DiscoveryService implements AutoCloseable {
             adsRegistration.close();
             queryRegistration.close();
             reconcileRegistration.close();
+            synchronized (this) {
+                if (tickRegistration != null) {
+                    tickRegistration.close();
+                    tickRegistration = null;
+                }
+            }
         } catch (Exception e) {
             throw new IllegalStateException("failed deregistering discovery from the bus", e);
         }

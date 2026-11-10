@@ -224,6 +224,26 @@ public final class GroupRuntime implements AutoCloseable {
         return true;
     }
 
+    /**
+     * Whether this node and every member of this group's current view are at an AppCard level (SPEC §6.1a.2;
+     * AppCard origin and formats, 2026-11-09): the gate under which an issuer writes a card's origin, formats, an
+     * {@code idp} host, and a spill reference. A member whose advertisement has not arrived counts as level 1.
+     *
+     * @param level the level the gated fields need
+     * @return true when the whole view reads them
+     */
+    public boolean viewAtAppCardLevel(int level) {
+        if (node == null || node.appCardLevel() < level) {
+            return false;
+        }
+        for (GroupMembership.Member member : membership.allMembers()) {
+            if (node.appCardLevel(member.id()) < level) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** This group's accepted revocations. */
     public RevocationRegistry revocations() {
         return revocations;

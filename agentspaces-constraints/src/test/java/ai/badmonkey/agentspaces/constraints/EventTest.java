@@ -23,11 +23,11 @@ class EventTest {
     public record Response(String id, String text, String error) {
     }
 
-    /** The platform's shape of a record written for a type the writer has no class of; the core only knows the shape. */
+    /** A host's shape of a record written for a type the writer has no class of; the core only knows the shape. */
     public record MappedRecord(int v, String type, String by, String key, Map<String, Object> fields) {
     }
 
-    static final String MAPPED_WIRE = "ai.badmonkey.bma.agent.support.MappedRecord#v1";
+    static final String MAPPED_WIRE = "com.example.support.MappedRecord#v1"; // neutral vectors, 2026-11-09
 
     @Test
     void aNullFieldIsKeptNotRefused() {

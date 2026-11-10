@@ -547,12 +547,15 @@ public final class ConnectorRuntime implements AutoCloseable {
                 }
                 Template<AssetInvocation> mine = Template.of(AssetInvocation.class)
                         .where("asset", Matchers.in(assets));
-                // The requesting peer is read before the take: a template read cannot see an
-                // entry while it is claimed (issue #16 §9.3), and the scope is judged against the
-                // requesting entry's signer (appendix F).
+                // A space other than a replicated one gives no record of a claimed entry, so there the
+                // requesting peer is read before the take: a template read cannot see an entry while
+                // it is claimed (issue #16 §9.3), and the scope is judged against the requesting
+                // entry's signer (appendix F).
                 requesters = new HashMap<>();
-                for (Space.Issued<AssetInvocation> issued : space.readAllIssued(mine, 64)) {
-                    requesters.put(issued.entry().invocationId(), issued.issuer().peer());
+                if (!(space instanceof ReplicatedSpace)) {
+                    for (Space.Issued<AssetInvocation> issued : space.readAllIssued(mine, 64)) {
+                        requesters.put(issued.entry().invocationId(), issued.issuer().peer());
+                    }
                 }
                 taken = space.take(mine, Lease.of(invokeLease), Duration.ofSeconds(1));
             } catch (InterruptedException e) {
@@ -597,10 +600,13 @@ public final class ConnectorRuntime implements AutoCloseable {
             }
             return;
         }
-        PeerId requester = requesters.get(id);
-        if (requester == null && space instanceof ReplicatedSpace replicated) {
-            requester = replicated.recordOf(taken.entryId()).map(record -> record.issuer().peer()).orElse(null);
-        }
+        // The requester is the signer of the entry taken. Any member can write an invocation under an id another
+        // member's invocation carries, so a replicated space answers from the taken entry's own record, which it
+        // holds while the entry is claimed; the scan's signer by id serves a space whose writers share one peer
+        // (PDT 2 follow-ups, 2026-11-09: a store's pin invoke charges its signer).
+        PeerId requester = space instanceof ReplicatedSpace replicated
+                ? replicated.recordOf(taken.entryId()).map(record -> record.issuer().peer()).orElse(null)
+                : requesters.get(id);
         Set<String> allowed = invokeOpsByAsset.getOrDefault(invocation.asset(), Set.of());
         Authorizer gate = authorizer;
         AssetInvocationResult result;

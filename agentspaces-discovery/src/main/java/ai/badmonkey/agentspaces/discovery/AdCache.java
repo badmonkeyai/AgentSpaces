@@ -85,10 +85,22 @@ public final class AdCache {
      */
     public static final int DEFAULT_MAX_ENTRIES = 8_192;
 
+    /**
+     * The default byte budget (SPEC §6.3, v0.1.32; AppCard origin and formats, 2026-11-09): 32 MiB, the sum of the
+     * cached advertisements' encodings. A rendezvous multiplies it as it multiplies the entry bound; see
+     * {@code DiscoveryService.cacheBytesFor}.
+     */
+    public static final long DEFAULT_MAX_BYTES = 33_554_432L;
+
     private final CborCodec codec;
     private final InstantSource clock;
     /** Bound on cached advertisements (ASF-019). */
     private final int maxEntries;
+    /** Bound on the sum of the cached advertisements' encodings (SPEC §6.3, v0.1.32). */
+    private final long maxBytes;
+    /** The sum of {@code adBytes} over the cached entries; written under this cache's lock. */
+    private long bytes;
+    private final java.util.concurrent.atomic.AtomicLong adsRefusedCacheFull = new java.util.concurrent.atomic.AtomicLong();
 
     /** How far in the future an ad's {@code issued} may run (ASF-027). */
     private static final java.time.Duration MAX_ISSUED_SKEW = java.time.Duration.ofMinutes(10);
@@ -123,12 +135,28 @@ public final class AdCache {
      *                   refused while the cache is full
      */
     public AdCache(CborCodec codec, InstantSource clock, int maxEntries) {
+        this(codec, clock, maxEntries, DEFAULT_MAX_BYTES);
+    }
+
+    /**
+     * Creates the cache with both bounds (SPEC §6.3, v0.1.32; AppCard origin and formats, 2026-11-09).
+     *
+     * @param codec      the CBOR codec
+     * @param clock      the time source for TTL eviction
+     * @param maxEntries the most advertisements the cache retains
+     * @param maxBytes   the most bytes of advertisement encodings the cache retains
+     */
+    public AdCache(CborCodec codec, InstantSource clock, int maxEntries, long maxBytes) {
         this.codec = Objects.requireNonNull(codec, "codec");
         this.clock = Objects.requireNonNull(clock, "clock");
         if (maxEntries <= 0) {
             throw new IllegalArgumentException("maxEntries must be positive: " + maxEntries);
         }
+        if (maxBytes <= 0) {
+            throw new IllegalArgumentException("maxBytes must be positive: " + maxBytes);
+        }
         this.maxEntries = maxEntries;
+        this.maxBytes = maxBytes;
     }
 
     /**
@@ -150,9 +178,7 @@ public final class AdCache {
      */
     public int purgeIssuer(PeerId issuer) {
         Objects.requireNonNull(issuer, "issuer");
-        int before = byId.size();
-        byId.values().removeIf(entry -> entry.advertisement().issuer().equals(issuer));
-        return before - byId.size();
+        return removeIf(entry -> entry.advertisement().issuer().equals(issuer));
     }
 
     /**
@@ -173,15 +199,33 @@ public final class AdCache {
      */
     public int purgeAgent(ai.badmonkey.agentspaces.common.id.AgentId agent) {
         Objects.requireNonNull(agent, "agent");
-        int before = byId.size();
-        byId.values().removeIf(entry -> entry.advertisement()
+        return removeIf(entry -> entry.advertisement()
                 instanceof ai.badmonkey.agentspaces.api.ad.AgentCard card && card.agent().equals(agent));
-        return before - byId.size();
     }
 
     /** Returns the bound on cached advertisements. */
     public int maxEntries() {
         return maxEntries;
+    }
+
+    /** Returns the byte budget: the most bytes of advertisement encodings the cache retains (SPEC §6.3, v0.1.32). */
+    public long maxBytes() {
+        return maxBytes;
+    }
+
+    /** Returns the sum of the cached advertisements' encodings, expired ones included until a read evicts them. */
+    public synchronized long bytes() {
+        return bytes;
+    }
+
+    /** How many advertisements this cache refused under its entry bound or its byte budget (SPEC §6.3, v0.1.32). */
+    public long adsRefusedCacheFull() {
+        return adsRefusedCacheFull.get();
+    }
+
+    /** The time source this cache evicts by, which the discovery service's spill holds also follow. */
+    InstantSource clock() {
+        return clock;
     }
 
     /**
@@ -216,7 +260,7 @@ public final class AdCache {
         }
         Advertisement ad;
         try {
-            ad = codec.fromBytes(stored.adBytes(), type);
+            ad = codec.fromWire(stored.adBytes(), type);
         } catch (RuntimeException e) {
             return Optional.empty();
         }
@@ -250,21 +294,47 @@ public final class AdCache {
                 && revocations.revoked(card.agent(), card.agentPublicKey())) {
             return Optional.empty(); // v0.1.13: a revoked agent advertises nothing
         }
-        CacheEntry candidate = new CacheEntry(ad, stored);
-        // ASF-019: the cache is bounded against advertisement floods. Updates
-        // to known ids always land; a brand-new id is refused while the cache
-        // is full (after clearing expired entries), so a flood can fill spare
-        // headroom but never evict legitimate live advertisements.
-        if (!byId.containsKey(ad.id()) && byId.size() >= maxEntries) {
+        return admit(new CacheEntry(ad, stored)) ? Optional.of(ad) : Optional.empty();
+    }
+
+    /**
+     * ASF-019 and SPEC §6.3 (v0.1.32; AppCard origin and formats, 2026-11-09): the cache is bounded against
+     * advertisement floods by entry count and by bytes. A brand-new id is refused while either bound would pass, and a
+     * newer version of a known id is refused while it would pass the byte budget, which keeps the version held; each
+     * check runs again after the expired entries leave. A flood can fill spare headroom but never evicts a live
+     * advertisement. An older or equal version of a known id leaves the held one in place.
+     */
+    private synchronized boolean admit(CacheEntry candidate) {
+        String id = candidate.advertisement().id();
+        long length = candidate.stored().adBytes().length;
+        if (!fits(id, candidate, length)) {
             evictExpired();
-            if (byId.size() >= maxEntries) {
-                return Optional.empty();
+            if (!fits(id, candidate, length)) {
+                adsRefusedCacheFull.incrementAndGet();
+                return false;
             }
         }
-        byId.merge(ad.id(), candidate, (existing, fresh) ->
-                fresh.advertisement().issued().isAfter(existing.advertisement().issued())
-                        ? fresh : existing);
-        return Optional.of(ad);
+        CacheEntry existing = byId.get(id);
+        if (existing == null) {
+            byId.put(id, candidate);
+            bytes += length;
+        } else if (candidate.advertisement().issued().isAfter(existing.advertisement().issued())) {
+            byId.put(id, candidate);
+            bytes += length - existing.stored().adBytes().length;
+        }
+        return true;
+    }
+
+    /** Whether the candidate fits both bounds, given what the cache holds for its id. */
+    private boolean fits(String id, CacheEntry candidate, long length) {
+        CacheEntry existing = byId.get(id);
+        if (existing == null) {
+            return byId.size() < maxEntries && bytes + length <= maxBytes;
+        }
+        if (!candidate.advertisement().issued().isAfter(existing.advertisement().issued())) {
+            return true; // the held version stays; nothing grows
+        }
+        return bytes - existing.stored().adBytes().length + length <= maxBytes;
     }
 
     /**
@@ -347,7 +417,7 @@ public final class AdCache {
         }
         Delta parsed;
         try {
-            parsed = codec.fromBytes(delta, Delta.class);
+            parsed = codec.fromWire(delta, Delta.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -364,7 +434,21 @@ public final class AdCache {
 
     private void evictExpired() {
         var now = clock.instant();
-        byId.values().removeIf(e -> e.advertisement().expired(now));
+        removeIf(e -> e.advertisement().expired(now));
+    }
+
+    /** Removes the matching entries and their bytes from the sum. */
+    private synchronized int removeIf(Predicate<CacheEntry> doomed) {
+        int removed = 0;
+        for (var it = byId.values().iterator(); it.hasNext(); ) {
+            CacheEntry entry = it.next();
+            if (doomed.test(entry)) {
+                it.remove();
+                bytes -= entry.stored().adBytes().length;
+                removed++;
+            }
+        }
+        return removed;
     }
 
     private static String typeTag(Advertisement ad) {

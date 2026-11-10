@@ -21,6 +21,7 @@ import ai.badmonkey.agentspaces.pdt.Kind;
 import ai.badmonkey.agentspaces.pdt.Link;
 import ai.badmonkey.agentspaces.pdt.NodeCodec;
 import ai.badmonkey.agentspaces.pdt.NodeFormatException;
+import ai.badmonkey.agentspaces.pdt.kinds.TextLeaf;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayDeque;
@@ -61,6 +62,10 @@ import java.util.Map;
  * a {@code vr} is an ordered map, a {@code raw} or {@code b} node is a byte string
  * (the form {@code PayloadTree} gives a single-chunk byte string, so a payload root
  * stays dag-cbor).
+ *
+ * <p>PDT 2 phase 6 (P2-T-02): a value above 1 KiB in the text form of {@link PText} spills to a
+ * {@code t} node holding the canonical bytes of its leaf, and reads back in the text form, except
+ * under a level-one context (§6.10.3, rule 7), where it spills as any other map does.
  *
  * <p>A value that would need an {@code x} node over the 1 MiB node bound of PD-N-04
  * is refused on the way in ({@link #MAX_X_VALUE}), so a map never holds a value it
@@ -159,6 +164,9 @@ public final class Spill {
         if (a instanceof BlobNode x && b instanceof BlobNode y) {
             return Arrays.equals(x.content, y.content);
         }
+        if (a instanceof TextNode x && b instanceof TextNode y) {
+            return Arrays.equals(x.value, y.value);
+        }
         return false;
     }
 
@@ -200,6 +208,9 @@ public final class Spill {
         if (cbor.length <= VALUE_LIMIT) {
             return cbor;
         }
+        if (!ctx.levelOne && PText.isText(cbor)) {
+            return new TextNode(cbor);
+        }
         int major = (cbor[0] & 0xff) >> 5;
         int info = cbor[0] & 0x1f;
         if (cbor.length > TREE_LIMIT) {
@@ -226,7 +237,7 @@ public final class Spill {
     }
 
     private static ChampNode subMap(byte[] cbor, Ctx ctx) {
-        Ctx sub = new Ctx(ctx.loader, KeyHasher.SHA256, ctx.edit);
+        Ctx sub = new Ctx(ctx.loader, KeyHasher.SHA256, ctx.edit, ctx.levelOne);
         ChampNode root = ChampNode.empty();
         long count = 0;
         int p = 1;
@@ -357,6 +368,9 @@ public final class Spill {
         if (ref instanceof XNode x) {
             return isLinkItem(x.value) ? resolveLinked(linkCid(x.value), ctx, depth + 1) : x.value;
         }
+        if (ref instanceof TextNode text) {
+            return text.value;
+        }
         if (ref instanceof OrderedNode ordered) {
             return reassembleOrdered(ordered.items, ctx, depth);
         }
@@ -380,6 +394,12 @@ public final class Spill {
             case Kind.M -> reassembleMap(ChampNode.loadRoot(cid, bytes, ctx.hasher), ctx, depth);
             case Kind.VR -> reassembleArray(VecRoot.decode(cid, bytes), ctx, depth);
             case Kind.B -> byteString(readBlob(cid, bytes, ctx));
+            case Kind.T -> {
+                if (ctx.levelOne) {
+                    throw new NodeFormatException(cid, "a level-one tree holds no text node (rule 7)");
+                }
+                yield PText.toWire(TextLeaf.decode(cid, bytes));
+            }
             default -> throw new NodeFormatException(cid, "a spilled value cannot be a node of kind '" + kind + "'");
         };
     }

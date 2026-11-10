@@ -35,6 +35,17 @@ import java.util.function.UnaryOperator;
  * returns a new vector and leaves the receiver unchanged; iteration is in index
  * order. A null element is refused.
  *
+ * <p>PDT 2 phase 6 (P2-R-02 to P2-R-04; srad/agentspaces-pdt2.md §3.7). {@code splice},
+ * {@code insertAt}, {@code slice}, and {@code concat} run in O(log n) node copies through the RRB
+ * operations of {@link Rrb} and return a {@linkplain #relaxed() relaxed} vector when the result
+ * lacks the shape of a dense one. A relaxed vector commits as it stands, an {@code rr} root over
+ * {@code rv} nodes with size tables, so an edit ships its path; its root depends on the edits
+ * that made it, and {@link #packed()} gives the {@code vr} vector of the same elements, the one
+ * root those elements have whatever the history. An edit that leaves the shape of a dense vector,
+ * an append, a prefix, or a splice at the end, returns the dense vector itself. Equality and the
+ * hash follow the elements: two vectors are equal when their packed roots are, which costs one
+ * packing of a relaxed vector, once.
+ *
  * @param <T> the element type
  */
 public final class PVector<T> implements Iterable<T> {
@@ -79,7 +90,9 @@ public final class PVector<T> implements Iterable<T> {
 
     /** The element at an index, loading nodes on demand. */
     public T nth(long index) {
-        return codec.decode(Spill.resolve(node.nth(checkIndex(index), ctx()), ctx()));
+        Ctx ctx = ctx();
+        int i = checkIndex(index);
+        return codec.decode(Spill.resolve(node.relaxed ? Rrb.nth(node, i, ctx) : node.nth(i, ctx), ctx));
     }
 
     /** The last element, if any. */
@@ -141,9 +154,17 @@ public final class PVector<T> implements Iterable<T> {
                     throw new NoSuchElementException();
                 }
                 Object ref;
-                int off = node.tailoff();
+                int off = node.trieCount();
                 if (i >= off) {
                     ref = node.tail[i - off];
+                } else if (node.relaxed) {
+                    // PDT 2 phase 6 (P2-R-04): a relaxed leaf starts where its parents' size tables say
+                    if (leaf == null || i - leafBase >= leaf.slots.length) {
+                        int[] start = new int[1];
+                        leaf = Rrb.leafAt(node, i, ctx, start);
+                        leafBase = start[0];
+                    }
+                    ref = leaf.item(i - leafBase);
                 } else {
                     int base = i & ~VecNode.MASK;
                     if (base != leafBase) {
@@ -164,20 +185,101 @@ public final class PVector<T> implements Iterable<T> {
     public PVector<T> conj(T element) {
         Objects.requireNonNull(element, "element");
         Ctx ctx = ctx();
-        return new PVector<>(backing, codec, node.conj(Spill.spill(codec.encode(element), ctx), ctx));
+        Object item = Spill.spill(codec.encode(element), ctx);
+        return new PVector<>(backing, codec, node.relaxed ? Rrb.conj(node, item, ctx) : node.conj(item, ctx));
     }
 
     /** A vector without its last element. */
     public PVector<T> pop() {
-        return new PVector<>(backing, codec, node.pop(ctx()));
+        Ctx ctx = ctx();
+        return new PVector<>(backing, codec, node.relaxed ? Rrb.pop(node, ctx) : node.pop(ctx));
     }
 
     /** A vector with the element at an index replaced. */
     public PVector<T> assoc(long index, T element) {
         Objects.requireNonNull(element, "element");
         Ctx ctx = ctx();
-        VecRoot next = node.assocN(checkIndex(index), Spill.spill(codec.encode(element), ctx), ctx);
+        int i = checkIndex(index);
+        Object item = Spill.spill(codec.encode(element), ctx);
+        VecRoot next = node.relaxed ? Rrb.assoc(node, i, item, ctx) : node.assocN(i, item, ctx);
         return next == node ? this : new PVector<>(backing, codec, next);
+    }
+
+    /**
+     * A vector with {@code deleteCount} elements from {@code index} replaced by {@code elements}
+     * (PDT 2 phase 6, P2-R-02), in O(log n) node copies plus the new elements.
+     *
+     * @param index       the first replaced index, at most the count
+     * @param deleteCount how many elements to remove there
+     * @param elements    the elements to put in their place, none null
+     * @return the vector
+     * @throws IndexOutOfBoundsException when the range passes the count
+     */
+    public PVector<T> splice(long index, long deleteCount, List<? extends T> elements) {
+        checkRange(index, index + deleteCount);
+        Ctx ctx = ctx();
+        return new PVector<>(backing, codec, Rrb.splice(node, (int) index, (int) deleteCount, items(elements, ctx), ctx));
+    }
+
+    /** A vector with an element inserted before an index, at most the count (PDT 2 phase 6, P2-R-02). */
+    public PVector<T> insertAt(long index, T element) {
+        return splice(index, 0, List.of(Objects.requireNonNull(element, "element")));
+    }
+
+    /** The elements {@code [from, to)} (PDT 2 phase 6, P2-R-02), sharing every node off the two cut paths. */
+    public PVector<T> slice(long from, long to) {
+        checkRange(from, to);
+        return new PVector<>(backing, codec, Rrb.slice(node, (int) from, (int) to, ctx()));
+    }
+
+    /**
+     * This vector followed by another (PDT 2 phase 6, P2-R-02): in O(log n) node copies when both
+     * share this vector's store, else by appending the other's elements one by one, since its
+     * nodes live in a store this vector cannot read.
+     */
+    public PVector<T> concat(PVector<T> other) {
+        if (other.isEmpty()) {
+            return this;
+        }
+        if (other.store() != store()) {
+            VectorEditor<T> editor = editor();
+            other.forEach(editor::conj);
+            return editor.done().value();
+        }
+        if (count() + other.count() > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("a vector holds at most 2^31 - 1 elements");
+        }
+        return new PVector<>(backing, codec, Rrb.concat(node, other.node, ctx()));
+    }
+
+    /**
+     * The leftwise-dense {@code vr} vector of the same elements (PDT 2 phase 6, P2-R-03): this
+     * vector when it is dense, else a rebuild whose cost is linear in the count.
+     */
+    public PVector<T> packed() {
+        return node.relaxed ? new PVector<>(backing, codec, Rrb.pack(node, ctx())) : this;
+    }
+
+    /**
+     * Whether the tree lacks the shape of a dense vector (PDT 2 phase 6, P2-R-01): its root is an
+     * {@code rr} node, and a head that names it is {@code PRef.v} 2 (srad/agentspaces-pdt2.md §6.10.3, rule 2).
+     */
+    public boolean relaxed() {
+        return node.relaxed;
+    }
+
+    private Object[] items(List<? extends T> elements, Ctx ctx) {
+        Object[] out = new Object[elements.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = Spill.spill(codec.encode(Objects.requireNonNull(elements.get(i), "element")), ctx);
+        }
+        return out;
+    }
+
+    private void checkRange(long from, long to) {
+        if (from < 0 || to < from || to > node.n) {
+            throw new IndexOutOfBoundsException("range [" + from + ", " + to + ") of a vector of " + node.n);
+        }
     }
 
     /** A vector with the element at an index replaced by {@code f} of it. */
@@ -202,15 +304,32 @@ public final class PVector<T> implements Iterable<T> {
         return (int) index;
     }
 
-    /** Equality by root (PD-V-04). */
+    /** Equality by root (PD-V-04), through the packed root when either vector is relaxed (PDT 2 phase 6, P2-R-03). */
     @Override
     public boolean equals(Object o) {
-        return o instanceof PVector<?> other && root().equals(other.root());
+        return o instanceof PVector<?> other && packedRoot().equals(other.packedRoot());
     }
 
     @Override
     public int hashCode() {
-        return root().hashCode();
+        return packedRoot().hashCode();
+    }
+
+    /**
+     * The root of the packed form: the root itself when dense, else the CID of the packed tree,
+     * hashed without writing it once this vector's own nodes are written, and kept on the root.
+     */
+    private String packedRoot() {
+        String root = root();
+        if (!node.relaxed) {
+            return root;
+        }
+        String known = node.packedCid;
+        if (known == null) {
+            known = new Flusher(backing.store()).cidOf(Rrb.pack(node, ctx()));
+            node.packedCid = known;
+        }
+        return known;
     }
 
     @Override

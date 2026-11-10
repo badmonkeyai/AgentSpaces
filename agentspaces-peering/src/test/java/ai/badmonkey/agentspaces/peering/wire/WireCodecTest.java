@@ -241,4 +241,28 @@ class WireCodecTest {
                 sender.peerId(), sender.peerId(), new HlcTimestamp(43L, 0, "n"), new byte[]{1});
         assertThat(wire.decodeDetailed(wire.encodeBare(channelHello), Optional.of(sender.peerId()), null)).isEmpty();
     }
+
+    /**
+     * HLC round four, 2026-11-08 (decision D3): Java verified a frame's signature over the
+     * re-encoded envelope, and Jackson decoded overlong UTF-8, tagged text, and
+     * indefinite-length text to the canonical stamp, so each relabelled frame verified as
+     * signed while every client refused it. Each is now undecodable before any verification,
+     * signed or bare on an attested channel.
+     */
+    @Test
+    void aStampThatIsNoCanonicalCborTextMakesTheFrameUndecodable() {
+        Envelope envelope = new Envelope(WireCodec.WIRE_VERSION, GroupId.of("zG"), Envelope.Kind.RUMOR,
+                sender.peerId(), sender.peerId(), new HlcTimestamp(42L, 0, "nA"), new byte[]{1, 2, 3});
+        byte[] signed = wire.encode(envelope, sender);
+        byte[] bare = wire.encodeBare(envelope);
+        assertThat(wire.decode(signed)).isPresent();
+        assertThat(wire.decode(bare, Optional.of(sender.peerId()))).isPresent();
+        for (java.util.Map.Entry<String, byte[]> variant : HostileStamps.items("42:0:n", "A").entrySet()) {
+            byte[] item = HostileStamps.item("42:0:nA");
+            assertThat(wire.decodeDetailed(HostileStamps.splice(signed, item, variant.getValue()), Optional.empty(), null))
+                    .as("signed, " + variant.getKey()).isEmpty();
+            assertThat(wire.decode(HostileStamps.splice(bare, item, variant.getValue()), Optional.of(sender.peerId())))
+                    .as("attested, " + variant.getKey()).isEmpty();
+        }
+    }
 }

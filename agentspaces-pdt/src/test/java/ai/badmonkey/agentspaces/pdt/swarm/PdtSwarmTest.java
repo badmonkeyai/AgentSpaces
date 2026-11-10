@@ -115,6 +115,11 @@ class PdtSwarmTest {
     }
 
     private Peer newPeer(String address, long seed, String... seedAddresses) throws IOException {
+        return newPeer(address, seed, 1, seedAddresses);
+    }
+
+    /** A peer at a PDT feature level (P2-F-05): 2 reads and sends the level-2 forms. */
+    private Peer newPeer(String address, long seed, int pdtLevel, String... seedAddresses) throws IOException {
         PeerIdentity identity = PeerIdentity.generate();
         PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).build();
         node.listen(network.register(address), address);
@@ -129,7 +134,8 @@ class PdtSwarmTest {
         NodeStore store = new NodeStore(new MemoryBlockStore(), clock);
         Content content = Content.builder(new CapabilityPipes(runtime, codec), runtime, space, identity.peerId())
                 .codec(codec).clock(clock).store(new MemoryPieceStore(clock, 0)).blocks(blocks).random(new Random(seed))
-                .treeStore(PdtSwarm.treeStore(store)).advertisements(peer -> Optional.ofNullable(ads.get(peer))).build();
+                .treeStore(PdtSwarm.treeStore(store)).advertisements(peer -> Optional.ofNullable(ads.get(peer)))
+                .pdtLevel(pdtLevel).build();
         ads.put(identity.peerId(), content.describe(groupId));
         runtime.onTick(content::tick);
         content.start();
@@ -371,6 +377,119 @@ class PdtSwarmTest {
         assertThat(onB.read(offset, 1)[0]).isEqualTo(edited);
         assertThat(onB.read(offset - 1, 1)[0]).isEqualTo(bytes[(int) offset - 1]);
         assertThat(onB.read(offset + 1, 1)[0]).isEqualTo(bytes[(int) offset + 1]);
+    }
+
+    @Test
+    void aOneByteEditOfAThirtyTwoMiBBlobShipsUnderEightKiBBetweenLevelTwoPeers() throws Exception {
+        // PDT 2 phase 4, P2-Z-02 and P2-Z-03 at test scale: the writer keeps the edited chunk's frame, and the
+        // reader that holds the previous version receives the frame and the path in place of the chunk
+        Peer a = newPeer("a", 1, 2);
+        Peer b = newPeer("b", 2, 2, "a");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        byte[] bytes = seededBytes(BLOB_BYTES, 42);
+        PBlob b0 = PBlob.of(bytes, a.store());
+        String root0 = b0.root();
+        a.swarm().hold(root0);
+        assertThat(runUntil(Duration.ofSeconds(10), () -> holdersComplete(b, root0) == 1)).isTrue();
+        TreeFetch full = b.swarm().fetchTree(root0);
+        assertThat(runUntil(Duration.ofSeconds(60), full::complete)).as(full.trace().toString()).isTrue();
+        b.swarm().hold(root0);
+
+        long offset = 17_000_001L;
+        byte edited = (byte) (bytes[(int) offset] ^ 0x5a);
+        PBlob b1 = b0.splice(offset, 1, new byte[]{edited});
+        String root1 = b1.root();
+        BlobTree.Entry chunk = chunkAt(b1, offset);
+        long delta = bytesNotIn(a.store(), root1, root0);
+        a.swarm().hold(root1);
+        assertThat(runUntil(Duration.ofSeconds(10), () -> holdersComplete(b, root1) == 1)).isTrue();
+
+        TreeFetch fetch = b.swarm().fetchTree(root1, List.of(root0));
+        assertThat(runUntil(Duration.ofSeconds(30), fetch::complete)).as(fetch.trace().toString()).isTrue();
+        assertThat(b.store().complete(root1)).isTrue();
+        TreeFetch.Progress p = fetch.progress();
+        System.out.printf("P2-Z-03: a one-byte edit of a %d MiB blob shipped %d bytes at level 2, for a delta of %d bytes"
+                + " (edited chunk %d bytes), %d round trips%n", BLOB_BYTES >> 20, p.bytesReceived(), delta, chunk.length(),
+                p.roundTrips());
+        assertThat(p.bytesReceived()).as("the frame and the path").isLessThan(8 * 1024);
+        assertThat(a.content().stats().bytesServed()).isPositive();
+        assertThat(p.roundTrips()).isLessThanOrEqualTo(2);
+        PBlob onB = PBlob.load(b.store(), root1);
+        assertThat(onB.read(offset, 1)[0]).isEqualTo(edited);
+        assertThat(onB.read(offset - 1, 3)).containsExactly(bytes[(int) offset - 1], edited, bytes[(int) offset + 1]);
+    }
+
+    @Test
+    void aWriterKeepsNoFramesUntilAnotherMemberAdvertisesLevelTwo() throws Exception {
+        // PDT 2 phase 4 measures (owner default of 2026-11-09, srad/agentspaces-pdt2.md §10.14): frames go only from a
+        // level-2 holder to a level-2 asker, so an edit keeps none, and compresses nothing, until both sides exist
+        Peer a = newPeer("a", 1, 2);
+        Peer b = newPeer("b", 2, 1, "a");
+        for (int i = 0; i < 4; i++) {
+            tickAll();
+        }
+        PBlob onA = PBlob.of(seededBytes(1 << 20, 6), a.store()).splice(300_000L, 1, new byte[]{7});
+        assertThat(a.store().deltas().size()).as("a level-2 writer whose only member reads level 1").isZero();
+        PBlob onB = PBlob.of(seededBytes(1 << 20, 7), b.store()).splice(300_000L, 1, new byte[]{7});
+        assertThat(b.store().deltas().size()).as("a level-1 writer, which never sends a frame").isZero();
+
+        Peer c = newPeer("c", 3, 2, "a");
+        assertThat(runUntil(Duration.ofSeconds(10), () -> a.runtime().membership().member(c.id()).isPresent())).isTrue();
+        onA.splice(600_000L, 1, new byte[]{9});
+        assertThat(a.store().deltas().size()).as("once a member advertises level 2").isEqualTo(1);
+        onB.splice(600_000L, 1, new byte[]{9});
+        assertThat(b.store().deltas().size()).as("a level-1 writer still keeps none").isZero();
+    }
+
+    @Test
+    void aFlatArtifactsManifestNamesItsIdentityAndItsKeptOutboard() throws Exception {
+        // PDT 2 phase 4, P2-B-06 and P2-H-05 (rule 11): a swarm with a tree store names a plaintext artifact's
+        // identity and outboard in the manifest's attrs, whatever the piece size
+        Peer a = newPeer("a", 1);
+        byte[] bytes = seededBytes(3 * 1024 * 1024 + 11, 5);
+        ai.badmonkey.agentspaces.agent.content.Manifest small = a.content().publish(bytes,
+                a.content().publishOptions().withPieceSize(256 * 1024).withName("weights.bin"));
+        ai.badmonkey.agentspaces.agent.content.Manifest large = a.content().publish(bytes,
+                a.content().publishOptions().withPieceSize(1024 * 1024).withName("weights.bin"));
+        String identity = ai.badmonkey.agentspaces.content.tree.Cids.identity(ai.badmonkey.agentspaces.pdt.blob.Blake3.digest(bytes));
+        ai.badmonkey.agentspaces.pdt.blob.BaoOutboard.Built outboard =
+                ai.badmonkey.agentspaces.pdt.blob.BaoOutboard.of(new java.io.ByteArrayInputStream(bytes));
+        assertThat(small.root()).isNotEqualTo(large.root());
+        assertThat(small.blake3()).contains(identity);
+        assertThat(large.blake3()).as("one identity whatever the piece size").contains(identity);
+        assertThat(small.bao()).contains(outboard.root());
+        assertThat(small.attrs()).containsOnlyKeys("pdt.blake3", "pdt.bao");
+        assertThat(a.store().has(outboard.root())).isTrue();
+        assertThat(a.store().pinned()).as("the outboard stays while the artifact does").contains(outboard.root());
+    }
+
+    @Test
+    void aPublishWhoseAttrsLeaveNoRoomForTheIdentityStillPublishesWithoutIt() throws Exception {
+        // PDT 2 phase 4 gate, P2-B-06 and P2-Q-REL-08: the identity is advisory, so a publish whose own attrs fill the
+        // manifest's bounds (32 entries, or 4 KiB) publishes as before and names no identity
+        Peer a = newPeer("a", 1);
+        byte[] bytes = seededBytes(200_000, 6);
+        java.util.Map<String, String> full = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < ai.badmonkey.agentspaces.agent.content.Manifest.MAX_ATTRS; i++) {
+            full.put("k" + i, "v" + i);
+        }
+        ai.badmonkey.agentspaces.agent.content.Manifest many = a.content().publish(bytes,
+                a.content().publishOptions().withAttrs(full).withName("many.bin"));
+        assertThat(many.violation()).isEmpty();
+        assertThat(many.attrs()).isEqualTo(full);
+        assertThat(many.blake3()).isEmpty();
+        java.util.Map<String, String> large = java.util.Map.of("note", "x".repeat(
+                ai.badmonkey.agentspaces.agent.content.Manifest.MAX_ATTRS_BYTES - "note".length()));
+        ai.badmonkey.agentspaces.agent.content.Manifest big = a.content().publish(bytes,
+                a.content().publishOptions().withAttrs(large).withName("big.bin"));
+        assertThat(big.violation()).isEmpty();
+        assertThat(big.attrs()).isEqualTo(large);
+        java.util.Map<String, String> some = java.util.Map.of("owner", "ops");
+        ai.badmonkey.agentspaces.agent.content.Manifest room = a.content().publish(bytes,
+                a.content().publishOptions().withAttrs(some).withName("room.bin"));
+        assertThat(room.attrs()).containsKeys("owner", "pdt.blake3", "pdt.bao");
     }
 
     @Test

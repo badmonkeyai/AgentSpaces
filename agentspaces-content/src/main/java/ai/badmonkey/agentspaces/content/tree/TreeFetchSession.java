@@ -82,9 +82,22 @@ import java.util.concurrent.locks.ReentrantLock;
  * source has answered {@code missing} for everything left to ask, the fetch waits,
  * and when the options name a timeout it fails after it with an exception naming
  * the root (PD-X-08); a new holding then starts a new fetch through the capability.
+ * A {@code missing} answer benches its source for that CID alone, for a backoff
+ * with a random spread, after which the session asks it again (swarm retries):
+ * a holder may come to hold what it lacked, and the wait ends only when no
+ * source answers within the timeout.
  * Received node bytes count against the download budget of the policy through
  * {@link Fabric#withinDownloadBudget} (PD-P-02): once the day's budget is spent
  * the session sends nothing more until the budget allows again.
+ *
+ * <p>Intra-chunk deltas (PDT 2 phase 4, P2-Z-01; srad/agentspaces-pdt2.md §3.8). A session whose peer reads the
+ * level-2 forms ({@link Fabric#readsDeltas}) applies the {@code NODES.deltas} of a {@code TREE_WANT} answer: the
+ * chunk a delta names must pass the rule above, or its sender is struck; a delta over a base this store lacks is
+ * ignored and the chunk asked for by {@code NODE_WANT}; a frame that does not open ({@link Dcz#decode}) is refused
+ * without a strike and the chunk asked for whole, and since each such frame costs a read and a hash of its base,
+ * the session opens no later frame from that source (P2-Q-SEC-05); a frame that opens to bytes that do not hash to
+ * the chunk's CID strikes its sender. Only a verified chunk is stored, never the frame, and the frame's bytes are
+ * what the session counts as received.
  *
  * <p>A session is also the bare {@code NODE_WANT} batch of {@code Content.fetchNodes}:
  * no root, a fixed set of wanted CIDs, links not followed, complete when every
@@ -100,6 +113,10 @@ public final class TreeFetchSession implements TreeFetch {
     static final int SUBTREE_SOURCES = 2;
     /** A batch outstanding this long (or twice its source's smoothed round trip) is late enough to duplicate. */
     static final long ENDGAME_LATE_MILLIS = 1_000;
+    /** The first bench of a source that answered {@code missing} for a CID; each later such answer doubles it (swarm retries). */
+    static final long MISSING_BENCH_MILLIS = 1_000;
+    /** The longest bench of a source for one CID (swarm retries). */
+    static final long MISSING_BENCH_MAX_MILLIS = 16_000;
 
     /** What the session needs from the capability. */
     public interface Fabric {
@@ -147,14 +164,45 @@ public final class TreeFetchSession implements TreeFetch {
 
         /** The session completed. */
         void onComplete(TreeFetchSession session);
+
+        /** Whether this peer reads the level-2 forms (P2-F-05), so a session applies {@code NODES.deltas} (P2-Z-01). */
+        default boolean readsDeltas() {
+            return false;
+        }
     }
 
     private static final class Source extends SourceRanking.Source {
-        /** CIDs this source answered {@code missing} or {@code REJECT} not-held for. */
-        final Set<String> lacks = new HashSet<>();
+        /**
+         * CIDs this source answered {@code missing} or {@code REJECT} not-held for, each with the clock time its bench
+         * ends and the answers so far. A holder that lacked a node may hold it later, its own fetch or push having run
+         * on, so the session asks it again once the bench ends; the bench doubles with each such answer, with a random
+         * spread (swarm retries, ROBUSTNESS.md §10.3 B6).
+         */
+        private final Map<String, long[]> lacks = new HashMap<>();
+        /** Whether a frame of this source did not open, so the session opens none of its later frames (P2-Q-SEC-05). */
+        boolean framesRefused;
 
         Source(PeerId id) {
             super(id);
+        }
+
+        /** Whether the source is benched for a CID at {@code now}. */
+        boolean lacks(String cid, long now) {
+            long[] bench = lacks.get(cid);
+            return bench != null && now < bench[0];
+        }
+
+        /** Benches the source for each CID it lacks, unless a bench of it runs already. */
+        void lack(java.util.Collection<String> cids, long now) {
+            for (String cid : cids) {
+                long[] bench = lacks.computeIfAbsent(cid, c -> new long[2]);
+                if (now < bench[0]) {
+                    continue;
+                }
+                bench[1]++;
+                long wait = Math.min(MISSING_BENCH_MAX_MILLIS, MISSING_BENCH_MILLIS << Math.min(bench[1] - 1, 16));
+                bench[0] = now + wait + java.util.concurrent.ThreadLocalRandom.current().nextLong(wait / 2 + 1);
+            }
         }
     }
 
@@ -223,6 +271,9 @@ public final class TreeFetchSession implements TreeFetch {
     private boolean budgetSpent;
     /** Frontier CIDs a holder named that no verified node links to (PD-X-04). */
     private long foreignCidsRefused;
+    /** Chunks rebuilt from a delta, and deltas refused (PDT 2 phase 4, P2-Z-01). */
+    private long deltasApplied;
+    private long deltasRefused;
 
     /**
      * A tree fetch.
@@ -502,13 +553,22 @@ public final class TreeFetchSession implements TreeFetch {
                     }
                 }
                 missing = asked;
-                source.lacks.addAll(missing);
-                last = acceptBatch(request, list, missing);
+                source.lack(missing, now);
+                last = acceptBatch(request, list, missing, now);
             } else {
                 last = false;
                 for (byte[] node : list) {
                     if (!acceptSubtreeNode(request, node)) {
                         break;
+                    }
+                }
+                if (nodes.deltas() != null && fabric.readsDeltas()) {
+                    for (Messages.NodeDelta delta : nodes.deltas()) {
+                        if (!outstanding.containsKey(request.req)) {
+                            break; // the source was struck
+                        }
+                        bytes += delta.dcz().length;
+                        acceptDelta(request, delta);
                     }
                 }
                 if (outstanding.containsKey(request.req)) {
@@ -522,7 +582,7 @@ public final class TreeFetchSession implements TreeFetch {
                                 + " missing at that holder, " + added + " more to ask elsewhere");
                     }
                 }
-                source.lacks.addAll(missing);
+                source.lack(missing, now);
             }
             if (outstanding.containsKey(request.req)) {
                 if (last) {
@@ -612,6 +672,26 @@ public final class TreeFetchSession implements TreeFetch {
         }
     }
 
+    /** Chunks this session rebuilt from an intra-chunk delta and verified (P2-Z-01). */
+    public long deltasApplied() {
+        lock.lock();
+        try {
+            return deltasApplied;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Deltas whose frame did not open or did not rebuild the chunk its CID names (P2-Z-01, P2-Q-SEC-05). */
+    public long deltasRefused() {
+        lock.lock();
+        try {
+            return deltasRefused;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /**
      * A {@code TREE_END}.
      *
@@ -646,7 +726,7 @@ public final class TreeFetchSession implements TreeFetch {
                 return true;
             }
             if (end.reason() == Messages.END_HAVES_NOT_HELD) {
-                source.lacks.addAll(haves);
+                source.lack(haves, now);
             }
             note("subtree " + request.subtree + " from " + source.id.display() + " ended (" + end.reason() + "): "
                     + end.frontier().size() + " frontier cids"
@@ -694,7 +774,7 @@ public final class TreeFetchSession implements TreeFetch {
                 note("source " + source.id.display() + " rejected (" + reject.reason() + "); dropped for a while");
                 releaseAll(source);
             } else {
-                source.lacks.add(reject.root());
+                source.lack(List.of(reject.root()), now);
                 holdingsDirty = true;
             }
             schedule();
@@ -707,7 +787,7 @@ public final class TreeFetchSession implements TreeFetch {
     // ------------------------------------------------------------ verification
 
     /** Verifies a NODE_WANT answer's nodes against the request's CIDs in order; true when the request is answered in full. */
-    private boolean acceptBatch(Request request, List<byte[]> list, List<String> missing) {
+    private boolean acceptBatch(Request request, List<byte[]> list, List<String> missing, long now) {
         Source source = request.source;
         for (byte[] node : list) {
             byte[] digest = Digests.sha256(node);
@@ -723,10 +803,10 @@ public final class TreeFetchSession implements TreeFetch {
                 return false;
             }
             for (int i = request.matched; i < at; i++) {
-                source.lacks.add(request.cids.get(i)); // skipped: the holder lacks it or lists it missing
+                source.lack(List.of(request.cids.get(i)), now); // skipped: the holder lacks it or lists it missing
             }
             request.matched = at + 1;
-            accept(request.cids.get(at), node, source, request.subtree, request.generation);
+            accept(request.cids.get(at), node, source, request.subtree, request.generation, node.length);
         }
         int lacking = 0;
         for (String cid : request.cids) {
@@ -748,22 +828,83 @@ public final class TreeFetchSession implements TreeFetch {
                     + " is neither the subtree root nor a link of a verified node");
             return false;
         }
-        accept(cid, node, request.source, request.subtree, request.generation);
+        accept(cid, node, request.source, request.subtree, request.generation, node.length);
         return true;
     }
 
-    private void accept(String cid, byte[] node, Source source, String subtree, int generation) {
+    /** Applies one delta of a TREE_WANT answer as the class comment describes; the source is struck on a forgery. */
+    private void acceptDelta(Request request, Messages.NodeDelta delta) {
+        String cid = delta.cid();
+        if (!expected.contains(cid)) {
+            foreignCidsRefused++;
+            strike(request.source, "a delta of TREE_WANT " + request.req + " under " + request.subtree + " names " + cid
+                    + ", which no verified node links to");
+            return;
+        }
+        if (store.has(cid) || verified.contains(cid)) {
+            bytesReceived += delta.dcz().length; // a duplicate delivery still costs its bytes
+            return;
+        }
+        if (Cids.parse(cid).codec() != Cids.RAW || Cids.parse(delta.base()).codec() != Cids.RAW) {
+            deltasRefused++;
+            note("a delta for " + cid + " over " + delta.base() + " names no two chunks; asking for it whole");
+            frontier.add(cid);
+            return;
+        }
+        if (request.source.framesRefused) {
+            frontier.add(cid); // P2-Q-SEC-05: a source whose frame did not open gets no more base reads
+            return;
+        }
+        Optional<byte[]> base = store.get(delta.base());
+        if (base.isEmpty()) {
+            note("a delta for " + cid + " over " + delta.base() + ", which this store lacks; asking for the chunk by NODE_WANT");
+            frontier.add(cid);
+            return;
+        }
+        byte[] chunk;
+        try {
+            chunk = Dcz.decode(base.get(), delta.dcz());
+        } catch (IllegalArgumentException e) {
+            deltasRefused++;
+            request.source.framesRefused = true;
+            note("a delta for " + cid + " from " + request.source.id.display() + " refused (" + e.getMessage()
+                    + "); asking for the chunk whole, and for its later chunks whole too");
+            frontier.add(cid);
+            return;
+        }
+        if (!Cids.of(chunk, Cids.RAW).equals(cid)) {
+            deltasRefused++;
+            strike(request.source, "a delta of TREE_WANT " + request.req + " rebuilds bytes that do not hash to " + cid);
+            return;
+        }
+        deltasApplied++;
+        accept(cid, chunk, request.source, request.subtree, request.generation, delta.dcz().length);
+    }
+
+    /** Stores a verified node and follows its links; {@code wireBytes} is what it cost to receive (a delta's frame). */
+    private void accept(String cid, byte[] node, Source source, String subtree, int generation, long wireBytes) {
+        if (done.isDone()) {
+            return; // the store refused an earlier node of this answer, which ended the fetch
+        }
         frontier.remove(cid);
-        bytesReceived += node.length; // every delivery that verified, a duplicate included, so the cost is visible
+        bytesReceived += wireBytes; // every delivery that verified, a duplicate included, so the cost is visible
         if (!verified.add(cid)) {
             return;
         }
         if (!store.has(cid)) {
-            store.putVerified(cid, node);
+            try {
+                store.putVerified(cid, node);
+            } catch (StoreRefusedException refused) {
+                // PDT 2 phase 7, P2-X-08: the store's quota, say; the sender did nothing wrong, so nobody is struck
+                note("the store refused " + cid + " (" + refused.getMessage() + "); failed");
+                outstanding.clear();
+                done.completeExceptionally(refused);
+                return;
+            }
         }
         nodesVerified++;
-        source.bytesVerified += node.length;
-        fabric.onNodesVerified(1, node.length);
+        source.bytesVerified += wireBytes;
+        fabric.onNodesVerified(1, wireBytes);
         if (root == null) {
             return; // a bare batch follows no links
         }
@@ -936,14 +1077,14 @@ public final class TreeFetchSession implements TreeFetch {
         if (root != null && !store.has(root)) {
             if (!askedNodes.contains(root)) {
                 for (Source s : usable) {
-                    if (s.inFlight < s.window && !s.lacks.contains(root)) {
+                    if (s.inFlight < s.window && !s.lacks(root, now)) {
                         askedNodes.add(root); // once per source: a tick before the answer must not ask again
                         send(s, Messages.NODE_WANT, List.of(root), null, now);
                         break;
                     }
                 }
             }
-            if (outstanding.isEmpty() && allLack(usable, root)) {
+            if (outstanding.isEmpty() && allLack(usable, root, now)) {
                 stalled("the root");
             } else {
                 lastSourceSeenAtMillis = now;
@@ -960,7 +1101,7 @@ public final class TreeFetchSession implements TreeFetch {
             Source chosen = null;
             for (int i = 0; i < top.size() && chosen == null; i++) {
                 Source s = top.get((turn + i) % top.size());
-                if (s.inFlight < s.window && !s.lacks.contains(subtree)) {
+                if (s.inFlight < s.window && !s.lacks(subtree, now)) {
                     chosen = s;
                 }
             }
@@ -991,7 +1132,7 @@ public final class TreeFetchSession implements TreeFetch {
                 List<String> batch = new ArrayList<>();
                 for (java.util.Iterator<String> it = candidates.iterator(); it.hasNext() && batch.size() < Messages.MAX_WANT_CIDS; ) {
                     String cid = it.next();
-                    if (!s.lacks.contains(cid)) {
+                    if (!s.lacks(cid, now)) {
                         batch.add(cid);
                         it.remove();
                     }
@@ -1010,8 +1151,10 @@ public final class TreeFetchSession implements TreeFetch {
             }
         }
         if (outstanding.isEmpty() && (!candidates.isEmpty() || !pendingSubtrees.isEmpty())) {
-            // nothing in flight and nothing any usable source will answer: no reachable holder of what is left
-            if (store.complete(root)) {
+            // nothing in flight and nothing any usable source will answer: no reachable holder of what is left; a bare
+            // batch names no root, so it stalls here and fails at its timeout (swarm retries, the gate's adversarial
+            // review, ROBUSTNESS.md §10.6)
+            if (root != null && store.complete(root)) {
                 finish();
                 return;
             }
@@ -1024,9 +1167,9 @@ public final class TreeFetchSession implements TreeFetch {
         }
     }
 
-    private static boolean allLack(List<Source> usable, String cid) {
+    private static boolean allLack(List<Source> usable, String cid, long now) {
         for (Source s : usable) {
-            if (!s.lacks.contains(cid)) {
+            if (!s.lacks(cid, now)) {
                 return false;
             }
         }
@@ -1092,7 +1235,7 @@ public final class TreeFetchSession implements TreeFetch {
                 }
                 List<String> batch = new ArrayList<>();
                 for (String cid : r.cids) {
-                    if (!store.has(cid) && !s.lacks.contains(cid)) {
+                    if (!store.has(cid) && !s.lacks(cid, now)) {
                         batch.add(cid);
                     }
                 }

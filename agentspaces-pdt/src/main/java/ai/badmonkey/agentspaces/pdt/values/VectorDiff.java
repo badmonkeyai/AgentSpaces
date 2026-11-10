@@ -25,7 +25,9 @@ import java.util.List;
  * range appended in mine past the base's count, and the range removed from the
  * base past mine's count. The walk compares the two tries by CID and descends
  * only where they differ, so its cost is proportional to the changes times the
- * depth; the tail region is compared element by element.
+ * depth; the tail region is compared element by element. When either vector is
+ * relaxed (PDT 2 phase 6, P2-R-02) an edit shifts every index after it, so the walk
+ * compares the common indices element by element.
  *
  * @param changed      the index ranges, in order, whose elements differ
  * @param appended     the indices in mine beyond the base's count; empty when none
@@ -64,6 +66,16 @@ public record VectorDiff(List<Range> changed, Range appended, Range removed, int
         VecRoot a = mine.node();
         VecRoot b = base.node();
         int common = Math.min(a.n, b.n);
+        if (a.relaxed || b.relaxed) {
+            for (int i = 0; i < common && !a.cid.equals(b.cid); i++) {
+                if (!Spill.equalHashed(Rrb.nth(a, i, walk.mineCtx), Rrb.nth(b, i, walk.baseCtx))) {
+                    walk.mark(i);
+                }
+            }
+            walk.close();
+            return new VectorDiff(Collections.unmodifiableList(walk.ranges), new Range(common, a.n), new Range(common, b.n),
+                    walk.visited);
+        }
         int trieLimit = Math.min(a.tailoff(), b.tailoff());
         if (trieLimit > 0 && !a.cid.equals(b.cid)) {
             walk.tries(a, b, trieLimit);

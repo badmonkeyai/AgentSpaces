@@ -185,6 +185,19 @@ public final class PeerNode implements AutoCloseable {
     public static final String RECORDLESS_HINT = "wire.recordless";
     /** Members whose advertisement carries {@link #RECORDLESS_HINT}. */
     private final Set<PeerId> recordlessPeers = ConcurrentHashMap.newKeySet();
+    /**
+     * The hint a node advertises once every decoder it runs reads the v0.1.32 schemas of the AppCard and the
+     * AgentCard ({@code wire.appcard=2}; SPEC §6.1a.2 and §9; AppCard origin and formats, 2026-11-09): canonical
+     * decimal text, read as level N or above. An issuer writes a card's origin, formats, an {@code idp} host, and a
+     * spill reference only while every member of its view is at level 2.
+     */
+    public static final String APPCARD_HINT = "wire.appcard";
+    /** The AppCard level this build reads and, by default, advertises. */
+    public static final int APPCARD_LEVEL = 2;
+    /** The AppCard level each member's advertisement states, for members above level 1. */
+    private final Map<PeerId, Integer> appCardLevels = new ConcurrentHashMap<>();
+    /** The AppCard level this node advertises; 1 advertises no hint. */
+    private final int appCardLevel;
     /** Members admitted since the last tick, per group: each gets a targeted anti-entropy round on the next tick. */
     private final Map<GroupId, Set<PeerId>> newlyAdmitted = new ConcurrentHashMap<>();
     /** The seeds each group was joined with, re-dialed when the view is empty (ROBUSTNESS.md §3.3, §3.6). */
@@ -670,14 +683,14 @@ public final class PeerNode implements AutoCloseable {
     private String relayedKind(byte[] frame) {
         try {
             ai.badmonkey.agentspaces.peering.wire.WireCodec.Signed signed =
-                    codec.fromBytes(frame, ai.badmonkey.agentspaces.peering.wire.WireCodec.Signed.class);
+                    codec.fromWire(frame, ai.badmonkey.agentspaces.peering.wire.WireCodec.Signed.class);
             if (signed == null || signed.envelope() == null || signed.envelope().kind() == null) {
                 return "unknown";
             }
             Envelope.Kind kind = signed.envelope().kind();
             if (kind == Envelope.Kind.PIPE_DATA && signed.envelope().body() != null) {
                 try {
-                    RelayPipeFrame pipe = codec.fromBytes(signed.envelope().body(), RelayPipeFrame.class);
+                    RelayPipeFrame pipe = codec.fromWire(signed.envelope().body(), RelayPipeFrame.class);
                     if (pipe != null && pipe.capability() != null) {
                         return kind.name() + ":" + pipe.capability();
                     }
@@ -968,6 +981,10 @@ public final class PeerNode implements AutoCloseable {
         if (builder.recordless) {
             nodeHints.put(RECORDLESS_HINT, "1");
         }
+        this.appCardLevel = builder.appCardLevel;
+        if (appCardLevel > 1) {
+            nodeHints.put(APPCARD_HINT, Integer.toString(appCardLevel));
+        }
         if (coalesceWindow != null) {
             nodeHints.put(BATCH_HINT, "1");
             flusher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1033,6 +1050,7 @@ public final class PeerNode implements AutoCloseable {
         private Duration peerAdInterval = Duration.ofSeconds(30);
         private boolean lazyPush = true;
         private boolean recordless = true;
+        private int appCardLevel = APPCARD_LEVEL;
         private Duration coalesceWindow;
         private ChannelAuth channelAuth = ChannelAuth.SIGNED;
         private RevocationRegistry.RevocationValidator revocationValidator =
@@ -1259,6 +1277,22 @@ public final class PeerNode implements AutoCloseable {
          */
         public Builder recordless(boolean enabled) {
             this.recordless = enabled;
+            return this;
+        }
+
+        /**
+         * The AppCard level this node advertises under {@link #APPCARD_HINT} (SPEC §6.1a.2; AppCard origin and formats,
+         * 2026-11-09): {@link #APPCARD_LEVEL} by default. Level 1 advertises no hint, so a test builds a mixed fleet in
+         * which every issuer keeps a card's gated fields out of the view.
+         *
+         * @param level 1 or 2
+         * @return this builder
+         */
+        public Builder appCardLevel(int level) {
+            if (level < 1 || level > APPCARD_LEVEL) {
+                throw new IllegalArgumentException("this build reads AppCard levels 1 to " + APPCARD_LEVEL + ": " + level);
+            }
+            this.appCardLevel = level;
             return this;
         }
 
@@ -1644,7 +1678,10 @@ public final class PeerNode implements AutoCloseable {
      * Returns how many inbound frames the wire codec refused outright (spec
      * §9): failed signature, half-signed, unknown wire version, or garbage.
      * Such frames name no verified sender, so they count here and strike
-     * nobody.
+     * nobody. A frame whose stamp is any CBOR item other than a definite-length,
+     * untagged, shortest-form text string is garbage too (HLC round four,
+     * 2026-11-08, decision D3). An inner frame of a verified BATCH that does
+     * not decode counts here as well, and the outer signer is struck for it.
      */
     public long framesDropped() {
         return framesDropped.get();
@@ -1797,7 +1834,7 @@ public final class PeerNode implements AutoCloseable {
 
     /**
      * The wire hints this node advertises ({@code wire.batch}, {@code wire.tree},
-     * {@code wire.session}, {@code wire.hashes}, {@code wire.recordless}), a copy.
+     * {@code wire.session}, {@code wire.hashes}, {@code wire.recordless}, {@code wire.appcard}), a copy.
      *
      * @return the hints
      */
@@ -2367,7 +2404,7 @@ public final class PeerNode implements AutoCloseable {
     /** Decodes a hint's founding bytes, or null when they are not a signed founding advertisement. */
     private SignedGroupAdvertisement decodeFounding(byte[] bytes) {
         try {
-            return codec.fromBytes(bytes, SignedGroupAdvertisement.class);
+            return codec.fromWire(bytes, SignedGroupAdvertisement.class);
         } catch (RuntimeException e) {
             return null;
         }
@@ -2492,6 +2529,44 @@ public final class PeerNode implements AutoCloseable {
      */
     public boolean advertisesRecordless(PeerId peer) {
         return peer != null && recordlessPeers.contains(peer);
+    }
+
+    /**
+     * The AppCard level a hint's text states (SPEC §6.1a.2, §9): canonical decimal text, so {@code 2}, {@code 10}, or a
+     * value past every integer reads as at least that level; no hint, any other text, and {@code 0} read as level 1.
+     *
+     * @param text the hint's text, or null
+     * @return the level, at least 1
+     */
+    public static int appCardLevelOf(String text) {
+        if (text == null || text.isEmpty() || text.length() > 1 && text.charAt(0) == '0') {
+            return 1;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) < '0' || text.charAt(i) > '9') {
+                return 1;
+            }
+        }
+        if (text.length() > 9) {
+            return Integer.MAX_VALUE;
+        }
+        return Math.max(1, Integer.parseInt(text));
+    }
+
+    /**
+     * The AppCard level a member's advertisement states (SPEC §6.1a.2): 1 for a member without the hint, with any
+     * other text, or whose advertisement this node has not received.
+     *
+     * @param peer the member
+     * @return its level
+     */
+    public int appCardLevel(PeerId peer) {
+        return peer == null ? 1 : appCardLevels.getOrDefault(peer, 1);
+    }
+
+    /** The AppCard level this node advertises. */
+    public int appCardLevel() {
+        return appCardLevel;
     }
 
     /** Whether this node expects to open a session with the peer (a hint seeded it, or its advertisement said so). */
@@ -2637,8 +2712,9 @@ public final class PeerNode implements AutoCloseable {
                 send(groupId, to, Envelope.Kind.PRUNE, prune);
             }
         };
+        // the bus times its asks for announced items by this node's clock (swarm retries, ROBUSTNESS.md §10.2)
         GossipBus gossip = new GossipBus(membership, sender, codec,
-                groupAd.gossip().fanout(), GossipBus.DEFAULT_HOPS);
+                groupAd.gossip().fanout(), GossipBus.DEFAULT_HOPS, clock::millis, random);
         if (lazyPush) {
             gossip.lazyPush(treePeers::contains);
             gossip.directDelivery(PEER_AD_STREAM); // introduced directly and flooded: never a tree duplicate
@@ -2911,6 +2987,7 @@ public final class PeerNode implements AutoCloseable {
             sessionPeers.remove(peer);
             hashPeers.remove(peer);
             recordlessPeers.remove(peer);
+            appCardLevels.remove(peer); // FR-6: a member counts at level 2 only on an advertisement held now
         }
         LOG.log(System.Logger.Level.INFO, "left group " + groupId.value() + ": " + held.size()
                 + " member(s) forgotten, " + closed + " connection(s) closed");
@@ -3196,7 +3273,7 @@ public final class PeerNode implements AutoCloseable {
         }
         if (frames.size() == 1) {
             // Nothing to coalesce: forward the inner frame as itself, re-signed as a plain frame.
-            Envelope inner = codec.fromBytes(frames.get(0), Envelope.class);
+            Envelope inner = codec.fromBytes(frames.get(0), Envelope.class); // this node's own outbox
             sendNow(group, to, inner.kind(), inner.body());
             return;
         }
@@ -3206,7 +3283,7 @@ public final class PeerNode implements AutoCloseable {
     private void onBatch(GroupRuntime runtime, Envelope envelope, TransportConnection connection) {
         Bodies.Batch batch;
         try {
-            batch = codec.fromBytes(envelope.body(), Bodies.Batch.class);
+            batch = codec.fromWire(envelope.body(), Bodies.Batch.class);
         } catch (RuntimeException e) {
             strike(envelope.from(), "malformed BATCH body");
             return;
@@ -3217,8 +3294,12 @@ public final class PeerNode implements AutoCloseable {
         for (byte[] bytes : batch.frames()) {
             Envelope inner;
             try {
-                inner = codec.fromBytes(bytes, Envelope.class);
+                inner = codec.fromWire(bytes, Envelope.class);
             } catch (RuntimeException e) {
+                // HLC round four, 2026-11-08 (decision D5): an inner frame that does not decode, a
+                // stamp that is no canonical text among the causes, counts as undecodable like a
+                // frame alone, and the outer signature that covers its bytes names the signer.
+                framesDropped.incrementAndGet();
                 strike(envelope.from(), "malformed frame in BATCH");
                 return;
             }
@@ -3588,7 +3669,7 @@ public final class PeerNode implements AutoCloseable {
     private boolean onRelaySignal(GroupRuntime runtime, Envelope envelope) {
         RelayPipeFrame frame;
         try {
-            frame = codec.fromBytes(envelope.body(), RelayPipeFrame.class);
+            frame = codec.fromWire(envelope.body(), RelayPipeFrame.class);
         } catch (RuntimeException e) {
             return false;
         }
@@ -3597,7 +3678,7 @@ public final class PeerNode implements AutoCloseable {
         }
         RelaySignal signal;
         try {
-            signal = codec.fromBytes(frame.payload(), RelaySignal.class);
+            signal = codec.fromWire(frame.payload(), RelaySignal.class);
         } catch (RuntimeException e) {
             return true;
         }
@@ -3940,7 +4021,7 @@ public final class PeerNode implements AutoCloseable {
                               TransportConnection connection) {
         switch (envelope.kind()) {
             case PING -> {
-                Bodies.Ping ping = codec.fromBytes(envelope.body(), Bodies.Ping.class);
+                Bodies.Ping ping = codec.fromWire(envelope.body(), Bodies.Ping.class);
                 onProbePiggyback(runtime, envelope.from(), ping.root(), ping.hashes(), ping.have());
                 GossipBus gossip = runtime.gossip();
                 Map<String, byte[]> hashes = gossip.probeHashes();
@@ -3948,13 +4029,13 @@ public final class PeerNode implements AutoCloseable {
                         hashes == null ? gossip.rootDigest() : null, hashes, gossip.piggyback(envelope.from())));
             }
             case PING_REQ -> {
-                Bodies.PingReq req = codec.fromBytes(envelope.body(), Bodies.PingReq.class);
+                Bodies.PingReq req = codec.fromWire(envelope.body(), Bodies.PingReq.class);
                 long relay = relayNonce.nextLong();
                 relays.put(relay, new Relay(envelope.from(), req.nonce(), req.target()));
                 send(runtime.id(), req.target(), Envelope.Kind.PING, new Bodies.Ping(relay));
             }
             case ACK -> {
-                Bodies.Ack ack = codec.fromBytes(envelope.body(), Bodies.Ack.class);
+                Bodies.Ack ack = codec.fromWire(envelope.body(), Bodies.Ack.class);
                 Relay relay = relays.get(ack.nonce());
                 if (relay != null) {
                     // Vouch for the target only when the target itself answered
@@ -3973,17 +4054,17 @@ public final class PeerNode implements AutoCloseable {
                 }
             }
             case RUMOR -> runtime.gossip().onRumor(envelope.from(),
-                    codec.fromBytes(envelope.body(), Bodies.Rumor.class));
+                    codec.fromWire(envelope.body(), Bodies.Rumor.class));
             case DIGEST -> runtime.gossip().onDigest(envelope.from(),
-                    codec.fromBytes(envelope.body(), Bodies.Digest.class));
+                    codec.fromWire(envelope.body(), Bodies.Digest.class));
             case PULL_RESP -> runtime.gossip().onPullResp(envelope.from(),
-                    codec.fromBytes(envelope.body(), Bodies.PullResp.class));
+                    codec.fromWire(envelope.body(), Bodies.PullResp.class));
             case HAVE -> runtime.gossip().onHave(envelope.from(),
-                    codec.fromBytes(envelope.body(), Bodies.Have.class));
+                    codec.fromWire(envelope.body(), Bodies.Have.class));
             case GRAFT -> runtime.gossip().onGraft(envelope.from(),
-                    codec.fromBytes(envelope.body(), Bodies.Graft.class));
+                    codec.fromWire(envelope.body(), Bodies.Graft.class));
             case PRUNE -> runtime.gossip().onPrune(envelope.from(),
-                    codec.fromBytes(envelope.body(), Bodies.Prune.class));
+                    codec.fromWire(envelope.body(), Bodies.Prune.class));
             case QUERY, QUERY_HIT, BLOCK_WANT, BLOCK, PIPE_DATA -> {
                 if (envelope.kind() == Envelope.Kind.PIPE_DATA && onRelaySignal(runtime, envelope)) {
                     break; // the node's own signal, consumed here (LB-R-07)
@@ -4015,10 +4096,6 @@ public final class PeerNode implements AutoCloseable {
     /** The capability type of WebRTC signalling (SRAD srad/agentspaces-js.md §3.5). */
     static final String RTC_SIGNAL_CAPABILITY = "aspace:cap/rtc-signal";
 
-    /** The head of a {@code PIPE_DATA} body: the capability type alone, every other key ignored. */
-    private record PipeHead(String capability) {
-    }
-
     /**
      * The one relayed inner frame required attestation admits (SPEC §5.6, v0.1.21; SRAD
      * srad/agentspaces-js.md JS-N-03, decision 6): a fully signed {@code PIPE_DATA} of the
@@ -4035,7 +4112,9 @@ public final class PeerNode implements AutoCloseable {
             return false;
         }
         try {
-            PipeHead head = codec.fromBytes(envelope.body(), PipeHead.class);
+            // HLC round six, 2026-11-08 (owner ruling F3): the whole pipe frame, since a record
+            // that names one of its fields is no longer the body's encoding
+            RelayPipeFrame head = codec.fromWire(envelope.body(), RelayPipeFrame.class);
             return head != null && (RTC_SIGNAL_CAPABILITY.equals(head.capability())
                     || RELAY_SIGNAL_CAPABILITY.equals(head.capability()));
         } catch (RuntimeException e) {
@@ -4096,7 +4175,7 @@ public final class PeerNode implements AutoCloseable {
         }
         SignedGroupAdvertisement founding;
         try {
-            founding = codec.fromBytes(envelope.body(), SignedGroupAdvertisement.class);
+            founding = codec.fromWire(envelope.body(), SignedGroupAdvertisement.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -4151,7 +4230,7 @@ public final class PeerNode implements AutoCloseable {
         if (envelope.kind() == Envelope.Kind.PING && connection != null) {
             Bodies.Ping ping;
             try {
-                ping = codec.fromBytes(envelope.body(), Bodies.Ping.class);
+                ping = codec.fromWire(envelope.body(), Bodies.Ping.class);
             } catch (RuntimeException e) {
                 return;
             }
@@ -4170,7 +4249,7 @@ public final class PeerNode implements AutoCloseable {
         }
         Bodies.Rumor rumor;
         try {
-            rumor = codec.fromBytes(envelope.body(), Bodies.Rumor.class);
+            rumor = codec.fromWire(envelope.body(), Bodies.Rumor.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -4322,7 +4401,7 @@ public final class PeerNode implements AutoCloseable {
             ai.badmonkey.agentspaces.peering.membership.CredentialRevocationRegistry registry,
             byte[] payload) {
         try {
-            return registry.verify(codec.fromBytes(payload,
+            return registry.verify(codec.fromWire(payload,
                     RevocationRegistry.SignedRevocation.class)) != null;
         } catch (RuntimeException e) {
             return false;
@@ -4346,7 +4425,7 @@ public final class PeerNode implements AutoCloseable {
 
     private boolean revocationVerifiable(RevocationRegistry registry, byte[] payload) {
         try {
-            return registry.verify(codec.fromBytes(payload,
+            return registry.verify(codec.fromWire(payload,
                     RevocationRegistry.SignedRevocation.class)) != null;
         } catch (RuntimeException e) {
             return false;
@@ -4489,7 +4568,7 @@ public final class PeerNode implements AutoCloseable {
         }
         Bodies.ChannelHello hello;
         try {
-            hello = codec.fromBytes(envelope.body(), Bodies.ChannelHello.class);
+            hello = codec.fromWire(envelope.body(), Bodies.ChannelHello.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -4596,7 +4675,7 @@ public final class PeerNode implements AutoCloseable {
         }
         Bodies.SessionHello hello;
         try {
-            hello = codec.fromBytes(envelope.body(), Bodies.SessionHello.class);
+            hello = codec.fromWire(envelope.body(), Bodies.SessionHello.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -4699,7 +4778,7 @@ public final class PeerNode implements AutoCloseable {
     private void onRelayFrame(GroupRuntime runtime, Envelope envelope) {
         Bodies.RelayFrame relayed;
         try {
-            relayed = codec.fromBytes(envelope.body(), Bodies.RelayFrame.class);
+            relayed = codec.fromWire(envelope.body(), Bodies.RelayFrame.class);
         } catch (RuntimeException e) {
             return;
         }
@@ -5015,7 +5094,7 @@ public final class PeerNode implements AutoCloseable {
             }
             byte[][] payloads;
             try {
-                payloads = codec.fromBytes(delta, byte[][].class);
+                payloads = codec.fromWire(delta, byte[][].class);
             } catch (RuntimeException e) {
                 return;
             }
@@ -5092,6 +5171,12 @@ public final class PeerNode implements AutoCloseable {
             recordlessPeers.add(ad.issuer());
         } else {
             recordlessPeers.remove(ad.issuer());
+        }
+        int level = appCardLevelOf(ad.resourceHints().get(APPCARD_HINT));
+        if (level > 1) {
+            appCardLevels.put(ad.issuer(), level);
+        } else {
+            appCardLevels.remove(ad.issuer());
         }
         rememberReach(runtime.id(), ad);
         if (credentialHintListeners.isEmpty()) {
@@ -5190,28 +5275,36 @@ public final class PeerNode implements AutoCloseable {
     }
 
     private Optional<PeerAdvertisement> verifiedPeerAd(byte[] payload) {
+        return decodeSignedPeerAd(codec, payload)
+                .filter(ad -> !ad.expired(clock.instant())
+                        && !ad.issued().isAfter(clock.instant().plus(MAX_AD_ISSUED_SKEW)));
+    }
+
+    /**
+     * Decodes a signed peer advertisement and verifies it: the wrapper and the advertisement each
+     * in their own wire encoding (HLC round six, 2026-11-08, owner rulings F1 and F3), the key the
+     * issuer's, and the signature over the raw {@code adBytes}.
+     *
+     * @param codec   the codec
+     * @param payload the signed advertisement as received
+     * @return the advertisement, or empty when it does not decode or verify
+     */
+    static Optional<PeerAdvertisement> decodeSignedPeerAd(CborCodec codec, byte[] payload) {
         SignedPeerAd signed;
-        try {
-            signed = codec.fromBytes(payload, SignedPeerAd.class);
-        } catch (RuntimeException e) {
-            return Optional.empty();
-        }
-        if (signed == null || signed.adBytes() == null || signed.publicKey() == null
-                || signed.signature() == null
-                || signed.publicKey().length != Ed25519.RAW_PUBLIC_KEY_LENGTH) {
-            return Optional.empty();
-        }
         PeerAdvertisement ad;
         try {
-            ad = codec.fromBytes(signed.adBytes(), PeerAdvertisement.class);
+            signed = codec.fromWire(payload, SignedPeerAd.class);
+            if (signed.adBytes() == null || signed.publicKey() == null || signed.signature() == null
+                    || signed.publicKey().length != Ed25519.RAW_PUBLIC_KEY_LENGTH) {
+                return Optional.empty();
+            }
+            ad = codec.fromWire(signed.adBytes(), PeerAdvertisement.class);
         } catch (RuntimeException e) {
             return Optional.empty();
         }
         if (!PeerId.fromPublicKey(signed.publicKey()).equals(ad.issuer())
                 || !Ed25519.verify(Ed25519.publicKeyFromRaw(signed.publicKey()),
-                        signed.adBytes(), signed.signature())
-                || ad.expired(clock.instant())
-                || ad.issued().isAfter(clock.instant().plus(MAX_AD_ISSUED_SKEW))) {
+                        signed.adBytes(), signed.signature())) {
             return Optional.empty();
         }
         return Optional.of(ad);

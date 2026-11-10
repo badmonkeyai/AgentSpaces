@@ -51,6 +51,18 @@ public interface PieceStore {
      */
     void open(Manifest manifest);
 
+    /**
+     * Prepares a root for writes once its piece table is verified, for a table that does not
+     * ride on the manifest. A backend that keys pieces by hash marks the pieces it already holds
+     * (PDT 2 phase 1, P2-H-02); every other backend opens the root as {@link #open(Manifest)} does.
+     *
+     * @param manifest the manifest
+     * @param table    the verified piece table
+     */
+    default void open(Manifest manifest, byte[] table) {
+        open(manifest);
+    }
+
     /** The verified pieces of a root; empty when unknown. */
     BitSet have(String root);
 

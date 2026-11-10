@@ -913,7 +913,7 @@ public class AgentSpacesAutoConfiguration {
             GroupRuntime runtime = join(node, groupConfig, composed, canLocate(composed), identity);
             authorizers.register(groupConfig.getName(), runtime);
             Authorizer authorizer = authorizers.forGroup(groupConfig.getName());
-            DiscoveryService discovery = DiscoveryService.create(runtime, codec,
+            DiscoveryService discovery = discoveryFor(properties.getDiscovery(), runtime, codec,
                     identity.peerId(), clock, roles);
             AgentSpaces.GroupContext context = spaces.register(
                     groupConfig.getName(), runtime.id(), runtime, discovery);
@@ -949,7 +949,18 @@ public class AgentSpacesAutoConfiguration {
                 refDef.setName(properties.getPdt().getSpace());
                 ReplicatedSpace refSpace = buildSpace(runtime, identity, refDef, blocks, discovery,
                         ring, authorizer, clock, schemaRegistry, null, 0, 0);
-                pdt = pdts.build(properties.getPdt(), groupConfig.getName(), refSpace, clock, ring);
+                pdt = pdts.build(properties.getPdt(), groupConfig.getName(), refSpace, clock, ring, discovery,
+                        properties.getStore().getChallengeDeadline(), identity);
+            }
+            // srad/agentspaces-pdt2.md §7.2, P2-S-10: a store needs the swarm, which then reads the level-2 forms,
+            // and the facade; a host that builds the facades itself (Micronaut) builds its stores too
+            if (properties.getStore().isEnabled() && !properties.getContent().isEnabled()) {
+                throw new IllegalStateException("agentspaces.store.enabled=true needs agentspaces.content.enabled=true"
+                        + " and agentspaces.pdt.enabled=true: a store holds trees and artifacts on the content swarm");
+            }
+            if (properties.getStore().isEnabled() && pdt == null && !pdts.resolvesStores()) {
+                throw new IllegalStateException("agentspaces.store.enabled=true needs agentspaces.pdt.enabled=true:"
+                        + " a store pins and holds trees through the group's Pdt facade");
             }
             if (properties.getContent().isEnabled()) {
                 if (!properties.getCapabilities().isEnabled()) {
@@ -963,22 +974,37 @@ public class AgentSpacesAutoConfiguration {
                 content = buildContent(properties.getContent(), groupConfig.getName(), context.pipes(), runtime,
                         contentSpace, identity, codec, clock, blocks, ring, authorizer,
                         hostPieceStores.apply(groupConfig.getName()), discovery,
-                        // a host that builds its own facade (Micronaut, PD-C-03) hands the holder a store
-                        // resolver, so the swarm still carries a tree store over the group's node store
-                        pdt == null ? pdts.treeStoreFor(groupConfig.getName()).orElse(null) : pdt.treeStore());
+                        // a host that builds its own facade (Micronaut, PD-C-03) hands the holder its tree store,
+                        // over the group's node store, sealed for sealed-nodes (PDT 2 phase 7, P2-X-04)
+                        pdt == null ? pdts.treeStoreFor(groupConfig.getName(), ring).orElse(null) : pdt.treeStore(),
+                        properties.getStore().isEnabled() ? ai.badmonkey.agentspaces.content.Content.PDT_LEVEL : 1);
+                // SPEC §6.1a.5 (v0.1.32): the swarm takes the parts documents of this group's large cards
+                discovery.spillStore(new ai.badmonkey.agentspaces.content.ContentSpillStore(content));
                 bulk = new ai.badmonkey.agentspaces.content.SpacePayloads(content);
                 escalateAbove = properties.getContent().getEscalateAbove();
                 if (pdt != null) {
                     pdts.register(groupConfig.getName(), pdt, content, runtime, node);
+                    if (properties.getStore().isEnabled()) {
+                        pdts.stores().register(properties.getStore(), groupConfig.getName(), pdt, discovery, identity, clock,
+                                authorizer, runtime, node);
+                    }
                 }
             }
+            // PDT 2 phase 7, P2-X-04: a host that builds its facade after this wiring (Micronaut) has trees too,
+            // which its spaces and binder reach through the holder's deferred seams once it adopts the facade
+            boolean trees = pdt != null || (pdts.resolvesStores() && content != null);
+            if (trees) {
+                // PDT 2 phase 7, P2-X-03: @PdtRef sites resolve through the group's facade when a bean binds
+                context.binder().refs(pdts.refsFor(groupConfig.getName()));
+            }
+            Map<String, AgentSpacesProperties.PersistentTrees.SpaceEscalation> escalations =
+                    pdts.escalations(properties.getPdt());
             for (AgentSpacesProperties.SpaceDef spaceDef : groupConfig.getSpaces()) {
                 // srad/agentspaces-pdt.md §3.7, PD-E-01, PD-E-06: a space named under
                 // agentspaces.pdt.spaces escalates through the persistent trees, unsealed, with
                 // the flat swarm as its fallback unless it requires the trees.
-                AgentSpacesProperties.PersistentTrees.SpaceEscalation escalation =
-                        properties.getPdt().getSpaces().get(spaceDef.getName());
-                if (escalation != null && escalation.getEscalateAbove() > 0 && pdt == null) {
+                AgentSpacesProperties.PersistentTrees.SpaceEscalation escalation = escalations.get(spaceDef.getName());
+                if (escalation != null && escalation.getEscalateAbove() > 0 && !trees) {
                     throw new IllegalStateException("agentspaces.pdt.spaces." + spaceDef.getName()
                             + ".escalate-above needs agentspaces.pdt.enabled=true");
                 }
@@ -987,8 +1013,8 @@ public class AgentSpacesAutoConfiguration {
                 ai.badmonkey.agentspaces.api.spi.BulkPayloads fallback = null;
                 boolean treesRequired = false;
                 boolean sealBefore = true;
-                if (escalation != null && escalation.getEscalateAbove() > 0 && pdt != null) {
-                    spaceBulk = pdt.payloads();
+                if (escalation != null && escalation.getEscalateAbove() > 0) {
+                    spaceBulk = pdt != null ? pdt.payloads() : pdts.payloadsFor(groupConfig.getName());
                     spaceAbove = escalation.getEscalateAbove();
                     fallback = escalation.isRequire() ? null : bulk;
                     treesRequired = escalation.isRequire();
@@ -1041,15 +1067,20 @@ public class AgentSpacesAutoConfiguration {
      * replaces the store {@code agentspaces.pdt.store.kind} names, and its
      * {@link PdtMergeFunction} beans, registered on every facade (PD-R-05).
      *
-     * @param stores the application's node store bean, if any
-     * @param merges the application's merge functions
+     * @param stores        the application's node store bean, if any
+     * @param merges        the application's merge functions
+     * @param storePolicies the application's {@code StorePolicy} bean, if any (PDT 2 phase 3)
      * @return the holder
      */
     @Bean
     @ConditionalOnMissingBean
     public Pdts agentSpacesPdts(ObjectProvider<ai.badmonkey.agentspaces.pdt.NodeStore> stores,
-                                ObjectProvider<PdtMergeFunction> merges) {
-        return new Pdts(stores.getIfAvailable(), merges.orderedStream().toList());
+                                ObjectProvider<PdtMergeFunction> merges,
+                                ObjectProvider<ai.badmonkey.agentspaces.store.StorePolicy> storePolicies) {
+        Pdts pdts = new Pdts(stores.getIfAvailable(), merges.orderedStream().toList());
+        // PDT 2 phase 3, P2-Q-MNT-01: a StorePolicy bean replaces the policy agentspaces.store.* builds
+        pdts.stores().userPolicy(storePolicies.getIfAvailable());
+        return pdts;
     }
 
     /**
@@ -1225,7 +1256,7 @@ public class AgentSpacesAutoConfiguration {
         if (hasDocument) {
             ai.badmonkey.agentspaces.peering.node.SignedGroupAdvertisement founding;
             try {
-                founding = CborCodec.defaultCodec().fromBytes(
+                founding = CborCodec.defaultCodec().fromWire(
                         Base64.getDecoder().decode(config.getFoundingDocument().trim()),
                         ai.badmonkey.agentspaces.peering.node.SignedGroupAdvertisement.class);
             } catch (RuntimeException e) {
@@ -1343,6 +1374,23 @@ public class AgentSpacesAutoConfiguration {
     }
 
     /**
+     * A group's discovery under {@code agentspaces.discovery.*} (SPEC §6.3 and §6.1a.5, v0.1.32; AppCard origin and
+     * formats, 2026-11-09): an unset cache bound takes the role's default, a set one applies as given, and the spill
+     * fetch bound applies as set.
+     */
+    static DiscoveryService discoveryFor(AgentSpacesProperties.Discovery config, GroupRuntime runtime,
+                                         ai.badmonkey.agentspaces.common.codec.CborCodec codec,
+                                         ai.badmonkey.agentspaces.common.id.PeerId self, java.time.InstantSource clock,
+                                         java.util.Set<ai.badmonkey.agentspaces.api.ad.PeerAdvertisement.PeerRole> roles) {
+        Integer entries = config.getCache().getMaxEntries();
+        Long bytes = config.getCache().getMaxBytes();
+        ai.badmonkey.agentspaces.discovery.AdCache cache = new ai.badmonkey.agentspaces.discovery.AdCache(codec, clock,
+                entries != null ? entries : DiscoveryService.cacheBoundFor(roles),
+                bytes != null ? bytes : DiscoveryService.cacheBytesFor(roles));
+        return new DiscoveryService(runtime, cache, codec, self).maxSpillFetchBytes(config.getSpill().getMaxFetchBytes());
+    }
+
+    /**
      * Builds the content swarm of a group from {@code agentspaces.content.*}
      * (srad/large-networks-bulk-data.md §7.2): the store composed from the listed
      * backends (a per-group directory for {@code file}), the policy from the
@@ -1357,7 +1405,7 @@ public class AgentSpacesAutoConfiguration {
             GroupRuntime runtime, ReplicatedSpace contentSpace, PeerIdentity identity, CborCodec codec,
             InstantSource clock, BlockExchange blocks, GroupKeyRing ring, Authorizer authorizer,
             List<ai.badmonkey.agentspaces.content.PieceStore> hosted, DiscoveryService discovery,
-            ai.badmonkey.agentspaces.content.tree.TreeStore treeStore) {
+            ai.badmonkey.agentspaces.content.tree.TreeStore treeStore, int pdtLevel) {
         java.util.List<ai.badmonkey.agentspaces.content.PieceStore> backends = new java.util.ArrayList<>();
         java.util.List<ai.badmonkey.agentspaces.content.PieceStore> unplaced = new java.util.ArrayList<>(
                 hosted == null ? List.of() : hosted);
@@ -1387,11 +1435,27 @@ public class AgentSpacesAutoConfiguration {
                                 + ": " + e.getMessage(), e);
                     }
                 }
+                case "hash" -> {
+                    // PDT 2 phase 2, P2-H-04: every piece once under its hash, in a directory beside the file store's
+                    if (config.getStore().isEncryptAtRest()) {
+                        throw new IllegalStateException("agentspaces.content.store.encrypt-at-rest: the hash backend names"
+                                + " its pieces by their plaintext hashes and cannot encrypt them; use the file backend");
+                    }
+                    java.nio.file.Path path = java.nio.file.Path.of(config.getStore().getPath())
+                            .resolve(groupName.replaceAll("[^A-Za-z0-9._-]", "_") + ".hash");
+                    try {
+                        backends.add(new ai.badmonkey.agentspaces.content.HashPieceStore(path, codec, clock,
+                                config.getStore().getQuota()));
+                    } catch (java.io.IOException e) {
+                        throw new IllegalStateException("agentspaces.content.store.path: cannot use " + path
+                                + ": " + e.getMessage(), e);
+                    }
+                }
                 case "memory" -> backends.add(new ai.badmonkey.agentspaces.content.MemoryPieceStore(
                         clock, config.getStore().getQuota()));
                 case "in-place" -> backends.add(new ai.badmonkey.agentspaces.content.InPlaceStore());
                 default -> throw new IllegalStateException("agentspaces.content.store.backends: unknown kind '"
-                        + kind + "' (file, memory, in-place" + (hosted == null || hosted.isEmpty() ? ""
+                        + kind + "' (file, hash, memory, in-place" + (hosted == null || hosted.isEmpty() ? ""
                         : ", or a host backend: " + hosted.stream().map(ai.badmonkey.agentspaces.content.PieceStore::kind)
                         .collect(java.util.stream.Collectors.joining(", "))) + ")");
             }
@@ -1446,7 +1510,7 @@ public class AgentSpacesAutoConfiguration {
                 .codec(codec).clock(clock).store(store).blocks(blocks).keyRing(ring).authorizer(authorizer)
                 .policy(policy).pieceSize(config.getPieceSize())
                 .holdingLease(ai.badmonkey.agentspaces.api.space.Lease.of(config.getHoldingLease()))
-                .discovery(discovery);
+                .discovery(discovery).pdtLevel(pdtLevel);
         if (treeStore != null) {
             builder.treeStore(treeStore);
         }

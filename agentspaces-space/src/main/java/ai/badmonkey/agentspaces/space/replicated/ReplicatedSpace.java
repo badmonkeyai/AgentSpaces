@@ -34,6 +34,7 @@ import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.api.security.AgentCertificate;
 import ai.badmonkey.agentspaces.api.spi.AgentIdentity;
+import ai.badmonkey.agentspaces.common.crypto.Digests;
 import ai.badmonkey.agentspaces.common.crypto.Ed25519;
 import ai.badmonkey.agentspaces.identity.AgentCertificates;
 import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
@@ -45,6 +46,7 @@ import ai.badmonkey.agentspaces.identity.AdvertisementSigner;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.peering.gossip.ReconcilableState;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
+import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.ConsistencyHint;
 import ai.badmonkey.agentspaces.space.DiscoveryPublisher;
 import ai.badmonkey.agentspaces.space.SpaceAdmissionException;
@@ -102,7 +104,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link #markReadOnly()} turns the space read-only. Lease lapses surface as
  * {@code EXPIRED} and {@code REAPPEARED} events from the sweep that the
  * anti-entropy tick (or {@link #sweepNow()}) runs, and the same sweep collects
- * tombstones twice the maximum lease after their lease lapsed (spec §7.3).
+ * tombstones twice the maximum lease after their lease lapsed (spec §7.3). A
+ * cancel surfaces as {@code EXPIRED} too, as on a {@code LocalSpace}: at the
+ * cancelling replica at once, and at every other replica that held the entry
+ * when the withdrawal merges, once per entry with the lapse (core cancel
+ * events, 2026-11-09).
  */
 public final class ReplicatedSpace implements Space, AutoCloseable {
 
@@ -265,23 +271,38 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final AtomicLong stampsLogicalRefused = new AtomicLong();
     /** Space deltas, by rumor or by anti-entropy, that did not decode (HLC canonical stamps, 2026-11-08). */
     private final AtomicLong deltasUndecodable = new AtomicLong();
+    /** Distinct states and claims refused as hostile for a stamp an hour past the far-future margin. */
+    private final AtomicLong stampsFarFutureRefused = new AtomicLong();
+    /** Distinct states and claims deferred for a stamp past the far-future margin. */
+    private final AtomicLong stampsFarFutureDeferred = new AtomicLong();
 
     // ---- tombstone GC and lease-lapse events (spec §7.2, §7.3)
     /** Builder override for the GC horizon, or null to use the observed maximum. */
     private final Duration maxLeaseOverride;
     /** Largest lease duration this replica has observed for the space, capped. */
     private volatile long maxLeaseObservedMillis;
-    /** Entries whose EXPIRED event already fired here. Under {@link #lock}. */
+    /** Entries whose EXPIRED event already fired here, for a lapse or a cancel. Under {@link #lock}. */
     private final Set<EntryId> expiredFired = new HashSet<>();
     /** Claim epoch per entry whose REAPPEARED event already fired here. Under {@link #lock}. */
     private final Map<EntryId, Long> reappearedEpochs = new HashMap<>();
     /** Claim epoch per entry whose TAKEN event already fired here: a won local take, or a merged remote claim
      *  (a replica that only watches a lane hears of its takes this way). Under {@link #lock}. */
     private final Map<EntryId, Long> takenEpochs = new HashMap<>();
-    /** Hashes of remote claims, and of states refused for their stamps, already rejected
+    /** Keys of remote claims, and of states refused for their stamps, already rejected
      * here, so a lagging honest replica re-offering the same contested claim or state is
-     * not struck once per round. Under {@link #lock}. */
+     * not struck once per round. Each key covers signed content alone (HLC round four,
+     * 2026-11-08, decision D5). Under {@link #lock}. */
     private final Set<String> rejectedOffers = java.util.Collections.newSetFromMap(
+            new java.util.LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+                    return size() > REJECTED_OFFERS_CAP;
+                }
+            });
+    /** Keys of states and claims deferred here for a stamp past the far-future margin, so a
+     * re-offer before the wall catches up counts once (HLC round four, 2026-11-08, decision D4).
+     * Under {@link #lock}. */
+    private final Set<String> deferredOffers = java.util.Collections.newSetFromMap(
             new java.util.LinkedHashMap<>(16, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
@@ -929,6 +950,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
 
         @Override
+        public List<EntryId> undecodableEntries(Template<?> template, int limit) {
+            return ReplicatedSpace.this.undecodableEntries(template, limit);
+        }
+
+        @Override
         public void complete(TakenEntry<?> taken) {
             completeInternal(actor, taken, null, null, Map.of());
         }
@@ -1149,6 +1175,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             events = sweepLocked();
         }
         events.forEach(Runnable::run);
+    }
+
+    /** How many take claims this replica holds, its own and its partners'; for tests and the console. */
+    public int claimsHeld() {
+        synchronized (lock) {
+            return claims.size();
+        }
     }
 
     /** How many block fetches wait for their next attempt (LB-B-02); for tests and the console. */
@@ -1516,6 +1549,35 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                             ? Attestation.AGENT_ATTESTED : Attestation.PEER_ASSERTED)));
             if (results.size() == limit) {
                 break;
+            }
+        }
+        return results;
+    }
+
+    @Override
+    public List<EntryId> undecodableEntries(Template<?> template, int limit) {
+        Objects.requireNonNull(template, "template");
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive: " + limit);
+        }
+        registerSchema(template.type());
+        // HLC round six, 2026-11-08 (ruling R3): the readAll visibility rule, and of the entries the
+        // template selects, those whose payload is here in the clear and holds no value of its type
+        List<EntryRecord> candidates;
+        synchronized (lock) {
+            candidates = availableRecords(candidateType(template));
+        }
+        List<EntryId> results = new ArrayList<>();
+        for (EntryRecord record : candidates) {
+            if (!selects(template, record) || template.type().isInstance(valueCache.get(record.entryId()))) {
+                continue;
+            }
+            byte[] payload = clearPayload(record);
+            if (payload != null && decodeDocument(payload, template.type()) == null) {
+                results.add(record.entryId());
+                if (results.size() == limit) {
+                    break;
+                }
             }
         }
         return results;
@@ -1915,10 +1977,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         sleep(settleWindow);
         synchronized (lock) {
             TakeClaim winner = claimOf(claimedId);
+            // Core cancel events, 2026-11-09: an entry completed or withdrawn during the settle window is
+            // nobody's to take, so a cancel that merged meanwhile leaves the take empty, as on a LocalSpace.
             boolean won = winner != null && winner.holder().equals(holder)
-                    && winner.epoch() == myClaim.epoch() && !winner.expired(nowMillis());
+                    && winner.epoch() == myClaim.epoch() && !winner.expired(nowMillis())
+                    && crdt.state(claimedId).map(EntryState::present).orElse(false);
             if (!won) {
-                return Optional.empty(); // lost the race; retry elsewhere
+                return Optional.empty(); // lost the race, or the entry went; retry elsewhere
             }
             takenEpochs.put(claimedId, myClaim.epoch());
         }
@@ -1982,7 +2047,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private void onDelta(PeerId from, byte[] payload) {
         SpaceWire.Delta delta;
         try {
-            delta = codec.fromBytes(payload, SpaceWire.Delta.class);
+            // HLC round six, 2026-11-08 (owner rulings F1 and F3): only the delta's own wire encoding
+            delta = codec.fromWire(payload, SpaceWire.Delta.class);
         } catch (RuntimeException e) {
             deltasUndecodable.incrementAndGet(); // HLC canonical stamps, 2026-11-08
             return;
@@ -2102,6 +2168,26 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return deltasUndecodable.get();
     }
 
+    /**
+     * Distinct folded states and gossip claims this replica refused as hostile because a stamp
+     * lies more than {@link #FAR_FUTURE_HOSTILE_MILLIS} past its far-future margin (HLC round
+     * four, 2026-11-08, decision D4). Each verified first, was acknowledged, and struck its signer.
+     */
+    public long stampsFarFutureRefused() {
+        return stampsFarFutureRefused.get();
+    }
+
+    /**
+     * Distinct folded states and gossip claims this replica deferred because a stamp lies past
+     * its wall time plus {@link HybridLogicalClock#MAX_DRIFT_MILLIS} plus the skew margin, by at
+     * most {@link #FAR_FUTURE_HOSTILE_MILLIS} (HLC round four, 2026-11-08, decision D4). Such a
+     * state is neither merged nor acknowledged nor struck; it merges when anti-entropy offers it
+     * after this replica's wall catches up.
+     */
+    public long stampsFarFutureDeferred() {
+        return stampsFarFutureDeferred.get();
+    }
+
     /** Recordless states waiting here for their record now. */
     public int pendingRecordless() {
         synchronized (lock) {
@@ -2118,6 +2204,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if ((received.adds() != null && received.adds().size() > MAX_DOTS_PER_STATE)
                 || (received.removes() != null && received.removes().size() > MAX_DOTS_PER_STATE)) {
             return; // inflated dot set: hostile, drop before verification cost
+        }
+        if (received.leaseStamp() == null || received.leaseValue() == null) {
+            // HLC round five, 2026-11-08 (decision E7): such a state decodes, as in every
+            // implementation, but a lease register holds nothing without its stamp and value.
+            // Dropped before any judgement: it merges nothing, counts nothing, strikes nobody.
+            return;
         }
         boolean hadRecord = received.record() != null;
         SpaceWire.EntryStateDto dto = received;
@@ -2152,20 +2244,47 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // completion, removal, or lease unable to delete a signed entry.
             return;
         }
+        // After verifyState: the revocation judgement reads the state's signing
+        // time (signedAt, the lease stamp), so those must be authenticated, and
+        // only an authentic state may earn a refused-and-acknowledged line. HLC
+        // round five, 2026-11-08 (decision E6): before the stamp checks, as for a
+        // claim, so a revoked actor's state counts in no stamp counter and strikes
+        // nobody, whatever its stamps.
+        if (refusedForRevocation(dto)) {
+            return; // ASF-047: authentic, but its actor is revoked in this group
+        }
         if (!stampsAcceptable(dto)) {
             // HLC logical counter, 2026-11-08 (Rust team report): a record or lease
             // stamp whose logical counter is above LOGICAL_LIMIT froze this space's
             // clock below, and the state then carried the stamp on to every replica
             // through gossip and anti-entropy. The space judges it after
             // verification, so the refusal names the state's signer.
-            refuseStateStamps(dto);
+            refuseState(dto, !HybridLogicalClock.isAcceptable(dto.record().issued()), LOGICAL_VIOLATION,
+                    stampsLogicalRefused);
             return;
         }
-        // After verifyState: the revocation judgement reads the state's signing
-        // time (signedAt, the lease stamp), so those must be authenticated, and
-        // only an authentic state may earn a refused-and-acknowledged line.
-        if (refusedForRevocation(dto)) {
-            return; // ASF-047: authentic, but its actor is revoked in this group
+        // HLC round four, 2026-11-08 (decision D4): a state stamped past the far-future margin
+        // waits for this replica's wall, unacknowledged, so anti-entropy offers it again; one
+        // stamped an hour beyond the margin is hostile. Judged after verification, so a refusal
+        // names the state's signer, and before the stamps reach the space clock.
+        // HLC round six, 2026-11-08 (owner ruling F4): an agent-signed state's signedAt is
+        // judged with its lease stamp, since the same party signs both.
+        Lead issuedLead = lead(dto.record().issued().physical(), nowMillis());
+        Lead leaseLead = lead(dto.leaseStamp().physical(), nowMillis());
+        Lead signedLead = dto.signedAt() == null ? Lead.WITHIN : lead(dto.signedAt().physical(), nowMillis());
+        if (issuedLead == Lead.HOSTILE || leaseLead == Lead.HOSTILE || signedLead == Lead.HOSTILE) {
+            refuseState(dto, issuedLead == Lead.HOSTILE, FAR_FUTURE_VIOLATION, stampsFarFutureRefused);
+            return;
+        }
+        if (issuedLead == Lead.DEFERRED || leaseLead == Lead.DEFERRED || signedLead == Lead.DEFERRED) {
+            boolean first;
+            synchronized (lock) {
+                first = deferredOffers.add(stateOfferKey(dto));
+            }
+            if (first) {
+                stampsFarFutureDeferred.incrementAndGet();
+            }
+            return;
         }
         EntryId entryId = dto.record().entryId();
         if (!admitsState(dto)) {
@@ -2198,9 +2317,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         boolean isNew;
         boolean nowCompleted;
         boolean visible;
+        Runnable withdrawn;
         synchronized (lock) {
             boolean wasKnown = crdt.state(entryId).isPresent();
             boolean wasCompleted = crdt.state(entryId).map(EntryState::completed).orElse(false);
+            boolean wasPresent = crdt.state(entryId).map(EntryState::present).orElse(false);
             crdt = crdt.merge(SpaceStateCrdt.of(entryId, dto.toState()));
             generation++;
             issuerKeys.putIfAbsent(entryId, dto.issuerPublicKey());
@@ -2221,6 +2342,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // WRITTEN is for an entry a reader could see: present and unexpired.
             // A withdrawn or lapsed entry learned late is history, not news.
             visible = merged.present() && merged.lease().value().expiresAtMillis() > nowMillis();
+            // Core cancel events, 2026-11-09: a merged cancel of an entry present here raises EXPIRED once.
+            withdrawn = withdrawnEvent(entryId, wasPresent);
+        }
+        if (withdrawn != null) {
+            withdrawn.run();
         }
         if (isNew && visible) {
             Optional<Object> value = decodeValue(dto.record());
@@ -2424,6 +2550,16 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     static final long MAX_CLAIM_PREDATES_ISSUE_MILLIS = HybridLogicalClock.MAX_DRIFT_MILLIS;
 
     /**
+     * How far past the far-future margin, this replica's wall time plus
+     * {@link HybridLogicalClock#MAX_DRIFT_MILLIS} plus {@link PeerNode#FAR_FUTURE_SKEW_MARGIN_MILLIS},
+     * a stamp may lie and still be deferred (HLC round four, 2026-11-08,
+     * decision D4). An honest replica whose clock a hostile stamp dragged to its ceiling writes
+     * ahead of a receiver whose wall runs behind by the receiver's skew, which an hour covers
+     * many times over. A stamp further ahead is hostile.
+     */
+    public static final long FAR_FUTURE_HOSTILE_MILLIS = Duration.ofHours(1).toMillis();
+
+    /**
      * Whether every stamp a verified state carries is acceptable (HLC logical counter,
      * 2026-11-08, Rust team report): the record's issue stamp and the lease stamp, which the
      * state would feed this space's clock, and an agent-signed state's {@code signedAt}, which
@@ -2432,7 +2568,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      */
     private static boolean stampsAcceptable(SpaceWire.EntryStateDto dto) {
         return HybridLogicalClock.isAcceptable(dto.record().issued())
-                && (dto.leaseStamp() == null || HybridLogicalClock.isAcceptable(dto.leaseStamp()))
+                && HybridLogicalClock.isAcceptable(dto.leaseStamp())
                 && (dto.signedAt() == null || HybridLogicalClock.isAcceptable(dto.signedAt()));
     }
 
@@ -2443,36 +2579,86 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * lease stamp and {@code signedAt}, the claim holder for a completion and the issuer
      * otherwise. HLC canonical stamps, 2026-11-08: the refusal is acknowledged in the digest,
      * as ASF-047 acknowledges a revoked actor's state, so partners stop re-offering it; only a
-     * state whose signatures verified reaches here.
+     * state whose signatures verified reaches here. HLC round four, 2026-11-08 (decision D5):
+     * a distinct state is one distinct signed content, its entry, issue stamp, and signed view.
+     *
+     * @param issuedAtFault whether the issue stamp, which the record's issuer signed, is refused
+     * @param violation     the violation reported against the signer
+     * @param counter       the counter a first refusal adds to
      */
-    private void refuseStateStamps(SpaceWire.EntryStateDto dto) {
+    private void refuseState(SpaceWire.EntryStateDto dto, boolean issuedAtFault, String violation,
+                             AtomicLong counter) {
         EntryRecord record = dto.record();
         PeerId signer = record.issuer().peer();
         boolean first;
         synchronized (lock) {
-            if (HybridLogicalClock.isAcceptable(record.issued()) && dto.completed()) {
+            if (!issuedAtFault && dto.completed()) {
                 // verifyState found the holder's claim; null only if collected since.
                 SpaceWire.SignedClaim claim = claims.get(record.entryId());
                 signer = claim == null ? null : claim.claim().holder().peer();
             }
-            String hash = stateHash(dto.toState());
-            first = rejectedOffers.add("state:" + record.entryId().value() + "="
-                    + record.issued().encoded() + "/" + hash);
-            if (refusedAck.put("e:" + record.entryId().value() + "=" + hash, Boolean.TRUE) == null) {
+            first = rejectedOffers.add(stateOfferKey(dto));
+            if (refusedAck.put("e:" + record.entryId().value() + "=" + stateHash(dto.toState()),
+                    Boolean.TRUE) == null) {
                 generation++;
             }
         }
         if (first) {
-            stampsLogicalRefused.incrementAndGet();
+            counter.incrementAndGet();
             if (signer != null) {
-                runtime.reportMisbehavior(signer, LOGICAL_VIOLATION + " in a state for entry "
-                        + record.entryId());
+                runtime.reportMisbehavior(signer, violation + " in a state for entry " + record.entryId());
             }
         }
     }
 
+    /**
+     * The key a state offer is judged under, its signed content alone (HLC round four,
+     * 2026-11-08, decision D5): the entry, the issue stamp, and the digest of the signed view.
+     * The view sorts the dots, so a re-offer with its dots in another order is the same offer,
+     * and it holds {@code signedAt}, so two states that differ only there are two.
+     */
+    private String stateOfferKey(SpaceWire.EntryStateDto dto) {
+        return "state:" + dto.record().entryId().value() + "=" + dto.record().issued().encoded() + "/"
+                + java.util.HexFormat.of().formatHex(Digests.sha256(stateSignBytes(dto)));
+    }
+
+    /**
+     * The key a claim offer is judged under, its signed map and its entry (HLC round four,
+     * 2026-11-08, decision D5), so two claims that differ only in their holder are two.
+     */
+    private String claimOfferKey(TakeClaim claim, EntryId entryId) {
+        return "claim:" + java.util.HexFormat.of().formatHex(Digests.sha256(codec.toBytes(claim)))
+                + "@" + entryId.value();
+    }
+
+    /** How a stamp stands against this replica's far-future margin (HLC round four, 2026-11-08, decision D4). */
+    private enum Lead {
+        /** At or inside the margin: the stamp merges, clamped by the clock. */
+        WITHIN,
+        /** Past the margin by at most {@link #FAR_FUTURE_HOSTILE_MILLIS}: deferred until the wall catches up. */
+        DEFERRED,
+        /** Further past it: hostile, refused and struck. */
+        HOSTILE
+    }
+
+    /**
+     * Judges a stamp's physical part against wall time plus {@link HybridLogicalClock#MAX_DRIFT_MILLIS}
+     * plus {@link PeerNode#FAR_FUTURE_SKEW_MARGIN_MILLIS}, the margin a frame's stamp is judged
+     * by too (HLC round four, 2026-11-08, decision D4).
+     */
+    private static Lead lead(long physical, long nowMillis) {
+        long margin = nowMillis + HybridLogicalClock.MAX_DRIFT_MILLIS + PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS;
+        if (physical <= margin) {
+            return Lead.WITHIN;
+        }
+        return physical - margin <= FAR_FUTURE_HOSTILE_MILLIS ? Lead.DEFERRED : Lead.HOSTILE;
+    }
+
     /** The violation every stamp refusal reports (HLC logical counter, 2026-11-08, Rust team report). */
     private static final String LOGICAL_VIOLATION = "logical counter above " + HybridLogicalClock.LOGICAL_LIMIT;
+
+    /** The violation a hostile far-future stamp reports (HLC round four, 2026-11-08, decision D4). */
+    private static final String FAR_FUTURE_VIOLATION = "far-future stamp";
 
     /**
      * Refuses an ordered-log claim whose stamp may not merge, before the lattice (HLC
@@ -2488,7 +2674,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         boolean first;
         synchronized (lock) {
-            first = rejectedOffers.add(claimHash(claim) + "@" + entryId.value());
+            first = rejectedOffers.add(claimOfferKey(claim, entryId));
         }
         if (first) {
             stampsLogicalRefused.incrementAndGet();
@@ -2522,6 +2708,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         String violation = null;
         boolean firstRejection = false;
+        boolean firstDeferral = false;
         EntryRecord takenRecord = null;
         AgentId takenHolder = null;
         synchronized (lock) {
@@ -2532,6 +2719,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             TakeClaim current = claimOf(entryId);
             long now = nowMillis();
             long observed = current == null ? 0 : current.epoch();
+            Lead lead = lead(offered.stamp().physical(), now);
             HlcTimestamp issued = crdt.state(entryId)
                     .map(state -> state.record().issued()).orElse(null);
             if (!admitted) {
@@ -2541,6 +2729,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 // stamp froze the space clock below and the claim carried it on to
                 // every replica. The holder signed it, so it is reported like the rest.
                 violation = LOGICAL_VIOLATION;
+            } else if (lead == Lead.HOSTILE) {
+                // HLC round four, 2026-11-08 (decision D4): hostile, refused and struck.
+                violation = FAR_FUTURE_VIOLATION;
             } else if (offered.epoch() > observed + MAX_CLAIM_EPOCH_JUMP) {
                 violation = "claim epoch jump";
             } else if (offered.expiresAtMillis() > now + MAX_CLAIM_HOLD_MILLIS) {
@@ -2558,15 +2749,21 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 // stamp, and an honest race is decided within the settle window.
                 violation = "far-past claim stamp contesting a held entry";
             }
+            // HLC round four, 2026-11-08 (decision D4): a claim past the margin is from an honest
+            // holder whose clock a hostile stamp dragged ahead. It waits, unmerged and unstruck,
+            // and anti-entropy offers it again once this replica's wall catches up.
+            boolean deferred = violation == null && lead == Lead.DEFERRED;
             Long decided = logDecidedEpochs.get(entryId);
-            if (violation == null && decided != null && offered.epoch() <= decided
+            if (!deferred && violation == null && decided != null && offered.epoch() <= decided
                     && !offered.equals(current)) {
                 // QA4 A4-5: the ordered log already decided this epoch. A different
                 // gossip claim at the same or a lower epoch is not a contender;
                 // only the identical claim (an attestation upgrade) may merge.
                 return;
             }
-            if (violation == null) {
+            if (deferred) {
+                firstDeferral = deferredOffers.add(claimOfferKey(offered, entryId));
+            } else if (violation == null) {
                 claims.merge(entryId, claim, SpaceWire.SignedClaim::merge);
                 generation++;
                 hlc.update(offered.stamp()); // spec §11: bounded-drift regime
@@ -2583,8 +2780,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     takenHolder = merged.holder();
                 }
             } else {
-                firstRejection = rejectedOffers.add(claimHash(offered) + "@" + entryId.value());
+                firstRejection = rejectedOffers.add(claimOfferKey(offered, entryId));
             }
+        }
+        if (firstDeferral) {
+            stampsFarFutureDeferred.incrementAndGet();
         }
         if (takenRecord != null) {
             EntryRecord record = takenRecord;
@@ -2595,6 +2795,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (violation != null && firstRejection) {
             if (LOGICAL_VIOLATION.equals(violation)) {
                 stampsLogicalRefused.incrementAndGet();
+            } else if (FAR_FUTURE_VIOLATION.equals(violation)) {
+                stampsFarFutureRefused.incrementAndGet();
             }
             // The hostile claim carries its author's own verified signature
             // (verifyClaim ran first), so this is witnessed, attributable
@@ -2702,10 +2904,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // the peer key verifies the certificate for exactly this holder, and the
         // certificate's agent key verifies the claim. A claim carrying a
         // certificate but a peer-key signature is refused, as a record would be.
-        // SPEC §4.2 v0.1.13: judged at the claim's own stamp, which a renewal keeps.
-        return certificates.verifyAt(signed.holderCertificate(), signed.holderKey(),
-                signed.claim().holder(), Instant.ofEpochMilli(signed.claim().stamp().physical()),
-                clock.instant())
+        // SPEC §4.2 v0.1.13: judged at the claim's own stamp, which a renewal keeps. HLC round
+        // five, 2026-11-08 (decision E4): by the window alone; mergeClaim judges how far the stamp
+        // leads this replica's wall, as it does for a peer-signed claim.
+        return certificates.verifyCovering(signed.holderCertificate(), signed.holderKey(),
+                signed.claim().holder(), Instant.ofEpochMilli(signed.claim().stamp().physical()))
                 && Ed25519.verifyRaw(signed.holderCertificate().agentPublicKey(), bytes,
                         signed.signature());
     }
@@ -2847,7 +3050,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         SpaceWire.SyncDelta sync;
         try {
-            sync = codec.fromBytes(delta, SpaceWire.SyncDelta.class);
+            // HLC round six, 2026-11-08 (owner rulings F1 and F3): only the delta's own wire encoding
+            sync = codec.fromWire(delta, SpaceWire.SyncDelta.class);
         } catch (RuntimeException e) {
             deltasUndecodable.incrementAndGet(); // HLC canonical stamps, 2026-11-08
             return;
@@ -2956,60 +3160,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     private <T> Optional<T> decodeIfMatches(Template<T> template, EntryRecord record) {
-        // An Object template selects any type (v0.1.24): a watcher reads foreign entries through its
-        // registry's decoding; a typed template still selects its own schema name only.
-        if (template.type() != Object.class && !record.type().equals(schemas.schemaNameOf(template.type()))) {
-            return Optional.empty();
-        }
-        if (!template.matchesType(record.type())) {
-            return Optional.empty();
-        }
-        // Issue #16 §9.2 matching order: type, tags, then decode and fields. The
-        // tags sit on the record, so a tagged template never decodes an entry it
-        // would not select.
-        if (!template.matchesTags(record.tags())) {
+        if (!selects(template, record)) {
             return Optional.empty();
         }
         Object value = valueCache.get(record.entryId());
         if (value == null) {
-            byte[] payload = record.payload();
-            if (payload == null && isBulkRef(record)) {
-                // LB-E-03: a bulk reference is served when the artifact is complete here and
-                // acquired in the background otherwise, with the same never-block rule.
-                ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(record.payloadRef());
-                payload = seam == null ? null : seam.local(record.payloadRef()).orElse(null);
-                if (payload == null && seam != null) {
-                    ensureBulk(record, NO_ARRIVAL);
-                }
-            } else if (payload == null && record.payloadRef() != null && blocks != null) {
-                // Spec §7.2 / P7: reads never block on the network. Serve the
-                // block when it is already here; otherwise start one background
-                // fetch and report the entry as not yet visible. A blocking read
-                // polls within its own timeout and sees the entry once the block
-                // lands; readAll simply skips it this time.
-                payload = blocks.local(record.payloadRef()).orElse(null);
-                if (payload == null) {
-                    fetchInBackground(record);
-                }
-            }
+            byte[] payload = clearPayload(record);
             if (payload == null) {
-                return Optional.empty(); // block not fetched yet; invisible for now
+                return Optional.empty();
             }
-            if (keyRing != null && payloadSealed(record)) {
-                payload = open(record, payload);
-                if (payload == null) {
-                    return Optional.empty(); // sealed under a key this replica lacks
-                }
-            }
-            try {
-                value = codec.fromBytes(payload, template.type());
-            } catch (RuntimeException e) {
-                return Optional.empty(); // ciphertext without the key, or foreign bytes
-            }
+            value = decodeDocument(payload, template.type());
             if (value == null) {
-                // Foreign bytes that happen to decode as CBOR null (a sealed
-                // payload whose nonce starts with 0xF6, once in 256 writes):
-                // the same verdict as a decode failure, and never cached.
                 return Optional.empty();
             }
             valueCache.put(record.entryId(), value);
@@ -3018,6 +3179,68 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return Optional.empty();
         }
         return Optional.of(template.type().cast(value));
+    }
+
+    /** Whether a template selects a record by its type and tags, before any decode. */
+    private boolean selects(Template<?> template, EntryRecord record) {
+        // An Object template selects any type (v0.1.24): a watcher reads foreign entries through its
+        // registry's decoding; a typed template still selects its own schema name only.
+        if (template.type() != Object.class && !record.type().equals(schemas.schemaNameOf(template.type()))) {
+            return false;
+        }
+        if (!template.matchesType(record.type())) {
+            return false;
+        }
+        // Issue #16 §9.2 matching order: type, tags, then decode and fields. The
+        // tags sit on the record, so a tagged template never decodes an entry it
+        // would not select.
+        return template.matchesTags(record.tags());
+    }
+
+    /**
+     * A record's payload in the clear, or null while its block or bulk artifact is not here (a
+     * background fetch starts) or when it is sealed under a key this replica lacks.
+     */
+    private byte[] clearPayload(EntryRecord record) {
+        byte[] payload = record.payload();
+        if (payload == null && isBulkRef(record)) {
+            // LB-E-03: a bulk reference is served when the artifact is complete here and
+            // acquired in the background otherwise, with the same never-block rule.
+            ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(record.payloadRef());
+            payload = seam == null ? null : seam.local(record.payloadRef()).orElse(null);
+            if (payload == null && seam != null) {
+                ensureBulk(record, NO_ARRIVAL);
+            }
+        } else if (payload == null && record.payloadRef() != null && blocks != null) {
+            // Spec §7.2 / P7: reads never block on the network. Serve the
+            // block when it is already here; otherwise start one background
+            // fetch and report the entry as not yet visible. A blocking read
+            // polls within its own timeout and sees the entry once the block
+            // lands; readAll simply skips it this time.
+            payload = blocks.local(record.payloadRef()).orElse(null);
+            if (payload == null) {
+                fetchInBackground(record);
+            }
+        }
+        if (payload == null) {
+            return null; // block not fetched yet; invisible for now
+        }
+        if (keyRing != null && payloadSealed(record)) {
+            return open(record, payload); // null when sealed under a key this replica lacks
+        }
+        return payload;
+    }
+
+    /** A payload decoded as a value of the type, or null for bytes that hold none. */
+    private Object decodeDocument(byte[] payload, Class<?> type) {
+        try {
+            // HLC round six, 2026-11-08: a payload is a document in the wire encoding. Foreign
+            // bytes that happen to decode as CBOR null (a sealed payload whose nonce starts with
+            // 0xF6, once in 256 writes) get the same verdict as a decode failure.
+            return codec.fromDocument(payload, type);
+        } catch (RuntimeException e) {
+            return null; // ciphertext without the key, or foreign bytes
+        }
     }
 
     private Optional<Object> decodeValue(EntryRecord record) {
@@ -3055,7 +3278,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return schemas.classFor(record.type()).flatMap(type -> {
             Object value;
             try {
-                value = codec.fromBytes(plain, type);
+                value = codec.fromDocument(plain, type); // HLC round six, 2026-11-08
             } catch (RuntimeException e) {
                 return Optional.empty(); // ciphertext without the key, or foreign bytes
             }
@@ -3304,7 +3527,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * returned event deliveries run after it is released.
      *
      * <p>Events fire once per transition: {@code EXPIRED} once per entry whose
-     * write lease has lapsed, {@code REAPPEARED} once per lapsed claim epoch,
+     * write lease has lapsed, unless a cancel already raised it (core cancel
+     * events, 2026-11-09), {@code REAPPEARED} once per lapsed claim epoch,
      * which is the same per-entry dedup the WRITTEN and COMPLETED paths use.
      * Then tombstones (completed, withdrawn, or lapsed entries whose lease
      * expired more than twice the maximum lease ago) are collected, along with
@@ -3319,16 +3543,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             EntryId entryId = record.entryId();
             if (record.lease().expiresAtMillis() <= now) {
                 if (expiredFired.add(entryId)) {
-                    // the decoded value of a lapsed entry is never read again (reads keep to live entries); the EXPIRED
-                    // event carries the cached value out rather than decoding it back in, so a stream of large entries
-                    // stops pinning minutes of values at the lapse, not at collection (2026-11-07)
-                    Object lapsed = valueCache.remove(entryId);
-                    if (lapsed != null) {
-                        events.add(() -> fire(SpaceEvent.Kind.EXPIRED, entryId, lapsed, record.issuer(), record.issuer(), record));
-                    } else {
-                        events.add(() -> decodeValue(record, false).ifPresent(value ->
-                                fire(SpaceEvent.Kind.EXPIRED, entryId, value, record.issuer(), record.issuer(), record)));
-                    }
+                    events.add(expiredEvent(entryId, record));
                 }
                 continue;
             }
@@ -3342,6 +3557,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (credentialRule != null) {
             credentialRule.index().expire(now); // spec §7.5: a lapsed credential stops admitting
         }
+        dropOrphanedClaims(now);
         Set<EntryId> collected = crdt.collectable(now, maxLeaseMillis());
         if (!collected.isEmpty()) {
             if (blocks != null || bulk != null) {
@@ -3386,10 +3602,66 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return events;
     }
 
+    /**
+     * Drops each lapsed claim for an entry this replica does not hold, never held or already
+     * collected (HLC round six, 2026-11-08, ruling R10). A claim merges before its entry's state,
+     * since a completed state authenticates against it, so a claim may arrive for an entry that
+     * never follows; kept, every such claim stayed for good. A live claim stays, and an
+     * anti-entropy partner that holds the entry offers its claim again with the state. Callers
+     * hold {@link #lock}.
+     */
+    private void dropOrphanedClaims(long now) {
+        java.util.Iterator<Map.Entry<EntryId, SpaceWire.SignedClaim>> it = claims.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<EntryId, SpaceWire.SignedClaim> e = it.next();
+            if (e.getValue().claim().expired(now) && crdt.state(e.getKey()).isEmpty()) {
+                it.remove();
+                logDecidedEpochs.remove(e.getKey());
+                takenEpochs.remove(e.getKey());
+                reappearedEpochs.remove(e.getKey());
+                generation++;
+            }
+        }
+    }
+
     /** Queues an event for delivery outside the lock; silent when the value cannot be decoded here. */
     private void deferredEvent(List<Runnable> events, SpaceEvent.Kind kind, EntryRecord record) {
         events.add(() -> decodeValue(record).ifPresent(value ->
                 fire(kind, record.entryId(), value, record.issuer(), record.issuer(), record)));
+    }
+
+    /**
+     * The {@code EXPIRED} event of an entry that left this replica by its lease lapse or by its writer's cancel
+     * (core cancel events, 2026-11-09), to deliver outside the lock. Callers hold {@link #lock} and have just added
+     * the entry to {@link #expiredFired}. Reads keep to live entries, so nothing reads the decoded value of a gone
+     * entry again: the event carries the cached value out rather than decoding it back in, and a stream of large
+     * entries stops pinning minutes of values when each entry goes, not at its collection (2026-11-07).
+     */
+    private Runnable expiredEvent(EntryId entryId, EntryRecord record) {
+        Object gone = valueCache.remove(entryId);
+        if (gone != null) {
+            return () -> fire(SpaceEvent.Kind.EXPIRED, entryId, gone, record.issuer(), record.issuer(), record);
+        }
+        return () -> decodeValue(record, false).ifPresent(value ->
+                fire(SpaceEvent.Kind.EXPIRED, entryId, value, record.issuer(), record.issuer(), record));
+    }
+
+    /**
+     * The {@code EXPIRED} event a withdrawal raises here (core cancel events, 2026-11-09; SPEC §7.2), or null. A
+     * cancel, this replica's own or a merged one, that leaves an entry this replica held present withdrawn and
+     * uncompleted raises {@code EXPIRED}, the kind {@code LocalSpace} raises for a cancel. {@link #expiredFired}
+     * keeps it to one per entry, whichever comes first of the cancel and the lease sweep, so a redelivered cancel
+     * raises nothing. An entry learned first as withdrawn was never present here, and an entry completed first stays
+     * completed (completion dominates), so neither raises one. Callers hold {@link #lock}.
+     *
+     * @param wasPresent whether the entry was present here before the cancel or the merge
+     */
+    private Runnable withdrawnEvent(EntryId entryId, boolean wasPresent) {
+        EntryState state = crdt.state(entryId).orElse(null);
+        if (!wasPresent || state == null || state.present() || state.completed() || !expiredFired.add(entryId)) {
+            return null;
+        }
+        return expiredEvent(entryId, state.record().withLease(state.lease().value()));
     }
 
     /** Binds a ciphertext to its entry within this space (and so this group). */
@@ -3507,9 +3779,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     signableBytes(record), record.sig());
         }
         // SPEC §4.2 v0.1.13: judged at the record's issue stamp, not at receipt,
-        // so an agent's history stays mergeable after its certificate lapses.
-        return certificates.verifyAt(certificate, issuerKey, record.issuer(),
-                Instant.ofEpochMilli(record.issued().physical()), clock.instant())
+        // so an agent's history stays mergeable after its certificate lapses. HLC round
+        // five, 2026-11-08 (decision E4): by the window alone; mergeState judges how far
+        // the stamp leads this replica's wall, as it does for a peer-signed record.
+        return certificates.verifyCovering(certificate, issuerKey, record.issuer(),
+                Instant.ofEpochMilli(record.issued().physical()))
                 && Ed25519.verifyRaw(certificate.agentPublicKey(), signableBytes(record), record.sig());
     }
 
@@ -3630,11 +3904,14 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (dto.agentSigned()) {
             // v0.1.13 two-key rule for transitions: the certificate verifies under
             // the party's peer key for exactly that party and covers the signing
-            // time, and the state verifies under the certificate's agent key.
+            // time, and the state verifies under the certificate's agent key. HLC
+            // round six, 2026-11-08 (owner ruling F4): the certificate is judged at
+            // signedAt with no drift ceiling, and mergeState judges how far signedAt
+            // leads by the far-future rule of decision D4, as it judges the lease stamp.
             return dto.signedAt() != null && dto.stateCertificate() != null
                     && party.encoded().equals(dto.signer())
-                    && certificates.verifyAt(dto.stateCertificate(), signerKey, party,
-                            Instant.ofEpochMilli(dto.signedAt().physical()), clock.instant())
+                    && certificates.verifyCovering(dto.stateCertificate(), signerKey, party,
+                            Instant.ofEpochMilli(dto.signedAt().physical()))
                     && Ed25519.verifyRaw(dto.stateCertificate().agentPublicKey(),
                             stateSignBytes(dto), dto.stateSig());
         }
@@ -3785,18 +4062,28 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         @Override
         public void cancel() {
             SpaceWire.EntryStateDto dto = null;
+            Runnable expired = null;
             synchronized (lock) {
-                if (crdt.state(entryId).isPresent()) {
-                    requireIssuerActs(entryId, crdt.state(entryId).get().record(), actor);
+                EntryState state = crdt.state(entryId).orElse(null);
+                // Core cancel events, 2026-11-09: only a present entry has anything to withdraw. One completed,
+                // withdrawn, or unknown here stays as it is, as on a LocalSpace, and nothing goes out: an issuer's
+                // signature over a completed state verifies nowhere (SPEC §11a.4), and it would have replaced the
+                // holder's completion as the state this replica forwards.
+                if (state != null && state.present()) {
+                    requireIssuerActs(entryId, state.record(), actor);
                     crdt = crdt.remove(entryId);
                     generation++;
                     indexCredential(entryId);
                     dto = signedDto(entryId,
                             issuerKeys.getOrDefault(entryId, identity.rawPublicKey()), actor);
+                    expired = withdrawnEvent(entryId, true);
                 }
             }
             if (dto != null) {
                 publishDelta(new SpaceWire.Delta(wireForm(entryId, dto), null, null), "x:" + entryId);
+            }
+            if (expired != null) {
+                expired.run();
             }
         }
     }

@@ -128,6 +128,36 @@ class RevocationRegistryTest {
         assertThat(fired).isEmpty();
     }
 
+    /**
+     * HLC round six, 2026-11-08 (owner rulings F1 and F3): a revocation and its wrapper each decode
+     * only from their own wire encoding, so the founder's signature over a relabelled form (a
+     * duration Java does not print, a field the advertisement does not name) revokes nobody, and
+     * neither does a wrapper whose fields arrive in another order.
+     */
+    @Test
+    void aRevocationInAnyFormButItsOwnEncodingIsRefused() {
+        RevocationRegistry registry = registry(RevocationValidator.founderRooted());
+        SignedRevocation genuine = founderRevocation();
+        String hex = java.util.HexFormat.of().formatHex(genuine.adBytes());
+        String ttl = "6374746c" + "66505437323048"; // "ttl": "PT720H"
+        assertThat(hex).contains(ttl);
+        for (String relabel : List.of(hex.replace(ttl, "6374746c" + "6450333044"), // "ttl": "P30D"
+                hex.replace(ttl, ttl + "6178f5"))) { // "x": true
+            byte[] adBytes = java.util.HexFormat.of().parseHex(relabel);
+            assertThat(registry.accept(new SignedRevocation(adBytes, founder.rawPublicKey(),
+                    founder.sign(adBytes)))).as(relabel).isEmpty();
+        }
+        ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim reordered =
+                new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        reordered.put("publicKey", genuine.publicKey());
+        reordered.put("adBytes", genuine.adBytes());
+        reordered.put("signature", genuine.signature());
+        assertThat(registry.accept(codec.toBytes(reordered))).as("the wrapper's fields out of order").isEmpty();
+        assertThat(registry.revoked(victim)).isFalse();
+        assertThat(fired).isEmpty();
+        assertThat(registry.accept(codec.toBytes(genuine))).isPresent();
+    }
+
     /** Spec §11 (ASF-027): an issue stamp beyond the skew window is refused; within it, accepted. */
     @Test
     void aFarFutureIssueStampIsRefused() {

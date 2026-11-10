@@ -83,6 +83,14 @@ class SpaceDefaultsTest {
     }
 
     @Test
+    void undecodableEntriesAreNoneByDefault() {
+        // HLC round six, 2026-11-08 (ruling R3): a space that holds the values its writers gave it
+        // decodes all of them
+        org.assertj.core.api.Assertions.assertThat(new Minimal().undecodableEntries(Template.of(String.class), 10))
+                .isEmpty();
+    }
+
+    @Test
     void writerStaysEmptyByDefault() {
         org.assertj.core.api.Assertions.assertThat(new Minimal().writer())
                 .isEqualTo(Optional.<AgentId>empty());

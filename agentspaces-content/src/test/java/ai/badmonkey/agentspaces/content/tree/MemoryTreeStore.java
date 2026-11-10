@@ -33,10 +33,21 @@ public final class MemoryTreeStore implements TreeStore {
 
     private final Map<String, byte[]> nodes = new ConcurrentHashMap<>();
     private final Map<String, byte[]> served = new ConcurrentHashMap<>();
+    private final Map<String, List<ai.badmonkey.agentspaces.content.Messages.NodeDelta>> deltas = new ConcurrentHashMap<>();
 
     public MemoryTreeStore putAll(NodeFixtures.Tree tree) {
         nodes.putAll(tree.nodes());
         return this;
+    }
+
+    /** Keeps one intra-chunk delta for its chunk, in place of any kept before (PDT 2 phase 4, P2-Z-02). */
+    public void keepDelta(ai.badmonkey.agentspaces.content.Messages.NodeDelta delta) {
+        deltas.put(delta.cid(), List.of(delta));
+    }
+
+    @Override
+    public List<ai.badmonkey.agentspaces.content.Messages.NodeDelta> deltas(String cid) {
+        return deltas.getOrDefault(cid, List.of());
     }
 
     /** Serves these bytes for a CID in place of the stored node. */
@@ -74,6 +85,9 @@ public final class MemoryTreeStore implements TreeStore {
 
     @Override
     public List<String> links(String cid, byte[] bytes) {
+        if (Cids.parse(cid).codec() == Cids.RAW) {
+            return List.of(); // a raw chunk is a leaf
+        }
         return NodeFixtures.linksOf(bytes);
     }
 

@@ -122,21 +122,33 @@ public final class Guardrails {
                 }
             }
             // a check whose action is "finding" passes the content on: the provider answered pass for it (BuiltinProvider.outcome)
-            if (GuardrailPolicy.FINDING.equals(check.action()) && verdict.passes() && hit(provider, check, input, context)) {
-                findings.add(new GuardrailFinding(policy.group(), policy.version(), name, where, subject, GuardrailPolicy.FINDING, "hit recorded", now));
+            if (GuardrailPolicy.FINDING.equals(check.action()) && verdict.passes()) {
+                String found = hit(provider, check, input, context);
+                if (found != null) {
+                    findings.add(new GuardrailFinding(policy.group(), policy.version(), name, where, subject, GuardrailPolicy.FINDING, found, now));
+                }
             }
         }
         return new Outcome(current, findings, false, "", "");
     }
 
-    /** A {@code finding} check re-asks the provider with action refuse to learn whether it hit (the walk never stops on it). */
-    private static boolean hit(GuardrailProvider provider, GuardrailPolicy.Check check, String input, Map<String, String> context) {
+    /**
+     * A {@code finding} check re-asks the provider with action refuse to learn whether it hit (the walk never stops on
+     * it): the reason the provider gives, so the finding names what it found (spiral 6, S6-X-02: a terms check that
+     * logs names the term), or null when it did not hit.
+     */
+    private static String hit(GuardrailProvider provider, GuardrailPolicy.Check check, String input, Map<String, String> context) {
         try {
             Map<String, String> probe = new LinkedHashMap<>(context);
             probe.put("action", GuardrailPolicy.REFUSE);
-            return !provider.check(check.kind(), input, probe).passes();
+            return switch (provider.check(check.kind(), input, probe)) {
+                case Verdict.Pass p -> null;
+                case Verdict.Refuse r -> r.reason();
+                case Verdict.Redact r -> r.reason();
+                case Verdict.Quarantine q -> q.reason();
+            };
         } catch (RuntimeException e) {
-            return false;
+            return null;
         }
     }
 

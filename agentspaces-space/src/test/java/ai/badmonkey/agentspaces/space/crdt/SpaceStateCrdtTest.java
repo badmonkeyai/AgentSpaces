@@ -57,6 +57,32 @@ class SpaceStateCrdtTest {
         assertThat(state.knownEntries()).isEqualTo(1);
     }
 
+    /**
+     * Swap amplification (ROBUSTNESS.md §10.8): a replica reads its state many times between two changes, and every read
+     * rebuilt each present record with its lease. A state builds its live records once; a changed state builds its own.
+     */
+    @Test
+    void aStateBuildsItsLiveRecordsOnceAndAChangedStateBuildsItsOwn() {
+        EntryRecord first = record("e1");
+        EntryRecord second = record("e2");
+        SpaceStateCrdt state = SpaceStateCrdt.empty()
+                .add(first, new Dot("r1", 1), lease(10, "r1", 5_000))
+                .add(second, new Dot("r1", 2), lease(11, "r1", 6_000));
+
+        List<EntryRecord> read = state.liveRecords();
+        assertThat(state.liveRecords()).isSameAs(read);
+        assertThat(read).hasSize(2);
+
+        SpaceStateCrdt renewed = state.setLease(first.entryId(), lease(20, "r1", 9_000));
+        assertThat(renewed.liveRecords()).isNotSameAs(read);
+        assertThat(renewed.liveRecords()).filteredOn(r -> r.entryId().equals(first.entryId()))
+                .singleElement().extracting(r -> r.lease().expiresAtMillis()).isEqualTo(9_000L);
+        assertThat(state.liveRecords()).filteredOn(r -> r.entryId().equals(first.entryId()))
+                .singleElement().extracting(r -> r.lease().expiresAtMillis()).isEqualTo(5_000L);
+        assertThat(renewed.remove(second.entryId()).liveRecords()).extracting(EntryRecord::entryId)
+                .containsExactly(first.entryId());
+    }
+
     @Test
     void removeWithdrawsObservedAdds() {
         EntryRecord record = record("e1");

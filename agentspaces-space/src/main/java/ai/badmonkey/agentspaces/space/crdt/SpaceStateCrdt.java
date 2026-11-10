@@ -44,6 +44,11 @@ public final class SpaceStateCrdt {
     private static final SpaceStateCrdt EMPTY = new SpaceStateCrdt(Map.of());
 
     private final Map<EntryId, EntryState> entries;
+    /**
+     * The live records, built on the first read (swap amplification, ROBUSTNESS.md §10.8): the state never changes, and
+     * a replica reads it many times between two changes, so each read used to rebuild every present record.
+     */
+    private volatile List<EntryRecord> live;
 
     private SpaceStateCrdt(Map<EntryId, EntryState> entries) {
         this.entries = Map.copyOf(entries);
@@ -131,10 +136,15 @@ public final class SpaceStateCrdt {
 
     /** Returns the records of currently present entries. */
     public List<EntryRecord> liveRecords() {
-        return entries.values().stream()
-                .filter(EntryState::present)
-                .map(state -> state.record().withLease(state.lease().value()))
-                .toList();
+        List<EntryRecord> built = live;
+        if (built == null) {
+            built = entries.values().stream()
+                    .filter(EntryState::present)
+                    .map(state -> state.record().withLease(state.lease().value()))
+                    .toList();
+            live = built;
+        }
+        return built;
     }
 
     /**

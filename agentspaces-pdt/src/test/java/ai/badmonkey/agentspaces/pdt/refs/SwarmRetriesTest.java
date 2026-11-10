@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.pdt.refs;
 
 import ai.badmonkey.agentspaces.agent.pdt.PRef;
 import ai.badmonkey.agentspaces.api.space.Lease;
+import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
 import ai.badmonkey.agentspaces.content.tree.Cids;
 import ai.badmonkey.agentspaces.content.tree.TreeFetch;
@@ -376,6 +377,59 @@ class SwarmRetriesTest {
         assertThat(onR.deref().toMap()).as("and so does the reader").isEqualTo(merged);
         assertThat(onRConflicts).extracting(PConflict::reason).doesNotContain(PConflict.NO_COMMON_BASE);
         assertThat(r.pdt().refs().chainNodesMissed()).isZero();
+    }
+
+    /**
+     * Concurrent heads, the gate of srad/agentspaces-pdt2.md §10.20: a chain node that is late in a walk stays the
+     * version's chain node. A writer whose merge could not fetch a head's chain node, or whose tick walked the store
+     * alone while the node was still in flight, forgot which node describes the head, so the version it wrote next
+     * linked no node for that base. The chain broke there for good, and a peer that met a later head before the
+     * base's entry ended its walk at the break and merged with no base, while the writers still raced.
+     */
+    @Test
+    void aWriterWhoseWalkMissedAHeadsChainNodeStillLinksItFromTheVersionItWrites() throws Exception {
+        Duration loadTimeout = Duration.ofSeconds(2);
+        RefFleet.Spec slow = RefFleet.Spec.defaults().pdt(b -> b.loadTimeout(loadTimeout));
+        RefFleet.Peer a = fleet.newPeer("a", 480, slow);
+        RefFleet.Peer b = fleet.newPeer("b", 481, slow, "a");
+        RefFleet.Peer c = fleet.newPeer("c", 482, slow, "a");
+        RefFleet.Peer w = fleet.newPeer("w", 483, slow, "a");
+        fleet.settle(8);
+        Ref<PMap<String, String>> onA = a.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        Ref<PMap<String, String>> onB = b.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        Ref<PMap<String, String>> onC = c.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        Ref<PMap<String, String>> onW = w.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        PMap<String, String> base = onB.swap(m -> m.assoc("k", "base"));
+        assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> fleet.allHold(base.root())
+                && List.of(onA, onC, onW).stream().allMatch(ref -> ref.heads().roots().equals(List.of(base.root()))))).isTrue();
+        String baseVg = Ancestry.cid(RefFleet.headEntries(b, NAME).get(0).value()).orElseThrow();
+        // c writes h over p, whose entry w never reads, so w's walk needs h's chain node, which c alone holds
+        PMap<String, String> p = onB.at(base.root()).assoc("p", "b");
+        String pVg = b.store().put(vg(b, p.root(), base.root(), baseVg).encode(), Cids.DAG_CBOR);
+        copyTree(b.store(), c.store(), p.root());
+        PMap<String, String> h = onC.at(p.root()).assoc("h", "c");
+        String hVg = c.store().put(vg(c, h.root(), p.root(), pVg).encode(), Cids.DAG_CBOR);
+        RefFleet.writeHead(c, NAME, PRef.KIND_MAP, h.root(), p.root(), 2, h.count(), Duration.ofMinutes(10), Map.of(Ancestry.ATTR, hVg));
+        PMap<String, String> k = onA.at(base.root()).assoc("k2", "a");
+        String kVg = a.store().put(vg(a, k.root(), base.root(), baseVg).encode(), Cids.DAG_CBOR);
+        RefFleet.writeHead(a, NAME, PRef.KIND_MAP, k.root(), base.root(), 2, k.count(), Duration.ofMinutes(10), Map.of(Ancestry.ATTR, kVg));
+        assertThat(fleet.runUntil(Duration.ofSeconds(20), () -> Set.copyOf(onW.heads().roots()).equals(Set.of(h.root(), k.root()))
+                && w.store().complete(h.root()) && w.store().complete(k.root()))).isTrue();
+        assertThat(w.store().has(hVg)).as("w has not read h's chain node").isFalse();
+
+        // h's chain node is late at w: its holders answer w only after w's merge has given up on it
+        fleet.network.hold("b", "w");
+        fleet.network.hold("c", "w");
+        PMap<String, String> mine = onW.swap(m -> m.assoc("w", "w"));
+        assertThat(w.pdt().refs().chainNodesMissed()).as("the merge walked without h's chain node").isPositive();
+        PRef written = RefFleet.headEntries(w, NAME).stream().map(Space.Entry::value)
+                .filter(head -> head.root().equals(mine.root())).findFirst().orElseThrow();
+        String writtenVg = Ancestry.cid(written).orElseThrow();
+        VgNode node = Ancestry.read(writtenVg, mine.root(), w.store().get(writtenVg).orElseThrow()).orElseThrow();
+        assertThat(node.previous()).extracting(Link::cid).as("w's version links the chain node of each base it merged")
+                .containsExactlyInAnyOrder(hVg, kVg);
+        fleet.network.release("b", "w", SimNetwork.Order.FIFO, 0);
+        fleet.network.release("c", "w", SimNetwork.Order.FIFO, 0);
     }
 
     /** A {@code vg} node of a version with one base, written by a peer's ref writer, linking the base's node. */

@@ -797,13 +797,17 @@ public final class Refs implements AutoCloseable {
      * members of both groups read the version and the bridge serves its nodes to both. The bridge
      * pattern keeps one node store under both groups and the nodes do not move; over two plain
      * stores the nodes are copied once into the target's store. The target's head carries no
-     * inline delta, so its writer holds the root in the second group's swarm.
+     * inline delta, so its writer holds the root in the second group's swarm: a version this
+     * store holds in part, as under the lazy follow, is fetched whole first, within the load
+     * timeout, from the heads' issuers and the root's holders.
      *
      * @param ref    the handle in this engine
      * @param target the engine of the second group
      * @param <T>    the value type
      * @return the handle of the same ref in the target engine
      * @throws IllegalStateException when the stores differ and either is sealed
+     * @throws NodeUnavailableException when the stores differ and the rest of a version held in
+     *                                  part did not arrive within the load timeout
      */
     public <T> Ref<T> share(Ref<T> ref, Refs target) {
         Objects.requireNonNull(ref, "ref");
@@ -813,14 +817,15 @@ public final class Refs implements AutoCloseable {
         if (state == null) {
             throw new IllegalArgumentException("no handle for " + ref.name() + " in this engine");
         }
-        T value = deref(state).value();
-        String root = state.kind.root(value);
+        Result<T> read = deref(state);
+        String root = state.kind.root(read.value());
         if (target.store != store) {
             if (store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore
                     || target.store instanceof ai.badmonkey.agentspaces.pdt.seal.SealedNodeStore) {
                 throw new IllegalStateException("sharing between two stores re-seals the nodes, which a share does not do;"
                         + " keep one store under both groups");
             }
+            fetchWhole(root, read.heads());
             for (String cid : store.reachable(root)) {
                 if (!target.store.has(cid)) {
                     target.store.putVerified(cid, store.stored(cid).orElseThrow());
@@ -830,6 +835,33 @@ public final class Refs implements AutoCloseable {
         Ref<T> shared = target.ref(ref.name(), state.kind);
         shared.swap(current -> shared.at(root));
         return shared;
+    }
+
+    /**
+     * Fetches the nodes of a version this store holds in part, so a share over two stores copies the whole tree
+     * (pre-publish 0.6.0, ROBUSTNESS.md §10.11 item 3); the heads' issuers and the root's holders serve it.
+     */
+    private void fetchWhole(String root, Heads heads) {
+        if (held(root)) {
+            return;
+        }
+        List<PeerId> sources = issuersOf(heads.heads());
+        for (Holding holding : swarm.content().spaces().holdings(root)) {
+            if (!sources.contains(holding.holder())) {
+                sources.add(holding.holder());
+            }
+        }
+        TreeFetch fetch = swarm.fetchTree(root, List.of(), new FetchOptions(config.loadTimeout(), Set.copyOf(sources), Set.of()));
+        try {
+            fetch.await(config.loadTimeout());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!held(root)) {
+            fetch.cancel();
+            throw new NodeUnavailableException(root, sources.stream().map(PeerId::toString).toList(),
+                    "a share into a second store copies the whole version, and this store holds it in part");
+        }
     }
 
     // ------------------------------------------------------------ reading
@@ -857,13 +889,19 @@ public final class Refs implements AutoCloseable {
                 waiting.add(head);
             }
         }
+        Set<Heads.Head> superseded = wait && !waiting.isEmpty() ? supersededBy(loadable, live) : Set.of();
         if (wait && !waiting.isEmpty()) {
-            awaitFetches(state, waiting);
+            List<Heads.Head> awaited = new ArrayList<>(waiting);
+            awaited.removeAll(superseded);
+            awaitFetches(state, awaited);
         }
         for (Heads.Head head : waiting) {
             if (loadable(state, head)) {
                 loadable.add(head);
                 continue;
+            }
+            if (superseded.contains(head)) {
+                continue; // an older version the read folds away: its fetch runs on, and it is no late head
             }
             Pending pending = state.pending.get(head.root());
             if (wait && pending != null && !pending.fetch.isDoneOrFailed()) {
@@ -886,6 +924,27 @@ public final class Refs implements AutoCloseable {
             }
         }
         return new Heads(state.name, headsAmong(loadable));
+    }
+
+    /**
+     * The live entries a loadable head supersedes, directly or through other live entries, by the base rule of
+     * {@link #headsAmong}: older versions a read does not wait for (pre-publish 0.6.0, ROBUSTNESS.md §10.11 item 4).
+     * A bridge that read right after a burst of swaps waited the whole load timeout for the writer's superseded
+     * versions, which the writer cancels two gossip rounds later in any case.
+     */
+    private static Set<Heads.Head> supersededBy(List<Heads.Head> loadable, List<Heads.Head> live) {
+        Set<Heads.Head> superseded = new HashSet<>();
+        Deque<Heads.Head> frontier = new ArrayDeque<>(loadable);
+        while (!frontier.isEmpty()) {
+            Heads.Head newer = frontier.poll();
+            long by = newer.seq() >= PRef.MAX_SEQ ? Long.MAX_VALUE : newer.seq();
+            for (Heads.Head older : live) {
+                if (older.seq() < by && newer.base().contains(older.root()) && superseded.add(older)) {
+                    frontier.add(older);
+                }
+            }
+        }
+        return superseded;
     }
 
     /**
@@ -1059,8 +1118,8 @@ public final class Refs implements AutoCloseable {
         }
         List<Set<String>> walks = new ArrayList<>();
         boolean allEndAtFirst = true;
-        // the merge may wait, so the chain nodes the store lacks come from the heads' issuers (P2-V-02)
-        ChainReader reader = new ChainReader(state, issuersOf(heads));
+        // the merge may wait, so the chain nodes the store lacks come from the heads' issuers and the other writers (P2-V-02)
+        ChainReader reader = new ChainReader(state, chainSources(state, heads));
         for (Heads.Head head : heads) {
             Walk walk = walk(state, head.root(), reader);
             walks.add(walk.roots());
@@ -1138,6 +1197,23 @@ public final class Refs implements AutoCloseable {
             }
         }
         return peers;
+    }
+
+    /**
+     * The peers a walk asks for the chain nodes its store lacks (P2-V-02): the heads' issuers, then the writer of
+     * every version this engine knows. A head's writer fetches the chain nodes it linked on a later tick, and a
+     * reader may meet the head before the entry of its base, so for that while the base's own writer alone holds the
+     * base's chain node; a walk that asked the heads' issuers alone waited out the load timeout and merged with no
+     * base (concurrent heads, srad/agentspaces-pdt2.md §10.20).
+     */
+    private static List<PeerId> chainSources(State<?> state, List<Heads.Head> heads) {
+        Set<PeerId> peers = new LinkedHashSet<>(issuersOf(heads));
+        synchronized (state.known) {
+            for (Heads.Head version : state.known.values()) {
+                peers.add(version.issuer().peer());
+            }
+        }
+        return new ArrayList<>(peers);
     }
 
     /**
@@ -1224,7 +1300,13 @@ public final class Refs implements AutoCloseable {
             return null;
         }
         reader.prefetch(List.of(cid));
-        Optional<VgNode> node = store.get(cid).flatMap(bytes -> Ancestry.read(cid, root, bytes));
+        Optional<byte[]> bytes = store.get(cid);
+        if (bytes.isEmpty()) {
+            // a late node stays the version's chain node, so the next walk asks again and the next version this
+            // writer writes still links it (concurrent heads, srad/agentspaces-pdt2.md §10.20)
+            return null;
+        }
+        Optional<VgNode> node = Ancestry.read(cid, root, bytes.get());
         synchronized (state.known) {
             if (node.isEmpty()) {
                 // a head without a usable ancestry: its version reads from the memory of the versions seen
@@ -1385,8 +1467,8 @@ public final class Refs implements AutoCloseable {
             frontier.add(head.root());
         }
         // PDT 2 phase 2, P2-V-05: a version no entry described here reads from its chain node, which the
-        // store holds after a restart and a lazy follower fetches from the heads' issuers
-        ChainReader reader = new ChainReader(state, issuersOf(heads.heads()));
+        // store holds after a restart and a lazy follower fetches from the heads' issuers and the other writers
+        ChainReader reader = new ChainReader(state, chainSources(state, heads.heads()));
         boolean lazyFollower = !config.followsFully(state.name) && state.kind.lazy();
         while (!frontier.isEmpty() && out.size() < n) {
             String cid = frontier.poll();

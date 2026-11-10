@@ -50,9 +50,13 @@ class ConcurrentHeadsTest {
     private static final int SWAPS = 100;
     private static final int KEYS = 40;
     /**
-     * Three seeded repeats fit the 60 s budget (about 9 s each on the inline fabric); {@code -Dpdt.repeats=10} runs
+     * Three seeded repeats take about 250 s at a 1-minute load of 5 (about 80 s each on the inline fabric, most of
+     * it in the node ticks, and 20 to 36 s of it in the settle wait; concurrent heads, srad/agentspaces-pdt2.md
+     * §10.20), where they took 9 s each before the swarm retries; {@code -Dpdt.repeats=10} runs
      * the row's ten, and {@code -Dpdt.repeats=20} the twenty loaded repeats of PDT 2 phase 1, P2-V-04, in which the
-     * late joiner walks the version chain (P2-V-02) past every version whose entry is gone.
+     * late joiner walks the version chain (P2-V-02) past every version whose entry is gone. On 2026-11-10 the three
+     * took 70 to 75 s of wall and 124 to 131 s of CPU with every frame signed, and 20 to 24 s and 48 to 55 s once
+     * {@link RefFleet} ran {@code ChannelAuth.SESSION} (SESSION test fleets, ROBUSTNESS.md §10.10).
      */
     private static final int REPEATS = Integer.getInteger("pdt.repeats", 3);
 
@@ -71,6 +75,12 @@ class ConcurrentHeadsTest {
         System.out.printf("PD-Q-REL-02: %d seeded repeats in %d ms%n", REPEATS, (System.nanoTime() - started) / 1_000_000);
     }
 
+    private static void missedBase(PConflict conflict, List<PConflict> missed) {
+        if (PConflict.NO_COMMON_BASE.equals(conflict.reason())) {
+            missed.add(conflict);
+        }
+    }
+
     private void run(RefFleet fleet, long seed, int repeat) throws Exception {
         long fleetStart = System.nanoTime();
         List<RefFleet.Peer> writers = new ArrayList<>();
@@ -85,9 +95,15 @@ class ConcurrentHeadsTest {
         }
         fleet.settle(12);
         long fleetMillis = (System.nanoTime() - fleetStart) / 1_000_000;
+        // concurrent heads (srad/agentspaces-pdt2.md §10.20): a writer's swap over a merge that missed its base writes the
+        // later head whole, and every peer then converges on a value that lost the other heads' writes, so the run counts
+        // every merge on every peer, the writers' swaps too
+        List<PConflict> missedBases = new CopyOnWriteArrayList<>();
         List<Ref<PMap<String, String>>> writerRefs = new ArrayList<>();
         for (RefFleet.Peer w : writers) {
-            writerRefs.add(w.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR));
+            Ref<PMap<String, String>> ref = w.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+            ref.onConflict(c -> missedBase(c, missedBases));
+            writerRefs.add(ref);
         }
         List<Ref<PMap<String, String>>> readerRefs = new ArrayList<>();
         List<List<PConflict>> conflictsSeen = new ArrayList<>();
@@ -95,6 +111,7 @@ class ConcurrentHeadsTest {
             Ref<PMap<String, String>> ref = r.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
             List<PConflict> seen = new CopyOnWriteArrayList<>();
             ref.onConflict(seen::add);
+            ref.onConflict(c -> missedBase(c, missedBases));
             readerRefs.add(ref);
             conflictsSeen.add(seen);
         }
@@ -195,6 +212,7 @@ class ConcurrentHeadsTest {
             writerConflicts += (int) writers.get(w).pdt().stats().conflicts();
         }
         assertThat(roots).as("one deref root on 13 peers").hasSize(1);
+        assertThat(missedBases).as("every merge on every peer, the writers' swaps too, found its common base").isEmpty();
         assertThat(readerConflicts).as("the final deref counted the same conflicts on every reader").hasSize(1);
         long perReader = readerConflicts.iterator().next();
         for (List<PConflict> seen : conflictsSeen) {

@@ -36,7 +36,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * is ignored and counted and never throws out of deref, swap, the tick, or the
  * space's delivery; a head at the seq ceiling leaves every successor valid and
  * a head above it is ignored; several unloadable heads cost one load timeout
- * together, and their fetches and roots are dropped once the heads go.
+ * together, and their fetches and roots are dropped once the heads go; a read
+ * waits for no head that a held head supersedes.
  */
 class HeadBoundsTest {
 
@@ -167,5 +168,51 @@ class HeadBoundsTest {
         assertThat(onB.deref().root()).isEqualTo(v1.root());
         System.out.printf("PD-V-06 / §6.7 row 4: %d phantom heads cost one deref %d ms; after their cancel 0 fetches active, %d live roots%n",
                 n, waited, b.pdt().refs().liveRoots().size());
+    }
+
+    /**
+     * A read waits for no head a held head supersedes (pre-publish 0.6.0, ROBUSTNESS.md §10.11 item 4): the held head
+     * lists the second phantom as its base and the second lists the first, so both are older versions the read folds
+     * away. Before, the read waited the whole load timeout for their fetches, as a bridge's read did for a writer's
+     * superseded versions after a burst of swaps.
+     */
+    @Test
+    void aReadWaitsForNoHeadAHeldHeadSupersedes() throws Exception {
+        Duration loadTimeout = Duration.ofSeconds(2);
+        RefFleet.Spec slow = RefFleet.Spec.defaults().pdt(p -> p.loadTimeout(loadTimeout));
+        RefFleet.Peer a = fleet.newPeer("a", 1, slow);
+        RefFleet.Peer b = fleet.newPeer("b", 2, slow, "a");
+        fleet.settle(6);
+        String held = b.pdt().mapRef("scratch", RefFleet.STR, RefFleet.STR).swap(m -> m.assoc("k1", "v1")).root();
+        Random random = new Random(11);
+        List<String> phantoms = new ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            byte[] nobody = new byte[48];
+            random.nextBytes(nobody);
+            phantoms.add(Cids.of(nobody, Cids.DAG_CBOR));
+        }
+        List<PRef> chain = List.of(
+                new PRef(PRef.VERSION, NAME, PRef.KIND_MAP, phantoms.get(0), List.of(), 1, 1, null,
+                        PRef.MODE_MULTI, PRef.SEALING_NONE, null, null),
+                new PRef(PRef.VERSION, NAME, PRef.KIND_MAP, phantoms.get(1), List.of(phantoms.get(0)), 2, 1, null,
+                        PRef.MODE_MULTI, PRef.SEALING_NONE, null, null),
+                new PRef(PRef.VERSION, NAME, PRef.KIND_MAP, held, List.of(phantoms.get(1)), 3, 1, null,
+                        PRef.MODE_MULTI, PRef.SEALING_NONE, null, null));
+        for (PRef head : chain) {
+            a.refSpace().write(head, Lease.of(Duration.ofMinutes(10)), head.tags());
+        }
+        assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> RefFleet.headEntries(b, NAME).size() == 3)).isTrue();
+
+        Ref<PMap<String, String>> onB = b.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
+        long started = System.nanoTime();
+        PMap<String, String> seen = onB.deref();
+        long waited = (System.nanoTime() - started) / 1_000_000;
+
+        assertThat(seen.root()).isEqualTo(held);
+        assertThat(seen.toMap()).isEqualTo(java.util.Map.of("k1", "v1"));
+        assertThat(onB.heads().roots()).containsExactly(held);
+        assertThat(waited).as("the read waited for neither superseded version").isLessThan(loadTimeout.toMillis() / 2);
+        System.out.printf("§10.11 item 4: a read over two superseded phantom heads took %d ms against a %d ms load timeout%n",
+                waited, loadTimeout.toMillis());
     }
 }

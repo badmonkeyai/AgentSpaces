@@ -46,6 +46,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * one RUMOR frame per receiving member rather than fanout per member; a member that does not
  * advertise the hint still receives every item through the random fan-out and never sees a
  * HAVE, GRAFT or PRUNE; and a member cut off from the tree is grafted back by an announcement.
+ * The fleet runs {@code ChannelAuth.SIGNED} on purpose: the heavy fleets run SESSION (SESSION test fleets,
+ * ROBUSTNESS.md §10.10), and this one keeps a multi-peer gossip tree on per-frame Ed25519 signatures.
  */
 class LazyPushClusterTest {
 
@@ -67,7 +69,7 @@ class LazyPushClusterTest {
 
     private PeerNode node(String address, long seed, boolean lazyPush) throws IOException {
         PeerNode node = PeerNode.builder(PeerIdentity.generate()).clock(clock).randomSeed(seed)
-                .lazyPush(lazyPush).build();
+                .channelAuth(PeerNode.ChannelAuth.SIGNED).lazyPush(lazyPush).build();
         node.listen(network.register(address), address);
         nodes.add(node);
         GroupRuntime runtime = node.joinGroup(groupAd, GroupMembership.Config.defaults(),
@@ -153,6 +155,12 @@ class LazyPushClusterTest {
         assertThat(sent(Envelope.Kind.HAVE)).as("announcements went out on the period").isGreaterThan(0);
         assertThat(sent(Envelope.Kind.GRAFT) - graftsBefore).as("a settled tree needs no repair, or almost none")
                 .isLessThanOrEqualTo(3);
+        assertThat(nodes).as("every frame carried its Ed25519 signature (SESSION test fleets, ROBUSTNESS.md §10.10)")
+                .allSatisfy(node -> {
+                    assertThat(node.sessionFramesSent()).isZero();
+                    assertThat(node.bareFramesSent()).isZero();
+                    assertThat(node.signedFramesSent()).isPositive();
+                });
     }
 
     @Test

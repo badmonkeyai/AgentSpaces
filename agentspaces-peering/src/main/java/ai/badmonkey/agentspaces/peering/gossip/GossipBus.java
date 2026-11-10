@@ -209,12 +209,23 @@ public final class GossipBus {
      * eager push takes, or it would fetch a copy already on its way and the duplicate would prune a sound edge
      * (Plumtree's timer rule); a uniform spread keeps the members that heard one announcement from asking together;
      * later asks back off with the same spread and go round the announcers again while members still announce the item.
+     * The base and the spread follow the lateness the node observes (swarm retries, adaptive wait, ROBUSTNESS.md
+     * §10.9): the p90 of its graft round trips or the p90 of how long its tree copies came after their first
+     * announcement, whichever is longer. Before it has observed either, it waits as the TCP runs of §10.4 chose.
      */
-    /** The base of the wait between the first HAVE for an unseen item and its first GRAFT. */
+    /**
+     * The base of the wait between the first HAVE for an unseen item and its first GRAFT before the node has observed any
+     * lateness, and the longest base after: the base is the observed lateness, up to this.
+     */
     static final long GRAFT_BASE_MILLIS = 500;
-    /** The narrowest window the first GRAFT is spread over, uniformly, past the base; it widens to twice the p90 graft round trip. */
-    static final long GRAFT_SPREAD_MIN_MILLIS = 1_000;
-    /** The widest spread window, however slow the observed graft round trips. */
+    /** The window the first GRAFT is spread over, uniformly, past the base, before the node has observed any lateness. */
+    static final long GRAFT_SPREAD_COLD_MILLIS = 1_000;
+    /**
+     * The narrowest spread window once the node observes lateness, which widens it to twice the observed lateness: one
+     * node tick, so a member that got the item by an earlier ask announces it before the last members ask.
+     */
+    static final long GRAFT_SPREAD_MIN_MILLIS = 250;
+    /** The widest spread window, however late the copies and the answers the node observes. */
     static final long GRAFT_SPREAD_MAX_MILLIS = 4_000;
     /** The wait after the first GRAFT; each later ask doubles it up to {@link #GRAFT_BACKOFF_MAX_MILLIS}. */
     static final long GRAFT_BACKOFF_MILLIS = 1_000;
@@ -222,7 +233,7 @@ public final class GossipBus {
     static final long GRAFT_BACKOFF_MAX_MILLIS = 8_000;
     /** How long an item stays wanted after its last announcement; a member's probes announce what it forwarded lately. */
     static final long MISSING_HORIZON_MILLIS = 15_000;
-    /** Graft round trips kept for the p90 that sizes the spread. */
+    /** Graft round trips, and tree copies' lateness, kept for the p90s that size the wait. */
     static final int GRAFT_RTT_SAMPLES = 64;
     /**
      * Asks in a row an announcer leaves unanswered before a member asks the other announcers first: three, so the rare
@@ -250,14 +261,17 @@ public final class GossipBus {
         final List<PeerId> announcers = new ArrayList<>();
         /** The announcers asked in the current round; a round ends once each was asked. */
         final java.util.Set<PeerId> asked = new java.util.HashSet<>();
+        /** When the first announcement came, from which a tree copy's lateness counts (adaptive wait). */
+        final long heardAtMillis;
         long askAtMillis;
         long announcedAtMillis;
         int asks;
 
-        Missing(String streamId, byte[] hash, PeerId firstHeard, long askAtMillis) {
+        Missing(String streamId, byte[] hash, PeerId firstHeard, long heardAtMillis, long askAtMillis) {
             this.streamId = streamId;
             this.hash = hash;
             this.firstHeard = firstHeard;
+            this.heardAtMillis = heardAtMillis;
             this.askAtMillis = askAtMillis;
         }
 
@@ -376,9 +390,75 @@ public final class GossipBus {
                     return size() > MISSING_CAPACITY;
                 }
             });
-    /** The latest graft round trips in milliseconds, a ring, guarded by itself; the count is a long so it never wraps. */
-    private final long[] graftRtts = new long[GRAFT_RTT_SAMPLES];
-    private long graftRttCount;
+    /**
+     * The members this node asked for an item whose answers are still due after another copy came, by item (asker-only
+     * repair, ROBUSTNESS.md §10.9). Such an answer arrives as a duplicate with a budget of one, and it prunes the edge its
+     * GRAFT made, as a duplicate answer did when it kept its rumor's budget. Bounded like the asks.
+     */
+    private final Map<String, java.util.Set<PeerId>> answersDue = Collections.synchronizedMap(
+            new LinkedHashMap<>(64, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, java.util.Set<PeerId>> eldest) {
+                    return size() > MISSING_CAPACITY;
+                }
+            });
+    /** The latest graft round trips in milliseconds, by the member that answered. */
+    private final LatenessRing graftRtts = new LatenessRing();
+    /**
+     * How long the latest tree copies came after their item's first announcement, in milliseconds, by the first announcer
+     * (swarm retries, adaptive wait): only copies that came while the item was wanted, from a member this node did not
+     * ask, so a copy merely late and a copy that made an ask premature both count, and a repair never does.
+     */
+    private final LatenessRing copyLateness = new LatenessRing();
+
+    /** The samples of one ring a single member may hold at most: fewer than a tenth of the ring, so one member cannot set its p90. */
+    static final int SAMPLES_PER_MEMBER = 6;
+
+    /**
+     * The latest lateness samples, each with the member it came from, guarded by itself (swarm retries, adaptive wait, the
+     * gate of ROBUSTNESS.md §10.9). A new sample takes the place of the ring's oldest, unless its member already holds
+     * {@link #SAMPLES_PER_MEMBER}: then it takes the place of that member's oldest. A member that pushes its items right
+     * after announcing them, or answers its asks at once or late on purpose, therefore moves the p90 only together with
+     * the other members. The count is a long so it never wraps.
+     */
+    private static final class LatenessRing {
+        private final long[] millis = new long[GRAFT_RTT_SAMPLES];
+        private final PeerId[] members = new PeerId[GRAFT_RTT_SAMPLES];
+        private final long[] order = new long[GRAFT_RTT_SAMPLES];
+        private long count;
+
+        synchronized void add(PeerId member, long sample) {
+            int filled = (int) Math.min(count, GRAFT_RTT_SAMPLES);
+            int slot = filled < GRAFT_RTT_SAMPLES ? filled : 0;
+            int own = -1;
+            int held = 0;
+            for (int i = 0; i < filled; i++) {
+                if (member.equals(members[i])) {
+                    held++;
+                    own = own < 0 || order[i] < order[own] ? i : own;
+                }
+                if (filled == GRAFT_RTT_SAMPLES && order[i] < order[slot]) {
+                    slot = i;
+                }
+            }
+            if (held >= SAMPLES_PER_MEMBER) {
+                slot = own;
+            }
+            millis[slot] = sample;
+            members[slot] = member;
+            order[slot] = count++;
+        }
+
+        /** The p90 of the samples, or -1 while the ring holds none. */
+        synchronized long p90() {
+            long[] samples = java.util.Arrays.copyOf(millis, (int) Math.min(count, GRAFT_RTT_SAMPLES));
+            if (samples.length == 0) {
+                return -1;
+            }
+            java.util.Arrays.sort(samples);
+            return samples[Math.min(samples.length - 1, (int) Math.ceil(samples.length * 0.9) - 1)];
+        }
+    }
     private final Map<String, Bodies.Rumor> recent = Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, false) {
                 @Override
@@ -943,8 +1023,11 @@ public final class GossipBus {
             }
             // A duplicate over a tree edge means an edge is redundant (Plumtree PRUNE). A copy
             // delivered point to point (hop budget 1: an introduction, a refresh) and a stream the
-            // node also delivers directly are not evidence about the tree; a GRAFT answer carries
-            // the budget its rumor was cached with, so it counts as a tree push. Which
+            // node also delivers directly are not evidence about the tree, and neither is the
+            // asker's forward of a GRAFT answer, which carries a budget of one too (asker-only
+            // repair, ROBUSTNESS.md §10.9): a repaired item comes late by nature, and those copies
+            // say nothing about which edge is redundant. An answer that comes after another copy
+            // does prune the edge its GRAFT made, as it did when it kept its rumor's budget. Which
             // edge goes: the duplicate's, unless it travelled markedly fewer hops than the first
             // copy (PATH_SWAP_THRESHOLD), in which case the first sender's edge is the longer
             // path and is pruned instead. The partition is shared by every source, so a node
@@ -961,7 +1044,8 @@ public final class GossipBus {
                 // of the cycle, which a synchronous fabric produces before the fan-out finishes.
                 return;
             }
-            if (capable != null && capable.test(from) && rumor.hopsRemaining() > 1
+            boolean dueAnswer = rumor.hopsRemaining() == 1 && answerDue(key, from);
+            if (capable != null && capable.test(from) && (rumor.hopsRemaining() > 1 || dueAnswer)
                     && !directStreams.contains(rumor.streamId())) {
                 PeerId pruned = from;
                 boolean directFromOrigin = rumor.hopsRemaining() >= defaultHops && first.hops() < defaultHops;
@@ -981,18 +1065,20 @@ public final class GossipBus {
         if (!directStreams.contains(rumor.streamId())) {
             activity = true;
         }
+        Missing arrived;
         synchronized (missing) {
-            Missing arrived = missing.remove(key);
+            arrived = missing.remove(key);
             if (arrived != null) {
                 leaveShare(key, arrived);
             }
         }
-        noteCopy(key, from);
+        boolean treePush = rumor.hopsRemaining() > 1 && !directStreams.contains(rumor.streamId());
+        boolean asked = noteCopy(key, from, arrived, treePush);
         // A first copy over a pruned edge restores it, when it was a tree push: a copy delivered
-        // point to point (hop budget one: a refresh, an introduction) or on a direct stream says
-        // nothing about the tree, just as such a duplicate never prunes. A graft answer carries
-        // the budget its rumor was cached with, so it restores the edge as a tree push does.
-        if (rumor.hopsRemaining() > 1 && !directStreams.contains(rumor.streamId())) {
+        // point to point (hop budget one: a refresh, an introduction, a graft answer) or on a
+        // direct stream says nothing about the tree, just as such a duplicate never prunes. The
+        // GRAFT itself made the asker's edge to the member it asked eager at both ends.
+        if (treePush) {
             lazy.remove(from);
         }
         RumorHandler handler = handlers.get(rumor.streamId());
@@ -1009,6 +1095,14 @@ public final class GossipBus {
         if (hops > 1) {
             forward(key, hash, new Bodies.Rumor(rumor.streamId(), rumor.itemId(),
                     hops - 1, rumor.payload()), from);
+        } else if ((asked || arrived != null && arrived.asks > 0) && !directStreams.contains(rumor.streamId())) {
+            // Asker-only repair (ROBUSTNESS.md §10.9): the answer to this node's GRAFT ended its
+            // budget here, and this node forwards the item along its own eager edges as usual.
+            // Each copy carries the same budget of one, so it ends at the member it reaches and
+            // prunes nothing there, and the lazy members hear of the item from this node. The
+            // record of the asks in flight is bounded, and a flood's asks can push one out before
+            // a slow answer comes, so the item's own entry among the wanted items counts too (the gate).
+            forward(key, hash, new Bodies.Rumor(rumor.streamId(), rumor.itemId(), 1, rumor.payload()), from);
         }
     }
 
@@ -1120,7 +1214,7 @@ public final class GossipBus {
                     if (missing.size() >= MISSING_CAPACITY) {
                         makeRoom(from);
                     }
-                    entry = new Missing(item.streamId(), item.hash(), from, now + GRAFT_BASE_MILLIS + spread());
+                    entry = new Missing(item.streamId(), item.hash(), from, now, now + base() + spread());
                     missing.put(key, entry);
                     joinShare(key, entry);
                 } else if (!entry.announcers.contains(from) && shares.get(entry.firstHeard).alone.remove(key)) {
@@ -1188,9 +1282,30 @@ public final class GossipBus {
         return random.nextLong(spreadWindow() + 1);
     }
 
-    /** The spread window: twice the p90 graft round trip this node observes, between its floor and ceiling. */
+    /**
+     * The lateness this node observes (swarm retries, adaptive wait, ROBUSTNESS.md §10.9): the p90 of its latest graft
+     * round trips or the p90 of how long its latest tree copies came after their first announcement, whichever is
+     * longer, or -1 before it has observed either. Each member holds a few samples of each ring at most, so one member
+     * cannot pull the wait to its floor or push it to its ceiling alone (the gate).
+     */
+    private long lateness() {
+        return Math.max(graftRtts.p90(), copyLateness.p90());
+    }
+
+    /** The base of the first ask's wait: the observed lateness, up to {@link #GRAFT_BASE_MILLIS}, which is also the base before any. */
+    private long base() {
+        long lateness = lateness();
+        return lateness < 0 ? GRAFT_BASE_MILLIS : Math.min(GRAFT_BASE_MILLIS, lateness);
+    }
+
+    /**
+     * The spread window: twice the observed lateness, between its floor and ceiling, or {@link #GRAFT_SPREAD_COLD_MILLIS}
+     * before the node has observed any.
+     */
     private long spreadWindow() {
-        return Math.max(GRAFT_SPREAD_MIN_MILLIS, Math.min(GRAFT_SPREAD_MAX_MILLIS, 2 * graftRttP90()));
+        long lateness = lateness();
+        return lateness < 0 ? GRAFT_SPREAD_COLD_MILLIS
+                : Math.max(GRAFT_SPREAD_MIN_MILLIS, Math.min(GRAFT_SPREAD_MAX_MILLIS, 2 * lateness));
     }
 
     /**
@@ -1202,20 +1317,7 @@ public final class GossipBus {
      */
     public long repairWindowMillis() {
         long window = spreadWindow();
-        return GRAFT_BASE_MILLIS + window + GRAFT_BACKOFF_MILLIS + window;
-    }
-
-    /** The p90 of the latest graft round trips, or zero before the first. */
-    private long graftRttP90() {
-        long[] samples;
-        synchronized (graftRtts) {
-            samples = java.util.Arrays.copyOf(graftRtts, (int) Math.min(graftRttCount, GRAFT_RTT_SAMPLES));
-        }
-        if (samples.length == 0) {
-            return 0;
-        }
-        java.util.Arrays.sort(samples);
-        return samples[Math.min(samples.length - 1, (int) Math.ceil(samples.length * 0.9) - 1)];
+        return base() + window + GRAFT_BACKOFF_MILLIS + window;
     }
 
     /** The wait after an item's {@code asks}-th ask: 1, 2, 4, 8 s, then 8 s. */
@@ -1224,40 +1326,71 @@ public final class GossipBus {
     }
 
     /**
-     * Notes the first copy of an item this node grafted (swarm retries): a copy from a member asked gives a round trip
-     * for the spread and clears that member's unanswered asks, a copy from any other member makes the asks premature,
+     * Notes the first copy of an item (swarm retries). For an item this node asked for, a copy from a member asked gives
+     * a round trip and clears that member's unanswered asks, a copy from any other member makes the asks premature,
      * counted once, and each member asked whose copy did not come first has one more unanswered ask. A later copy, a late
      * answer among them, repaired nothing, so it neither widens the spread nor counts (the gate's adversarial review,
-     * ROBUSTNESS.md §10.6).
+     * ROBUSTNESS.md §10.6). A tree copy of a wanted item from a member not asked gives its lateness after the item's
+     * first announcement (adaptive wait, §10.9).
+     *
+     * @param arrived  the item's entry among the wanted items, or null when nobody announced it first
+     * @param treePush whether the copy came as a tree push, its budget above one
+     * @return whether this node had asked for the item
      */
-    private void noteCopy(String key, PeerId from) {
-        Long sentAt;
+    private boolean noteCopy(String key, PeerId from, Missing arrived, boolean treePush) {
+        Long sentAt = null;
+        boolean asked;
         synchronized (grafted) {
             Grafted asks = grafted.remove(key);
-            if (asks == null) {
-                return;
-            }
-            sentAt = asks.sentAtMillis.get(from);
-            for (PeerId asked : asks.sentAtMillis.keySet()) {
-                if (asked.equals(from)) {
-                    unanswered.remove(asked);
-                } else {
-                    unanswered.merge(asked, 1, (held, one) -> Math.min(UNANSWERED_STRIKES, held + one));
+            asked = asks != null;
+            if (asked) {
+                sentAt = asks.sentAtMillis.get(from);
+                java.util.Set<PeerId> due = new java.util.HashSet<>();
+                for (PeerId member : asks.sentAtMillis.keySet()) {
+                    if (member.equals(from)) {
+                        unanswered.remove(member);
+                    } else {
+                        unanswered.merge(member, 1, (held, one) -> Math.min(UNANSWERED_STRIKES, held + one));
+                        due.add(member);
+                    }
+                }
+                if (!due.isEmpty()) {
+                    answersDue.put(key, due);
                 }
             }
         }
-        if (sentAt == null) {
-            count("GRAFT_PREMATURE");
-            return;
+        long now = clock.getAsLong();
+        if (sentAt != null) {
+            graftRtts.add(from, Math.max(0, now - sentAt));
+            return true;
         }
-        synchronized (graftRtts) {
-            graftRtts[(int) (graftRttCount++ % GRAFT_RTT_SAMPLES)] = Math.max(0, clock.getAsLong() - sentAt);
+        if (asked) {
+            count("GRAFT_PREMATURE");
+        }
+        if (arrived != null && treePush) {
+            copyLateness.add(arrived.firstHeard, Math.max(0, now - arrived.heardAtMillis));
+        }
+        return asked;
+    }
+
+    /** Whether a copy from {@code from} is the answer to an ask of this node that another copy overtook; consumes it. */
+    private boolean answerDue(String key, PeerId from) {
+        synchronized (answersDue) {
+            java.util.Set<PeerId> due = answersDue.get(key);
+            if (due == null || !due.remove(from)) {
+                return false;
+            }
+            if (due.isEmpty()) {
+                answersDue.remove(key);
+            }
+            return true;
         }
     }
 
     /**
-     * Handles an inbound GRAFT: the asker is an eager member again, and gets the item if this
-     * node still holds it. One answer per ask bounds what an asker can make this node send.
+     * Handles an inbound GRAFT: the asker is an eager member again, and gets the item if this node still holds it, as a
+     * copy for the asker alone whose hop budget ends there (asker-only repair, ROBUSTNESS.md §10.9). The asker forwards
+     * the item along its own eager edges. One answer per ask bounds what an asker can make this node send.
      *
      * @param from  the asking member
      * @param graft the item asked for
@@ -1271,7 +1404,7 @@ public final class GossipBus {
         }
         Bodies.Rumor cached = recent.get(key(graft.streamId(), graft.hash()));
         if (cached != null) {
-            sender.sendRumor(from, cached);
+            sender.sendRumor(from, new Bodies.Rumor(cached.streamId(), cached.itemId(), 1, cached.payload()));
         }
     }
 

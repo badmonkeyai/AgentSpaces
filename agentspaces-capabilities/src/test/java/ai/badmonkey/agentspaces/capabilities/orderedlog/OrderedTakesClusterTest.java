@@ -163,6 +163,35 @@ class OrderedTakesClusterTest {
         }
     }
 
+    /**
+     * The 0.6.0 regression, 2026-11-10: a take whose claim the log commits after the caller's timeout returned empty
+     * while the committed claim named the caller, so nobody adopted, drained or completed the entry until the claim's
+     * lease lapsed. An ORDERED reduce on a 200 ms poll stalled 30 s at a time that way (agentspaces-clj
+     * layer4_options_test). The taker now waits out its submitted claim's attempt window and holds the entry.
+     */
+    @Test
+    @Timeout(60)
+    void aClaimTheLogCommitsAfterTheTakersTimeoutStillHandsTheEntryToTheTaker() throws Exception {
+        List<Member> members = cluster();
+        awaitLeader(members);
+        Member a = members.get(0);
+        Member b = members.get(1);
+        a.space().write(new TaskEntry("late-commit", 1), MINUTES_30);
+        assertThat(b.space().read(Template.of(TaskEntry.class))).isPresent();
+
+        // the taker's frames wait in the network, so the log cannot commit its claim inside the taker's 100 ms
+        network.hold("n1", "n0");
+        network.hold("n1", "n2");
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byB = CompletableFuture.supplyAsync(
+                () -> b.ordered().take(Template.of(TaskEntry.class), MINUTES_10, Duration.ofMillis(100)));
+        Thread.sleep(400);
+        network.release("n1", "n0", SimNetwork.Order.FIFO, 0);
+        network.release("n1", "n2", SimNetwork.Order.FIFO, 0);
+        tickUntilDone(members, 1500, byB);
+
+        assertThat(byB.get()).as("the taker holds the entry its committed claim names").isPresent();
+    }
+
     @Test
     @Timeout(60)
     void exactlyOneCommittedTakeWinsPerEntry() throws Exception {

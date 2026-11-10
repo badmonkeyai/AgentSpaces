@@ -36,6 +36,7 @@ import ai.badmonkey.agentspaces.api.security.AgentCertificate;
 import ai.badmonkey.agentspaces.api.spi.AgentIdentity;
 import ai.badmonkey.agentspaces.common.crypto.Digests;
 import ai.badmonkey.agentspaces.common.crypto.Ed25519;
+import ai.badmonkey.agentspaces.common.crypto.VerifiedSignatures;
 import ai.badmonkey.agentspaces.identity.AgentCertificates;
 import ai.badmonkey.agentspaces.common.hlc.HlcTimestamp;
 import ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock;
@@ -189,6 +190,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     static final Duration DEFAULT_ADVERTISEMENT_TTL = Duration.ofMinutes(15);
 
     private final Object lock = new Object();
+    /**
+     * The record, state and claim signatures this replica verified (swap amplification, ROBUSTNESS.md §10.8): a state
+     * that came by anti-entropy and again by gossip, and a record that comes again with every later state of its entry,
+     * verify once.
+     */
+    private final VerifiedSignatures signatures = new VerifiedSignatures(VerifiedSignatures.DEFAULT_CAPACITY);
     private SpaceStateCrdt crdt = SpaceStateCrdt.empty();
     /** Bumped under the lock on every change of the reconciled state; the digest cache is keyed on it. */
     private long generation;
@@ -2897,8 +2904,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         byte[] bytes = codec.toBytes(signed.claim());
         if (signed.holderCertificate() == null) {
-            return Ed25519.verify(Ed25519.publicKeyFromRaw(signed.holderKey()), bytes,
-                    signed.signature());
+            return signatures.verify(signed.holderKey(), bytes, signed.signature());
         }
         // The two-key rule of TECH-SPEC §7.2, applied to claims (QA4 A4-7 phase 3):
         // the peer key verifies the certificate for exactly this holder, and the
@@ -2909,8 +2915,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // leads this replica's wall, as it does for a peer-signed claim.
         return certificates.verifyCovering(signed.holderCertificate(), signed.holderKey(),
                 signed.claim().holder(), Instant.ofEpochMilli(signed.claim().stamp().physical()))
-                && Ed25519.verifyRaw(signed.holderCertificate().agentPublicKey(), bytes,
-                        signed.signature());
+                && signatures.verify(signed.holderCertificate().agentPublicKey(), bytes, signed.signature());
     }
 
     /**
@@ -3775,8 +3780,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return false;
         }
         if (certificate == null) {
-            return Ed25519.verify(Ed25519.publicKeyFromRaw(issuerKey),
-                    signableBytes(record), record.sig());
+            return signatures.verify(issuerKey, signableBytes(record), record.sig());
         }
         // SPEC §4.2 v0.1.13: judged at the record's issue stamp, not at receipt,
         // so an agent's history stays mergeable after its certificate lapses. HLC round
@@ -3784,7 +3788,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // the stamp leads this replica's wall, as it does for a peer-signed record.
         return certificates.verifyCovering(certificate, issuerKey, record.issuer(),
                 Instant.ofEpochMilli(record.issued().physical()))
-                && Ed25519.verifyRaw(certificate.agentPublicKey(), signableBytes(record), record.sig());
+                && signatures.verify(certificate.agentPublicKey(), signableBytes(record), record.sig());
     }
 
     /** The signature covers the record's immutable identity; leases change freely. */
@@ -3912,16 +3916,14 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     && party.encoded().equals(dto.signer())
                     && certificates.verifyCovering(dto.stateCertificate(), signerKey, party,
                             Instant.ofEpochMilli(dto.signedAt().physical()))
-                    && Ed25519.verifyRaw(dto.stateCertificate().agentPublicKey(),
-                            stateSignBytes(dto), dto.stateSig());
+                    && signatures.verify(dto.stateCertificate().agentPublicKey(), stateSignBytes(dto), dto.stateSig());
         }
         if (partyAttested) {
             // A6: an agent-attested party's transitions must be agent-signed, so
             // its peer (or a sibling agent on it) cannot act in its name.
             return false;
         }
-        return Ed25519.verify(Ed25519.publicKeyFromRaw(signerKey),
-                stateSignBytes(dto), dto.stateSig());
+        return signatures.verify(signerKey, stateSignBytes(dto), dto.stateSig());
     }
 
     /** The bytes an actor signs to authenticate a state transition. */

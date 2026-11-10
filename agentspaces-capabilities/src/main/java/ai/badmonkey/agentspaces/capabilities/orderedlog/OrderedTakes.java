@@ -348,7 +348,8 @@ public final class OrderedTakes {
      *
      * @param template  the template to match
      * @param takeLease the TAKE lease
-     * @param timeout   how long to keep trying (spans leader elections)
+     * @param timeout   how long to keep trying (spans leader elections); a claim already submitted is waited on
+     *                  for its attempt window even past it
      * @param <T>       the entry type
      * @return the taken entry, or empty when out-arbitrated or timed out
      */
@@ -378,9 +379,11 @@ public final class OrderedTakes {
                 raft.submit(command);
                 // Wait for the log to decide this generation, but only for a
                 // bounded attempt window: a command lost to a leader election is
-                // resubmitted on the next scan rather than waited on forever.
-                long attemptDeadline = Math.min(deadline,
-                        System.nanoTime() + Duration.ofSeconds(3).toNanos());
+                // resubmitted on the next scan rather than waited on forever. The
+                // window holds even past the caller's timeout: a claim the log
+                // commits after the caller gave up would hold the entry for its whole
+                // lease with nobody to adopt it (the 0.6.0 regression, 2026-11-10).
+                long attemptDeadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
                 while (System.nanoTime() < attemptDeadline) {
                     Optional<TakeClaim> decided = space.currentClaim(entryId.get());
                     if (decided.isPresent() && decided.get().epoch() >= epoch) {

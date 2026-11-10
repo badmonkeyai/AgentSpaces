@@ -135,14 +135,28 @@ class SketchSessionTest {
         assertThat(outcome.rounds()).isLessThanOrEqualTo(SketchServer.MAX_ROUNDS);
     }
 
+    /**
+     * The symbols RIBLT needs depend on the session's fresh key, and on the difference alone, since the common CIDs
+     * cancel. For 100 differences 200,000 keys needed a mean of 1.454 symbols a difference (median 145, p99 173). The
+     * session sends 140 symbols, then 165, 190 and 200, so a key decodes in one round 33.6 % of the time, in two 62.7 %,
+     * in three or four 3.6 %, and falls back past the cap in 0.06 % (reviews/pre-publish-0.6.0/measures-and-flake.md).
+     * One key cannot carry a bound of two rounds, and 200 keys can: about 193 of them decode by RIBLT in one or two
+     * rounds on average, and fewer than 175 come about three times in a hundred million runs. Every session must find
+     * the difference exactly, whatever its encoding.
+     */
     @Test
-    void ribltDecodesASmallDifferenceInOneOrTwoRounds() throws Exception {
-        Pair pair = Pair.scattered(20_000, 100, 4);
-        SketchSession.Outcome outcome = run(pair.asker(), pair.holder(), 100);
-        assertThat(outcome.encoding()).isEqualTo("riblt");
-        assertThat(outcome.have()).containsExactlyInAnyOrderElementsOf(pair.askerOnly());
-        assertThat(digests(outcome.need())).containsExactlyInAnyOrderElementsOf(digests(pair.holderOnly()));
-        assertThat(outcome.rounds()).isLessThanOrEqualTo(2);
+    void ribltDecodesASmallDifferenceInOneOrTwoRoundsForAlmostEveryKey() throws Exception {
+        Pair pair = Pair.scattered(2_000, 100, 4);
+        int withinTwoRounds = 0;
+        for (int key = 0; key < 200; key++) {
+            SketchSession.Outcome outcome = run(pair.asker(), pair.holder(), 100);
+            assertThat(outcome.have()).containsExactlyInAnyOrderElementsOf(pair.askerOnly());
+            assertThat(digests(outcome.need())).containsExactlyInAnyOrderElementsOf(digests(pair.holderOnly()));
+            if (outcome.encoding().equals("riblt") && outcome.rounds() <= 2) {
+                withinTwoRounds++;
+            }
+        }
+        assertThat(withinTwoRounds).as("keys of 200 that decode by RIBLT in one or two rounds").isGreaterThanOrEqualTo(175);
     }
 
     @Test

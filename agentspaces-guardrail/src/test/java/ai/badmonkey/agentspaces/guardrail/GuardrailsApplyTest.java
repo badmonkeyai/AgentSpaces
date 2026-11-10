@@ -79,6 +79,21 @@ class GuardrailsApplyTest {
         assertThat(Guardrails.apply(null, "gateway", "x", "anything", List.of(), Duration.ofSeconds(1), NOW).passed()).isTrue();
     }
 
+    /** Spiral 6 (S6-X-02): a check that only logs records what it found, so the finding names the term and the line passes. */
+    @Test
+    void aLoggingCheckRecordsWhatItFoundAndPasses() {
+        GuardrailPolicy policy = new GuardrailPolicy(1, "front-desk", 2, List.of(
+                new GuardrailPolicy.Check("builtin", "terms", "gateway", "finding", Map.of("deny", "competitor"))), "refuse");
+        Guardrails.Outcome out = Guardrails.apply(policy, "gateway", "req-9", "Is the competitor cheaper?", List.of(new BuiltinProvider()), Duration.ofSeconds(2), NOW);
+        assertThat(out.passed()).isTrue();
+        assertThat(out.content()).isEqualTo("Is the competitor cheaper?");
+        assertThat(out.findings()).singleElement().satisfies(f -> {
+            assertThat(f.action()).isEqualTo("finding");
+            assertThat(f.detail()).isEqualTo("denied term: 'competitor'");
+        });
+        assertThat(Guardrails.apply(policy, "gateway", "req-10", "Is it cheaper?", List.of(new BuiltinProvider()), Duration.ofSeconds(2), NOW).findings()).isEmpty();
+    }
+
     @Test
     void aThrowingProviderYieldsOnError() {
         GuardrailPolicy.Check vendor = new GuardrailPolicy.Check("vendor-x", "content-safety", "gateway", "refuse", Map.of("threshold", "0.8"));

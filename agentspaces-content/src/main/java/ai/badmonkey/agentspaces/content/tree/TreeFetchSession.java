@@ -1058,6 +1058,16 @@ public final class TreeFetchSession implements TreeFetch {
         if (done.isDone() || !started) {
             return;
         }
+        if (outstanding.isEmpty() && frontier.isEmpty() && pendingSubtrees.isEmpty() && inFlightSubtrees.isEmpty()) {
+            // swarm retries, sliding window, the ShareTest bridge race (ROBUSTNESS.md §10.11): a request that left
+            // flight at its timeout, after other fetches over the same store filled what it asked for, leaves nothing
+            // to ask for; only an answer checked the root, so the session waited for good. Check it here, before the
+            // sources: a complete root needs none
+            checkComplete();
+            if (done.isDone()) {
+                return;
+            }
+        }
         long now = fabric.nowMillis();
         List<Source> order = ranking.order(sources.values());
         List<Source> usable = new ArrayList<>();

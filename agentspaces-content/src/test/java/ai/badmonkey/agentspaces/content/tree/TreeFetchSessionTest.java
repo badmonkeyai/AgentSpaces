@@ -379,4 +379,42 @@ class TreeFetchSessionTest {
         assertThat(session.progress().bytesReceived()).as(session.trace().toString()).isEqualTo(treeBytes);
         assertThat(session.progress().nodesVerified()).isEqualTo(v1.nodes().size());
     }
+
+    /**
+     * Swarm retries, sliding window, the ShareTest bridge race (ROBUSTNESS.md §10.11): a follower that fetches many
+     * versions at once runs one session per root over one store, and the sessions fill each other's subtrees. Here an
+     * earlier version's fetch has stored all of the tree but the root and what lies below one child, the session's
+     * batches bring that part, and the holder's walk of the child answers too late. The walk leaves flight at its
+     * timeout with its subtree complete, and nothing is left to ask for. Only an answer made the session check its
+     * root, so it never ended: it published no holding, ran no callback, and stayed among the capability's fetches.
+     */
+    @Test
+    void aWalkReleasedAfterItsSubtreeFilledEndsTheFetchComplete() {
+        NodeFixtures.Tree v1 = v1();
+        SimTreeFabric fabric = new SimTreeFabric();
+        SimTreeFabric.Holder slow = fabric.holder("zSlow").holds(v1);
+        slow.tamper = m -> answersAWalk(slow, m) ? null : m; // a walk's answer lands after its timeout, as unsolicited
+        MemoryTreeStore mine = new MemoryTreeStore().putAll(v1);
+        String child = NodeFixtures.linksOf(v1.nodes().get(v1.root())).get(0);
+        for (String cid : mine.reachable(child)) {
+            if (!cid.equals(child)) {
+                mine.remove(cid);
+            }
+        }
+        mine.remove(v1.root());
+        TreeFetchSession session = start(fabric, mine, v1.root(), List.of(), FetchOptions.defaults());
+        assertThat(mine.complete(v1.root())).as("the batches brought the rest while the walk was out").isTrue();
+        assertThat(session.isDone()).as("the walk is still out").isFalse();
+
+        assertThat(fabric.runUntilDone(80, TICK)).as(session.trace().toString()).isTrue();
+        assertThat(session.complete()).as(session.trace().toString()).isTrue();
+        assertThat(fabric.completed).as("the capability hears of the end, so it publishes the holding").isTrue();
+        assertThat(fabric.strikes).isEmpty();
+    }
+
+    /** Whether a holder's message answers one of the subtree walks it was asked for. */
+    private static boolean answersAWalk(SimTreeFabric.Holder holder, Object message) {
+        int req = message instanceof Messages.Nodes n ? n.req() : message instanceof Messages.TreeEnd e ? e.req() : -1;
+        return holder.received.stream().anyMatch(ask -> ask instanceof Messages.TreeWant w && w.req() == req);
+    }
 }

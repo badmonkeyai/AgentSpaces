@@ -62,6 +62,8 @@ import java.util.function.Consumer;
  * space per peer for the refs and a {@link Pdt} facade built before the content
  * swarm (so the swarm takes {@code pdt.treeStore()}) and attached after. Frames
  * travel inline, ticks run on the test thread, and leases run on the test clock.
+ * Every node runs in {@code ChannelAuth.SESSION} (SESSION test fleets, ROBUSTNESS.md §10.10; ShareTest's
+ * bridge test joined them, ROBUSTNESS.md §10.11).
  */
 class RefFleet {
 
@@ -83,7 +85,6 @@ class RefFleet {
     final Set<String> dead = new HashSet<>();
     final Map<String, java.util.concurrent.atomic.AtomicLong> nodeTickNanos = new ConcurrentHashMap<>();
     final java.util.concurrent.atomic.AtomicLong ticks = new java.util.concurrent.atomic.AtomicLong();
-
     record Peer(String name, PeerIdentity identity, PeerNode node, GroupRuntime runtime, ReplicatedSpace contentSpace,
                 ReplicatedSpace refSpace, Content content, NodeStore store, Pdt pdt, java.util.concurrent.atomic.AtomicLong pdtTickNanos,
                 java.util.concurrent.atomic.AtomicLong contentTickNanos) {
@@ -135,7 +136,10 @@ class RefFleet {
 
     Peer newPeer(String address, long seed, Spec spec, String... seedAddresses) throws IOException {
         PeerIdentity identity = PeerIdentity.generate();
-        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).build();
+        // SESSION test fleets (ROBUSTNESS.md §10.10): one signed SESSION_HELLO per connection, then a MAC per frame
+        // (SPEC §5.6), where SIGNED spent most of the fleet's CPU on Ed25519 frame signatures; the fabric attests
+        // nobody, so no frame travels bare (RefFleetSessionTest)
+        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).channelAuth(PeerNode.ChannelAuth.SESSION).build();
         node.listen(network.register(address), address);
         List<PeerAdvertisement.Endpoint> seeds = new ArrayList<>();
         for (String s : seedAddresses) {

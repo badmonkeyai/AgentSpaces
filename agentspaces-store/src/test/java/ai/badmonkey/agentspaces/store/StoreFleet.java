@@ -73,6 +73,14 @@ final class StoreFleet implements AutoCloseable {
 
     static final Codec<String> STR = Codec.of(String.class);
     static final Duration HOLDING = Duration.ofSeconds(2);
+    /*
+     * The product default. Each tick moves the test clock 250 ms while the stores' fetches run on their own
+     * threads, so on a loaded machine the clock outruns them: a 60 s timeout was 240 ticks, under a second of
+     * real time, and a starved fetch was abandoned though nothing was wrong (the winner of a pin race then
+     * held its take with nothing fetched). Ten minutes still abandons a truly stuck fetch inside a test's
+     * real-time wait; tests that probe the timeout set their own (PinProgressTest).
+     */
+    static final Duration FETCH_TIMEOUT = Duration.ofMinutes(10);
 
     final TestClock clock = TestClock.create();
     final SimNetwork network = new SimNetwork();
@@ -185,7 +193,7 @@ final class StoreFleet implements AutoCloseable {
         if (spec.store() != null) {
             ContentStore.Builder storeBuilder = ContentStore.builder(pdt, discovery, identity).name(address)
                     .policy(spec.store()).clock(clock).holdingInterval(HOLDING).takeLease(Duration.ofSeconds(20))
-                    .fetchTimeout(Duration.ofSeconds(60));
+                    .fetchTimeout(FETCH_TIMEOUT);
             if (spec.granted()) {
                 storeBuilder.authorizer(GRANT_ALL);
             }

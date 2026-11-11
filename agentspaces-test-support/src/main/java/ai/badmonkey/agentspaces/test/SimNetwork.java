@@ -54,6 +54,8 @@ public final class SimNetwork {
 
     private final Map<String, java.util.Deque<Held>> held = new ConcurrentHashMap<>();
     private final Set<String> holding = new CopyOnWriteArraySet<>();
+    /** Orders a release against a concurrent send on the same link, so no frame is stranded in a queue nobody drains. */
+    private final Object holdLock = new Object();
     private final Set<String> oneWayDrops = new CopyOnWriteArraySet<>();
     private final Map<String, java.util.concurrent.atomic.AtomicLong> oneWayDropped = new ConcurrentHashMap<>();
     private final Map<String, java.util.List<Consumer<byte[]>>> taps = new ConcurrentHashMap<>();
@@ -72,8 +74,11 @@ public final class SimNetwork {
     /** Delivers everything held from one node to another, in the given order; returns how many frames were delivered. */
     public int release(String from, String to, Order order, long seed) {
         String key = directed(from, to);
-        holding.remove(key);
-        java.util.Deque<Held> queue = held.remove(key);
+        java.util.Deque<Held> queue;
+        synchronized (holdLock) { // a frame sent mid-release joins this queue or goes straight through, never neither
+            holding.remove(key);
+            queue = held.remove(key);
+        }
         if (queue == null) {
             return 0;
         }
@@ -327,8 +332,12 @@ public final class SimNetwork {
                 wire = mutator.apply(wire);
             }
             if (holding.contains(key)) {
-                held.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedDeque<>()).add(new Held(target, wire));
-                return;
+                synchronized (holdLock) {
+                    if (holding.contains(key)) { // still held: a release did not run since the check above
+                        held.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedDeque<>()).add(new Held(target, wire));
+                        return;
+                    }
+                }
             }
             target.receiver.accept(wire);
         }

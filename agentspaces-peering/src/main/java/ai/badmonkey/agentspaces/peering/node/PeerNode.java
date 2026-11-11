@@ -506,7 +506,8 @@ public final class PeerNode implements AutoCloseable {
             new CopyOnWriteArrayList<>();
     /** Bound on remembered hint maps; least-recently-refreshed evict. */
     private static final int HINTS_CAPACITY = 4_096;
-    /** The hints last delivered per peer, so an unchanged refresh is not re-delivered. */
+    /** The hints each member's newest admitted self-advertisement carries, kept with or without a listener, so an
+     * unchanged refresh is not re-delivered and a listener registered later hears them (ISSUE-MemberHintSnapshot FR-2). */
     private final Map<PeerId, Map<String, String>> lastHints =
             java.util.Collections.synchronizedMap(
                     new java.util.LinkedHashMap<>(256, 0.75f, true) {
@@ -1500,11 +1501,22 @@ public final class PeerNode implements AutoCloseable {
      * Registers a credential-hint listener on a built node; the same contract
      * as {@link Builder#onCredentialHints}, for wiring that learns of the
      * listener after the node exists (the Spring starter's authorizer bean).
+     * It first hears the current hints of every member the node holds, so
+     * registering late misses nobody.
      *
      * @param listener receives the peer and its current hint map
      */
     public void onCredentialHints(BiConsumer<PeerId, Map<String, String>> listener) {
-        credentialHintListeners.add(Objects.requireNonNull(listener, "listener"));
+        Objects.requireNonNull(listener, "listener");
+        // ISSUE-MemberHintSnapshot FR-3: a listener registered after a member's admission hears the member's current
+        // hints now, not at its next change. Under the map's lock, so a change that lands meanwhile reaches the
+        // listener after the hints it replaces.
+        synchronized (lastHints) {
+            credentialHintListeners.add(listener);
+            for (Map.Entry<PeerId, Map<String, String>> e : List.copyOf(lastHints.entrySet())) {
+                listener.accept(e.getKey(), e.getValue());
+            }
+        }
     }
 
     /**
@@ -5179,9 +5191,6 @@ public final class PeerNode implements AutoCloseable {
             appCardLevels.remove(ad.issuer());
         }
         rememberReach(runtime.id(), ad);
-        if (credentialHintListeners.isEmpty()) {
-            return;
-        }
         Map<String, String> hints = ad.resourceHints();
         Map<String, String> previous = lastHints.put(ad.issuer(), hints);
         if (admission || !hints.equals(previous)) {

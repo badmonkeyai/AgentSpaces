@@ -237,6 +237,42 @@ class PeerClusterTest {
         assertThat(observer.offCredentialHints(listener)).as("taking off an absent listener is a no-op").isFalse();
     }
 
+    /**
+     * ISSUE-MemberHintSnapshot FR-2, FR-3 (spiral 6's shared build, 2026-11-11: a connector registered its listener after
+     * the starter's, once a replica was admitted, and never learnt the replica's credential, so every granted call was
+     * refused): a listener registered after a member's admission, with another listener registered first, hears the
+     * member's current hints at once, and a listener on a node that had none hears them too.
+     */
+    @Test
+    void aLateListenerHearsTheCurrentHintsOfEveryMember() throws Exception {
+        PeerNode observer = PeerNode.builder(PeerIdentity.generate()).clock(clock).randomSeed(34).build();
+        observer.listen(network.register("obs3"), "obs3");
+        nodes.add(observer);
+        List<Map.Entry<PeerId, Map<String, String>>> first = new CopyOnWriteArrayList<>();
+        PeerNode holder = newNode("holder3", 35);
+        holder.credentialHint(JoinCredentials.OIDC_HINT_KEY, "token-v1");
+        observer.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        holder.joinGroup(groupAd, GroupMembership.Config.defaults(), seed("obs3"));
+        tickAll(4);
+        List<Map.Entry<PeerId, Map<String, String>>> unheard = new CopyOnWriteArrayList<>();
+        observer.onCredentialHints((peer, hints) -> unheard.add(Map.entry(peer, hints)));
+        assertThat(unheard).as("a node with no listener at the admission still holds the member's hints")
+                .extracting(Map.Entry::getKey).containsExactly(holder.peerId());
+
+        observer.onCredentialHints((peer, hints) -> first.add(Map.entry(peer, hints)));
+        tickAll(4);
+        List<Map.Entry<PeerId, Map<String, String>>> late = new CopyOnWriteArrayList<>();
+        observer.onCredentialHints((peer, hints) -> late.add(Map.entry(peer, hints)));
+        assertThat(late).as("the member's current hints, at registration").hasSize(1);
+        assertThat(late.get(0).getKey()).isEqualTo(holder.peerId());
+        assertThat(late.get(0).getValue()).containsEntry(JoinCredentials.OIDC_HINT_KEY, "token-v1");
+
+        holder.credentialHint(JoinCredentials.OIDC_HINT_KEY, "token-v2");
+        tickAll(4);
+        assertThat(late).as("and every change after").hasSize(2);
+        assertThat(late.get(1).getValue()).containsEntry(JoinCredentials.OIDC_HINT_KEY, "token-v2");
+    }
+
     @Test
     void policyGroupDefersToTheValidator() throws Exception {
         PeerIdentity founderId = PeerIdentity.generate();

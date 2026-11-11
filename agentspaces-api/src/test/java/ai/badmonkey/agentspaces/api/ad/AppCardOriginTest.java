@@ -45,16 +45,23 @@ class AppCardOriginTest {
 
     private static final CborCodec CODEC = CborCodec.defaultCodec();
 
-    /** The card of golden vector app_card_origin_formats_cbor (neutral vectors, 2026-11-09). */
+    /**
+     * The card of golden vector app_card_origin_formats_cbor (neutral vectors, 2026-11-09; the realm values of SPEC
+     * v0.1.33, REALM.md §5 revision 4, 2026-11-11): the realm's semver in {@code origin.version}, the form and the
+     * specification commit in {@code realm.format}, {@code realm.commit}, {@code realm.digest} (the SHA-256 of the
+     * document {@code "realm:\n  name: example-realm\n  version: 1.0.0\n"}), and the app link as {@code url}.
+     */
     static AppCard imported() {
         Map<String, String> attrs = new LinkedHashMap<>();
         attrs.put("realm.namespace", "urn:realm:example-realm#");
         attrs.put("realm.reads", "Item,Order");
-        attrs.put("realm.format", "1");
+        attrs.put("realm.format", "yaml@89faba629f66e715421ba0f1b535142e4d2ef3aa");
+        attrs.put("realm.digest", "sha256:ae7219d1e1e24b382d3ffc38aeb92052628db2d0f55d5dc75b3a72fd19965637");
+        attrs.put("realm.commit", "0123456789abcdef0123456789abcdef01234567");
         return new AppCard("aspace://zApps/app/zPeerA/example-app", PeerId.of("zPeerA"), GroupId.of("zApps"),
                 Instant.parse("2026-11-09T09:00:00Z"), Duration.ofMinutes(15), "example-app", "fed", "static", "example-realm",
-                List.of(), List.of(), "", "https://apps.example.org/example-app.html", "", "1", List.of(), null)
-                .withOrigin(AppCard.Origin.of("realm", "example-realm/example-app", "", attrs))
+                List.of(), List.of(), "", "app://example-realm/example-app", "", "1", List.of(), null)
+                .withOrigin(AppCard.Origin.of("realm", "example-realm/example-app", "1.0.0", attrs))
                 .withFormats(List.of("text/html", "application/geo+json", "urn:realm:example-realm#"));
     }
 
@@ -78,7 +85,7 @@ class AppCardOriginTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> attrs = (Map<String, Object>) origin.get("attrs");
         assertThat(new ArrayList<>(attrs.keySet())).as("the P2 key order: shorter UTF-8 first, then bytewise")
-                .containsExactly("realm.reads", "realm.format", "realm.namespace");
+                .containsExactly("realm.reads", "realm.commit", "realm.digest", "realm.format", "realm.namespace");
         Path vector = Path.of("src/test/resources/vectors/app_card_origin_formats_cbor.hex");
         String hex = HexFormat.of().formatHex(bytes);
         if (!Files.exists(vector)) {

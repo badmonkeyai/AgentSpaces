@@ -1765,15 +1765,22 @@ public final class GoldenVectors {
         GroupId apps = GroupId.of("zApps");
         java.time.Instant at = java.time.Instant.parse("2026-11-09T09:00:00Z");
 
-        // app_card_origin_formats_cbor: a fed static card with origin and formats; the three attrs keys pin the P2 key order
+        // app_card_origin_formats_cbor: a fed static card with origin and formats; the five attrs keys pin the P2 key order
+        // (shorter first, then the three keys of 12 bytes bytewise). v0.1.33 (REALM.md §5 revision 4, 2026-11-11) gives
+        // it the realm values: the realm's semver in origin.version, realm.format the form read and the commit of the
+        // Embabel Realm Specification the reader follows, realm.commit the realm's own commit, realm.digest the SHA-256
+        // of a small import document, and the app link app://<realm>/<app> as url
+        String realmDocument = "realm:\n  name: example-realm\n  version: 1.0.0\n";
         Map<String, String> attrs = new java.util.LinkedHashMap<>();
         attrs.put("realm.namespace", "urn:realm:example-realm#");
         attrs.put("realm.reads", "Item,Order");
-        attrs.put("realm.format", "1");
+        attrs.put("realm.format", "yaml@89faba629f66e715421ba0f1b535142e4d2ef3aa");
+        attrs.put("realm.digest", "sha256:" + hex.formatHex(Digests.sha256(realmDocument.getBytes(StandardCharsets.UTF_8))));
+        attrs.put("realm.commit", "0123456789abcdef0123456789abcdef01234567");
         ai.badmonkey.agentspaces.api.ad.AppCard imported = new ai.badmonkey.agentspaces.api.ad.AppCard(
                 "aspace://zApps/app/zPeerA/example-app", peer, apps, at, Duration.ofMinutes(15), "example-app", "fed", "static",
-                "example-realm", List.of(), List.of(), "", "https://apps.example.org/example-app.html", "", "1", List.of(), null)
-                .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("realm", "example-realm/example-app", "", attrs))
+                "example-realm", List.of(), List.of(), "", "app://example-realm/example-app", "", "1", List.of(), null)
+                .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("realm", "example-realm/example-app", "1.0.0", attrs))
                 .withFormats(List.of("text/html", "application/geo+json", "urn:realm:example-realm#"));
         json.append(field("app_card_origin_formats_cbor", hex.formatHex(codec.toBytes(imported))));
 
@@ -1813,8 +1820,18 @@ public final class GoldenVectors {
         json.append(number("card_spill_threshold_bytes", ai.badmonkey.agentspaces.api.ad.CardSpill.SPILL_THRESHOLD_BYTES));
         json.append(number("card_spill_warn_bytes", ai.badmonkey.agentspaces.api.ad.CardSpill.WARN_THRESHOLD_BYTES));
 
-        // the refusals: each is undecodable under SPEC §6.1b and §6.1a.2 to §6.1a.5
-        RawAppCard raw = RawAppCard.of(imported);
+        // the refusals: each is undecodable under SPEC §6.1b and §6.1a.2 to §6.1a.5. They start from the realm card of
+        // v0.1.32, so the v0.1.33 realm values of app_card_origin_formats_cbor leave their bytes as they were
+        Map<String, String> v0132Attrs = new java.util.LinkedHashMap<>();
+        v0132Attrs.put("realm.namespace", "urn:realm:example-realm#");
+        v0132Attrs.put("realm.reads", "Item,Order");
+        v0132Attrs.put("realm.format", "1");
+        ai.badmonkey.agentspaces.api.ad.AppCard refusalBase = new ai.badmonkey.agentspaces.api.ad.AppCard(
+                "aspace://zApps/app/zPeerA/example-app", peer, apps, at, Duration.ofMinutes(15), "example-app", "fed", "static",
+                "example-realm", List.of(), List.of(), "", "https://apps.example.org/example-app.html", "", "1", List.of(), null)
+                .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("realm", "example-realm/example-app", "", v0132Attrs))
+                .withFormats(List.of("text/html", "application/geo+json", "urn:realm:example-realm#"));
+        RawAppCard raw = RawAppCard.of(refusalBase);
         RawOrigin origin = raw.origin();
         RawAppCard hosted = RawAppCard.of(hostCardOf());
         RawAppCard stub = RawAppCard.of(boardStub);

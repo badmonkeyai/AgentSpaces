@@ -157,6 +157,83 @@ class NeutralityGuardTest {
     }
 
     @Test
+    void sweepFindsAPlantedInternalReferenceInEverySpecificationDocument(@TempDir Path workspace) throws IOException {
+        Path core = workspace.resolve("agentspaces");
+        write(core.resolve("tools/golden/golden.json"), "{}\n");
+        write(core.resolve("agentspaces-api/src/main/java/A.java"), "/** Built for ISSUE-AppCard, see srad/x.md. */\nclass A {\n}\n");
+        Path spec = workspace.resolve("agentspaces-spec");
+        write(spec.resolve("SPEC.md"), "# SPEC\n\n**6.1a.2 The AppCard (v0.1.25 addendum; ISSUE-AppCard).**\n");
+        write(spec.resolve("TECH-SPEC.md"), "# TECH-SPEC\n\nThe DTLS binding (v0.1.19, SRAD `srad/dtls-support.md`) runs.\n");
+        write(spec.resolve("REALM.md"), "# REALM\n\nSee `reviews/realm-spec-review-2026-11-10.md`.\n");
+        write(spec.resolve("REGISTRY.md"), "# REGISTRY\n\nWritten under owner decision 1 of 2026-11-09.\n");
+        write(spec.resolve("README.md"), "# README\n\nA reader ignores a key it does not know (P2-F-03).\n");
+        write(spec.resolve("golden.json"), "{}\n");
+        write(spec.resolve("docs/vectors.md"), "# Vectors\n\nThe subordinate-key vectors (QA4 A4-7 phase 1).\n");
+
+        NeutralityGuard.Report report = NeutralityGuard.sweep(core);
+
+        assertThat(report.findings()).extracting(Finding::file, Finding::line, Finding::name).containsExactly(
+                tuple("agentspaces-spec/README.md", 3, "P2-F-03"),
+                tuple("agentspaces-spec/REALM.md", 3, "reviews/"),
+                tuple("agentspaces-spec/REGISTRY.md", 3, "owner decision"),
+                tuple("agentspaces-spec/SPEC.md", 3, "ISSUE-AppCard"),
+                tuple("agentspaces-spec/TECH-SPEC.md", 3, "SRAD"),
+                tuple("agentspaces-spec/TECH-SPEC.md", 3, "srad/"),
+                tuple("agentspaces-spec/docs/vectors.md", 3, "QA4"),
+                tuple("agentspaces-spec/docs/vectors.md", 3, "A4-7"));
+    }
+
+    @Test
+    void findsEachKindOfInternalReferenceInASpecificationDocument() {
+        String text = String.join("\n",
+                "the AppCard revision of ISSUE-AppCardOriginFormats",
+                "PDT 2 (srad/agentspaces-pdt2.md §10)",
+                "see reviews/realm-spec-review-2026-11-10.md",
+                "VCDIFF frames (P2-Z-05) and the relay (LB-E-04, JS-W-11, FR-22, ASF-047, JC-4)",
+                "the QA2 workstreams and the PERF2 round",
+                "the DTLS revision (SRAD dtls-support)",
+                "(HLC round six, 2026-11-08, owner ruling F4)",
+                "the owner's rulings of that day, and the owner answers 3");
+
+        assertThat(NeutralityGuard.scanSpecification("SPEC.md", text)).extracting(Finding::line, Finding::name)
+                .containsExactly(
+                        tuple(1, "ISSUE-AppCardOriginFormats"),
+                        tuple(2, "srad/"),
+                        tuple(3, "reviews/"),
+                        tuple(4, "P2-Z-05"),
+                        tuple(4, "LB-E-04"),
+                        tuple(4, "JS-W-11"),
+                        tuple(4, "FR-22"),
+                        tuple(4, "ASF-047"),
+                        tuple(4, "JC-4"),
+                        tuple(5, "QA2"),
+                        tuple(5, "PERF2"),
+                        tuple(6, "SRAD"),
+                        tuple(7, "HLC round"),
+                        tuple(7, "owner ruling"),
+                        tuple(8, "owner's rulings"),
+                        tuple(8, "owner answers"));
+    }
+
+    @Test
+    void leavesTheSpecificationsOwnWordsAlone() {
+        String text = String.join("\n",
+                "`DIRECTIVE_ISSUER` and `MAX_CLAIM_PREDATES_ISSUE_MILLIS`",
+                "UTF-8, UTF-16, SHA-256, AES-256, P-256, ISO-8601, SipHash-2-4, DAG-CBOR",
+                "rule F4 of §9.2, the item rules S1 to S12, and P2: everything is leased",
+                "nothing lives forever without an owner renewing it; its owner sets a price",
+                "an adversarial review of the same day, and the fifth review round",
+                "https://github.com/example/agentspaces/issues/16 and the `issues` space");
+
+        assertThat(NeutralityGuard.scanSpecification("SPEC.md", text)).isEmpty();
+    }
+
+    @Test
+    void internalReferencesCountOnlyInTheSpecification() {
+        assertThat(NeutralityGuard.scan("A.java", "// built for ISSUE-AppCard, see srad/x.md (P2-F-03)\n")).isEmpty();
+    }
+
+    @Test
     void sweepFailsWhenASpecificationDocumentIsMissing(@TempDir Path workspace) throws IOException {
         Path core = workspace.resolve("agentspaces");
         write(core.resolve("tools/golden/golden.json"), "{}\n");
@@ -172,7 +249,9 @@ class NeutralityGuardTest {
         NeutralityGuard.Report report = NeutralityGuard.sweep(Path.of(".."));
 
         assertThat(report.read()).contains("agentspaces/tools/golden/golden.json");
-        assertThat(report.findings()).as("platform names in the neutral inputs (run agentspaces/tools/neutrality-check.sh)")
+        assertThat(report.findings())
+                .as("platform names in the neutral inputs, or internal references in the specification"
+                        + " (run agentspaces/tools/neutrality-check.sh)")
                 .isEmpty();
     }
 

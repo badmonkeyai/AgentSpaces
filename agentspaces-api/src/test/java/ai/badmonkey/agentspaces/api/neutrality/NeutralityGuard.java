@@ -26,6 +26,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -65,14 +66,26 @@ import java.util.stream.Stream;
  * {@code console} of {@code REGISTRY.md}, the open catalogs {@code agentspaces-viz} and {@code agentspaces-widgets},
  * and the words realm, console, and tenant in prose and refusal vectors.
  *
+ * <p>The specification is public, so its documents ({@code agentspaces-spec/*.md} and the Markdown files under
+ * {@code agentspaces-spec/docs/}) also name nothing that points into the vendor's own planning: the patterns of
+ * {@link #INTERNAL} find an internal ticket name ({@code ISSUE-} and a name), a path into the planning or review
+ * folders ({@code srad/}, {@code reviews/}), an internal plan or finding id (such as {@code P2-F-03}, {@code A4-7},
+ * {@code ASF-047}, {@code QA4}, or {@code PERF2}), the word SRAD, a review-round label ({@code HLC round}), and
+ * process wording about the owner's rulings, decisions, or answers. A document says instead what a rule is for and
+ * which version of the specification brought it. These patterns never match the specification's own words:
+ * {@code DIRECTIVE_ISSUER}, UTF-8, SHA-256, P-256, the rule labels S1 to S12, P1 to P4, F1 to F4, and R1 to R12, the
+ * principle P2, an owner who renews a lease, or an adversarial review. They read the specification alone; the core,
+ * a2ui, and commerce sources keep their own references.
+ *
  * <p>The core gate runs it as {@code NeutralityGuardTest}. The plain command line, from the workspace root, is
  * {@code agentspaces/tools/neutrality-check.sh}, or with the JDK alone
  * {@code java agentspaces/agentspaces-api/src/test/java/ai/badmonkey/agentspaces/api/neutrality/NeutralityGuard.java agentspaces};
- * it prints each finding as {@code file:line:column} and exits 1 when it finds any.
+ * it prints each finding as {@code file:line:column} and exits 1 when it finds any platform name or internal
+ * reference.
  */
 public final class NeutralityGuard {
 
-    /** One platform name in one line of one file. */
+    /** One platform name, or one internal reference in a specification document, in one line of one file. */
     public record Finding(String file, int line, int column, String name, String names, String context) {
         @Override
         public String toString() {
@@ -100,6 +113,18 @@ public final class NeutralityGuard {
             new Deny(Pattern.compile("enterprise-platform"), "the platform's project"),
             new Deny(Pattern.compile("(?i)bad monkey agentic ai platform"), "the platform's product name"));
 
+    /** What a public specification document never names: references into the vendor's own planning and reviews. */
+    private static final List<Deny> INTERNAL = List.of(
+            new Deny(Pattern.compile("(?<![A-Za-z0-9_])ISSUE-[A-Za-z0-9][A-Za-z0-9-]*"), "an internal ticket name"),
+            new Deny(Pattern.compile("(?<![A-Za-z0-9_/.-])(?:srad|reviews)/"), "a path into the internal planning or review folders"),
+            new Deny(Pattern.compile("(?<![A-Za-z0-9_-])(?:P2|PD|S6|AD|LB|CQ|FR|A4|ASF|JC|JD|JS|G2|PRF|TODO)-(?:[A-Z]-)?[0-9]{1,3}(?![0-9A-Za-z])"),
+                    "an internal plan or finding id"),
+            new Deny(Pattern.compile("(?<![A-Za-z0-9_])(?:QA|PERF)[0-9](?![0-9A-Za-z])"), "an internal review or performance pass"),
+            new Deny(Pattern.compile("(?<![A-Za-z0-9_])SRAD(?![A-Za-z0-9_])"), "an internal design document"),
+            new Deny(Pattern.compile("(?<![A-Za-z0-9_])HLC round(?![A-Za-z0-9_])"), "an internal review-round label"),
+            new Deny(Pattern.compile("(?i)(?<![A-Za-z0-9_])owner(?:'s)? (?:rulings?|decisions?|answers?)(?![A-Za-z0-9_])"),
+                    "process wording about internal decisions"));
+
     /** The specification documents a sweep requires beside {@code golden.json}. */
     private static final List<String> SPEC_DOCUMENTS = List.of("SPEC.md", "TECH-SPEC.md", "REALM.md", "REGISTRY.md");
     private static final Set<String> BUILD_DIRECTORIES = Set.of("target", "node_modules", ".git");
@@ -120,6 +145,7 @@ public final class NeutralityGuard {
         Path root = core.toAbsolutePath().normalize();
         Path workspace = root.getParent();
         List<Path> files = new ArrayList<>();
+        Set<Path> documents = new HashSet<>();
         files.add(root.resolve("tools/golden/golden.json"));
         files.addAll(tree(root.resolve("agentspaces-api/src/test/resources/vectors"), file -> true));
         files.addAll(tree(root, file -> isMain(root.relativize(file))));
@@ -128,13 +154,15 @@ public final class NeutralityGuard {
             // golden.json and the *.md documents only: golden-examples.json is the platform's file and stays unread.
             files.add(spec.resolve("golden.json"));
             SPEC_DOCUMENTS.forEach(document -> files.add(spec.resolve(document)));
-            try (Stream<Path> documents = Files.list(spec)) {
-                documents.filter(file -> file.getFileName().toString().endsWith(".md"))
+            try (Stream<Path> others = Files.list(spec)) {
+                others.filter(file -> file.getFileName().toString().endsWith(".md"))
                         .filter(file -> !SPEC_DOCUMENTS.contains(file.getFileName().toString()))
                         .sorted()
                         .forEach(files::add);
             }
             files.addAll(tree(spec.resolve("docs"), file -> file.getFileName().toString().endsWith(".md")));
+            files.stream().filter(file -> file.startsWith(spec) && file.getFileName().toString().endsWith(".md"))
+                    .forEach(documents::add);
         }
         Path a2ui = workspace.resolve("agentspaces-a2ui");
         if (Files.isDirectory(a2ui)) {
@@ -156,7 +184,8 @@ public final class NeutralityGuard {
             }
             String name = workspace.relativize(file).toString().replace(file.getFileSystem().getSeparator(), "/");
             read.add(name);
-            findings.addAll(scan(name, new String(bytes, StandardCharsets.UTF_8)));
+            String text = new String(bytes, StandardCharsets.UTF_8);
+            findings.addAll(documents.contains(file) ? scanSpecification(name, text) : scan(name, text));
         }
         findings.sort(Comparator.comparing(Finding::file).thenComparingInt(Finding::line).thenComparingInt(Finding::column));
         return new Report(List.copyOf(read), List.copyOf(findings));
@@ -170,16 +199,35 @@ public final class NeutralityGuard {
      * @return the findings, by line and column
      */
     public static List<Finding> scan(String file, String text) {
+        return scan(file, text, false);
+    }
+
+    /**
+     * Finds every platform name and every internal reference in one specification document's text, one finding per
+     * name and line.
+     *
+     * @param file the document's name, as the findings report it
+     * @param text the document's text
+     * @return the findings, by line and column
+     */
+    public static List<Finding> scanSpecification(String file, String text) {
+        return scan(file, text, true);
+    }
+
+    private static List<Finding> scan(String file, String text, boolean specification) {
         List<Finding> found = new ArrayList<>();
         String[] lines = text.split("\n", -1);
         for (int index = 0; index < lines.length; index++) {
             String line = lines[index];
             Map<String, Finding> named = new LinkedHashMap<>();
-            match(file, index + 1, 0, line, null, named);
+            match(file, index + 1, 0, line, null, named, DENIED);
+            if (specification) {
+                match(file, index + 1, 0, line, null, named, INTERNAL);
+            }
             Matcher hex = HEX_RUN.matcher(line);
             while (hex.find()) {
                 for (String decoded : strings(HexFormat.of().parseHex(hex.group()))) {
-                    match(file, index + 1, hex.start(), decoded, "hex-decoded", named);
+                    match(file, index + 1, hex.start(), decoded, "hex-decoded", named, DENIED);
                 }
             }
             named.values().stream().sorted(Comparator.comparingInt(Finding::column)).forEach(found::add);
@@ -188,7 +236,7 @@ public final class NeutralityGuard {
     }
 
     /**
-     * Sweeps from the command line and exits 1 when it finds a platform name.
+     * Sweeps from the command line and exits 1 when it finds a platform name or an internal reference.
      *
      * @param args the core directory, {@code .} by default
      * @throws IOException when a required file is missing or a file cannot be read
@@ -196,15 +244,16 @@ public final class NeutralityGuard {
     public static void main(String[] args) throws IOException {
         Report report = sweep(Path.of(args.length > 0 ? args[0] : "."));
         report.findings().forEach(System.out::println);
-        System.out.printf("neutrality check: %d files read, %d platform names found%n",
+        System.out.printf("neutrality check: %d files read, %d platform names or internal references found%n",
                 report.read().size(), report.findings().size());
         if (!report.findings().isEmpty()) {
             System.exit(1);
         }
     }
 
-    private static void match(String file, int line, int column, String text, String decoded, Map<String, Finding> named) {
-        for (Deny deny : DENIED) {
+    private static void match(String file, int line, int column, String text, String decoded, Map<String, Finding> named,
+            List<Deny> denied) {
+        for (Deny deny : denied) {
             Matcher matcher = deny.pattern().matcher(text);
             while (matcher.find()) {
                 String context = excerpt(text, matcher.start(), matcher.end());

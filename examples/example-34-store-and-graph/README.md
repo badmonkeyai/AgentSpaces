@@ -20,7 +20,7 @@ half, as a crash would leave it. It reconciles its held roots with `store-b`
 by negentropy and fetches what it lost.
 
 The libraries are `agentspaces-pdt` and `agentspaces-store`
-(`srad/agentspaces-pdt2.md`). A `db` value is a DataScript database as a tree
+(SPEC annex H and §6.1a.6). A `db` value is a DataScript database as a tree
 of `dn` nodes in three indexes, and a transaction rides on the head as the
 tail. A content store is a member that takes signed pins from the content
 space, holds their roots, writes receipts, answers possession challenges
@@ -42,16 +42,16 @@ role and passes the reader's node requests to the analysts.
 
 ## What the steps show
 
-| Step | What happens | Row |
-|---|---|---|
-| graph v0 | The graph peer folds every datom into the three indexes of the first version | P2-D-01, P2-D-03 |
-| analysts | Two analysts add three to five findings each at once; every swap takes the head the one before it wrote, so the versions form one chain | PD-R-04, P2-D-03 |
-| one transaction | A finding's datoms ride on the head in the tail: the new root and the tail node, under 2 KB | P2-Q-PRF-01 |
-| Python lookup | The reader answers the lookup and the findings about Acme, the tail's included, from a few nodes of the graph | P2-D-04, P2-D-09, PD-Q-INT-01 |
-| pin | The data agent pins the table for two copies; both stores take it and write receipts, one of them blind | P2-S-03, P2-S-08 |
-| the writer leaves | The late reader fetches every byte from the two stores and reads back the writer's BLAKE3 identity | P2-Q-REL-02, P2-B-01 |
-| challenges | The reader challenges each store with 16 picks; the blind store proves the sealed nodes without the key | P2-S-07, P2-Q-REL-03 |
-| restart and reconcile | `store-a` restarts with a pack cut in half, finds the table incomplete, reconciles with `store-b`, and fetches what it lost | P2-K-03, P2-Q-REL-06 |
+| Step | What happens |
+|---|---|
+| graph v0 | The graph peer folds every datom into the three indexes of the first version |
+| analysts | Two analysts add three to five findings each at once; every swap takes the head the one before it wrote, so the versions form one chain |
+| one transaction | A finding's datoms ride on the head in the tail: the new root and the tail node, under 2 KB |
+| Python lookup | The reader answers the lookup and the findings about Acme, the tail's included, from a few nodes of the graph |
+| pin | The data agent pins the table for two copies; both stores take it and write receipts, one of them blind |
+| the writer leaves | The late reader fetches every byte from the two stores and reads back the writer's BLAKE3 identity |
+| challenges | The reader challenges each store with 16 picks; the blind store proves the sealed nodes without the key |
+| restart and reconcile | `store-a` restarts with a pack cut in half, finds the table incomplete, reconciles with `store-b`, and fetches what it lost |
 
 The stores follow the ref space lazily, so a store holds what a requester
 pinned on it and nothing a ref happens to name. The reconcile is the only

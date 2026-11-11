@@ -45,15 +45,17 @@ import java.util.stream.Stream;
  * <p>A sweep reads the inputs the ruling covers, relative to the core directory {@code agentspaces/} and its workspace:
  * <ul>
  *   <li>{@code agentspaces-spec/golden.json} and its vendored copy {@code agentspaces/tools/golden/golden.json};</li>
- *   <li>the api pins {@code agentspaces/agentspaces-api/src/test/resources/vectors/}, and the a2ui pins
- *       {@code agentspaces-a2ui/src/test/resources/vectors/} and {@code golden/};</li>
- *   <li>the specification: {@code SPEC.md}, {@code TECH-SPEC.md}, {@code REALM.md}, {@code REGISTRY.md}, and every
- *       other {@code agentspaces-spec/*.md};</li>
- *   <li>every file under a {@code src/main} of the core, and under {@code agentspaces-a2ui/src/main}.</li>
+ *   <li>the api pins {@code agentspaces/agentspaces-api/src/test/resources/vectors/}, the a2ui pins
+ *       {@code agentspaces-a2ui/src/test/resources/vectors/} and {@code golden/}, and the commerce pins
+ *       {@code agentspaces-commerce/src/test/resources/vectors/};</li>
+ *   <li>the specification: {@code SPEC.md}, {@code TECH-SPEC.md}, {@code REALM.md}, {@code REGISTRY.md}, every
+ *       other {@code agentspaces-spec/*.md}, and every Markdown file under {@code agentspaces-spec/docs/};</li>
+ *   <li>every file under a {@code src/main} of the core, under {@code agentspaces-a2ui/src/main}, and under
+ *       {@code agentspaces-commerce/src/main}.</li>
  * </ul>
  * It never reads {@code golden-examples.json}, the non-normative file of one console's realistic vectors (owner
- * answer 6). The specification and a2ui inputs are read when their directories sit beside the core, as they do in
- * the workspace; a standalone core checkout has neither.
+ * answer 6). The specification, a2ui, and commerce inputs are read when their directories sit beside the core, as
+ * they do in the workspace; a standalone core checkout has none of them.
  *
  * <p>Every line is matched as text, and every run of hex in it is decoded and matched too: each CBOR text or byte
  * string inside the bytes that holds printable UTF-8, and the whole run when it is such text. That is how the review
@@ -108,7 +110,7 @@ public final class NeutralityGuard {
     }
 
     /**
-     * Sweeps the core directory and the specification and a2ui directories beside it.
+     * Sweeps the core directory and the specification, a2ui, and commerce directories beside it.
      *
      * @param core the core directory, {@code agentspaces/}
      * @return the files read and the platform names found
@@ -132,12 +134,18 @@ public final class NeutralityGuard {
                         .sorted()
                         .forEach(files::add);
             }
+            files.addAll(tree(spec.resolve("docs"), file -> file.getFileName().toString().endsWith(".md")));
         }
         Path a2ui = workspace.resolve("agentspaces-a2ui");
         if (Files.isDirectory(a2ui)) {
             files.addAll(tree(a2ui.resolve("src/main"), file -> true));
             files.addAll(tree(a2ui.resolve("src/test/resources/vectors"), file -> true));
             files.addAll(tree(a2ui.resolve("src/test/resources/golden"), file -> true));
+        }
+        Path commerce = workspace.resolve("agentspaces-commerce");
+        if (Files.isDirectory(commerce)) {
+            files.addAll(tree(commerce.resolve("src/main"), file -> true));
+            files.addAll(tree(commerce.resolve("src/test/resources/vectors"), file -> true));
         }
         List<String> read = new ArrayList<>();
         List<Finding> findings = new ArrayList<>();

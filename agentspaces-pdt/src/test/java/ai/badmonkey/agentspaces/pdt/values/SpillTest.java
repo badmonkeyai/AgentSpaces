@@ -252,7 +252,8 @@ class SpillTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> map.assoc("big", text))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("CBOR bytes exceeds the " + Spill.MAX_X_VALUE)
-                .hasMessageContaining("1 MiB");
+                .hasMessageContaining("1 MiB")
+                .hasMessageContaining("store a value this large as a byte string");
         String fits = "t".repeat(1_000_000);
         PMap<String, String> held = map.assoc("fits", fits);
         assertThat(kinds(store, held.root())).containsExactlyInAnyOrder(Kind.M, Kind.X);

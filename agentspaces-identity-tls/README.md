@@ -8,7 +8,7 @@ or under a CA trust read afresh on every call.
 
 **Architecture position.** Layer 0, Identity (a helper for the Layer 1 bindings). Used by `tls`
 (`agentspaces-peering`) and `dtls` (`agentspaces-transport-dtls`), and planned for `wss`. One copy,
-so a fix to the attestation path lands everywhere at once (SRAD `srad/dtls-support.md` DT-A-05).
+so a fix to the attestation path lands everywhere at once.
 
 ## Key dependencies
 

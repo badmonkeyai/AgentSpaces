@@ -37,7 +37,7 @@ final class TextNode extends TreeNode {
         try {
             this.node = PText.fromWire(value).encode();
         } catch (NodeFormatException tooLarge) {
-            throw new IllegalArgumentException("a text value whose t node exceeds the 1 MiB node bound (PD-N-04): "
+            throw new IllegalArgumentException("a text value whose t node exceeds the 1 MiB node bound; split it into smaller texts: "
                     + tooLarge.getMessage(), tooLarge);
         }
     }

@@ -62,7 +62,7 @@ mirror, `JoinTicket` (the issue #16 reserved type, real class in
 `agentspaces-agent`), stands in for a module outside this classpath: the
 generator checks it only when the class loads and prints a note otherwise, so
 `agentspaces-agent/target/classes` on `CP` turns that check on. The `pdt_*`
-vectors (srad/agentspaces-pdt.md PD-N-07) come from
+vectors come from
 `ai.badmonkey.agentspaces.pdt.golden.PdtVectors`, which the generator calls by
 reflection: with `agentspaces-pdt/target/classes` on `CP` (and
 `agentspaces-content/target/classes`, which it needs at run time) they are

@@ -17,6 +17,8 @@ One dependency matches each way an application is built:
 
 The bill of materials, `agentspaces-dependencies`, manages the version of every module in this repository and of the third-party libraries the suite is tested against (Jackson, BouncyCastle, Netty QUIC, Nimbus). Import it once and leave the version off every AgentSpaces dependency. The Spring AI and Micronaut libraries release from their own repositories and carry their own version; see their READMEs.
 
+The open commerce records (`Mandate`, `Order`, and the AP2 credential chain check `Mandates.verify`) are [`agentspaces-commerce`](https://github.com/badmonkeyai/agentspaces-commerce), which also releases from its own repository: `ai.badmonkey.agentspaces:agentspaces-commerce:0.6.0`.
+
 ## Maven (`pom.xml`)
 
 ```xml

@@ -664,7 +664,8 @@ final class FetchSession implements Fetch {
                 if (!fabric.mayRequest(source.rangeLength)) {
                     if (!downloadBudgetNoted) {
                         downloadBudgetNoted = true;
-                        note("the download budget for today is spent; waiting for the next day (LB-P-06)");
+                        note("the download budget for today is spent; waiting for the next day;"
+                                + " ContentPolicy.downloadBytesPerDay sets the budget");
                     }
                     return;
                 }

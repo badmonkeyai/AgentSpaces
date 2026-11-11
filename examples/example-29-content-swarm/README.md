@@ -8,7 +8,7 @@ artifact into the second group from one store, and a member there fetches it
 from the bridge.
 
 The capability is `aspace:cap/content-swarm` (`agentspaces-content`,
-`srad/large-networks-bulk-data.md`): the space replicates a small signed
+SPEC annex G): the space replicates a small signed
 manifest and a leased holding per member, and the bytes move on capability pipes
 over whatever transport sessions exist. The demo runs every peer on `tcp`; the
 swarm never names a binding, and `ContentSwarmFleet.start` takes a map of
@@ -40,7 +40,7 @@ sources each worker drew from, and the bridge's share into the second group.
   skipped without it unless `-Dtsclient.required=true`. The mixed fleet also
   asserts that the busiest source's window stays at least half full and that no
   peer suspects another while pieces flow.
-- `ContentRelaySitesTest`: scenario 3 of the SRAD over real sockets. Two
+- `ContentRelaySitesTest`: sites behind relays, over real sockets. Two
   dial-only kits sit behind their own site relays, and both relays attach to a
   headquarters relay. Loopback cannot hide a listener, so the sites are kept
   apart by binding: site A speaks `ws`, site B `tls`, and the relays reach

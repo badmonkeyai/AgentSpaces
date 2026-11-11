@@ -19,6 +19,7 @@ import ai.badmonkey.agentspaces.api.ad.AgentCard;
 import ai.badmonkey.agentspaces.api.ad.AssetCard;
 import ai.badmonkey.agentspaces.api.ad.CapabilityAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
+import ai.badmonkey.agentspaces.api.ad.ModelCard;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.SpaceAdvertisement;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
@@ -184,6 +185,63 @@ class SemanticDiscoveryTest {
         assertThat(matches).isNotEmpty();
         assertThat(((AgentCard) matches.get(0).advertisement()).agent().localName())
                 .isEqualTo("desk");
+    }
+
+    private ModelCard model(Wired peer, String name, String version, List<String> tasks, String modality,
+                            String engine, String licence) {
+        return new ModelCard("aspace://" + groupId.value() + "/model/" + name + "@" + version,
+                peer.identity().peerId(), groupId, clock.instant(), Duration.ofMinutes(15),
+                name, version, tasks, modality, Map.of(), licence, Map.of(), Map.of(), Map.of(), Map.of(),
+                engine, List.of(peer.identity().peerId()));
+    }
+
+    /**
+     * SPEC §6.1a.1: a ModelCard ranks by its name, version, tasks, modality, engine, and licence, the text the
+     * TypeScript, Python, and Ruby clients index, so every implementation ranks a model card alike.
+     */
+    @Test
+    void aModelCardRanksByItsNameTasksAndEngine() throws Exception {
+        Wired peer = newPeer("a", 1, Set.of());
+        publishFixtures(peer);
+        ModelCard classifier = model(peer, "claims-classifier", "1.2", List.of("classify", "embed"), "text",
+                "onnx", "Apache-2.0");
+        ModelCard transcriber = model(peer, "meeting-transcriber", "3", List.of("transcribe"), "audio",
+                "vllm", "MIT");
+        peer.discovery().publish(signer.sign(classifier, peer.identity()));
+        peer.discovery().publish(signer.sign(transcriber, peer.identity()));
+
+        assertThat(SemanticDiscovery.textOf(model(peer, "m", "1", List.of("classify", "embed"), "text",
+                "onnx", "Apache-2.0"))).isEqualTo("m 1 classify embed text onnx Apache-2.0");
+
+        List<SemanticDiscovery.Match> forClassifier = peer.semantic().query("classify claims onnx", 5);
+        assertThat(forClassifier).isNotEmpty();
+        assertThat(forClassifier.get(0).advertisement()).isEqualTo(classifier);
+
+        List<SemanticDiscovery.Match> forAudio = peer.semantic().query("transcribe audio", 5);
+        assertThat(forAudio).isNotEmpty();
+        assertThat(forAudio.get(0).advertisement()).isEqualTo(transcriber);
+    }
+
+    /** SPEC §6.1a.1 and §8: a rendezvous answers a remote query with the model cards it ranks, by the same text. */
+    @Test
+    void aNewcomerFindsAModelCardThroughTheRendezvous() throws Exception {
+        Wired rendezvous = newPeer("rdv", 1, Set.of(PeerAdvertisement.PeerRole.RENDEZVOUS));
+        Wired newcomer = newPeer("new", 2, Set.of(), "rdv");
+        tickAll(4);
+        network.partition("rdv", "new");
+        ModelCard classifier = model(rendezvous, "claims-classifier", "1.2", List.of("classify", "embed"), "text",
+                "onnx", "Apache-2.0");
+        rendezvous.discovery().publish(signer.sign(classifier, rendezvous.identity()));
+        network.heal();
+        assertThat(newcomer.discovery().find(ModelCard.class, c -> true))
+                .as("the newcomer's cache is cold by construction").isEmpty();
+
+        List<SemanticDiscovery.Match> matches = newcomer.semantic()
+                .remoteQuery("classify claims onnx", 5, Duration.ofSeconds(2));
+
+        assertThat(matches).isNotEmpty();
+        assertThat(matches.get(0).advertisement()).isEqualTo(classifier);
+        assertThat(newcomer.discovery().find(ModelCard.class, c -> true)).containsExactly(classifier);
     }
 
     @Test

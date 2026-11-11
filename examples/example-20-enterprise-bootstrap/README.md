@@ -13,5 +13,4 @@ mvn -q exec:java -Dexec.args="seeds.corp.example:7500 7500 7501"
 The name's A records must point at this host (two seeds on the loopback
 ports). The flow test runs the same with an in-memory resolver. For the
 records a beacon prints, SRV and DNS-SD locators, and the `agentspaces.bootstrap.*`
-properties, see the `agentspaces-bootstrap` and `agentspaces-beacon` projects
-and `srad/discovery-bootstrap-customization.md`.
+properties, see the `agentspaces-bootstrap` and `agentspaces-beacon` projects.

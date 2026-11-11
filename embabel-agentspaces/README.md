@@ -26,7 +26,7 @@ with no Embabel artifact and activates only when Embabel is on the application c
   planner finds the fleet's scouts as planner actions through this bridge.
 - Embabel's platform exposes no undeploy in the interface this module reaches; a vanished action
   stays in the previous generation until the platform restarts.
-- Large planner inputs and outputs (srad/large-networks-bulk-data.md, SPEC v0.1.23 §7.1): with
+- Large planner inputs and outputs (SPEC v0.1.23 §7.1): with
   `agentspaces.content.enabled=true` on the host, a `@SpaceTake` input or a result a remote action
   writes above `agentspaces.content.escalate-above` (4 MiB) travels as an artifact of the content
   swarm and arrives whole on the planner's side; nothing in this module changes for it. A planner

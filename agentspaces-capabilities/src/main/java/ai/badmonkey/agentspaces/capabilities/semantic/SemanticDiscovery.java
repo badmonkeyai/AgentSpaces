@@ -19,6 +19,7 @@ import ai.badmonkey.agentspaces.api.ad.Advertisement;
 import ai.badmonkey.agentspaces.api.ad.AgentCard;
 import ai.badmonkey.agentspaces.api.ad.AssetCard;
 import ai.badmonkey.agentspaces.api.ad.CapabilityAdvertisement;
+import ai.badmonkey.agentspaces.api.ad.ModelCard;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.SpaceAdvertisement;
 import ai.badmonkey.agentspaces.api.spi.CapabilityProvider;
@@ -50,7 +51,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * meaning over the group's advertisements. The structural path answers "who
  * produces a Finding#v1?"; this capability answers "who can summarize legal
  * PDFs cheaply?" and "who holds customer order history?" by ranking AgentCards,
- * AssetCards, AppCards, and CapabilityAdvertisements against a free-text query under the
+ * AssetCards, ModelCards, AppCards, and CapabilityAdvertisements against a free-text query under the
  * pluggable {@link Embedder}.
  *
  * <p>Queries are local-first (spec P7): {@link #query} ranks the local
@@ -329,6 +330,7 @@ public final class SemanticDiscovery implements CapabilityProvider {
         List<Advertisement> ads = new ArrayList<>();
         ads.addAll(discovery.find(AgentCard.class, card -> true));
         ads.addAll(discovery.find(AssetCard.class, card -> true));
+        ads.addAll(discovery.find(ModelCard.class, card -> true));
         ads.addAll(discovery.find(ai.badmonkey.agentspaces.api.ad.AppCard.class, card -> true));
         ads.addAll(discovery.find(CapabilityAdvertisement.class, ad -> true));
         ads.addAll(discovery.find(SpaceAdvertisement.class, ad -> true));
@@ -353,6 +355,11 @@ public final class SemanticDiscovery implements CapabilityProvider {
         if (ad instanceof AssetCard card) {
             return card.description() + " " + card.asset() + " " + card.uri()
                     + " " + card.shape();
+        }
+        if (ad instanceof ModelCard card) {
+            // SPEC §6.1a.1: the text the TypeScript, Python, and Ruby clients index for a ModelCard
+            return card.name() + " " + card.version() + " " + String.join(" ", card.tasks())
+                    + " " + card.modality() + " " + card.engine() + " " + card.licence();
         }
         if (ad instanceof ai.badmonkey.agentspaces.api.ad.AppCard app) {
             // SPEC §6.1a.2 v0.1.32 (AppCard origin and formats, 2026-11-09): the inline fields, which a stub keeps

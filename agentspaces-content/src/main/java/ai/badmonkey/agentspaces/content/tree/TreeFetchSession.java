@@ -492,12 +492,13 @@ public final class TreeFetchSession implements TreeFetch {
             }
             if (budgetSpent && fabric.withinDownloadBudget(0)) {
                 budgetSpent = false;
-                note("download budget available again; resuming (PD-P-02)");
+                note("download budget available again; resuming");
             }
             schedule();
             if (waiting && !options.timeout().isZero() && !options.timeout().isNegative()
                     && now - lastSourceSeenAtMillis > options.timeout().toMillis()) {
-                note("no reachable tree holder for " + options.timeout() + "; failed (PD-X-08)");
+                note("no reachable tree holder for " + options.timeout() + "; failed;"
+                        + " check that a member holding the tree is online, or give the fetch a longer timeout");
                 done.completeExceptionally(new IllegalStateException("no reachable holder of tree " + root()
                         + " after " + options.timeout()));
             }
@@ -597,7 +598,8 @@ public final class TreeFetchSession implements TreeFetch {
             }
             if (bytes > 0 && !fabric.withinDownloadBudget(bytes) && !budgetSpent) {
                 budgetSpent = true;
-                note("download budget spent after " + bytesReceived + " bytes; sending nothing more today (PD-P-02)");
+                note("download budget spent after " + bytesReceived + " bytes; asking for nothing more today;"
+                        + " ContentPolicy.downloadBytesPerDay sets the budget");
             }
             checkComplete();
             schedule();
@@ -1189,7 +1191,7 @@ public final class TreeFetchSession implements TreeFetch {
     /** Every usable source has answered missing for what is left: the fetch waits as if it had no source (PD-X-08). */
     private void stalled(String what) {
         if (!waiting) {
-            note("every source lacks " + what + "; waiting for another holder (PD-X-08)");
+            note("every source lacks " + what + "; waiting for another holder");
         }
         waiting = true;
     }

@@ -33,8 +33,9 @@ import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * The neutrality guard of the platform-names review (ISSUE-AppCardOriginFormats §17 step 6): the golden vectors, the
- * api and a2ui pins, the specification, and the core's main sources name no part of the platform that builds on
- * AgentSpaces. The last test sweeps the real workspace, so the core gate fails on the first platform name.
+ * api, a2ui, and commerce pins, the specification, and the main sources of the core, a2ui, and commerce name no part
+ * of the platform that builds on AgentSpaces. The last test sweeps the real workspace, so the core gate fails on the
+ * first platform name.
  */
 class NeutralityGuardTest {
 
@@ -116,18 +117,43 @@ class NeutralityGuardTest {
         write(a2ui.resolve("src/main/resources/catalogs/c.json"), "{\n  \"$id\" : \"https://badmonkey.ai/ns/apps/v1/X\"\n}\n");
         write(a2ui.resolve("src/test/resources/golden/surfaces.json"), "{ \"catalog\" : \"bma-widgets\" }\n");
         write(a2ui.resolve("src/test/java/T.java"), "// bma-widgets in a test source\n");
+        Path commerce = workspace.resolve("agentspaces-commerce");
+        write(commerce.resolve("src/main/java/M.java"), "/** A mandate. */\nclass M {\n    String c = \"bma-commerce-merchant\";\n}\n");
+        write(commerce.resolve("src/test/resources/vectors/mandate_cbor.hex"), cborMap("role", "bma-shopper") + "\n");
+        write(commerce.resolve("src/test/java/MTest.java"), "// bma-commerce-payment in a test source\n");
 
         NeutralityGuard.Report report = NeutralityGuard.sweep(core);
 
         assertThat(report.findings()).extracting(Finding::file, Finding::line, Finding::name).containsExactly(
                 tuple("agentspaces-a2ui/src/main/resources/catalogs/c.json", 2, "badmonkey.ai/ns"),
                 tuple("agentspaces-a2ui/src/test/resources/golden/surfaces.json", 1, "bma-widgets"),
+                tuple("agentspaces-commerce/src/main/java/M.java", 3, "bma-commerce-merchant"),
+                tuple("agentspaces-commerce/src/test/resources/vectors/mandate_cbor.hex", 1, "bma-shopper"),
                 tuple("agentspaces/agentspaces-api/src/main/java/A.java", 3, "bma-viz"),
                 tuple("agentspaces/agentspaces-api/src/test/resources/vectors/x_cbor.hex", 1, "bma-widgets"));
         assertThat(report.read())
                 .contains("agentspaces/tools/golden/golden.json", "agentspaces-spec/golden.json", "agentspaces-spec/SPEC.md",
                         "agentspaces-spec/README.md")
                 .noneMatch(file -> file.contains("golden-examples") || file.contains("/target/") || file.contains("/src/test/java/"));
+    }
+
+    @Test
+    void sweepReadsTheSpecificationsDocumentsFolder(@TempDir Path workspace) throws IOException {
+        Path core = workspace.resolve("agentspaces");
+        write(core.resolve("tools/golden/golden.json"), "{}\n");
+        Path spec = workspace.resolve("agentspaces-spec");
+        for (String doc : List.of("SPEC.md", "TECH-SPEC.md", "REALM.md", "REGISTRY.md", "README.md")) {
+            write(spec.resolve(doc), "# " + doc + "\n");
+        }
+        write(spec.resolve("golden.json"), "{}\n");
+        write(spec.resolve("docs/README.md"), "# Documents\n");
+        write(spec.resolve("docs/records/vectors.md"), "# Vectors\n\nthe catalog bma-viz\n");
+
+        NeutralityGuard.Report report = NeutralityGuard.sweep(core);
+
+        assertThat(report.findings()).extracting(Finding::file, Finding::line, Finding::name)
+                .containsExactly(tuple("agentspaces-spec/docs/records/vectors.md", 3, "bma-viz"));
+        assertThat(report.read()).contains("agentspaces-spec/docs/README.md", "agentspaces-spec/docs/records/vectors.md");
     }
 
     @Test

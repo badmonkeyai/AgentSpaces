@@ -200,7 +200,8 @@ class PTextTest {
         PText huge = leftChain("abcdefgh", 36_000);
         assertThat(huge.leaf().runs()).hasSize(36_000);
         assertThatThrownBy(() -> empty.assoc("doc", huge))
-                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("1 MiB node bound");
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("1 MiB node bound")
+                .hasMessageContaining("split it into smaller texts");
 
         PMap<String, PText> mine = empty.assoc("doc", leftChain("alicealx", 20_000));
         PMap<String, PText> theirs = empty.assoc("doc", leftChain("bobbobbo", 20_000));

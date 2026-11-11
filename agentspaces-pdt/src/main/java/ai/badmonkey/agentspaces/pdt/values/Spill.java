@@ -128,7 +128,7 @@ public final class Spill {
     public static void checkKey(byte[] key) {
         if (isLinkItem(key)) {
             throw new IllegalArgumentException("a key must not be a bare link item (CBOR tag 42 over a CID): "
-                    + "a link item in a map node names a spilled node (PD-N-05); hold a CID as text");
+                    + "a link item in a map node names a spilled node; hold a CID as text");
         }
     }
 
@@ -203,7 +203,7 @@ public final class Spill {
     static Object spill(byte[] cbor, Ctx ctx) {
         if (isLinkItem(cbor)) {
             throw new IllegalArgumentException("a value must not be a bare link item (CBOR tag 42 over a CID): "
-                    + "a link item in a value slot names a spilled node (PD-N-05); hold a CID as text");
+                    + "a link item in a value slot names a spilled node; hold a CID as text");
         }
         if (cbor.length <= VALUE_LIMIT) {
             return cbor;
@@ -226,7 +226,8 @@ public final class Spill {
         }
         if (cbor.length > MAX_X_VALUE) {
             throw new IllegalArgumentException("a value of " + cbor.length + " CBOR bytes exceeds the " + MAX_X_VALUE
-                    + " bytes an x node can hold under the 1 MiB node bound (PD-N-04)");
+                    + " bytes an x node can hold under the 1 MiB node bound; store a value this large as a byte string,"
+                    + " which becomes a blob, or split it into a map or a vector");
         }
         return new XNode(cbor);
     }

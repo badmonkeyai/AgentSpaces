@@ -259,6 +259,7 @@ class TreeFetchSessionTest {
         }
         assertThat(session.progress().requestsSent()).as("nothing more is sent while the budget is spent").isEqualTo(requests);
         assertThat(session.trace()).anySatisfy(line -> assertThat(line).contains("download budget spent"));
+        assertThat(session.trace()).anySatisfy(line -> assertThat(line).contains("ContentPolicy.downloadBytesPerDay"));
 
         fabric.downloadBudget = Long.MAX_VALUE; // the next day
         assertThat(fabric.runUntilDone(200, TICK)).as(session.trace().toString()).isTrue();

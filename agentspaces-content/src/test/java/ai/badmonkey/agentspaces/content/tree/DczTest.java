@@ -80,7 +80,8 @@ class DczTest {
         byte[] vcdiff = frame.clone();
         vcdiff[0] = Dcz.VCDIFF;
         assertThatThrownBy(() -> Dcz.decode(base, vcdiff)).isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("VCDIFF");
+                .hasMessageContaining("VCDIFF")
+                .hasMessageContaining("send a zstd frame");
         byte[] unknown = frame.clone();
         unknown[0] = 'x';
         assertThatThrownBy(() -> Dcz.decode(base, unknown)).isInstanceOf(IllegalArgumentException.class)

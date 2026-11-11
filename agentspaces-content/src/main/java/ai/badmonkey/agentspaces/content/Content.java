@@ -1711,7 +1711,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                 new IllegalStateException("root " + root + " is not in this peer's store"));
         if (Manifest.HASHING_SEALED.equals(held.hashing())) {
             throw new IllegalStateException("root " + root + " is hashed sealed and belongs to its group;"
-                    + " share(root, lease, source) re-seals it under this group's key as a new root (LB-G-03)");
+                    + " share(root, lease, source) re-seals it under this group's key as a new root");
         }
         if (store.have(root).cardinality() < held.pieces()) {
             throw new IllegalStateException("root " + root + " is incomplete here: "
@@ -2038,7 +2038,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             }
             if (!ok) {
                 LOG.warning("content store: root " + root
-                        + " failed its sampled verification on start and is forgotten (LB-T-10)");
+                        + " failed its sampled verification on start and is forgotten; fetch it again from a holder");
                 store.forget(root);
                 rootsDroppedOnSample.incrementAndGet(); // counted after the forget, so the count says it is done
             }
@@ -2091,7 +2091,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         synchronized (externalVerified) {
             if (external.roots().contains(m.root())) { // two wants in flight count one drop
                 LOG.warning("content store: " + external.kind() + " root " + m.root() + " piece " + index
-                        + " no longer matches its manifest; the root is forgotten (LB-T-10)");
+                        + " no longer matches its manifest; the root is forgotten; fetch it again from a holder");
                 externalVerified.removeIf(k -> k.startsWith(m.root() + "#"));
                 store.forget(m.root());
                 rootsDroppedOnSample.incrementAndGet(); // counted after the forget, so the count says it is done

@@ -11,7 +11,7 @@ received and whether its delta came inline on the head or by a tree fetch, the
 round trips of the same delta measured by a meter peer, and each reader's merge
 conflicts.
 
-The library is `agentspaces-pdt` (`srad/agentspaces-pdt.md`): a value is a
+The library is `agentspaces-pdt` (SPEC annex H): a value is a
 tree of content-addressed nodes, a version moves as the nodes a receiver lacks,
 and a ref is the set of live `PRef` heads of one name in the `pdt` space. The
 nodes travel on the content swarm's tree exchange (`agentspaces-content`,
@@ -33,31 +33,31 @@ client's `pdt` package are present (`$PYTHON`, or
 
 ## What the steps show
 
-| Step | What happens | Row |
-|---|---|---|
-| 1 facts v0 | The curator builds the map; the analysts fetch its tree, the meter counts the round trips without a base | PD-Q-PRF-06 |
-| 1 facts one key | One key changes; every reader takes a few KiB inline on the head, and no tree node crosses a pipe | PD-Q-PRF-01, PD-Q-PRF-05 |
-| 2 round n | Three analysts swap ten revisions each; every reader, Python included, derefs one root from the merged heads | PD-Q-REL-02, PD-Q-INT-01 |
-| 2 curator folds heads | One swap persists the merge with every head as a base | §3.6 |
-| 3 table v0, edit, append, insert | The blob and its edits by delta against the held base | PD-Q-PRF-02 to 04 |
-| 4 | The auditor fetches the table cold while analyst-3 dies part way | PD-Q-REL-04 |
-| 5 | The `plans` space escalates a 3 MiB accumulator over 50 steps; each step ships about the delta | PD-E-08 |
+| Step | What happens |
+|---|---|
+| 1 facts v0 | The curator builds the map; the analysts fetch its tree, the meter counts the round trips without a base |
+| 1 facts one key | One key changes; every reader takes a few KiB inline on the head, and no tree node crosses a pipe |
+| 2 round n | Three analysts swap ten revisions each; every reader, Python included, derefs one root from the merged heads |
+| 2 curator folds heads | One swap persists the merge with every head as a base |
+| 3 table v0, edit, append, insert | The blob and its edits by delta against the held base |
+| 4 | The auditor fetches the table cold while analyst-3 dies part way |
+| 5 | The `plans` space escalates a 3 MiB accumulator over 50 steps; each step ships about the delta |
 
 The meter is a peer without refs: it holds the previous root and fetches each
 new root explicitly, so its `TreeFetch.Progress` reports the round trips the
-rows bound (two with the base held, the tree's depth plus one without). The
+test bounds (two with the base held, the tree's depth plus one without). The
 analysts' costs come from their facades' counters and the growth of their node
 stores.
 
 ## The tests
 
 - `PersistentValuesTest`: the composition over loopback tcp at the quick sizes
-  (a 32 MiB table, three rounds, twelve plan steps), asserting PD-Q-PRF-01 to
-  06 at their as-built bounds, equal roots on every Java reader, the Python
+  (a 32 MiB table, three rounds, twelve plan steps), asserting the byte and
+  round-trip bounds of the steps above at their as-built values, equal roots on every Java reader, the Python
   reader's root when it is present, the cold fetch's completion after the
-  kill, and the delta bound of PD-E-08 per plan step.
-- `PdtBindingsTest`: steps 1 to 3 on `dtls` with one holder behind a relay
-  (PD-Q-TST-03). The curator and analyst-1 listen on dtls; a relay with the
+  kill, and the delta bound per plan step.
+- `PdtBindingsTest`: steps 1 to 3 on `dtls` with one holder behind a relay.
+  The curator and analyst-1 listen on dtls; a relay with the
   RELAY role listens on dtls and tcp; analyst-2 is dial-only with a tcp
   transport alone and seeds the relay's tcp port, so it can dial no dtls
   listener and every head, inline delta, and tree node it exchanges crosses

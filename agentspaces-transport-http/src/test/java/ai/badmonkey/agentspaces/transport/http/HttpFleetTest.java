@@ -82,7 +82,7 @@ class HttpFleetTest {
     @Timeout(120)
     void sessionModeFleetOverWs() throws Exception {
         fleet("ws", PeerNode.ChannelAuth.SESSION, false, id -> new WebSocketTransport());
-        assertThat(peers.get(0).node().sessionFramesSent() + peers.get(1).node().sessionFramesSent())
+        assertThat(eventually(() -> peers.get(0).node().sessionFramesSent() + peers.get(1).node().sessionFramesSent()))
                 .as("frames travel under the session key once the hellos are exchanged").isPositive();
     }
 
@@ -96,7 +96,7 @@ class HttpFleetTest {
                 throw new IllegalStateException(e);
             }
         });
-        assertThat(peers.get(0).node().bareFramesSent() + peers.get(1).node().bareFramesSent())
+        assertThat(eventually(() -> peers.get(0).node().bareFramesSent() + peers.get(1).node().bareFramesSent()))
                 .as("frames travel bare on the attested channel").isPositive();
     }
 
@@ -105,7 +105,8 @@ class HttpFleetTest {
     void sessionModeFleetOverTheHttpExchange() throws Exception {
         fleet("http", PeerNode.ChannelAuth.SESSION, false,
                 id -> new HttpExchangeTransport().options(HttpOptions.defaults().withLongPoll(Duration.ofSeconds(2))));
-        assertThat(peers.get(0).node().sessionFramesSent() + peers.get(1).node().sessionFramesSent()).isPositive();
+        assertThat(eventually(() -> peers.get(0).node().sessionFramesSent() + peers.get(1).node().sessionFramesSent()))
+                .as("frames travel under the session key once the hellos are exchanged").isPositive();
     }
 
     @Test
@@ -145,6 +146,21 @@ class HttpFleetTest {
         }
         assertThat(memberIds(first)).contains(second.identity().peerId());
         assertThat(memberIds(second)).contains(first.identity().peerId());
+    }
+
+    /**
+     * A counter once it moves, or its value at the deadline. The channel switches to the session key (or to
+     * bare frames) only after the hello round trip confirms it, and a fast job can finish on signed frames
+     * before that; the fleet keeps gossiping each tick, so the switch shows within a few ticks, later under lag.
+     */
+    private static long eventually(java.util.function.LongSupplier counter) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        long value = counter.getAsLong();
+        while (value <= 0 && System.nanoTime() < deadline) {
+            Thread.sleep(100);
+            value = counter.getAsLong();
+        }
+        return value;
     }
 
     private static List<PeerId> memberIds(Peer peer) {

@@ -39,6 +39,7 @@ import java.net.SocketTimeoutException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -110,46 +111,87 @@ class DtlsHardeningTest {
     void aSpoofedClientHelloAllocatesNothingAndIsAnsweredSmaller() throws Exception {
         DtlsTransport.Bound bound = listen(DtlsOptions.defaults());
         byte[] hello = clientHello();
+        int sent;
         try (DatagramSocket spoofer = new DatagramSocket()) {
-            spoofer.setSoTimeout(5_000);
-            spoofer.send(new DatagramPacket(hello, hello.length, new InetSocketAddress("127.0.0.1", bound.port())));
             byte[] buf = new byte[2_048];
             DatagramPacket reply = new DatagramPacket(buf, buf.length);
-            spoofer.receive(reply);
+            sent = Datagrams.ask(spoofer, hello, new InetSocketAddress("127.0.0.1", bound.port()), reply, 10);
             assertThat(reply.getLength()).isLessThanOrEqualTo(hello.length);
             assertThat(buf[0]).as("a handshake record: HelloVerifyRequest").isEqualTo((byte) 22);
         }
         assertThat(bound.listener().halfOpen()).isZero();
         DtlsTransport owner = (DtlsTransport) closeables.get(0);
         assertThat(owner.associations()).isEmpty();
-        assertThat(owner.counters().helloVerifyRequestsSent()).isEqualTo(1);
+        // One answer per hello the listener read; a resent hello (after a lost one) is answered again.
+        assertThat(owner.counters().helloVerifyRequestsSent()).isBetween(1L, (long) sent);
     }
 
     @Test
     @Timeout(30)
     void aFloodFromOneSourceIsRateLimited() throws Exception {
-        DtlsTransport.Bound bound = listen(DtlsOptions.defaults()); // 8 per second per source
+        DtlsOptions options = DtlsOptions.defaults(); // 8 per second per source
+        DtlsTransport.Bound bound = listen(options);
+        DtlsTransport owner = (DtlsTransport) closeables.get(0);
+        DtlsCounters counters = owner.counters();
         byte[] hello = clientHello();
+        int flood = 100;
+        int rate = options.helloRatePerSource();
         int replies = 0;
         try (DatagramSocket flooder = new DatagramSocket()) {
             InetSocketAddress target = new InetSocketAddress("127.0.0.1", bound.port());
-            for (int i = 0; i < 100; i++) {
-                flooder.send(new DatagramPacket(hello, hello.length, target));
+            long start = System.nanoTime();
+            long deadline = start + TimeUnit.SECONDS.toNanos(12);
+            // UDP promises nothing: the kernel may drop part of a loopback burst and a loaded
+            // listener may read it late. So judge by what the listener actually read, and top up
+            // only the shortfall once the listener has had a moment, never a fixed client window.
+            while (seen(counters) < flood && System.nanoTime() < deadline) {
+                for (long i = seen(counters); i < flood; i++) {
+                    flooder.send(new DatagramPacket(hello, hello.length, target));
+                }
+                long settle = Math.min(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
+                while (seen(counters) < flood && System.nanoTime() < settle) {
+                    Thread.sleep(10);
+                }
             }
-            flooder.setSoTimeout(1_000);
+            double elapsed = (System.nanoTime() - start) / 1e9;
+            long answered = counters.helloVerifyRequestsSent();
+            long dropped = counters.clientHellosDropped();
+            long seen = answered + dropped;
+            // A token bucket admits at most its burst plus what it refilled while the flood lasted,
+            // however slowly the listener read it.
+            long budget = (long) Math.floor(rate * (1 + elapsed));
+            String state = "seen=" + seen + " answered=" + answered + " dropped=" + dropped
+                    + " elapsed=" + elapsed + "s budget=" + budget;
+            assertThat(seen).as("the listener read the flood: " + state).isGreaterThanOrEqualTo(flood);
+            assertThat(answered).as("hellos answered within the per-source rate: " + state)
+                    .isBetween(1L, budget);
+            assertThat(dropped).as("the rest dropped: " + state).isGreaterThanOrEqualTo(seen - budget);
+
+            // The answers are datagrams too: take what arrives, and if every one was lost, wait out
+            // a token and ask again rather than fail on one unlucky burst.
             byte[] buf = new byte[2_048];
-            try {
-                while (true) {
+            flooder.setSoTimeout(1_000);
+            long replyDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
+            while (replies < counters.helloVerifyRequestsSent() && System.nanoTime() < replyDeadline) {
+                try {
                     flooder.receive(new DatagramPacket(buf, buf.length));
                     replies++;
+                } catch (SocketTimeoutException quiet) {
+                    if (replies > 0) {
+                        break; // the rest were lost; one answer is enough
+                    }
+                    Thread.sleep(1_000L / rate + 1);
+                    flooder.send(new DatagramPacket(hello, hello.length, target));
                 }
-            } catch (SocketTimeoutException done) {
-                // drained
             }
         }
-        DtlsTransport owner = (DtlsTransport) closeables.get(0);
-        assertThat(replies).isBetween(1, 12);
-        assertThat(owner.counters().clientHellosDropped()).isGreaterThanOrEqualTo(85);
+        assertThat(replies).as("HelloVerifyRequests reached the flooder")
+                .isBetween(1, (int) counters.helloVerifyRequestsSent());
+    }
+
+    /** ClientHellos the listener has read: each is either answered or dropped by the rate. */
+    private static long seen(DtlsCounters counters) {
+        return counters.helloVerifyRequestsSent() + counters.clientHellosDropped();
     }
 
     @Test

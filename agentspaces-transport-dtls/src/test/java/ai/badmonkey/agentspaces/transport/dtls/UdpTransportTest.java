@@ -94,13 +94,11 @@ class UdpTransportTest {
         int port = listener.listenPort("127.0.0.1:0", c -> { });
         InetSocketAddress target = new InetSocketAddress("127.0.0.1", port);
         try (DatagramSocket socket = new DatagramSocket()) {
-            socket.setSoTimeout(2_000);
             byte[] hello = ByteBuffer.allocate(UdpTransport.HELLO_LENGTH).put((byte) 1).put((byte) UdpTransport.HELLO)
                     .putShort((short) 0).putLong(42).array();
-            socket.send(new DatagramPacket(hello, hello.length, target));
             byte[] buf = new byte[256];
             DatagramPacket reply = new DatagramPacket(buf, buf.length);
-            socket.receive(reply);
+            Datagrams.ask(socket, hello, target, reply, 10);
             assertThat(reply.getLength()).isLessThan(hello.length);
             assertThat(ByteBuffer.wrap(buf, 4, 8).getLong()).isEqualTo(42);
 

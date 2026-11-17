@@ -320,11 +320,13 @@ class AgentBinderJoinTest {
             intake.write(new Coverage("c1", true), HOUR);
             await(() -> !assessments().isEmpty(), Duration.ofSeconds(5));
             Thread.sleep(500);
-            // Both joiners saw the key complete; the later ticket withdrew, so one
-            // firing is the rule and a second one needs a partition (SPEC §10.3:
-            // LEASED is once per lease race per ticket, at least once fleet-wide).
+            // Both joiners saw the key complete; the later ticket withdrew once it saw
+            // the older one, so one firing is the rule. A second needs a ticket or a
+            // claim delivered after the other side decided, which late gossip does
+            // without any partition (SPEC §10.3: LEASED is once per lease race per
+            // ticket, at least once fleet-wide; KeyTickets says when it is twice).
             int firings = first.invocations.get() + second.invocations.get();
-            assertThat(firings).as("at least once, and once absent a partition").isBetween(1, 2);
+            assertThat(firings).as("at least once, at most once per joiner").isBetween(1, 2);
             assertThat(assessments()).hasSize(firings);
             await(() -> intake.readAll(Template.of(JoinTicket.class), 10).isEmpty(), Duration.ofSeconds(5));
         } finally {

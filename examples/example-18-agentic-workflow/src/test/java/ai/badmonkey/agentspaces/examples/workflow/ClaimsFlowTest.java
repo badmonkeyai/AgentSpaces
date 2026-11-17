@@ -18,6 +18,8 @@ package ai.badmonkey.agentspaces.examples.workflow;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
+import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
+import ai.badmonkey.agentspaces.agent.annotation.SpaceNotify;
 import ai.badmonkey.agentspaces.agent.join.JoinTicket;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Template;
@@ -38,6 +40,9 @@ import ai.badmonkey.agentspaces.examples.workflow.Claims.ReserveReport;
 import ai.badmonkey.agentspaces.examples.workflow.Claims.SeniorReview;
 import ai.badmonkey.agentspaces.examples.workflow.ClaimsFlow.Peer;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.measure.Measure;
+import ai.badmonkey.agentspaces.measure.Params;
+import ai.badmonkey.agentspaces.measure.Wait;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.time.Duration;
@@ -45,6 +50,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
@@ -56,6 +62,9 @@ import org.junit.jupiter.api.Timeout;
  * properties each stage promises hold at every replica.
  */
 class ClaimsFlowTest {
+
+    /** The join mode of the flow under way, a parameter of each measured wait so the two modes keep apart. */
+    private Params mode = Params.none();
 
     private static int freePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
@@ -80,6 +89,7 @@ class ClaimsFlowTest {
     }
 
     private void runTheFlow(boolean orderedJoin) throws Exception {
+        mode = Params.of("join", orderedJoin ? "ordered" : "leased");
         List<PeerIdentity> ids = List.of(PeerIdentity.generate(), PeerIdentity.generate(),
                 PeerIdentity.generate());
         List<PeerId> members = ids.stream().map(PeerIdentity::peerId).toList();
@@ -98,11 +108,19 @@ class ClaimsFlowTest {
                 throw new IllegalStateException("simulated crash in " + worker);
             }
         };
-        List<AutoCloseable> staff = orderedJoin
-                ? ClaimsFlow.staffWithOrderedJoin(a, b, c, counted) : ClaimsFlow.staff(a, b, c, counted);
+        List<AutoCloseable> staff = new java.util.ArrayList<>(orderedJoin
+                ? ClaimsFlow.staffWithOrderedJoin(a, b, c, counted) : ClaimsFlow.staff(a, b, c, counted));
+        // One witness per peer, beside each peer's reserve sensor and reached the same way, so a
+        // stage 8 failure says which replica's reaction never saw which priced claim.
+        Map<String, ReserveWitness> witnesses = new java.util.LinkedHashMap<>();
+        for (Peer peer : fleet) {
+            ReserveWitness witness = new ReserveWitness();
+            witnesses.put(peer.name(), witness);
+            staff.add(peer.group().bind(witness));
+        }
         try {
             // A log leader must exist before a payment can be taken; wait for the election.
-            assertThat(await(() -> fleet.stream().anyMatch(p -> p.ordered().raft().isLeader())
+            assertThat(await("workflow.claims.leader", () -> fleet.stream().anyMatch(p -> p.ordered().raft().isLeader())
                     ? Optional.of(true) : Optional.<Boolean>empty(), Duration.ofSeconds(40)))
                     .as("a payments log leader is elected").isPresent();
 
@@ -111,7 +129,7 @@ class ClaimsFlowTest {
             }
 
             // Stage 9: every case closes, once, with the expected outcome.
-            List<ClaimClosed> closed = await(() -> {
+            List<ClaimClosed> closed = await("workflow.claims.closed", () -> {
                 List<ClaimClosed> all = c.ledger().readAll(Template.of(ClaimClosed.class), 10);
                 return all.size() >= 5 ? Optional.of(all) : Optional.<List<ClaimClosed>>empty();
             }, Duration.ofSeconds(90)).orElseThrow();
@@ -132,19 +150,37 @@ class ClaimsFlowTest {
 
             // Stage 3: one assembly per claim, whatever the join mode. The assessments
             // themselves are consumed by the auction take, so the evidence is
-            // downstream: four priced claims, one per claim, and no assessment left
-            // unpriced; in ORDERED mode, no ticket left either.
-            Map<String, PricedClaim> priced = a.assessment().readAll(Template.of(PricedClaim.class), 10)
-                    .stream().collect(java.util.stream.Collectors.toMap(PricedClaim::claimId, p -> p));
-            assertThat(a.assessment().readAll(Template.of(PricedClaim.class), 10)).hasSize(4);
-            assertThat(priced.keySet()).containsExactlyInAnyOrder("CLM-1", "CLM-2", "CLM-3", "CLM-4");
+            // downstream: every claim priced, and no assessment left unpriced; in
+            // ORDERED mode, no ticket left either. The auction awards a claim to one
+            // adjuster only while every bid arrives within the settle window (SPEC
+            // §7.4); beyond it two adjusters can each price a claim. The completion is
+            // idempotent (the price is a pure function of the assessment), so every
+            // priced claim of one claim agrees, and every priced claim past the first
+            // is a duplicate the space detected and counted where the winning bid is held.
+            Map<String, List<PricedClaim>> pricings = a.assessment().readAll(Template.of(PricedClaim.class), 20)
+                    .stream().collect(java.util.stream.Collectors.groupingBy(PricedClaim::claimId));
+            assertThat(pricings.keySet()).containsExactlyInAnyOrder("CLM-1", "CLM-2", "CLM-3", "CLM-4");
+            pricings.forEach((claimId, all) -> assertThat(all).as("every pricing of " + claimId + " agrees")
+                    .extracting(PricedClaim::reserve, PricedClaim::recommendation).containsOnly(
+                            org.assertj.core.groups.Tuple.tuple(all.get(0).reserve(), all.get(0).recommendation())));
+            long countFrom = System.nanoTime();
+            assertThat(await("workflow.claims.duplicates-counted", () -> {
+                long duplicates = fleet.stream().mapToLong(peer -> peer.assessment().duplicateCompletions()).sum();
+                int extra = a.assessment().readAll(Template.of(PricedClaim.class), 20).size() - 4;
+                return extra == duplicates ? Optional.of(extra) : Optional.<Integer>empty();
+            }, Duration.ofSeconds(30))).as("every second pricing is a counted duplicate completion").isPresent();
+            System.out.printf("duplicate pricings: %d (counts agreed after %d ms)%n",
+                    a.assessment().readAll(Template.of(PricedClaim.class), 20).size() - 4,
+                    java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - countFrom));
+            Map<String, PricedClaim> priced = new java.util.HashMap<>();
+            pricings.forEach((claimId, all) -> priced.put(claimId, all.get(0)));
             assertThat(a.assessment().readAll(Template.of(ClaimAssessment.class), 10))
                     .as("every assessment was taken and priced").isEmpty();
             if (orderedJoin) {
                 for (Peer peer : fleet) {
-                    assertThat(await(() -> peer.payments().readAll(Template.of(JoinTicket.class), 10)
+                    assertThat(await("workflow.claims.tickets-drained", () -> peer.payments().readAll(Template.of(JoinTicket.class), 10)
                                     .isEmpty() ? Optional.of(true) : Optional.<Boolean>empty(),
-                            Duration.ofSeconds(20))).as("tickets drained at " + peer.name()).isPresent();
+                            Duration.ofSeconds(30))).as("tickets drained at " + peer.name()).isPresent();
                 }
             }
             // The fire claim's assessment came through the ontology instance: the
@@ -183,7 +219,7 @@ class ClaimsFlowTest {
             // and the payments drained everywhere (the exposure stage consumes each
             // payment as it folds it, after the ledger's reaction has seen it).
             for (Peer peer : fleet) {
-                Map<String, ClaimantExposure> exposure = await(() -> {
+                Map<String, ClaimantExposure> exposure = await("workflow.claims.exposure", () -> {
                     Map<String, ClaimantExposure> all = new java.util.HashMap<>();
                     for (String claimant : List.of("A. Okafor", "D. Varga")) {
                         Reductions.current(peer.payments(), ClaimantExposure.class, "exposure", claimant)
@@ -195,7 +231,7 @@ class ClaimsFlowTest {
                         .isEqualTo(new ClaimantExposure("A. Okafor", 720_000, 1));
                 assertThat(exposure.get("D. Varga")).as("exposure at " + peer.name())
                         .isEqualTo(new ClaimantExposure("D. Varga", 2_500_000, 1));
-                assertThat(await(() -> peer.payments().readAll(Template.of(PaymentOrder.class), 10).isEmpty()
+                assertThat(await("workflow.claims.payments-drained", () -> peer.payments().readAll(Template.of(PaymentOrder.class), 10).isEmpty()
                                 && peer.payments().readAll(Template.of(Payment.class), 10).isEmpty()
                                 ? Optional.of(true) : Optional.<Boolean>empty(),
                         Duration.ofSeconds(30))).as("orders and payments drained at " + peer.name()).isPresent();
@@ -204,7 +240,7 @@ class ClaimsFlowTest {
             // Stage 3a: the fork wrote one request and three tasks per assessed claim, one
             // shop per peer took its own tasks, and the gather kept the lowest of exactly
             // three quotes; the east shop prices lowest.
-            List<RepairEstimate> estimates = await(() -> {
+            List<RepairEstimate> estimates = await("workflow.claims.estimates", () -> {
                 List<RepairEstimate> all = c.ledger().readAll(Template.of(RepairEstimate.class), 10);
                 return all.size() >= 4 ? Optional.of(all) : Optional.<List<RepairEstimate>>empty();
             }, Duration.ofSeconds(30)).orElseThrow();
@@ -224,24 +260,47 @@ class ClaimsFlowTest {
                     .noneMatch(id -> id.startsWith("escalate:"));
 
             // Stage 8: the fleet's average reserve converges on (7200 + 0 + 0 + 25000) / 4.
+            // Measured over many runs, the estimate at peer-c is within 2% at most about 3 s after this
+            // stage starts (usually under 1 s); 30 s means it is clearly broken, and the time it took is printed.
             double expected = (7_200 + 0 + 0 + 25_000) / 4.0;
-            OptionalDouble sensed = await(() -> {
+            long sensing = System.nanoTime();
+            OptionalDouble sensed = await("workflow.settle.estimate", () -> {
                 OptionalDouble estimate = c.reserves().estimate(Settlement.RESERVE_EPOCH);
                 return estimate.isPresent() && Math.abs(estimate.getAsDouble() - expected) < expected * 0.02
                         ? Optional.of(estimate) : Optional.<OptionalDouble>empty();
-            }, Duration.ofSeconds(30)).orElseGet(() -> c.reserves().estimate(Settlement.RESERVE_EPOCH));
-            assertThat(sensed).isPresent();
-            assertThat(sensed.getAsDouble()).isCloseTo(expected, within(expected * 0.02));
+            }, Duration.ofSeconds(30), () -> reserveReport(fleet, witnesses))
+                    .orElseGet(() -> c.reserves().estimate(Settlement.RESERVE_EPOCH));
+            System.out.println("stage 8: the reserve estimate took "
+                    + Duration.ofNanos(System.nanoTime() - sensing).toMillis() + " ms to reach " + sensed);
+            assertThat(sensed).as(() -> reserveReport(fleet, witnesses)).isPresent();
+            assertThat(sensed.getAsDouble()).as(() -> reserveReport(fleet, witnesses))
+                    .isCloseTo(expected, within(expected * 0.02));
             // ...and the supervisor reported it exactly once, when it settled.
-            // Rounds are paced to the gossip period (one a second), so twenty settled steps are
-            // twenty-odd seconds after convergence, not five: a minute's budget.
-            List<ReserveReport> reports = await(() -> {
+            // The supervisor waits for forty settled rounds, paced to the gossip period (one a
+            // second), so the report comes about forty seconds after the last priced claim moved
+            // the estimate: measured at 38 to 43 s after this point over 40 runs. The wait is that
+            // deliberate span plus room for its variable part (convergence, under 3 s measured) and
+            // for a late claim (an ordered take that lapses holds one for its 30 s lease), so 120 s
+            // means clearly broken; the time it took is printed.
+            long reporting = System.nanoTime();
+            List<ReserveReport> reports = await("workflow.settle.report", () -> {
                 List<ReserveReport> all = c.ledger().readAll(Template.of(ReserveReport.class), 10);
                 return all.isEmpty() ? Optional.<List<ReserveReport>>empty() : Optional.of(all);
-            }, Duration.ofSeconds(60)).orElseThrow();
-            Thread.sleep(1500);
-            assertThat(c.ledger().readAll(Template.of(ReserveReport.class), 10)).hasSize(1);
-            assertThat(reports.get(0).averageReserve()).isCloseTo(expected, within(expected * 0.05));
+            }, Duration.ofSeconds(120), () -> reserveReport(fleet, witnesses)).orElseThrow();
+            System.out.println("stage 8: the supervisor reported after "
+                    + Duration.ofNanos(System.nanoTime() - reporting).toMillis() + " ms: " + reports);
+            // Reported once: the supervisor's estimate rule calls back once per epoch, and its one binding is on c.
+            // The fixed 1.5 s sleep is gone; the positive marker is the report replicated to every peer, which any
+            // second report written with it would have travelled beside, then exactly one is asserted everywhere.
+            await("workflow.settle.report-replicated", () -> fleet.stream().allMatch(peer ->
+                    !peer.ledger().readAll(Template.of(ReserveReport.class), 10).isEmpty())
+                    ? Optional.of(true) : Optional.<Boolean>empty(), Duration.ofSeconds(30));
+            for (Peer peer : fleet) {
+                assertThat(peer.ledger().readAll(Template.of(ReserveReport.class), 10)).as("reports at " + peer.name())
+                        .hasSize(1);
+            }
+            assertThat(reports.get(0).averageReserve()).as(() -> reserveReport(fleet, witnesses))
+                    .isCloseTo(expected, within(expected * 0.05));
         } finally {
             for (AutoCloseable s : staff) {
                 s.close();
@@ -269,10 +328,16 @@ class ClaimsFlowTest {
         List<AutoCloseable> staff = ClaimsFlow.staffWithoutPanel(a, b, c, Intake.Hook.NONE,
                 Duration.ofSeconds(1));
         try {
-            Thread.sleep(1500);
+            // formation, waited for rather than slept (was a fixed 1.5 s): every peer sees the other two
+            await("workflow.claims.formed", () -> fleet.stream().allMatch(peer -> members.stream()
+                    .filter(id -> !id.equals(peer.identity().peerId()))
+                    .allMatch(id -> peer.runtime().membership().member(id).isPresent()))
+                    ? Optional.of(true) : Optional.<Boolean>empty(), Duration.ofSeconds(30));
             a.intake().write(ClaimsFlow.CLAIMS.get(0), Lease.of(Duration.ofHours(1)));
-            assertThat(await(() -> a.vote().proposal("escalate:CLM-1"), Duration.ofSeconds(40)))
+            assertThat(await("workflow.claims.escalated", () -> a.vote().proposal("escalate:CLM-1"), Duration.ofSeconds(40)))
                     .as("the lapsed reminder escalated").isPresent();
+            // fm: (fixed sleep) an absence window with no positive marker to wait on: no second escalation is written,
+            // and nothing follows it in order (srad/feature-measurements.md §3.9)
             Thread.sleep(1500);
             assertThat(a.decisions().readAll(Template.of(VoteCapability.Proposal.class), 20))
                     .filteredOn(p -> p.proposalId().startsWith("escalate:")).hasSize(1);
@@ -285,16 +350,45 @@ class ClaimsFlowTest {
         }
     }
 
-    private static <T> Optional<T> await(Supplier<Optional<T>> probe, Duration timeout)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            Optional<T> value = probe.get();
-            if (value.isPresent()) {
-                return value;
-            }
-            Thread.sleep(200);
+    /**
+     * Records the priced claims the binder hands a reaction on one peer, as the
+     * reserve sensor's {@code @SpaceNotify} receives them.
+     */
+    @AgentSpec(name = "reserve-witness", description = "Records the priced claims a reserve reaction sees",
+            goals = {"witness reserves"})
+    public static final class ReserveWitness {
+        final List<String> seen = new CopyOnWriteArrayList<>();
+
+        @SpaceNotify(space = Pricing.SPACE)
+        public void saw(PricedClaim priced) {
+            seen.add(priced.claimId() + "=" + priced.reserve());
         }
-        return probe.get();
+    }
+
+    /** What every peer saw, held and estimated for stage 8, so a failure names the missing contribution. */
+    private static String reserveReport(List<Peer> fleet, Map<String, ReserveWitness> witnesses) {
+        StringBuilder report = new StringBuilder("the fleet's reserve state:");
+        for (Peer peer : fleet) {
+            report.append("\n  ").append(peer.name())
+                    .append(": reactions saw ").append(witnesses.get(peer.name()).seen)
+                    .append(", holds ").append(peer.assessment().readAll(Template.of(PricedClaim.class), 10).stream()
+                            .map(p -> p.claimId() + "=" + p.reserve()).toList())
+                    .append(", estimate ").append(peer.reserves().estimate(Settlement.RESERVE_EPOCH));
+        }
+        return report.toString();
+    }
+
+    /**
+     * A measured wait (srad/feature-measurements.md §3.5) that keeps the 200 ms poll it had. It returns the value
+     * once the probe has one; past the ceiling it fails with the diagnostics, so callers' presence checks always hold.
+     */
+    private <T> Optional<T> await(String metric, Supplier<Optional<T>> probe, Duration timeout) {
+        return await(metric, probe, timeout, () -> "");
+    }
+
+    private <T> Optional<T> await(String metric, Supplier<Optional<T>> probe, Duration timeout,
+                                  Supplier<String> diagnostics) {
+        return Optional.of(Measure.awaitValue(metric, timeout, probe,
+                Wait.with().params(mode).poll(Duration.ofMillis(200)).diagnostics(diagnostics)));
     }
 }

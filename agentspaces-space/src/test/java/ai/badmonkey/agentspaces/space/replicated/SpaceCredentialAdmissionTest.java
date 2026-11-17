@@ -93,7 +93,14 @@ class SpaceCredentialAdmissionTest {
     private Peer newPeer(String address, long seed, PeerIdentity identity,
                          Consumer<ReplicatedSpace.Builder> customize,
                          String... seedAddresses) throws IOException {
-        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).build();
+        return newPeer(address, seed, identity, 1L << 20, customize, seedAddresses);
+    }
+
+    /** {@link #newPeer} with the audit budget this member asks for (annex I.6). */
+    private Peer newPeer(String address, long seed, PeerIdentity identity, long auditBudget,
+                         Consumer<ReplicatedSpace.Builder> customize,
+                         String... seedAddresses) throws IOException {
+        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).auditBudget(auditBudget).build();
         node.listen(network.register(address), address);
         List<PeerAdvertisement.Endpoint> seeds = new ArrayList<>();
         for (String s : seedAddresses) {
@@ -465,5 +472,43 @@ class SpaceCredentialAdmissionTest {
         tickAll(4);
         assertThat(a.space().read(Template.of(TaskEntry.class))).as("completed on the issuer").isEmpty();
         assertThat(b.space().read(Template.of(TaskEntry.class))).isEmpty();
+    }
+
+    /**
+     * P37 (srad/replication-by-entry.md phase 4): a credential-admitted space joined under a budget far smaller than
+     * the space. The answers come newest first, so the grantee's writes reach the newcomer before the older credential
+     * that admits them; the newcomer drops those without a strike (the credential may be late), and since a write
+     * dropped for a missing credential is not acknowledged, later audits fetch it again once the credential is in. The
+     * newcomer ends holding every entry, its audited set equal to the issuer's, and nobody struck.
+     */
+    @Test
+    void aCredentialSpaceJoinedUnderASmallBudgetConvergesWithNoStrikeAndNothingLost() throws Exception {
+        PeerIdentity aId = PeerIdentity.generate();
+        Peer a = newPeer("a", 1, aId, credentialsFrom(aId.peerId()));
+        Peer b = newPeer("b", 2, PeerIdentity.generate(), credentialsFrom(aId.peerId()), "a");
+        tickAll(4);
+        a.space().grant(b.agent(), Set.of(Scope.WRITE), ONE_HOUR);
+        tickAll(4);
+        for (int i = 0; i < 150; i++) {
+            b.space().write(new TaskEntry("granted-" + i, i), MINUTES_30);
+        }
+        tickAll(4);
+        assertThat(a.space().knownEntries()).as("credential plus 150 writes").isEqualTo(151);
+
+        Peer c = newPeer("c", 3, PeerIdentity.generate(), 4096, credentialsFrom(aId.peerId()), "a");
+        for (int i = 0; i < 60 && c.space().knownEntries() < 151; i++) {
+            tickAll(1);
+        }
+        String seen = "c knows " + c.space().knownEntries() + " of " + a.space().knownEntries() + ", "
+                + c.runtime().gossip().auditSignals() + ", " + c.space().stats();
+        assertThat(c.space().credentialIndex().get().admits(b.agent(), Scope.WRITE, now())).as(seen).isTrue();
+        assertThat(c.space().knownEntries()).as("every entry, none lost to the early drops; " + seen).isEqualTo(151);
+        assertThat(c.space().readAll(Template.of(TaskEntry.class), 1_000)).hasSize(150);
+        assertThat(java.util.HexFormat.of().formatHex(c.space().streamHash()))
+                .isEqualTo(java.util.HexFormat.of().formatHex(a.space().streamHash()));
+        assertThat(c.runtime().gossip().auditSignals().remainderReceived())
+                .as("the answers were cut to the budget").isPositive();
+        assertThat(strikes(c.node(), a.node().peerId())).isZero();
+        assertThat(strikes(c.node(), b.node().peerId())).isZero();
     }
 }

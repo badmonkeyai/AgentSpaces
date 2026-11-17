@@ -64,7 +64,7 @@ class CardSpillTest {
         return new AppCard("aspace://zApps/app/zPeerA/example-board", PeerId.of("zPeerA"), GroupId.of("zApps"), AT, Duration.ofMinutes(15),
                 "example-board", "fed", "a2ui", "example", List.of("zApps/items", "zApps/orders"), List.of(), "", "", "", "1",
                 List.of("board", "items", "orders"),
-                new AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets"), "board", "views", List.of("board-1"), components()))
+                new AppCard.Ui("a2ui", "1.0", List.of("example-widgets"), "board", "views", List.of("board-1"), components()))
                 .withOrigin(AppCard.Origin.of("console", "example-console/example-board", "", null));
     }
 

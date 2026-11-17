@@ -280,4 +280,109 @@ class LargePayloadTest {
         a.space().sweepNow();
         assertThat(a.blocks().references(cid)).as("collected, so released").isZero();
     }
+
+    // ---- decision 21 of srad/replication-by-entry.md: a deferred WRITTEN for an entry that ended while its block travelled
+
+    /**
+     * B learns a content-addressed entry while it is present, but cannot reach the only holder of its block, so the
+     * WRITTEN waits for the block. The writer takes and completes the entry, and the completion reaches B (through C,
+     * which keeps no blocks) while the block is still missing, so B could raise nothing then. When the block lands, B
+     * raises COMPLETED alone: the entry was gone before any reader at B could see it, and a listener that pairs the
+     * events must not count it as live. Before the fix B raised a WRITTEN for the finished entry and no COMPLETED.
+     */
+    @Test
+    void anEntryCompletedWhileItsBlockTravelledRaisesCompletedAlone() throws Exception {
+        Peer a = newPeer("a", 1, true);
+        Peer b = newPeer("b", 2, true, "a");
+        Peer c = newPeer("c", 3, false, "a");
+        for (int i = 0; i < 6; i++) {
+            nodes.forEach(PeerNode::tick);
+        }
+        java.util.concurrent.CopyOnWriteArrayList<String> heard = new java.util.concurrent.CopyOnWriteArrayList<>();
+        b.space().notify(Template.of(BigEntry.class), event -> heard.add(event.kind() + ":" + event.entry().name()),
+                Lease.of(Duration.ofMinutes(30)));
+
+        network.partition("a", "b");
+        byte[] data = new byte[120_000];
+        new Random(41).nextBytes(data);
+        ai.badmonkey.agentspaces.api.space.EntryHandle written =
+                a.space().write(new BigEntry("brief", data), Lease.of(Duration.ofMinutes(30)));
+        awaitRecordAndFailedFetch(b, c, written.entryId());
+
+        var taken = a.space().take(Template.of(BigEntry.class), Lease.of(Duration.ofMinutes(5)), Duration.ZERO).orElseThrow();
+        a.space().complete(taken);
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (!b.space().recordOf(written.entryId(), false).isEmpty() && System.nanoTime() < deadline) {
+            nodes.forEach(PeerNode::tick); // the completion reaches B through C
+            Thread.sleep(20);
+        }
+        assertThat(b.space().recordOf(written.entryId(), true)).as("B holds the entry completed").isPresent();
+        assertThat(b.space().recordOf(written.entryId(), false)).isEmpty();
+        assertThat(heard).as("nothing yet: B cannot decode the value").isEmpty();
+
+        network.heal();
+        clock.advance(Duration.ofMillis(2_100));
+        deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (heard.isEmpty() && System.nanoTime() < deadline) {
+            nodes.forEach(PeerNode::tick); // the retry runs from the tick and the block lands
+            Thread.sleep(20);
+        }
+        Thread.sleep(200); // room for a stray second event to show
+        assertThat(heard).containsExactly("COMPLETED:brief");
+    }
+
+    /** As above, but the writer cancels the entry while the block travels: B raises nothing, since no reader saw it. */
+    @Test
+    void anEntryWithdrawnWhileItsBlockTravelledRaisesNothing() throws Exception {
+        Peer a = newPeer("a", 1, true);
+        Peer b = newPeer("b", 2, true, "a");
+        Peer c = newPeer("c", 3, false, "a");
+        for (int i = 0; i < 6; i++) {
+            nodes.forEach(PeerNode::tick);
+        }
+        java.util.concurrent.CopyOnWriteArrayList<String> heard = new java.util.concurrent.CopyOnWriteArrayList<>();
+        b.space().notify(Template.of(BigEntry.class), event -> heard.add(event.kind() + ":" + event.entry().name()),
+                Lease.of(Duration.ofMinutes(30)));
+
+        network.partition("a", "b");
+        byte[] data = new byte[120_000];
+        new Random(43).nextBytes(data);
+        ai.badmonkey.agentspaces.api.space.EntryHandle written =
+                a.space().write(new BigEntry("draft", data), Lease.of(Duration.ofMinutes(30)));
+        awaitRecordAndFailedFetch(b, c, written.entryId());
+
+        written.cancel();
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (b.space().recordOf(written.entryId(), false).isPresent() && System.nanoTime() < deadline) {
+            nodes.forEach(PeerNode::tick);
+            Thread.sleep(20);
+        }
+        assertThat(b.space().recordOf(written.entryId(), false)).as("withdrawn at B").isEmpty();
+
+        network.heal();
+        clock.advance(Duration.ofMillis(2_100));
+        for (int i = 0; i < 10; i++) {
+            nodes.forEach(PeerNode::tick);
+            Thread.sleep(20);
+        }
+        Thread.sleep(200);
+        assertThat(heard).isEmpty();
+    }
+
+    /** Ticks until B holds the entry's record (by way of C) and B's first fetch of the block has failed. */
+    private void awaitRecordAndFailedFetch(Peer b, Peer c, ai.badmonkey.agentspaces.api.entry.EntryId entryId)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (b.space().recordOf(entryId, true).isEmpty() && System.nanoTime() < deadline) {
+            nodes.forEach(PeerNode::tick);
+            Thread.sleep(20);
+        }
+        assertThat(c.space().recordOf(entryId, true)).as("C relayed the record").isPresent();
+        assertThat(b.space().recordOf(entryId, false)).as("B holds the record, present").isPresent();
+        deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (b.space().pendingBlockRetries() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(b.space().pendingBlockRetries()).as("B's first fetch failed and waits for its retry").isEqualTo(1);
+    }
 }

@@ -101,6 +101,39 @@ class PushSumSettleTest {
         assertThatThrownBy(() -> PushSumAggregate.Settle.after(1, -0.5)).isInstanceOf(IllegalArgumentException.class);
     }
 
+    /**
+     * A silence shorter than the rule does not settle a watch (example 18, R1 2026-11-14). The
+     * epoch goes quiet after its quiet ticks, and that silence used to count as the whole
+     * streak, so a watch asking for 25 steps fired after about 10 on a plateau of zeros that a
+     * late contribution was about to move, and reported the plateau.
+     */
+    @Test
+    void aSilenceShorterThanTheRuleDoesNotSettleAWatch() throws Exception {
+        PushSumAggregate a = peer("a", 1).quiet(10, 1e-3, 1_000);
+        PushSumAggregate b = peer("b", 2, "a").quiet(10, 1e-3, 1_000);
+        PushSumAggregate c = peer("c", 3, "a").quiet(10, 1e-3, 1_000);
+        List<PushSumAggregate> all = List.of(a, b, c);
+        tick(all, 3);
+        List<PushSumAggregate.Estimate> settled = new CopyOnWriteArrayList<>();
+        c.onEstimate("reserve"::equals, PushSumAggregate.Settle.after(25, 0.01), settled::add);
+
+        // The plateau: two zero contributions, heard by c, quiet everywhere after ten ticks.
+        a.start("reserve", 0.0);
+        b.start("reserve", 0.0);
+        tick(all, 20);
+        Thread.sleep(100);
+        assertThat(c.quiet("reserve")).as("the plateau went quiet").isTrue();
+        assertThat(settled).as("twenty ticks of silence are fewer than the twenty-five the rule asks for")
+                .isEmpty();
+
+        // The late contribution moves the estimate; the watch fires once, on the fleet's value.
+        a.start("reserve", 300.0);
+        tick(all, 80);
+        Thread.sleep(100);
+        assertThat(settled).hasSize(1);
+        assertThat(settled.get(0).value()).isCloseTo(100.0, within(1.0));
+    }
+
     @Test
     void firstFiresOnTheFirstEstimateAndAfterFiresOnceWhenStable() throws Exception {
         PushSumAggregate a = peer("a", 1);

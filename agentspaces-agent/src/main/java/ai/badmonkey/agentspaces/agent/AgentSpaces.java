@@ -185,6 +185,31 @@ public final class AgentSpaces implements AutoCloseable {
      *
      * @return the registry, or empty when each group's binder uses its default
      */
+    /**
+     * Registers configured {@link ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader}s for every binder
+     * (reviews/embabel-agentspaces-review-2026-11-12.md §7.2): hosts that cannot rely on {@code ServiceLoader}
+     * (native images, nested class loaders, tests) and hosts that configure a reader call this before any bean
+     * binds. A reader replaces a loaded one of the same class.
+     *
+     * @param readers the readers
+     * @return this facade
+     */
+    public AgentSpaces declarationReaders(List<ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader> readers) {
+        Objects.requireNonNull(readers, "readers").forEach(AgentBinder::registerDeclarationReader);
+        return this;
+    }
+
+    /**
+     * Registers take invokers for every binder (review §7.8): a host's runtime that runs claimed worker methods.
+     *
+     * @param invokers the invokers
+     * @return this facade
+     */
+    public AgentSpaces takeInvokers(List<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invokers) {
+        Objects.requireNonNull(invokers, "invokers").forEach(AgentBinder::registerTakeInvoker);
+        return this;
+    }
+
     public Optional<SchemaRegistry> schemaRegistry() {
         return Optional.ofNullable(schemaRegistry);
     }

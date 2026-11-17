@@ -1,6 +1,48 @@
 {
   "properties": [
     {
+      "name": "agentspaces.gossip.probe-hash-streams",
+      "type": "java.lang.Integer",
+      "description": "Per-stream probe hashes up to this many streams; above it a probe carries the root alone (srad/replication-by-entry.md RE-T-07). From 0 to 256. An unknown key under agentspaces.gossip refuses at start.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": 32
+    },
+    {
+      "name": "agentspaces.gossip.audit",
+      "type": "java.lang.Boolean",
+      "description": "Advertise the hint wire.ae=2 and audit spaces by their fingerprinted tries, fetching by entry id, toward members whose card carries it (SPEC annex I.6). Off, every stream keeps the hashed or text form.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": true
+    },
+    {
+      "name": "agentspaces.gossip.audit-sessions",
+      "type": "java.lang.Integer",
+      "description": "Audit sessions kept open per asker (SPEC annex I.6). From 1 to 4; a stream past the bound waits a round.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": 4
+    },
+    {
+      "name": "agentspaces.gossip.audit-budget",
+      "type": "java.lang.Long",
+      "description": "Bytes each answer to this node's audit requests may hold (SPEC annex I.6). From 4096 to 4194304.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": 1048576
+    },
+    {
+      "name": "agentspaces.space.renew-shortening-log",
+      "type": "java.lang.Boolean",
+      "description": "Log once per space, at INFO, the first renewal that asks for less than its lease has left; such a renewal keeps the longer lease (RE-H-01). An unknown key under agentspaces.space refuses at start.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": true
+    },
+    {
+      "name": "agentspaces.space.horizon",
+      "type": "java.lang.String",
+      "description": "per-entry advertises the hint wire.horizon=1, so a space whose whole view carries it collects a withdrawn entry five minutes at most after the entry's own lease expiry (SPEC 7.3); legacy keeps 2 x maxLease. Use legacy on a node that renews for an identity another node renews for at the same time.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": "per-entry"
+    },
+    {
       "name": "agentspaces.transport.quic.enabled",
       "type": "java.lang.Boolean",
       "description": "Register the quic binding. Needs ai.badmonkey.agentspaces:agentspaces-transport-quic on the classpath.",

@@ -65,6 +65,11 @@ public final class ReduceBinding implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(ReduceBinding.class.getName());
     private static final int READ_LIMIT = 256;
+    /**
+     * What close waits beyond the take lease and the poll: an ordered claim's 3 s attempt window, and the fold's
+     * writes.
+     */
+    private static final Duration CLOSE_MARGIN = Duration.ofSeconds(5);
 
     /** What the binder configured. */
     public record Config(String name, SpaceReduce.Mode mode, Space space, Class<?> elementType,
@@ -122,6 +127,10 @@ public final class ReduceBinding implements AutoCloseable {
     private final List<Thread> threads = new ArrayList<>();
     private volatile boolean running = true;
     private volatile boolean started;
+    /** The drain thread, which {@link #close} does not interrupt while it folds. */
+    private volatile Thread drainThread;
+    /** Whether the drain is inside a fold whose element it already won; guarded by {@link #lock}. */
+    private boolean folding;
 
     /**
      * @param config      what the binder resolved from the annotation
@@ -157,7 +166,9 @@ public final class ReduceBinding implements AutoCloseable {
         int seeded = sweep();
         subscriptions.add(subscribe());
         subscriptions.add(subscribeTickets());
-        threads.add(Thread.ofVirtual().name("space-reduce-" + config.name()).start(this::drain));
+        drainThread = Thread.ofVirtual().name("space-reduce-" + config.name()).unstarted(this::drain);
+        threads.add(drainThread);
+        drainThread.start();
         threads.add(Thread.ofVirtual().name("space-reduce-keep-" + config.name()).start(this::keep));
         LOG.log(System.Logger.Level.INFO, config.name() + ": " + config.mode() + " reduce of "
                 + config.elementType().getSimpleName() + " into " + config.accumulatorType().getSimpleName()
@@ -167,12 +178,48 @@ public final class ReduceBinding implements AutoCloseable {
                 + ", " + seeded + " key(s) pending");
     }
 
+    /**
+     * Stops the reduce, and returns once nothing more will be folded. A take in flight is interrupted: it makes no
+     * new claim, waits only for the claim it already has out to be decided (the ordered log's attempt window, or
+     * the space's settle window), and returns. A ticket it won is completed bare, which hands the key on at once
+     * instead of holding it for the take lease; an element it won is folded. A fold in progress is not interrupted;
+     * it finishes, retiring the previous accumulator in a single attempt, and close waits for it, because its
+     * element is this reducer's until the take lease lapses and stopping half way would hold it from every other
+     * reducer for that long. Close waits at most the take lease
+     * plus the poll timeout and a margin: past the lease a fold's completion is refused, so a longer wait buys
+     * nothing. Called from the reduce's own fold, close cannot wait for itself and returns at once; the drain stops
+     * when that fold returns.
+     */
     @Override
     public void close() {
         running = false;
-        threads.forEach(Thread::interrupt);
+        synchronized (lock) {
+            for (Thread thread : threads) {
+                if (thread != drainThread || !folding) {
+                    thread.interrupt();
+                }
+            }
+            lock.notifyAll();
+        }
         subscriptions.forEach(Subscription::close);
-        tickets.close();
+        long ceiling = System.nanoTime() + config.takeLease().duration().plus(config.pollTimeout())
+                .plus(CLOSE_MARGIN).toNanos();
+        for (Thread thread : threads) {
+            if (thread == Thread.currentThread()) {
+                continue;
+            }
+            long left = ceiling - System.nanoTime();
+            try {
+                if (left <= 0 || !thread.join(Duration.ofNanos(left))) {
+                    LOG.log(System.Logger.Level.WARNING, config.name() + ": " + thread.getName()
+                            + " still running when close gave up waiting");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); // the closer was interrupted: stop waiting, keep the status
+                break;
+            }
+        }
+        tickets.close(); // after the drain: an ORDERED drain reads the committed claims until it stops
     }
 
     // ------------------------------------------------------------------ elements arriving
@@ -332,8 +379,16 @@ public final class ReduceBinding implements AutoCloseable {
             return; // another reducer holds the key; its events or the sweep raise it again
         }
         EntryId mine = ticket.get().entryId();
+        if (!running) {
+            releaseTicket(key, ticket.get()); // closed while taking it: hand the key on now, not at the lease
+            return;
+        }
         if (config.mode() == SpaceReduce.Mode.ORDERED) {
             EntryId lock = tickets.awaitEarliestLive(key, mine);
+            if (lock == null && !running) {
+                releaseTicket(key, ticket.get()); // interrupted by close while the log's order resolved
+                return;
+            }
             if (lock == null) {
                 LOG.log(System.Logger.Level.DEBUG, config.name() + ": key '" + key
                         + "' undecided; releasing the ticket by its lease");
@@ -370,7 +425,7 @@ public final class ReduceBinding implements AutoCloseable {
                 if (element.isEmpty()) {
                     break;
                 }
-                if (!fold(key, element.get())) {
+                if (!foldWon(key, element.get())) {
                     break; // the method threw: the element reappears by its lease; stop the drain here
                 }
                 steps++;
@@ -389,6 +444,40 @@ public final class ReduceBinding implements AutoCloseable {
         if (steps > 0) {
             LOG.log(System.Logger.Level.DEBUG, config.name() + ": key '" + key + "' folded " + steps + " element(s)");
         }
+    }
+
+    /**
+     * Folds an element this reducer already won, shielded from close: close does not interrupt a fold in progress,
+     * and an interrupt that landed between the take's return and here is set aside until the fold is done, so the
+     * fold's own takes (retiring the previous accumulator) run as they always do. The status is set again
+     * afterwards when close was called, which ends the drain.
+     */
+    private boolean foldWon(String key, TakenEntry<?> element) {
+        synchronized (lock) {
+            folding = true;
+        }
+        boolean interrupted = Thread.interrupted();
+        try {
+            return fold(key, element);
+        } finally {
+            synchronized (lock) {
+                folding = false;
+            }
+            if (interrupted || !running) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** Completes a ticket bare and forgets the request, so the key's next element raises a new ticket. */
+    private void releaseTicket(String key, TakenEntry<JoinTicket> ticket) {
+        try {
+            config.space().complete(ticket);
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.DEBUG, config.name() + ": could not release the ticket for key '" + key
+                    + "' at close (" + e.getMessage() + "); it reappears by its lease");
+        }
+        tickets.forget(key);
     }
 
     /**
@@ -469,7 +558,10 @@ public final class ReduceBinding implements AutoCloseable {
             }
             Template<?> stale = Reductions.template(config.accumulatorType(), config.name(), key)
                     .whereTag(Reductions.STEPS_TAG, eq(Long.toString(Reductions.steps(predecessor))));
-            take(stale).ifPresent(taken -> config.space().complete(taken));
+            // A fold finishing during close makes one attempt rather than polling: close waits for it, and the
+            // attempt still waits out its own claim (an ordered claim's window), so a retirement is not torn.
+            Duration wait = running ? config.pollTimeout() : Duration.ZERO;
+            take(stale, wait).ifPresent(taken -> config.space().complete(taken));
         } catch (RuntimeException e) {
             LOG.log(System.Logger.Level.WARNING, config.name() + ": could not retire accumulator "
                     + predecessor.entryId() + " of key '" + key + "'; readers choose the highest steps", e);
@@ -487,11 +579,14 @@ public final class ReduceBinding implements AutoCloseable {
                 Matchers.predicate(value -> value != null && key.equals(String.valueOf(value))));
     }
 
-    @SuppressWarnings({"unchecked", "rawtypes"})
     private <T> Optional<TakenEntry<T>> take(Template<T> template) {
+        return take(template, config.pollTimeout());
+    }
+
+    private <T> Optional<TakenEntry<T>> take(Template<T> template, Duration timeout) {
         return config.mode() == SpaceReduce.Mode.ORDERED
-                ? config.coordinator().take(template, config.takeLease(), config.pollTimeout())
-                : config.space().take(template, config.takeLease(), config.pollTimeout());
+                ? config.coordinator().take(template, config.takeLease(), timeout)
+                : config.space().take(template, config.takeLease(), timeout);
     }
 
     // ------------------------------------------------------------------ housekeeping

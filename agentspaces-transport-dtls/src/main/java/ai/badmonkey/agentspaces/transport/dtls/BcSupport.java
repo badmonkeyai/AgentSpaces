@@ -160,7 +160,8 @@ final class BcSupport {
 
     /**
      * A dialer's socket. Bound to no one address, so it outlives a change of
-     * this host's address (DT-K-05), except toward a loopback peer, where it
+     * this host's address (DT-K-05; {@link DialSocket} connects it for the
+     * handshake alone), except toward a loopback peer, where it
      * binds the loopback address: macOS gives a wildcard socket an ephemeral
      * port that a socket bound to {@code 127.0.0.1} already holds, and every
      * datagram for that port then reaches the other socket. A dial to a

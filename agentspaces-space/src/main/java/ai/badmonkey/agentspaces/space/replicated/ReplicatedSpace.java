@@ -64,17 +64,19 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.InstantSource;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -86,10 +88,19 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Exclusive take runs the {@code LEASE_RACE} strategy (spec §7.4): a claim is
  * a {@link TakeClaim} lattice value published as a delta; after the settle window
- * the deterministic merge decides the winner identically on every replica. At
- * most one {@code complete} survives per entry (the CRDT's monotone completed
- * flag), and transient duplicate work during partitions is the documented
- * trade-off, so tasks should be idempotent.
+ * the deterministic merge decides the winner identically on every replica. The
+ * settle guarantee (SPEC §7.4, 2026-11-15): while every claim reaches every rival
+ * claimant within the settle window (half the window for an AUCTION counter-claim),
+ * at most one take of an entry wins. A claim later than that can leave two holders
+ * that each judged themselves the winner. A holder that learns of a better claim, or
+ * of the entry's completion, before it completes cannot complete; a holder whose
+ * claim wins the lattice and that learns of the displaced holder's completion first
+ * acknowledges that completion and writes no result. When each learns only after it
+ * completed, both did the work: the shared state still keeps one completion (the
+ * CRDT's monotone completed flag, and a completion authenticates only under the claim
+ * the lattice keeps), and the replica whose claim won counts the duplicate
+ * ({@link #duplicateCompletions()}). A result that must exist exactly once needs the
+ * ordered log (ORDERED) or an idempotent completion.
  *
  * <p>Entry records are signed over their immutable identity (id, space, type,
  * payload, issuer, issue stamp, tags), and receivers verify the signature and
@@ -104,8 +115,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link Builder#founderLease} or
  * {@link #markReadOnly()} turns the space read-only. Lease lapses surface as
  * {@code EXPIRED} and {@code REAPPEARED} events from the sweep that the
- * anti-entropy tick (or {@link #sweepNow()}) runs, and the same sweep collects
- * tombstones twice the maximum lease after their lease lapsed (spec §7.3). A
+ * group tick and every anti-entropy digest run when something is due (or
+ * {@link #sweepNow()} at once), and the same sweep collects tombstones at
+ * their horizon of spec §7.3 ({@link SpaceStateCrdt#keepMillis}): twice the
+ * maximum lease after their lease lapsed for a completion, five minutes at
+ * most for a lapse, and for a withdrawal the rule the view allows, never
+ * sooner than the clock drift ceiling. An expiry index keeps the sweep to the entries that are due, so
+ * an unchanged space costs O(1) per probe (reviews/IDLE-WORK-2026-11-13.md). A
  * cancel surfaces as {@code EXPIRED} too, as on a {@code LocalSpace}: at the
  * cancelling replica at once, and at every other replica that held the entry
  * when the withdrawal merges, once per entry with the lapse (core cancel
@@ -166,13 +182,27 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** The bus registrations this handle owns; closed by {@link #close()} (QA4 A4-9). */
     private final AutoCloseable streamRegistration;
     private final AutoCloseable reconcileRegistration;
+    /** Runs the expiry sweep from the group tick when something is due (see {@link #sweepIfDue()}). */
+    private final AutoCloseable sweepTick;
+    /**
+     * Whether only this replica's writer reads the space ({@link Builder#local()}): it neither gossips its writes
+     * nor joins anti-entropy, so the group pays nothing for it (reviews/IDLE-WORK-2026-11-13.md item 15, 5a(f)).
+     */
+    private final boolean local;
 
-    /** Bounds {@link #shardDropped} so a sharded replica offered a long stream
+    /** Bounds {@link #shardDroppedOrder} so a sharded replica offered a long stream
      * of out-of-shard entries does not accumulate acknowledgement lines forever. */
     private static final int SHARD_DROPPED_CAP = 8192;
 
-    /** Bounds {@link #refusedAck}. */
+    /** Bounds the acknowledged lines of one space ({@link #refusedAckOrder}). */
     private static final int REFUSED_ACK_CAP = 8192;
+
+    /**
+     * How long the acknowledgement of a re-offered collected tombstone is held after its last refusal (RE-H-03): the
+     * lapse grace, so a member that keeps the tombstone longer offers it at most once per hold instead of once per
+     * round, and the line is gone soon after that member collects it too.
+     */
+    static final long COLLECTED_ACK_HOLD_MILLIS = SpaceStateCrdt.LAPSED_GRACE_MILLIS;
 
     /** Bounds {@link #rejectedOffers}. */
     private static final int REJECTED_OFFERS_CAP = 4096;
@@ -189,6 +219,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** Default TTL of the published space advertisement (spec §7.5). */
     static final Duration DEFAULT_ADVERTISEMENT_TTL = Duration.ofMinutes(15);
 
+    private static final System.Logger LOG = System.getLogger(ReplicatedSpace.class.getName());
+
     private final Object lock = new Object();
     /**
      * The record, state and claim signatures this replica verified (swap amplification, ROBUSTNESS.md §10.8): a state
@@ -202,14 +234,75 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private byte[] digestCache;
     private long digestGeneration = -1;
     private long digestComputations;
-    private final Map<EntryId, SpaceWire.SignedClaim> claims = new HashMap<>();
+    /**
+     * Full-digest asks answered from the cache, and asks that had to rebuild it (RE-F-03's signals); hash asks are
+     * counted in their own pair below, not here. Under {@link #lock}.
+     */
+    private long digestCacheHits;
+    private long digestCacheMisses;
+    /** The same for the hash a probe or a hashed opening carries. Under {@link #lock}. */
+    private long digestHashHits;
+    private long digestHashMisses;
+    /**
+     * The SHA-256 of {@link #digestCache}, and the digest it was taken over (IDLE-WORK item 3): a probe and a hashed
+     * anti-entropy round ask for the hash of every stream, and re-hashing a cached multi-megabyte digest each time
+     * was most of what an unchanged space cost. Kept by identity with the cached digest, so it is stale exactly when
+     * the digest is.
+     */
+    private byte[] digestHashCache;
+    private byte[] digestHashOf;
+
+    // ---- the expiry index (IDLE-WORK item 4)
+    /**
+     * Each entry id with something the sweep will do for it, filed under the earliest time it is due: a write lease
+     * lapsing (EXPIRED), a take claim lapsing on a present entry (REAPPEARED), a lapsed claim on an entry this replica
+     * does not hold (dropped), or a tombstone reaching its collection horizon. The sweep used to visit every entry on
+     * every digest, which made a probe of an idle space cost the whole space; it now visits only what is due, and
+     * nothing at all until the earliest time here. Kept in step, under {@link #lock}, by {@link #reindex} at every
+     * place an entry's state, its claim, or the sweep's own once-only bookkeeping changes.
+     */
+    private final TreeMap<Long, Set<EntryId>> dueByTime = new TreeMap<>();
+    /** The time each id is filed under in {@link #dueByTime}. Under {@link #lock}. */
+    private final Map<EntryId, Long> dueOf = new HashMap<>();
+    /** No earlier than the first moment a pending recordless state outlives its TTL; MAX when none waits. Under {@link #lock}. */
+    private long pendingDueMillis = Long.MAX_VALUE;
+    /** The latest clock reading the index was computed at; a clock that steps back below it rebuilds the index. */
+    private long indexedAtMillis = Long.MIN_VALUE;
+    /** Entry ids the sweep has evaluated, for the test that an unchanged space visits none. Under {@link #lock}. */
+    private long sweepVisits;
+    /** What the last sweep did, for the property test against the full scan. Under {@link #lock}. */
+    private SweepActions lastSweep = SweepActions.NONE;
+
+    // ---- the change signal a waiting take or read sleeps on (IDLE-WORK 5a(a))
+    /** Bumped with every change a waiting take or read could act on. Under {@link #lock}. */
+    private long signals;
+    /** Threads waiting on {@link #lock} for a change; a change notifies only when there are any. Under {@link #lock}. */
+    private int waiters;
+    /**
+     * The longest a waiting take or read sleeps without a signal. Most of what lets a take succeed signals (a write, a
+     * merge, a renewal, a cancel, a claim, a sweep that lapses a claim, a block or artifact landing here); this bounds
+     * the wait on what cannot (a key that arrives for a sealed payload, a block stored by another path, a test clock
+     * moved by hand). The poll it replaces ran every 20 ms.
+     */
+    static final long WAIT_SLICE_MILLIS = 1_000;
+    /** How many times a blocking read or take has tried, for the test that a waiting take does not poll. */
+    private final AtomicLong waitingPolls = new AtomicLong();
+    /**
+     * The live index (RE-M-04, srad/replication-by-entry.md): every present entry's record under its current lease, by
+     * id, beside the map. A read after a change walks the live entries alone, where it used to rebuild the list from
+     * every entry the map held, tombstones included. A derived cache of {@link #crdt}, kept in step under
+     * {@link #lock} by {@link #setCrdt} at every place an entry's state changes.
+     */
+    private final LiveIndex liveIndex = new LiveIndex();
     /**
      * Entries whose current claim was decided by the ordered log, with the
      * decided epoch (QA4 A4-5). A log decision is authoritative for its epoch:
      * a gossip-borne claim at the same or a lower epoch cannot displace it,
      * which is the priority the old log-index re-stamp gave committed claims
      * by accident and this gives them by rule. An identical claim may still
-     * merge, so an attestation upgrade through a completion delta is allowed.
+     * merge, so an attestation upgrade through a completion delta is allowed,
+     * and so may the decided holder's renewal of its claim (same claim, later
+     * expiry), so a drain longer than the take lease keeps its hold at every voter.
      */
     private final Map<EntryId, Long> logDecidedEpochs = new HashMap<>();
     private final Map<EntryId, byte[]> issuerKeys = new HashMap<>();
@@ -217,21 +310,27 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * original {@code stateSig} (a relay cannot re-sign state it did not author).
      * Kept in step with {@link #crdt} by {@link #recordSignedState}. */
     private final Map<EntryId, SpaceWire.EntryStateDto> signedStates = new HashMap<>();
-    /** Digest lines for entries this sharded replica saw and dropped, so
-     * anti-entropy partners stop re-offering them; bounded LRU. */
     /**
-     * Digest lines ({@code e:<id>=<hash>} or {@code c:<id>=<hash>}) for states
-     * and claims this replica authenticated and refused because their actor is
-     * revoked (ASF-047). Advertised as {@code a:<line>} so anti-entropy
-     * partners stop re-offering them; bounded LRU.
+     * The order in which acknowledged lines ({@code e:<id>=<hash>} or {@code c:<id>=<hash>}) were last refused, oldest
+     * first, and the entry each names (ASF-047, and the stamp refusals of HLC canonical stamps, 2026-11-08). The lines
+     * themselves live in the slots of {@link #crdt} (RE-M-07), so one root covers every digest line; this access-ordered
+     * map only bounds them at {@link #REFUSED_ACK_CAP} per space, forgetting the least recently refused first, as the
+     * map that held the lines before did. Under {@link #lock}.
      */
-    private final Map<String, Boolean> refusedAck =
-            new java.util.LinkedHashMap<>(16, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
-                    return size() > REFUSED_ACK_CAP;
-                }
-            };
+    private final java.util.LinkedHashMap<String, EntryId> refusedAckOrder = new java.util.LinkedHashMap<>(16, 0.75f, true);
+    /**
+     * The acknowledged lines of re-offered collected tombstones (RE-H-03) and the time each is forgotten, in refusal
+     * order; each line is also in {@link #refusedAckOrder}, whose cap bounds both. Under {@link #lock}.
+     */
+    private final java.util.LinkedHashMap<String, Long> collectedAcks = new java.util.LinkedHashMap<>();
+    /**
+     * When each acknowledgement of a state or claim refused at the door is forgotten (P6, srad/replication-by-entry.md
+     * phase 4): once what it refused is past the horizon at which every honest holder collects it. Kept, the line
+     * would hold this replica's audited set apart from its partners' for good after they collect, and every round
+     * would descend to it and fetch nothing. Line to time, and time to lines for the sweep. Under {@link #lock}.
+     */
+    private final Map<String, Long> refusedForgetAt = new HashMap<>();
+    private final java.util.TreeMap<Long, Set<String>> refusedForgetBy = new java.util.TreeMap<>();
     /** Entries whose claim was refused for a revoked holder, so the completion
      * that would authenticate against that claim is acknowledged, not re-offered. */
     private final Set<EntryId> refusedClaimEntries = java.util.Collections.newSetFromMap(
@@ -241,13 +340,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     return size() > REFUSED_ACK_CAP;
                 }
             });
-    private final Map<EntryId, String> shardDropped =
-            new java.util.LinkedHashMap<>(16, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<EntryId, String> eldest) {
-                    return size() > SHARD_DROPPED_CAP;
-                }
-            };
+    /**
+     * The order in which out-of-shard entries were last dropped here, oldest first. Their lines live in the slots of
+     * {@link #crdt} (RE-M-07); this only bounds them at {@link #SHARD_DROPPED_CAP}, forgetting the oldest first, as
+     * the map that held them before did. Under {@link #lock}.
+     */
+    private final java.util.LinkedHashMap<EntryId, Boolean> shardDroppedOrder =
+            new java.util.LinkedHashMap<>(16, 0.75f, true);
     private final Map<EntryId, Object> valueCache = new ConcurrentHashMap<>();
     private final List<Sub> subscriptions = new CopyOnWriteArrayList<>();
     private final AtomicLong dotCounter = new AtomicLong();
@@ -274,6 +373,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final AtomicLong recordlessSent = new AtomicLong();
     private final AtomicLong recordlessMerged = new AtomicLong();
     private final AtomicLong recordlessHeld = new AtomicLong();
+    /** Takes that acknowledged an outbid holder's completion instead of doing the work again. */
+    private final AtomicLong outbidAcknowledged = new AtomicLong();
+    /** Entries completed here, with work, whose displaced rival's own completion arrived afterwards (SPEC §7.4). */
+    private final AtomicLong duplicateCompletions = new AtomicLong();
     /** Distinct states and claims refused for a logical counter above LOGICAL_LIMIT. */
     private final AtomicLong stampsLogicalRefused = new AtomicLong();
     /** Space deltas, by rumor or by anti-entropy, that did not decode (HLC canonical stamps, 2026-11-08). */
@@ -282,10 +385,71 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final AtomicLong stampsFarFutureRefused = new AtomicLong();
     /** Distinct states and claims deferred for a stamp past the far-future margin. */
     private final AtomicLong stampsFarFutureDeferred = new AtomicLong();
+    /** Signed states and claims this replica offered in anti-entropy deltas, and the states and claims it was offered. */
+    private final AtomicLong syncStatesSent = new AtomicLong();
+    private final AtomicLong syncClaimsSent = new AtomicLong();
+    private final AtomicLong syncStatesReceived = new AtomicLong();
+    private final AtomicLong syncClaimsReceived = new AtomicLong();
+    /**
+     * Renewals that asked for less than the lease had left (RE-H-01 and RE-H-02, srad/replication-by-entry.md §3.6).
+     * A renewal never shortens a lease (SPEC §7.2), so each such call kept the longer lease; the count shows which
+     * callers still ask for a shorter one.
+     */
+    private final AtomicLong renewShortenings = new AtomicLong();
+    /** Whether the first shortening renewal of this space was logged; each later one is only counted. */
+    private final AtomicBoolean renewShorteningLogged = new AtomicBoolean();
+    /**
+     * Re-offered states of entries this replica no longer holds, refused at the door as collectable tombstones and
+     * acknowledged (RE-H-03).
+     */
+    private final AtomicLong collectedReoffersAcknowledged = new AtomicLong();
+    /** Listener calls that threw; each is isolated, so the other listeners and events still run. */
+    private final AtomicLong listenerFailures = new AtomicLong();
 
     // ---- tombstone GC and lease-lapse events (spec §7.2, §7.3)
     /** Builder override for the GC horizon, or null to use the observed maximum. */
     private final Duration maxLeaseOverride;
+
+    // ---- the per-entry horizon (RE-H-04, RE-Q-REL-09; SPEC §7.3, v0.1.35)
+    /** Default rounds the view must stay fully hinted before the per-entry horizon engages. */
+    public static final int DEFAULT_HORIZON_ENGAGE_ROUNDS = 3;
+    /** Bounds of {@link #horizonEngageRounds(int)}. */
+    public static final int HORIZON_ENGAGE_ROUNDS_FLOOR = 1;
+    /** Bounds of {@link #horizonEngageRounds(int)}. */
+    public static final int HORIZON_ENGAGE_ROUNDS_CEILING = 64;
+    /** Rounds the view must stay fully hinted before the mode engages; settable at runtime within its bounds. */
+    private volatile int horizonEngageRounds = DEFAULT_HORIZON_ENGAGE_ROUNDS;
+    /** Guards the mode's hysteresis below; a leaf lock, never held while taking {@link #lock}. */
+    private final Object horizonLock = new Object();
+    /** The mode as last judged; read without a lock where a stale answer is harmless (the expiry index). */
+    private volatile HorizonMode horizonMode = HorizonMode.LEGACY;
+    /** Fully hinted rounds counted since the view last held an unhinted member. Under {@link #horizonLock}. */
+    private int horizonStreak;
+    /** Space-clock time the streak last counted a round, or {@link Long#MIN_VALUE}. Under {@link #horizonLock}. */
+    private long horizonCountedAtMillis = Long.MIN_VALUE;
+    /** Space-clock time the mode engaged, while it is engaged. Under {@link #horizonLock}. */
+    private long horizonEngagedAtMillis;
+    /** The mode reached {@link HorizonMode#PER_ENTRY}, so the expiry index must file every tombstone afresh. */
+    private volatile boolean horizonRefile;
+    /**
+     * Withdrawals filed at the legacy horizon under the per-entry mode only because a writer was out of view, by that
+     * writer's PeerID text (RE-H-04). When the writer comes back into view its wait becomes known, and they are filed
+     * again so that they fall due when it ends, as a pass over every entry would find. Keyed by writer, so a judgement
+     * looks once at each absent writer, never at every tombstone. Under {@link #lock}.
+     */
+    private final Map<String, Set<EntryId>> awaitingWriter = new HashMap<>();
+    /**
+     * Each writer's current stay in the view, as {node-clock join time, space-clock start} ({@link
+     * #writerInViewSince}). Read by the door outside {@link #lock} as well, so concurrent; one small pair per writer
+     * in view, dropped when the writer is found out of view and cleared with the index.
+     */
+    private final Map<String, long[]> writerStays = new java.util.concurrent.ConcurrentHashMap<>();
+    private final AtomicLong horizonEngagements = new AtomicLong();
+    private final AtomicLong horizonSettlements = new AtomicLong();
+    private final AtomicLong horizonDisengagements = new AtomicLong();
+    /** Whether this space logged a disengagement yet; later ones log at debug. */
+    private final java.util.concurrent.atomic.AtomicBoolean horizonDisengageLogged =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /** Largest lease duration this replica has observed for the space, capped. */
     private volatile long maxLeaseObservedMillis;
     /** Entries whose EXPIRED event already fired here, for a lapse or a cancel. Under {@link #lock}. */
@@ -295,6 +459,40 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** Claim epoch per entry whose TAKEN event already fired here: a won local take, or a merged remote claim
      *  (a replica that only watches a lane hears of its takes this way). Under {@link #lock}. */
     private final Map<EntryId, Long> takenEpochs = new HashMap<>();
+    /**
+     * The claim epoch per entry at which a holder that this replica's own claim displaces in the lattice has
+     * completed the entry anyway: an AUCTION incumbent a better bid outbid (example 18, 2026-11-15), or, under
+     * either strategy, a claimant whose claim reached it later than the settle window, so it judged itself the
+     * winner (the settle guarantee, SPEC §7.4, 2026-11-15). That holder judged its take before the better claim
+     * reached it, ran its action and completed. Its completion then reaches this replica, where the better claim
+     * holds the entry, and fails to authenticate against the held claim, so it is dropped (SPEC §11a.4). Dropping
+     * it is right for the shared state, but the work is done: this replica's take, when it is judged, or its
+     * completion, when it comes, acknowledges that completion under its own claim, which every replica
+     * authenticates, and writes no second result. Only claims held by this peer's agents are noted, so the map
+     * holds at most one line per take in flight here; it is bounded besides. Under {@link #lock}.
+     */
+    private final Map<EntryId, Long> outbidCompletions = new java.util.LinkedHashMap<>(16, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<EntryId, Long> eldest) {
+            return size() > OUTBID_COMPLETIONS_CAP;
+        }
+    };
+    /** At most this many {@link #outbidCompletions} lines are kept; past it the oldest goes. */
+    private static final int OUTBID_COMPLETIONS_CAP = 1024;
+    /**
+     * The claim epoch per entry that one of this peer's agents completed here with its own work (not an
+     * acknowledgement of a displaced holder's completion), until the entry is collected or a duplicate is counted.
+     * A displaced holder's authentic completion that arrives after it is the duplicate completion the settle
+     * guarantee leaves possible beyond the window (SPEC §7.4): both holders did the work. It is counted in
+     * {@link #duplicateCompletions} so an operator and a test can see it; nothing in the shared state changes.
+     * Bounded like {@link #outbidCompletions}. Under {@link #lock}.
+     */
+    private final Map<EntryId, Long> completedHere = new java.util.LinkedHashMap<>(16, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<EntryId, Long> eldest) {
+            return size() > OUTBID_COMPLETIONS_CAP;
+        }
+    };
     /** Keys of remote claims, and of states refused for their stamps, already rejected
      * here, so a lagging honest replica re-offering the same contested claim or state is
      * not struck once per round. Each key covers signed content alone (HLC round four,
@@ -331,6 +529,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final Map<String, BlockRetry> bulkRetries = new ConcurrentHashMap<>();
     /** The arrival callback of a read's poll: nothing to run, so it never joins a fetch in flight. */
     private static final Runnable NO_ARRIVAL = () -> { };
+    /**
+     * Entries whose merge deferred an event until their payload lands ({@link #payloadArrived}). Whoever removes the key
+     * raises the entry's event: the arrival, or a completion that could already decode the value. Bounded by the
+     * entries held here: the collection sweep and a retry that is given up drop a key.
+     */
+    private final Map<EntryId, Boolean> awaitingPayload = new ConcurrentHashMap<>();
 
     /** Deregisters the block-retry tick work on close. */
     private final AutoCloseable blockRetryTick;
@@ -414,30 +618,120 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // second registration under this stream id, so a second handle for a
         // name that is already open fails here, loudly, instead of silently
         // stealing the first handle's replication.
-        this.streamRegistration = runtime.gossip().onStream(streamId,
-                (from, itemId, payload) -> onDelta(from, payload));
-        this.reconcileRegistration = runtime.gossip().reconcile(streamId, new ReconcilableState() {
-            @Override
-            public byte[] digest() {
-                return ReplicatedSpace.this.digest();
-            }
+        this.local = builder.local;
+        if (local) {
+            // A writer-local space (Builder.local): nobody else reads it, so it registers nothing on the bus, no
+            // rumor handler and no anti-entropy state. Its sweep runs from the tick alone.
+            this.streamRegistration = () -> { };
+            this.reconcileRegistration = () -> { };
+        } else {
+            this.streamRegistration = runtime.gossip().onStream(streamId,
+                    (from, itemId, payload) -> onDelta(from, payload));
+            this.reconcileRegistration = runtime.gossip().reconcile(streamId, new ReconcilableState() {
+                @Override
+                public byte[] digest() {
+                    return ReplicatedSpace.this.digest();
+                }
 
-            @Override
-            public byte[] deltaFor(byte[] remoteDigest) {
-                return ReplicatedSpace.this.deltaFor(remoteDigest);
-            }
+                @Override
+                public byte[] digestHash() {
+                    return ReplicatedSpace.this.digestHash();
+                }
 
-            @Override
-            public void applyDelta(byte[] delta) {
-                ReplicatedSpace.this.applySyncDelta(delta);
-            }
+                @Override
+                public boolean applyDeltaChanged(byte[] delta) {
+                    return ReplicatedSpace.this.applySyncDelta(delta);
+                }
 
-            @Override
-            public void matched(PeerId from) {
-                ReplicatedSpace.this.digestMatched(from);
-            }
-        });
-        // Spec §7.5: a member creates a space by publishing its advertisement.
+                @Override
+                public byte[] deltaFor(byte[] remoteDigest) {
+                    return ReplicatedSpace.this.deltaFor(remoteDigest);
+                }
+
+                @Override
+                public void applyDelta(byte[] delta) {
+                    ReplicatedSpace.this.applySyncDelta(delta);
+                }
+
+                @Override
+                public void matched(PeerId from) {
+                    ReplicatedSpace.this.digestMatched(from);
+                }
+
+                // The trie audit of SPEC annex I.6 (srad/replication-by-entry.md phase 4): the bus asks these only
+                // toward a member on wire.ae=2.
+                @Override
+                public byte[] streamHash() {
+                    return ReplicatedSpace.this.streamHash();
+                }
+
+                @Override
+                public ReconcilableState.AuditNode auditNode(byte[] path) {
+                    ai.badmonkey.agentspaces.space.crdt.AuditNode node = ReplicatedSpace.this.auditNode(path);
+                    return new ReconcilableState.AuditNode(node.count(),
+                            node.kind() == ai.badmonkey.agentspaces.space.crdt.AuditNode.Kind.INNER, node.preimage());
+                }
+
+                @Override
+                public byte[] auditLines(byte[] path) {
+                    return ReplicatedSpace.this.auditLines(path);
+                }
+
+                @Override
+                public byte[] auditLines(byte[] path, long maxBytes) {
+                    return ReplicatedSpace.this.auditLines(path, maxBytes);
+                }
+
+                @Override
+                public java.util.Set<String> auditHeld(byte[] path, java.util.Collection<String> lines) {
+                    return ReplicatedSpace.this.auditHeld(path, lines);
+                }
+
+                @Override
+                public byte[] statesFor(java.util.Collection<String> ids) {
+                    return ReplicatedSpace.this.statesFor(ids);
+                }
+
+                // The budget of annex I.6 (srad/replication-by-entry.md phase 4, step 4b): a fetch and a get-space
+                // cut to the asker's budget, and a merge that names what it carried.
+                @Override
+                public ReconcilableState.Bounded statesFor(java.util.Collection<String> ids, long budget,
+                                                           boolean first) {
+                    return ReplicatedSpace.this.statesFor(ids, budget, first);
+                }
+
+                @Override
+                public ReconcilableState.Bounded deltaFor(byte[] remoteDigest, long budget, boolean first) {
+                    return ReplicatedSpace.this.deltaFor(remoteDigest, budget, first);
+                }
+
+                @Override
+                public ReconcilableState.Applied applyDeltaNamed(byte[] delta) {
+                    return ReplicatedSpace.this.applySyncDeltaNamed(delta);
+                }
+
+                @Override
+                public void linesSeen(PeerId from, String lines) {
+                    ReplicatedSpace.this.linesSeen(lines);
+                }
+
+                @Override
+                public void matchedUnder(PeerId from, byte[] path) {
+                    ReplicatedSpace.this.matchedUnder(path);
+                }
+
+                // The status figures of RE-Q-MNT-02, for a member's status page.
+                @Override
+                public ReconcilableState.Figures figures() {
+                    return ReplicatedSpace.this.figures();
+                }
+            });
+        }
+        // Lease lapses and collections fire from the tick as well as from the digest, so they keep time without
+        // gossip traffic: an O(1) look at the earliest due time when nothing is due (IDLE-WORK item 4).
+        this.sweepTick = runtime.onTick(this::sweepIfDue);
+        // Spec §7.5: a member creates a space by publishing its advertisement. A writer-local space publishes none
+        // (see refreshAdvertisement).
         refreshAdvertisement();
     }
 
@@ -479,6 +773,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         private ai.badmonkey.agentspaces.common.crypto.GroupKeyRing keyRing;
         private java.util.function.Predicate<Map<String, String>> tagShard;
         private Duration maxLease;
+        private boolean local;
         private DiscoveryPublisher publisher;
         private Duration advertisementTtl = DEFAULT_ADVERTISEMENT_TTL;
         private final List<Class<?>> schemaHints = new ArrayList<>();
@@ -736,6 +1031,25 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
          */
         public Builder maxLease(Duration maxLease) {
             this.maxLease = Objects.requireNonNull(maxLease, "maxLease");
+            return this;
+        }
+
+        /**
+         * Makes the space writer-local: a space only its own writer reads, such as a feed's scratch positions or a
+         * cache one agent keeps for itself. It does not register with the group's gossip bus, so it has no
+         * anti-entropy digest, joins no probe, and its writes, renewals, cancels, takes, and completions publish no
+         * rumor; it costs the group nothing (reviews/IDLE-WORK-2026-11-13.md item 15). It publishes no space
+         * advertisement either, even with {@link #advertise} set, since an advertisement says the space replicates,
+         * and a {@code FRESH} read starts no anti-entropy round. Everything else is as on a
+         * replicated space: leases, events, the tombstone sweep (run from the group tick), takes, and every handle
+         * of this replica on this node (see {@link ReplicatedSpace#as}). Other members never see its entries, and a
+         * member that opens a replicated space of the same name replicates without it. A second handle for the same
+         * name on this node is not refused, since the refusal lives in the bus registration a local space skips.
+         *
+         * @return this builder
+         */
+        public Builder local() {
+            this.local = true;
             return this;
         }
 
@@ -1029,12 +1343,16 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * loop calls this within the advertisement TTL. A no-op returning empty
      * when the space was built without {@link Builder#advertise} or has become
      * read-only: letting the advertisement lapse is how founders release a
-     * space.
+     * space. Also a no-op on a writer-local space ({@link Builder#local()}):
+     * every advertisement says the space replicates (FULL or TAG_SHARDED), so
+     * advertising a space nobody else can read would send members to a replica
+     * that never answers, and refreshing it would cost the group traffic for
+     * nothing.
      *
      * @return the advertisement published, when one was
      */
     public Optional<SignedAdvertisement<SpaceAdvertisement>> refreshAdvertisement() {
-        if (publisher == null || readOnly()) {
+        if (publisher == null || local || readOnly()) {
             return Optional.empty();
         }
         List<String> hints = new ArrayList<>(schemaNames);
@@ -1173,21 +1491,68 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * Applies lease lapses now (spec §7.2, §7.3): fires {@code EXPIRED} for
      * entries whose write lease lapsed and {@code REAPPEARED} for entries whose
      * take claim lapsed without completion, once per transition, and collects
-     * tombstones older than twice the maximum lease. The anti-entropy tick runs
-     * the same sweep; call this to sweep without traffic.
+     * tombstones past their horizon. The group tick and every
+     * anti-entropy digest run the same sweep whenever something is due; call
+     * this to sweep at once.
      */
     public void sweepNow() {
         List<Runnable> events;
         synchronized (lock) {
-            events = sweepLocked();
+            long now = nowMillis();
+            refileIfHorizonMoved(now);
+            events = sweepLocked(now);
         }
         events.forEach(Runnable::run);
+    }
+
+    /**
+     * Runs the sweep when something is due, and otherwise only looks at the earliest due time of the expiry index
+     * (IDLE-WORK item 4): the digest, the delta, and the group tick call this, so a space with nothing due costs
+     * O(1) per probe instead of a pass over every entry it has ever held.
+     */
+    void sweepIfDue() { // package-private for tests
+        List<Runnable> events;
+        SweepAudit audit = sweepAudit;
+        synchronized (lock) {
+            long now = nowMillis();
+            refileIfHorizonMoved(now);
+            SweepActions planned = audit == null ? null : fullScanPlan(now);
+            if (now >= indexedAtMillis && now < nextDueLocked()) {
+                if (audit != null) {
+                    audit.swept(now, planned, SweepActions.NONE); // a skipped sweep must be one with nothing to do
+                }
+                return;
+            }
+            events = sweepLocked(now);
+            if (audit != null) {
+                audit.swept(now, planned, lastSweep);
+            }
+        }
+        events.forEach(Runnable::run);
+    }
+
+    /**
+     * A test's view of every sweep the tick, the digest and the delta start: what a full pass would have done at that
+     * instant and what the indexed sweep did, {@link SweepActions#NONE} when it skipped. The property test holds the
+     * two equal on every such sweep, not only at its own check points, so a sweep skipped or run late in between is
+     * caught where it happens. Called under {@link #lock}; it must only record.
+     */
+    interface SweepAudit {
+        void swept(long now, SweepActions planned, SweepActions done);
+    }
+
+    /** Set by tests only; null in production, where it costs one volatile read per sweep. */
+    private volatile SweepAudit sweepAudit;
+
+    /** Installs the test's sweep audit (see {@link SweepAudit}). */
+    void auditSweeps(SweepAudit audit) { // package-private for tests
+        this.sweepAudit = audit;
     }
 
     /** How many take claims this replica holds, its own and its partners'; for tests and the console. */
     public int claimsHeld() {
         synchronized (lock) {
-            return claims.size();
+            return crdt.claimCount();
         }
     }
 
@@ -1199,6 +1564,294 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** The maximum lease the tombstone collector reckons with right now, in milliseconds. */
     public long maxLeaseMillis() {
         return maxLeaseOverride != null ? maxLeaseOverride.toMillis() : maxLeaseObservedMillis;
+    }
+
+    /**
+     * Where this space stands on the per-entry horizon of SPEC §7.3 (RE-H-04). The space reads it from its group's
+     * membership view and never from a caller.
+     */
+    public enum HorizonMode {
+        /** This node keeps the legacy rule, or some member of the view lacks {@code wire.horizon=1}. */
+        LEGACY,
+        /** Every member advertises the hint, but not yet for the rounds the hysteresis asks (RE-Q-REL-09). */
+        WAITING,
+        /**
+         * Engaged, and waiting one maximum lease plus the five-minute grace before withdrawals use the per-entry
+         * horizon, so that every copy a member renewed while its card in this view lacked the hint (a node that
+         * restarts on a release with the hint under the same peer id) has lapsed and is past its own lapse horizon
+         * first. The legacy rule still applies. A writer that was not in this view at all is judged per state instead:
+         * it must have been in view and hinted as long as this wait before its withdrawals use the per-entry horizon.
+         */
+        SETTLING,
+        /**
+         * A withdrawn entry is collectable {@code max(5 min, MAX_DRIFT)} after its own lease expiry, ten minutes with
+         * the ceiling of SPEC §11.
+         */
+        PER_ENTRY
+    }
+
+    /**
+     * The per-entry horizon's mode as last judged (RE-H-04, RE-F-03); a status figure. The rule a sweep or the door
+     * applies is judged afresh at that moment, so an unhinted member that joined since disengages it there at once.
+     *
+     * @return the mode
+     */
+    public HorizonMode horizonMode() {
+        return horizonMode;
+    }
+
+    /** How many times the per-entry horizon engaged here (entered {@link HorizonMode#SETTLING}). */
+    public long horizonEngagements() {
+        return horizonEngagements.get();
+    }
+
+    /** How many times the per-entry horizon came into force here (entered {@link HorizonMode#PER_ENTRY}). */
+    public long horizonSettlements() {
+        return horizonSettlements.get();
+    }
+
+    /** How many times an unhinted member in view disengaged the per-entry horizon here, from settling or in force. */
+    public long horizonDisengagements() {
+        return horizonDisengagements.get();
+    }
+
+    /** The rounds the view must stay fully hinted before the per-entry horizon engages. */
+    public int horizonEngageRounds() {
+        return horizonEngageRounds;
+    }
+
+    /**
+     * Sets the rounds the view must stay fully hinted before the per-entry horizon engages (RE-Q-REL-09); a round is
+     * one gossip period of the group on this space's clock. Takes effect at the next judgement; a streak already past
+     * the new bound engages then.
+     *
+     * @param rounds from {@link #HORIZON_ENGAGE_ROUNDS_FLOOR} to {@link #HORIZON_ENGAGE_ROUNDS_CEILING}
+     * @throws IllegalArgumentException when out of bounds
+     */
+    public void horizonEngageRounds(int rounds) {
+        if (rounds < HORIZON_ENGAGE_ROUNDS_FLOOR || rounds > HORIZON_ENGAGE_ROUNDS_CEILING) {
+            throw new IllegalArgumentException("horizon engage rounds must be from " + HORIZON_ENGAGE_ROUNDS_FLOOR
+                    + " to " + HORIZON_ENGAGE_ROUNDS_CEILING + ", not " + rounds);
+        }
+        this.horizonEngageRounds = rounds;
+    }
+
+    /**
+     * Judges the collection rule this replica may apply at {@code now} (RE-H-04, RE-Q-REL-09), and moves the mode:
+     * <ul>
+     *   <li>An unhinted member in view, or this node on the legacy setting, disengages at once and resets the streak.
+     *       Safety comes first: the per-entry horizon rests on every writer renewing by the rule.</li>
+     *   <li>A fully hinted view counts one round per judgement at least one gossip period after the last counted
+     *       one, and engages once it has counted {@link #horizonEngageRounds} of them, so a card that flaps does not
+     *       move the mode each time it does.</li>
+     *   <li>Once engaged, the rule comes into force a maximum lease plus the lapse grace later, and stays until an
+     *       unhinted member appears.</li>
+     * </ul>
+     * Called by the sweep and the door. The lone node, whose view is empty, judges by its own setting. The mode is
+     * the view's half of the precondition; the writer's half is judged per state ({@code ruleFor}), since a copy can
+     * come from a writer this view does not hold.
+     */
+    private SpaceStateCrdt.Horizon horizon(long now) {
+        if (!runtime.viewAdvertisesHorizon()) {
+            if (horizonMode != HorizonMode.LEGACY) {
+                disengageHorizon();
+            }
+            return SpaceStateCrdt.Horizon.LEGACY;
+        }
+        synchronized (horizonLock) {
+            HorizonMode mode = horizonMode;
+            if (mode == HorizonMode.LEGACY || mode == HorizonMode.WAITING) {
+                long round = Math.max(1, runtime.advertisement().gossip().period().toMillis());
+                if (horizonCountedAtMillis == Long.MIN_VALUE || now < horizonCountedAtMillis) {
+                    horizonCountedAtMillis = now; // the first hinted judgement, or a clock that stepped back
+                } else if (now - horizonCountedAtMillis >= round) {
+                    horizonStreak++;
+                    horizonCountedAtMillis = now;
+                }
+                if (horizonStreak >= horizonEngageRounds) {
+                    horizonEngagedAtMillis = now;
+                    horizonMode = mode = HorizonMode.SETTLING;
+                    horizonEngagements.incrementAndGet();
+                    LOG.log(System.Logger.Level.DEBUG, () -> "space " + name + ": every member advertises "
+                            + "wire.horizon=1 for " + horizonStreak + " rounds; the per-entry horizon engages, in "
+                            + "force after one maximum lease and the grace");
+                } else {
+                    horizonMode = mode = HorizonMode.WAITING;
+                }
+            }
+            if (mode == HorizonMode.SETTLING) {
+                long settle = Math.max(0, maxLeaseMillis()) + SpaceStateCrdt.LAPSED_GRACE_MILLIS;
+                if (now < horizonEngagedAtMillis) {
+                    horizonEngagedAtMillis = now; // the clock stepped back: the wait counts from here
+                } else if (now - horizonEngagedAtMillis >= settle) {
+                    horizonMode = mode = HorizonMode.PER_ENTRY;
+                    horizonSettlements.incrementAndGet();
+                    horizonRefile = true; // tombstones are due earlier now than the index filed them
+                }
+            }
+            return mode == HorizonMode.PER_ENTRY ? SpaceStateCrdt.Horizon.PER_ENTRY : SpaceStateCrdt.Horizon.LEGACY;
+        }
+    }
+
+    /** An unhinted member appeared, or this node went legacy: back to the legacy rule at once, streak reset. */
+    private void disengageHorizon() {
+        HorizonMode was;
+        synchronized (horizonLock) {
+            was = horizonMode;
+            horizonMode = HorizonMode.LEGACY;
+            horizonStreak = 0;
+            horizonCountedAtMillis = Long.MIN_VALUE;
+        }
+        if (was == HorizonMode.PER_ENTRY) {
+            // Since the drift floor of SPEC §7.3 (v0.1.35), a withdrawal's legacy horizon is never before its
+            // per-entry one, so the index is never late here; filing afresh spares the sweep a visit to every
+            // tombstone filed for the per-entry horizon that now waits longer.
+            horizonRefile = true;
+        }
+        if (was == HorizonMode.SETTLING || was == HorizonMode.PER_ENTRY) {
+            horizonDisengagements.incrementAndGet();
+            System.Logger.Level level = horizonDisengageLogged.compareAndSet(false, true)
+                    ? System.Logger.Level.INFO : System.Logger.Level.DEBUG;
+            LOG.log(level, () -> "space " + name + ": a member without wire.horizon=1 is in view; withdrawals keep "
+                    + "the legacy horizon again (was " + was + ")");
+        }
+    }
+
+    /** The rule as last judged, for filing tombstones in the expiry index; the sweep judges afresh before it acts. */
+    private SpaceStateCrdt.Horizon filedHorizon() {
+        return horizonMode == HorizonMode.PER_ENTRY ? SpaceStateCrdt.Horizon.PER_ENTRY : SpaceStateCrdt.Horizon.LEGACY;
+    }
+
+    /**
+     * The rule for one state under the mode this replica judged (RE-H-04). The mode says the view is hinted now, but a
+     * copy can come from a writer that is not in the view: across a partition, gone since, or back only lately. This
+     * replica cannot vouch for what such a writer renewed out of its sight (a second node on its identity, or an older
+     * release that shortens), so the per-entry horizon applies only to a state whose every writing node is this one,
+     * or a member that advertises {@code wire.horizon=1} and has been in the view longer than the longest lease plus
+     * the grace: whatever it renewed before it came into sight has lapsed and passed its own lapse horizon by then.
+     * Any other withdrawal keeps the legacy horizon here.
+     *
+     * <p>The writing node is the replica of the entry's add dot, set by the write and never changed, so the sweep and
+     * the door read the same answer for every copy of one entry. Present and completed states keep the same horizon
+     * under both rules, so only a withdrawal is looked up.
+     */
+    private SpaceStateCrdt.Horizon ruleFor(EntryState state, SpaceStateCrdt.Horizon mode, long now) {
+        if (mode != SpaceStateCrdt.Horizon.PER_ENTRY || state.present() || state.completed()) {
+            return mode;
+        }
+        return writerWaitMillis(state, now) == 0 ? SpaceStateCrdt.Horizon.PER_ENTRY : SpaceStateCrdt.Horizon.LEGACY;
+    }
+
+    /**
+     * How long before every node that wrote a state can be trusted with the per-entry horizon here: 0 when each is
+     * this replica or a hinted member in view for the maximum lease plus the grace; the rest of that wait when each is
+     * at least a hinted member in view; {@link Long#MAX_VALUE} when one is out of view, unhinted, or unreadable, since
+     * nothing here says when that would change.
+     */
+    private long writerWaitMillis(EntryState state, long now) {
+        if (state.adds().isEmpty()) {
+            return Long.MAX_VALUE;
+        }
+        String self = identity.peerId().value();
+        long settle = Math.max(0, maxLeaseMillis()) + SpaceStateCrdt.LAPSED_GRACE_MILLIS;
+        long wait = 0;
+        for (Dot add : state.adds()) {
+            if (add.replica().equals(self)) {
+                continue; // this replica's own write: its mode already says this node is hinted
+            }
+            long since = writerInViewSince(add.replica(), now);
+            if (since == Long.MAX_VALUE) {
+                return Long.MAX_VALUE;
+            }
+            if (since != Long.MIN_VALUE) {
+                long trustedAt = since > Long.MAX_VALUE - settle ? Long.MAX_VALUE : since + settle;
+                wait = Math.max(wait, trustedAt <= now ? 0 : trustedAt - now);
+            }
+        }
+        return wait;
+    }
+
+    /**
+     * Since when, on this space's clock, a writer has been a hinted member of the view in its current stay:
+     * {@link Long#MIN_VALUE} for this node, {@link Long#MAX_VALUE} for a writer out of view, unhinted, or unreadable.
+     * The membership measures the stay on the node's clock; the space converts it once, at the first judgement of
+     * the stay, and keeps it, so that its sweep, its door and its expiry index all reckon the writer's wait on the
+     * one clock they read, whatever the node's clock does meanwhile. A new stay (the member left and came back) starts
+     * afresh.
+     */
+    private long writerInViewSince(String writer, long now) {
+        long inView;
+        long joined;
+        try {
+            PeerId peer = PeerId.of(writer);
+            inView = runtime.hintedWriterInViewMillis(peer);
+            joined = runtime.membership().joinedAtMillis(peer);
+        } catch (IllegalArgumentException malformed) {
+            return Long.MAX_VALUE;
+        }
+        if (inView == Long.MAX_VALUE) {
+            return Long.MIN_VALUE;
+        }
+        if (inView < 0 || joined < 0) {
+            writerStays.remove(writer);
+            return Long.MAX_VALUE;
+        }
+        long[] stay = writerStays.get(writer);
+        if (stay == null || stay[0] != joined) {
+            stay = new long[]{joined, now - inView};
+            writerStays.put(writer, stay);
+        }
+        return stay[1];
+    }
+
+    /**
+     * Whether this replica collects a state now under the mode it judged (RE-H-04): by the state's rule, except that a
+     * withdrawal the per-entry mode cannot vouch for keeps the later of the legacy horizon and the per-entry one, that
+     * is {@code L + max(2 x maxLease, MAX_DRIFT)}. Both keep at least the drift floor of SPEC §7.3, so the legacy one
+     * is never the earlier today; the later of the two is kept so that a writer leaving the view can never bring its
+     * withdrawals' horizon closer whatever the two rules become: the expiry index files a tombstone by its horizon
+     * and must never find it due earlier than filed.
+     */
+    private boolean collectableHere(EntryState state, long now, SpaceStateCrdt.Horizon mode) {
+        long maxLease = maxLeaseMillis();
+        SpaceStateCrdt.Horizon rule = ruleFor(state, mode, now);
+        boolean byRule = SpaceStateCrdt.collectable(state, now, maxLease, rule);
+        if (mode == SpaceStateCrdt.Horizon.PER_ENTRY && rule == SpaceStateCrdt.Horizon.LEGACY) {
+            return byRule && SpaceStateCrdt.collectable(state, now, maxLease, SpaceStateCrdt.Horizon.PER_ENTRY);
+        }
+        return byRule;
+    }
+
+    /** The horizon {@link #collectableHere} reads for a state whose rule is already judged. */
+    private long horizonHere(EntryState state, SpaceStateCrdt.Horizon mode, SpaceStateCrdt.Horizon rule) {
+        long maxLease = maxLeaseMillis();
+        long byRule = SpaceStateCrdt.collectionHorizon(state, maxLease, rule);
+        if (mode == SpaceStateCrdt.Horizon.PER_ENTRY && rule == SpaceStateCrdt.Horizon.LEGACY) {
+            return Math.max(byRule, SpaceStateCrdt.collectionHorizon(state, maxLease, SpaceStateCrdt.Horizon.PER_ENTRY));
+        }
+        return byRule;
+    }
+
+    /** The first writer of a state this replica has no wait for (out of view, unhinted, or unreadable), or null. */
+    private String absentWriter(EntryState state) {
+        String self = identity.peerId().value();
+        for (Dot add : state.adds()) {
+            if (add.replica().equals(self)) {
+                continue;
+            }
+            if (writerInViewSince(add.replica(), nowMillis()) == Long.MAX_VALUE) {
+                return add.replica();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The rule this replica applies to a state under the mode as last judged, with the writer judged now; for tests.
+     * It does not judge the mode, so reading it never counts a round of the hysteresis.
+     */
+    SpaceStateCrdt.Horizon ruleFor(EntryState state) { // package-private for tests
+        return ruleFor(state, filedHorizon(), nowMillis());
     }
 
     // ------------------------------------------------------------ operations (§7.2)
@@ -1242,7 +1895,93 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
 
     /** Whether an agent may perform the scope here now (spec §7.5): WRITE for records, TAKE for claims and completions. */
     private boolean admits(AgentId agent, SpaceAdmission.Scope scope, long nowMillis) {
+        Batch running = batch;
+        if (running != null && running.owner == Thread.currentThread() && running.admitted != null) {
+            // An authorizer's answer, asked before the batch took the lock (RE-M-08).
+            Boolean asked = running.admitted.get(admissionKey(agent, scope));
+            if (asked != null) {
+                return asked;
+            }
+        }
         return admission.admits(agent, scope, nowMillis);
+    }
+
+    private static String admissionKey(AgentId agent, SpaceAdmission.Scope scope) {
+        return scope + " " + agent.encoded();
+    }
+
+    // ---- the batch of one anti-entropy delta (RE-M-08)
+
+    /**
+     * One anti-entropy delta being merged under one hold of {@link #lock} by its {@link #owner}: the generation moves
+     * once at its end, and what a merge would deliver outside the lock (events, misbehaviour reports) waits in
+     * {@link #after} until the lock is released.
+     */
+    private static final class Batch {
+        final Thread owner = Thread.currentThread();
+        final List<Runnable> after = new ArrayList<>();
+        /** An AUTHORIZER rule's answers by agent and scope, asked before the lock; null under any other rule. */
+        final Map<String, Boolean> admitted;
+        boolean changed;
+
+        Batch(Map<String, Boolean> admitted) {
+            this.admitted = admitted;
+        }
+    }
+
+    /**
+     * Set on a thread while it delivers the events an anti-entropy batch deferred (RE-M-08). Only there are listeners
+     * isolated from each other: the states are merged already and nothing fires those events again, so one listener's
+     * throw must not cost the others theirs. A direct write, take or complete fires as it always did, so a listener's
+     * exception reaches its caller, as on a LocalSpace.
+     */
+    private static final ThreadLocal<Boolean> DELIVERING_BATCH = new ThreadLocal<>();
+
+    /** The batch the thread merging an anti-entropy delta runs; null otherwise. Written under {@link #lock}. */
+    private volatile Batch batch;
+    /**
+     * How long the last delta held the lock, the merge alone without the signature checks made before it: RE-Q-PRF-01
+     * judges this part, and the benchmark reports it beside the whole. Under {@link #lock}.
+     */
+    private long lastBatchLockedNanos;
+
+    /** How long the last anti-entropy delta held the lock, in nanoseconds; for the benchmark of RE-Q-PRF-01. */
+    long lastBatchLockedNanos() {
+        synchronized (lock) {
+            return lastBatchLockedNanos;
+        }
+    }
+
+    /** The generation the digest cache is keyed on; for the test that a delta moves it once (RE-M-08). */
+    long generationForTest() {
+        synchronized (lock) {
+            return generation;
+        }
+    }
+
+    /**
+     * The signature checks of a received state made before the batch's lock. A completion is checked against the claim
+     * it is expected to meet under the lock, named in {@code against}; the merge reuses that answer only when the claim
+     * then held is that same proof, and checks again otherwise.
+     *
+     * @param against the claim a completion was checked against, or null (not a completion, or no claim was known)
+     */
+    private record Prechecked(boolean record, boolean state, SpaceWire.SignedClaim against) {
+    }
+
+    /** Runs work that belongs outside the lock now, or after the batch when this thread is merging one. */
+    private void later(Runnable work) {
+        Batch running = batch;
+        if (running != null && running.owner == Thread.currentThread()) {
+            running.after.add(work);
+        } else {
+            work.run();
+        }
+    }
+
+    /** Reports witnessed misbehaviour, after the batch when this thread is merging one. */
+    private void report(PeerId peer, String violation) {
+        later(() -> runtime.reportMisbehavior(peer, violation));
     }
 
     /**
@@ -1293,9 +2032,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return readAll(template, limit);
     }
 
-    /** One anti-entropy round (digest to one random member) for FRESH reads. */
+    /**
+     * One anti-entropy round (digest to one random member) for FRESH reads. Not on a writer-local space: it holds
+     * nothing another member could send, and the round would reconcile the bus's other streams for nothing.
+     */
     private void pullIfFresh(ConsistencyHint hint) {
-        if (hint == ConsistencyHint.FRESH) {
+        if (hint == ConsistencyHint.FRESH && !local) {
             runtime.gossip().antiEntropyTick();
         }
     }
@@ -1404,8 +2146,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private EntryHandle commitWrite(PreparedWrite prepared) {
         SpaceWire.EntryStateDto dto;
         synchronized (lock) {
-            crdt = crdt.add(prepared.signed(), prepared.dot(), prepared.lease());
-            generation++;
+            setCrdt(crdt.add(prepared.signed(), prepared.dot(), prepared.lease()), prepared.entryId());
+            bump(prepared.entryId());
             issuerKeys.put(prepared.entryId(), identity.rawPublicKey());
             if (prepared.certificate() != null) {
                 issuerCertificates.put(prepared.entryId(), prepared.certificate());
@@ -1503,9 +2245,44 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return results;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Under LEASE_RACE and AUCTION (SPEC §7.4) the take publishes its claim, waits the space's settle window, and
+     * wins only if its claim is still live when it judges the race. A take lease no longer than the settle window
+     * has always lapsed by then, so such a take is refused at once rather than racing for nothing until its timeout.
+     * Leave a margin above the window: a busy machine wakes the take late.
+     *
+     * <p>The win is exclusive only while every rival claim reaches this replica within the settle window (SPEC §7.4,
+     * the settle guarantee). A rival claim that arrives later and beats this one makes {@code complete} throw
+     * {@link LeaseExpiredException} if it arrives before the completion, and so does the entry's completion by
+     * anyone. If a holder this claim displaced completes the entry first, this take comes back empty, or its
+     * {@code complete} throws and writes no result, after acknowledging that completion. A rival that hears of this
+     * take only after both completed leaves a duplicate completion, which {@link #duplicateCompletions()} counts.
+     *
+     * @throws IllegalArgumentException if {@code takeLease} is no longer than the space's settle window
+     */
     @Override
     public <T> Optional<TakenEntry<T>> take(Template<T> template, Lease takeLease, Duration timeout) {
         return takeAs(writer, template, takeLease, timeout);
+    }
+
+    /**
+     * Refuses a take whose lease cannot outlast the settle window (SPEC §7.4). The race is judged right after the
+     * window and only a live claim wins, so with a lease no longer than the window every claim had lapsed when it was
+     * judged: the take came back empty at its timeout as if it had lost every race, while each doomed claim held the
+     * entry from other takers for its lease (found 2026-11-15, the TypeScript take refuses the same with a
+     * RangeError). The TypeScript take judges after a follow-up wait as well, so its bound is the window plus that
+     * wait; this take judges right after the window, so its bound is the window alone.
+     */
+    private void requireTakeLeaseOutlastsSettle(Lease takeLease) {
+        long leaseMillis = takeLease.duration().toMillis();
+        long settleMillis = settleWindow.toMillis();
+        if (leaseMillis <= settleMillis) {
+            throw new IllegalArgumentException("a take lease of " + leaseMillis + " ms cannot outlast the settle "
+                    + "window of " + settleMillis + " ms on space '" + name + "': the claim would lapse before the "
+                    + "take is judged (the lease must exceed the window)");
+        }
     }
 
     private <T> Optional<TakenEntry<T>> takeAs(AgentIdentity actor, Template<T> template,
@@ -1513,20 +2290,13 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Objects.requireNonNull(template, "template");
         Objects.requireNonNull(takeLease, "takeLease");
         Objects.requireNonNull(timeout, "timeout");
+        requireTakeLeaseOutlastsSettle(takeLease);
         registerSchema(template.type());
         requireWritable(actor, "take", SpaceAdmission.Scope.TAKE);
         observeLease(takeLease.duration().toMillis());
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (true) {
-            Optional<TakenEntry<T>> taken = tryTakeOnce(actor, template, takeLease);
-            if (taken.isPresent()) {
-                return taken;
-            }
-            if (System.nanoTime() >= deadline) {
-                return Optional.empty();
-            }
-            sleep(Duration.ofMillis(20));
-        }
+        // Between attempts the take waits for a change that could let it succeed, not a 20 ms poll that scanned the
+        // space fifty times a second for as long as it waited (IDLE-WORK 5a(a)).
+        return awaiting(timeout, () -> tryTakeOnce(actor, template, takeLease));
     }
 
     @Override
@@ -1680,6 +2450,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         try {
             streamRegistration.close();
             reconcileRegistration.close();
+            sweepTick.close();
             blockRetryTick.close();
             bulkRetryTick.close();
         } catch (Exception e) {
@@ -1753,8 +2524,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         refuseLogClaimStamp(entryId, claim, claim.holder().peer());
         synchronized (lock) {
-            claims.merge(entryId, attested, SpaceWire.SignedClaim::merge);
-            generation++;
+            mergeHeldClaim(entryId, attested);
+            bump(entryId);
             logDecidedEpochs.merge(entryId, claim.epoch(), Math::max);
         }
     }
@@ -1821,8 +2592,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Objects.requireNonNull(claim, "claim");
         refuseLogClaimStamp(entryId, claim, null);
         synchronized (lock) {
-            claims.merge(entryId, sign(claim, writer), SpaceWire.SignedClaim::merge);
-            generation++;
+            mergeHeldClaim(entryId, sign(claim, writer));
+            bump(entryId);
             logDecidedEpochs.merge(entryId, claim.epoch(), Math::max);
         }
     }
@@ -1950,11 +2721,21 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 TakeClaim current = claimOf(candidate.entry().entryId());
                 if (current != null && !current.expired(now)) {
                     // Held. Under AUCTION a strictly better bid may still counter-claim
-                    // while the incumbent's settle window is open (CBAA-style).
+                    // while the incumbent's settle window is open (CBAA-style), but only
+                    // in its first half. The incumbent decides it won when its window
+                    // ends, so a counter-claim made near that end reached it after the
+                    // decision: the incumbent ran its action and completed, and the
+                    // counter-claim, winning the lattice, completed the entry a second
+                    // time (Party Bus, 2026-11-15: a planner whose own two-second take
+                    // had just ended outbid another's claim 1,993 ms after it was
+                    // stamped, and the claim arrived 2 ms after that holder had won).
+                    // The second half is the counter-claim's time to travel. Travel time has no bound, so
+                    // the bound only makes a late counter-claim rare; when one still arrives after the
+                    // decision, the incumbent's completion tells this take to stand down (outbidCompletions).
                     boolean canOutbid =
                             strategy == ai.badmonkey.agentspaces.api.space.ConflictStrategyType.AUCTION
                                     && candidate.bid() < current.bid()
-                                    && now - current.stamp().physical() <= settleWindow.toMillis();
+                                    && now - current.stamp().physical() <= settleWindow.toMillis() / 2;
                     if (!canOutbid) {
                         continue;
                     }
@@ -1967,9 +2748,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                             epoch, hlc.now(), holder,
                             candidate.bid(), now + takeLease.duration().toMillis());
                 }
-                claims.merge(candidate.entry().entryId(), sign(myClaim, actor),
-                        SpaceWire.SignedClaim::merge);
-                generation++;
+                mergeHeldClaim(candidate.entry().entryId(), sign(myClaim, actor));
+                bump(candidate.entry().entryId());
                 claimedId = candidate.entry().entryId();
                 claimedValue = candidate.value();
                 claimedRecord = candidate.entry();
@@ -1981,7 +2761,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         publishDelta(new SpaceWire.Delta(null, claimedId, sign(myClaim, actor)),
                 "c:" + claimedId + ":" + myClaim.stamp().encoded());
-        sleep(settleWindow);
+        settle(settleWindow);
+        boolean doneByOutbid;
         synchronized (lock) {
             TakeClaim winner = claimOf(claimedId);
             // Core cancel events, 2026-11-09: an entry completed or withdrawn during the settle window is
@@ -1989,14 +2770,44 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             boolean won = winner != null && winner.holder().equals(holder)
                     && winner.epoch() == myClaim.epoch() && !winner.expired(nowMillis())
                     && crdt.state(claimedId).map(EntryState::present).orElse(false);
+            Long outbid = outbidCompletions.get(claimedId);
+            // The holder this claim displaced completed the entry during the window (see outbidCompletions):
+            // the work is done, so this take acknowledges that completion instead of doing it again. The line
+            // stays for completeInternal, which makes the acknowledgement and counts it.
+            doneByOutbid = won && outbid != null && outbid == myClaim.epoch();
+            if (!doneByOutbid) {
+                outbidCompletions.remove(claimedId);
+            }
             if (!won) {
                 return Optional.empty(); // lost the race, or the entry went; retry elsewhere
             }
-            takenEpochs.put(claimedId, myClaim.epoch());
+            if (!doneByOutbid) {
+                takenEpochs.put(claimedId, myClaim.epoch());
+            }
+        }
+        Taken<T> won = new Taken<>(claimedId, claimedValue, myClaim.epoch(), actor);
+        if (doneByOutbid) {
+            acknowledgeOutbidCompletion(actor, won);
+            return Optional.empty();
         }
         fire(SpaceEvent.Kind.TAKEN, claimedId, claimedValue, claimedRecord.issuer(),
                 claimedRecord.issuer(), claimedRecord);
-        return Optional.of(new Taken<>(claimedId, claimedValue, myClaim.epoch(), actor));
+        return Optional.of(won);
+    }
+
+    /**
+     * Completes, with no result, an entry this replica's claim holds after the holder it displaced completed it
+     * (see {@link #outbidCompletions}). The completion is signed under the claim every replica holds, so the
+     * replicas that dropped the displaced holder's completion converge on this one, and that holder's result stays
+     * the only one. completeInternal finds the line, counts the acknowledgement and reports it by throwing; a take
+     * that lapsed meanwhile has nothing to acknowledge and throws the same way.
+     */
+    private void acknowledgeOutbidCompletion(AgentIdentity actor, Taken<?> taken) {
+        try {
+            completeInternal(actor, taken, null, null, Map.of());
+        } catch (LeaseExpiredException acknowledgedOrLapsed) {
+            // acknowledged (counted there), or the claim lapsed or a better one arrived: whoever holds it completes it
+        }
     }
 
     private EntryHandle completeInternal(AgentIdentity actor, TakenEntry<?> taken, Object result,
@@ -2022,6 +2833,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         SpaceWire.EntryStateDto dto;
         SpaceWire.SignedClaim proof;
         Object completedValue;
+        boolean doneByOutbid;
         synchronized (lock) {
             TakeClaim claim = claimOf(t.entryId());
             long now = nowMillis();
@@ -2032,20 +2844,33 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 throw new LeaseExpiredException(
                         "take lease lapsed or lost for entry " + t.entryId());
             }
-            crdt = crdt.complete(t.entryId());
-            generation++;
+            // The holder this take displaced completed the entry after this take was judged (see
+            // outbidCompletions): the completion below acknowledges that one, and the result is not written.
+            Long outbid = outbidCompletions.remove(t.entryId());
+            doneByOutbid = outbid != null && outbid == t.epoch;
+            if (!doneByOutbid) {
+                // This holder does the work, so a displaced holder's completion that arrives later is a duplicate.
+                completedHere.put(t.entryId(), t.epoch);
+            }
+            setCrdt(crdt.complete(t.entryId()), t.entryId());
+            bump(t.entryId());
             completedValue = valueCache.get(t.entryId());
             // The completed state is signed by us, the holder; the receiver
             // authenticates it against our winning claim, which we carry along.
             dto = signedDto(t.entryId(),
                     issuerKeys.getOrDefault(t.entryId(), identity.rawPublicKey()), actor);
-            proof = claims.get(t.entryId());
+            proof = heldClaim(t.entryId());
             valueCache.remove(t.entryId()); // #11: stop pinning the completed value
         }
         publishDelta(new SpaceWire.Delta(wireForm(t.entryId(), dto), t.entryId(), proof), "d:" + t.entryId());
         fire(SpaceEvent.Kind.COMPLETED, t.entryId(),
                 completedValue == null ? t.entry() : completedValue,
                 dto.record().issuer(), actor.id(), dto.record());
+        if (doneByOutbid) {
+            outbidAcknowledged.incrementAndGet();
+            throw new LeaseExpiredException("entry " + t.entryId() + " was completed first by the holder this take"
+                    + " outbid or out-raced; this take acknowledged that completion and wrote no result");
+        }
         return preparedResult == null ? null : commitWrite(preparedResult);
     }
 
@@ -2066,13 +2891,104 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         // Merge the claim first: a completion state authenticates against the
         // holder's claim, which must be present before the state is verified.
-        if (delta.claim() != null && delta.claimEntry() != null
-                && verifyClaim(delta.claimEntry(), delta.claim())) {
+        boolean claimVerified = delta.claim() != null && delta.claimEntry() != null
+                && verifyClaim(delta.claimEntry(), delta.claim());
+        if (claimVerified) {
             mergeClaim(delta.claimEntry(), delta.claim());
             noteReplicated(delta.claimEntry()); // a remote took the entry, so it holds the record (PD-L-01)
         }
         if (delta.state() != null) {
-            mergeState(delta.state());
+            boolean merged = mergeState(delta.state());
+            if (!merged && claimVerified) {
+                noteOutbidCompletion(delta.claimEntry(), delta.claim(), delta.state());
+            }
+        }
+    }
+
+    /**
+     * Judges a completion this replica dropped because a claim held by one of this peer's agents displaces, in the
+     * lattice, the claim the completion travelled with, when that claim authenticates it. The displaced holder
+     * judged its take before the better claim reached it: an AUCTION incumbent a better bid outbid, or, under either
+     * strategy, a claimant whose rival's claim arrived later than the settle window (SPEC §7.4, the settle
+     * guarantee). The state itself stays dropped, as SPEC §11a.4 has every replica do. While this replica still
+     * holds the entry present, the completion is noted in {@link #outbidCompletions}, so this peer's take
+     * acknowledges it instead of doing the work a second time. When one of this peer's agents has already completed
+     * the entry with its own work ({@link #completedHere}), both did the work: the completion is counted as a
+     * duplicate ({@link #duplicateCompletions}), once per entry. A revoked or unadmitted holder's completion is no
+     * evidence, and neither is one at an epoch the ordered log decided, where the log alone names the holder.
+     *
+     * @param claimEntry the entry the delta's claim was sent for
+     * @param proof      the delta's claim, already verified
+     * @param received   the delta's state as received
+     */
+    private void noteOutbidCompletion(EntryId claimEntry, SpaceWire.SignedClaim proof,
+                                      SpaceWire.EntryStateDto received) {
+        if (!received.completed()) {
+            return;
+        }
+        EntryId entryId = received.entryIdOf();
+        if (entryId == null || !entryId.equals(claimEntry) || !entryId.equals(proof.claim().entryId())) {
+            return;
+        }
+        SpaceWire.EntryStateDto dto = received;
+        TakeClaim displaced = proof.claim();
+        boolean duplicate;
+        synchronized (lock) {
+            TakeClaim held = claimOf(entryId);
+            EntryState state = crdt.state(entryId).orElse(null);
+            long now = nowMillis();
+            Long decided = logDecidedEpochs.get(entryId);
+            if (held == null || state == null
+                    || !held.holder().peer().equals(identity.peerId()) // only this peer's own holders are judged
+                    || held.holder().equals(displaced.holder())
+                    // A lower epoch is displaced too: its holder never heard of the claim this replica saw lapse,
+                    // so it claimed the entry afresh, which only late delivery allows.
+                    || displaced.epoch() > held.epoch()
+                    || TakeClaim.merge(held, displaced) != held // the held claim displaces this one
+                    || (decided != null && displaced.epoch() <= decided)) {
+                return;
+            }
+            if (state.present()) {
+                if (held.expired(now) || displaced.expired(now)
+                        || Long.valueOf(held.epoch()).equals(outbidCompletions.get(entryId))) {
+                    return;
+                }
+                duplicate = false;
+            } else if (state.completed() && Long.valueOf(held.epoch()).equals(completedHere.get(entryId))) {
+                duplicate = true;
+            } else {
+                return;
+            }
+            if (dto.record() == null) {
+                if (dto.issuerPublicKey() == null || dto.adds() == null || dto.removes() == null) {
+                    return;
+                }
+                dto = received.withRecord(state.record()); // PD-L-02: a recordless completion, over the held record
+            }
+        }
+        if (runtime.revocationView().refuses(displaced.holder(), claimKey(proof), stateSigningTime(dto, null))
+                || !admits(displaced.holder(), SpaceAdmission.Scope.TAKE, nowMillis())
+                || !id.equals(dto.record().spaceId())
+                || !verifyState(dto, proof, true)) {
+            return;
+        }
+        boolean counted = false;
+        synchronized (lock) {
+            TakeClaim held = claimOf(entryId);
+            if (held == null || held.epoch() < displaced.epoch()) {
+                return;
+            }
+            if (duplicate) {
+                counted = completedHere.remove(entryId, held.epoch());
+            } else if (crdt.state(entryId).map(EntryState::present).orElse(false)) {
+                outbidCompletions.put(entryId, held.epoch());
+            }
+        }
+        if (counted) {
+            duplicateCompletions.incrementAndGet();
+            LOG.log(System.Logger.Level.INFO, () -> "space " + name + ": entry " + entryId.value() + " was completed"
+                    + " twice: here, and by " + displaced.holder() + ", whose claim lost the race but heard of the"
+                    + " winner later than the settle window (SPEC 7.4); the shared state keeps one completion");
         }
     }
 
@@ -2146,6 +3062,23 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return recordlessSent.get();
     }
 
+    /** Takes here that acknowledged an outbid holder's completion instead of doing the work again (package-private). */
+    long outbidAcknowledged() {
+        return outbidAcknowledged.get();
+    }
+
+    /**
+     * Entries this replica completed with its own work whose displaced rival's completion arrived afterwards: the
+     * duplicate completion that SPEC §7.4 leaves possible when a claim reaches a claimant later than the settle
+     * window. The shared state keeps one completion; the count is how an operator, or a test, sees that the work and
+     * any result were done twice. Counted once per entry, at the replica whose claim won the lattice.
+     *
+     * @return the count since this space was built
+     */
+    public long duplicateCompletions() {
+        return duplicateCompletions.get();
+    }
+
     /** Recordless states this replica merged over a held record (PD-L-02). */
     public long recordlessMerged() {
         return recordlessMerged.get();
@@ -2195,6 +3128,188 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return stampsFarFutureDeferred.get();
     }
 
+    /**
+     * Renewals of a write or take lease on this replica that asked for less than the lease had left (RE-H-01): the
+     * count of every such call since the space opened. A renewal never shortens a lease (SPEC §7.2, RE-H-02), so each
+     * of these kept the longer lease; the count names callers that still ask for less.
+     */
+    public long renewShortenings() {
+        return renewShortenings.get();
+    }
+
+    /**
+     * Re-offered states this replica refused at the door because their entry's tombstone is past its horizon and no
+     * longer held here, and acknowledged so the member offering them stops (RE-H-03, SPEC §7.3).
+     */
+    public long collectedReoffersAcknowledged() {
+        return collectedReoffersAcknowledged.get();
+    }
+
+    /**
+     * Counts a renewal that asked for less than its lease had left, and logs the first one of this space unless the
+     * node turned the log off ({@code agentspaces.space.renew-shortening-log}).
+     */
+    private void noteShortening(EntryId entryId, String lease, long currentExpiryMillis, long requestedExpiryMillis) {
+        if (requestedExpiryMillis >= currentExpiryMillis) {
+            return;
+        }
+        renewShortenings.incrementAndGet();
+        if (runtime.renewShorteningLog() && renewShorteningLogged.compareAndSet(false, true)) {
+            LOG.log(System.Logger.Level.INFO, "space " + name + ": the " + lease + " lease of entry " + entryId.value()
+                    + " was renewed for " + (currentExpiryMillis - requestedExpiryMillis)
+                    + " ms less than it had left, and kept the longer lease: a renewal never shortens a lease"
+                    + " (SPEC §7.2). Cancel and write again for a shorter one. Logged once for this space;"
+                    + " renewShortenings() counts every such renewal.");
+        }
+    }
+
+    /**
+     * A snapshot of what this replica holds and what its anti-entropy has cost (RE-Q-MNT-02, RE-F-03 in
+     * srad/replication-by-entry.md): the source for a member's status figures and for the signals a pacing adjuster
+     * reads. Taken under the space lock in one pass over the known entries, so it costs O(n) and is meant for a status
+     * page or a test, not for every round.
+     *
+     * @return the snapshot
+     */
+    public Stats stats() {
+        long now = nowMillis(); // read-only: no sweep runs, so a due tombstone not yet collected is counted as held
+        synchronized (lock) {
+            int present = 0;
+            int lapsed = 0;
+            int withdrawn = 0;
+            int completed = 0;
+            int leaseRunning = 0;
+            int[] ages = new int[4];
+            for (EntryId entryId : crdt.entryIds()) {
+                EntryState state = crdt.state(entryId).orElseThrow();
+                long expiry = state.lease().value().expiresAtMillis();
+                if (state.present()) {
+                    if (expiry > now) {
+                        present++;
+                        continue;
+                    }
+                    lapsed++;
+                } else if (state.completed()) {
+                    completed++;
+                } else {
+                    withdrawn++;
+                }
+                if (expiry > now) {
+                    leaseRunning++; // withdrawn or completed before its lease ran out: not yet past expiry
+                    continue;
+                }
+                ages[ageBucket(now - expiry)]++;
+            }
+            return new Stats(present, lapsed, withdrawn, completed,
+                    new TombstonesPastExpiry(leaseRunning, ages[0], ages[1], ages[2], ages[3]),
+                    crdt.claimCount(), refusedAckOrder.size(), shardDroppedOrder.size(), pendingStates.size(),
+                    maxLeaseObservedMillis, maxLeaseMillis(),
+                    digestCacheHits, digestCacheMisses, digestComputations, digestHashHits, digestHashMisses,
+                    syncStatesSent.get(), syncClaimsSent.get(), syncStatesReceived.get(), syncClaimsReceived.get(),
+                    renewShortenings.get());
+        }
+    }
+
+    /**
+     * The space's status figures (srad/replication-by-entry.md RE-Q-MNT-02): live entries, tombstones and their ages
+     * past expiry from {@link #stats()}, and the depth of the audit's trie. O(n) under the lock, like {@link #stats()}.
+     *
+     * @return the figures
+     */
+    ReconcilableState.Figures figures() {
+        Stats stats = stats();
+        TombstonesPastExpiry ages = stats.tombstonesPastExpiry();
+        Map<String, Long> buckets = new java.util.LinkedHashMap<>();
+        buckets.put("leaseRunning", (long) ages.leaseRunning());
+        buckets.put("underOneMinute", (long) ages.underOneMinute());
+        buckets.put("oneToTenMinutes", (long) ages.oneToTenMinutes());
+        buckets.put("tenMinutesToAnHour", (long) ages.tenMinutesToAnHour());
+        buckets.put("overAnHour", (long) ages.overAnHour());
+        int depth;
+        synchronized (lock) {
+            depth = crdt.trieDepth();
+        }
+        return new ReconcilableState.Figures(stats.present(), stats.tombstones(), buckets, depth);
+    }
+
+    private static int ageBucket(long ageMillis) {
+        if (ageMillis < 60_000L) {
+            return 0;
+        }
+        if (ageMillis < 600_000L) {
+            return 1;
+        }
+        return ageMillis < 3_600_000L ? 2 : 3;
+    }
+
+    /**
+     * Tombstones by the time since their lease expired, where a tombstone is a known entry no reader sees (lapsed,
+     * withdrawn, or completed). This is time past lease expiry, not time held as a tombstone: a withdrawn or completed
+     * entry keeps the lease it had, and its state carries dots but no time of withdrawal or completion, so a replica
+     * cannot tell how long ago it stopped being served. The collection horizon (SPEC §7.3) is counted from the same
+     * expiry, so these buckets say how near the tombstones are to collection. A withdrawn or completed entry whose
+     * lease has not yet run out is counted apart in {@code leaseRunning}, not filed as a fresh one.
+     *
+     * @param leaseRunning       withdrawn or completed entries whose lease has not yet expired
+     * @param underOneMinute     expired less than a minute ago
+     * @param oneToTenMinutes    one to ten minutes ago
+     * @param tenMinutesToAnHour ten minutes to an hour ago
+     * @param overAnHour         an hour ago or more
+     */
+    public record TombstonesPastExpiry(int leaseRunning, int underOneMinute, int oneToTenMinutes,
+                                       int tenMinutesToAnHour, int overAnHour) {
+        /** Every tombstone counted. */
+        public int total() {
+            return leaseRunning + underOneMinute + oneToTenMinutes + tenMinutesToAnHour + overAnHour;
+        }
+    }
+
+    /**
+     * What {@link #stats()} returns.
+     *
+     * @param present                entries a reader sees: present with an unexpired write lease
+     * @param lapsedInGrace          present entries whose write lease lapsed, kept for the lapse grace (SPEC §7.3)
+     * @param withdrawn              withdrawn entries kept as tombstones
+     * @param completed              completed entries kept as tombstones
+     * @param tombstonesPastExpiry   the lapsed, withdrawn and completed entries by the time since their lease expired
+     * @param claims                 take claims held
+     * @param acknowledgementLines   refused-and-acknowledged digest lines ({@code a:}), bounded
+     * @param shardDroppedLines      out-of-shard states acknowledged in the digest, bounded
+     * @param pendingRecordless      recordless states waiting for their record
+     * @param maxLeaseObservedMillis the longest lease seen in this space, capped as for the collection horizon
+     * @param maxLeaseMillis         the lease the collection horizon uses: the builder's override or the observed one
+     * @param digestCacheHits        full-digest asks (a digest sent whole) answered from the cache; a digest-hash ask
+     *                               is not counted here, so the two pairs are disjoint
+     * @param digestCacheMisses      full-digest asks that found the cache stale
+     * @param digestComputations     digests built, whichever ask found the cache stale: the rebuild count
+     * @param digestHashHits         digest-hash asks (a probe, a hashed opening or its answer) answered from the cache
+     * @param digestHashMisses       digest-hash asks that hashed the digest again, after rebuilding it when it was
+     *                               stale too
+     * @param syncStatesSent         signed states offered in anti-entropy deltas
+     * @param syncClaimsSent         signed claims offered in anti-entropy deltas
+     * @param syncStatesReceived     states received in anti-entropy deltas, merged or not
+     * @param syncClaimsReceived     claims received in anti-entropy deltas, merged or not
+     * @param renewShortenings       renewals that asked for less than the lease had left ({@link #renewShortenings()})
+     */
+    public record Stats(int present, int lapsedInGrace, int withdrawn, int completed,
+                        TombstonesPastExpiry tombstonesPastExpiry,
+                        int claims, int acknowledgementLines, int shardDroppedLines, int pendingRecordless,
+                        long maxLeaseObservedMillis, long maxLeaseMillis,
+                        long digestCacheHits, long digestCacheMisses, long digestComputations,
+                        long digestHashHits, long digestHashMisses,
+                        long syncStatesSent, long syncClaimsSent, long syncStatesReceived, long syncClaimsReceived,
+                        long renewShortenings) {
+        /** Every entry this replica knows, tombstones included. */
+        public int known() {
+            return present + lapsedInGrace + withdrawn + completed;
+        }
+
+        /** The lapsed, withdrawn and completed entries. */
+        public int tombstones() {
+            return lapsedInGrace + withdrawn + completed;
+        }
+    }
+
     /** Recordless states waiting here for their record now. */
     public int pendingRecordless() {
         synchronized (lock) {
@@ -2207,16 +3322,35 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * dots would otherwise be stored and re-sorted forever. */
     static final int MAX_DOTS_PER_STATE = 1_024;
 
-    private void mergeState(SpaceWire.EntryStateDto received) {
+    /**
+     * Merges one received state.
+     *
+     * @return whether the replica's state changed: false when the state was dropped, refused, deferred, held pending
+     *         its record, or already held here (IDLE-WORK item 8: such an offer is no activity)
+     */
+    private boolean mergeState(SpaceWire.EntryStateDto received) {
+        return mergeState(received, null);
+    }
+
+    /**
+     * Merges one received state, with the checks {@link #applySyncDelta} already made before it took the lock.
+     *
+     * @param checked the outcome of the signature checks that read nothing of this replica's state, or null to make
+     *                them here
+     */
+    private boolean mergeState(SpaceWire.EntryStateDto received, Prechecked checked) {
         if ((received.adds() != null && received.adds().size() > MAX_DOTS_PER_STATE)
                 || (received.removes() != null && received.removes().size() > MAX_DOTS_PER_STATE)) {
-            return; // inflated dot set: hostile, drop before verification cost
+            return false; // inflated dot set: hostile, drop before verification cost
         }
         if (received.leaseStamp() == null || received.leaseValue() == null) {
             // HLC round five, 2026-11-08 (decision E7): such a state decodes, as in every
             // implementation, but a lease register holds nothing without its stamp and value.
             // Dropped before any judgement: it merges nothing, counts nothing, strikes nobody.
-            return;
+            return false;
+        }
+        if (dropsControlId(received.entryIdOf())) {
+            return false; // annex I.6: dropped like the state above, uncounted and unacknowledged
         }
         boolean hadRecord = received.record() != null;
         SpaceWire.EntryStateDto dto = received;
@@ -2225,31 +3359,49 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // waits for the record; it never creates an entry and never fires an event alone.
             EntryId named = dto.entryIdOf();
             if (named == null || dto.issuerPublicKey() == null || dto.adds() == null || dto.removes() == null) {
-                return;
+                return false;
             }
             EntryRecord held;
             synchronized (lock) {
                 held = crdt.state(named).map(EntryState::record).orElse(null);
                 if (held == null) {
                     keepPending(named, dto);
-                    return;
+                    return false;
                 }
             }
             dto = received.withRecord(held);
             recordlessMerged.incrementAndGet();
         }
         final SpaceWire.EntryStateDto full = dto;
+        // A check made before the lock covers the state as it was received; a recordless state gets its record here.
+        Prechecked pre = hadRecord ? checked : null;
         if (dto.record() == null || dto.issuerPublicKey() == null
                 || !id.equals(dto.record().spaceId()) // a record from another space is not ours (QA4 A4-11)
                 || !dotsBoundToIssuer(dto)
-                || !verifyRecord(dto.record(), dto.issuerPublicKey(), dto.agentCertificate())) {
-            return;
+                || !(pre != null ? pre.record() : verifyRecord(dto.record(), dto.issuerPublicKey(),
+                        dto.agentCertificate()))) {
+            return false;
         }
-        if (!verifyState(dto)) {
+        // A completion is judged against the claim held now, which an earlier claim in the same delta may have set.
+        // The check made before the lock named the claim it expected; when that is the claim held, its answer stands,
+        // so a delta of completions verifies no signature under the lock (RE-M-08).
+        boolean authentic;
+        if (pre == null) {
+            authentic = verifyState(dto);
+        } else if (!dto.completed()) {
+            authentic = pre.state();
+        } else {
+            SpaceWire.SignedClaim held;
+            synchronized (lock) {
+                held = heldClaim(dto.record().entryId());
+            }
+            authentic = sameProof(held, pre.against()) ? pre.state() : verifyState(dto, held, false);
+        }
+        if (!authentic) {
             // Drop any state whose mutable fields are not authenticated by the
             // party authorized for the transition: this is what makes a forged
             // completion, removal, or lease unable to delete a signed entry.
-            return;
+            return false;
         }
         // After verifyState: the revocation judgement reads the state's signing
         // time (signedAt, the lease stamp), so those must be authenticated, and
@@ -2258,7 +3410,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // claim, so a revoked actor's state counts in no stamp counter and strikes
         // nobody, whatever its stamps.
         if (refusedForRevocation(dto)) {
-            return; // ASF-047: authentic, but its actor is revoked in this group
+            return false; // ASF-047: authentic, but its actor is revoked in this group
         }
         if (!stampsAcceptable(dto)) {
             // HLC logical counter, 2026-11-08 (Rust team report): a record or lease
@@ -2268,7 +3420,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // verification, so the refusal names the state's signer.
             refuseState(dto, !HybridLogicalClock.isAcceptable(dto.record().issued()), LOGICAL_VIOLATION,
                     stampsLogicalRefused);
-            return;
+            return false;
         }
         // HLC round four, 2026-11-08 (decision D4): a state stamped past the far-future margin
         // waits for this replica's wall, unacknowledged, so anti-entropy offers it again; one
@@ -2281,7 +3433,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         Lead signedLead = dto.signedAt() == null ? Lead.WITHIN : lead(dto.signedAt().physical(), nowMillis());
         if (issuedLead == Lead.HOSTILE || leaseLead == Lead.HOSTILE || signedLead == Lead.HOSTILE) {
             refuseState(dto, issuedLead == Lead.HOSTILE, FAR_FUTURE_VIOLATION, stampsFarFutureRefused);
-            return;
+            return false;
         }
         if (issuedLead == Lead.DEFERRED || leaseLead == Lead.DEFERRED || signedLead == Lead.DEFERRED) {
             boolean first;
@@ -2291,18 +3443,24 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (first) {
                 stampsFarFutureDeferred.incrementAndGet();
             }
-            return;
+            return false;
         }
         EntryId entryId = dto.record().entryId();
         if (!admitsState(dto)) {
-            return; // spec §7.5: authentic, but its actor is not admitted here
+            return false; // spec §7.5: authentic, but its actor is not admitted here
         }
         observeLease(dto.leaseValue().expiresAtMillis() - dto.leaseStamp().physical());
-        if (SpaceStateCrdt.collectable(dto.toState(), nowMillis(), maxLeaseMillis())) {
+        long doorNow = nowMillis();
+        EntryState offered = dto.toState();
+        if (collectableHere(offered, doorNow, horizon(doorNow))) {
             // Spec §7.3: a tombstone past the GC horizon, re-offered by a lagging
             // replica. Refusing it at the door is what keeps a collected tombstone
-            // from bouncing between replicas that sweep at different moments.
-            return;
+            // from bouncing between replicas that sweep at different moments. The
+            // door reads the same rule and the same clock as this replica's sweep
+            // (RE-H-04), so under the per-entry horizon a present copy older than
+            // a collected withdrawal is past its own lapse horizon here, and refused.
+            acknowledgeCollected(entryId, dto);
+            return false;
         }
         // Spec §11: remote stamps feed the space clock under the bounded-drift
         // regime (a far-future stamp is clamped, never adopted).
@@ -2315,23 +3473,38 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // entries are admission infrastructure and are stored on every shard.
             synchronized (lock) {
                 if (!crdt.state(entryId).isPresent()) {
-                    shardDropped.put(entryId, stateHash(dto.toState()));
-                    generation++;
-                    return;
+                    dropShard(entryId, stateHash(dto.toState()));
+                    bump();
+                    return false;
                 }
             }
         }
+        boolean changed;
         boolean isNew;
         boolean nowCompleted;
         boolean visible;
         Runnable withdrawn;
+        AgentId takenBy = null;
         synchronized (lock) {
             boolean wasKnown = crdt.state(entryId).isPresent();
             boolean wasCompleted = crdt.state(entryId).map(EntryState::completed).orElse(false);
             boolean wasPresent = crdt.state(entryId).map(EntryState::present).orElse(false);
-            crdt = crdt.merge(SpaceStateCrdt.of(entryId, dto.toState()));
-            generation++;
-            issuerKeys.putIfAbsent(entryId, dto.issuerPublicKey());
+            // A state this replica already holds (a re-offer by anti-entropy, a rumor that came twice by two paths)
+            // changes nothing: the map is not copied, the digest cache stays good, and the caller counts no
+            // activity (IDLE-WORK items 6 and 8). The merge keeps the held record, so equality is exact.
+            EntryState before = crdt.state(entryId).orElse(null);
+            EntryState incoming = dto.toState();
+            changed = before == null || !before.merge(incoming).equals(before);
+            if (changed) {
+                setCrdt(crdt.merge(entryId, incoming), entryId);
+            }
+            // An entry known only as a claim until now enters the digest with its issuer key, so that is a change too.
+            if (issuerKeys.putIfAbsent(entryId, dto.issuerPublicKey()) == null) {
+                changed = true;
+            }
+            if (changed) {
+                bump(entryId);
+            }
             if (dto.agentCertificate() != null) {
                 issuerCertificates.putIfAbsent(entryId, dto.agentCertificate());
             }
@@ -2349,50 +3522,130 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // WRITTEN is for an entry a reader could see: present and unexpired.
             // A withdrawn or lapsed entry learned late is history, not news.
             visible = merged.present() && merged.lease().value().expiresAtMillis() > nowMillis();
+            if (isNew && visible) {
+                // A watcher's TAKEN (S2-H-01) for a claim that merged before this record: a batch merges its claims
+                // before its states, and gossip may bring a claim ahead of its entry. It fires once, after the WRITTEN,
+                // while the claim is in force (R1 probe P2, reviews/RBE-REGRESSION-MATRIX.md).
+                TakeClaim inForce = claimOf(entryId);
+                if (inForce != null && !inForce.expired(nowMillis())
+                        && !Long.valueOf(inForce.epoch()).equals(takenEpochs.get(entryId))) {
+                    takenEpochs.put(entryId, inForce.epoch());
+                    takenBy = inForce.holder();
+                }
+            }
             // Core cancel events, 2026-11-09: a merged cancel of an entry present here raises EXPIRED once.
             withdrawn = withdrawnEvent(entryId, wasPresent);
+            if (!merged.present() && !merged.completed()) {
+                // IDLE-WORK 5a(e): a withdrawn entry keeps no decoded value (a completion drops its own below,
+                // after its event has used it).
+                valueCache.remove(entryId);
+            }
         }
-        if (withdrawn != null) {
-            withdrawn.run();
-        }
-        if (isNew && visible) {
-            Optional<Object> value = decodeValue(dto.record());
-            if (value.isPresent()) {
-                fire(SpaceEvent.Kind.WRITTEN, entryId, value.get(), dto.record().issuer(),
-                        dto.record().issuer(), dto.record());
-            } else if (dto.record().payload() == null && isBulkRef(dto.record())) {
-                // LB-E-03: a bulk entry fires its WRITTEN once the artifact is complete here.
-                EntryRecord record = dto.record();
-                if (seamFor(record.payloadRef()) != null) {
-                    ensureBulk(record, () -> decodeValue(record).ifPresent(v ->
-                            fire(SpaceEvent.Kind.WRITTEN, entryId, v, record.issuer(),
-                                    record.issuer(), record)));
+        // The events, after the merge and outside the lock; after the whole delta when it is one of many (RE-M-08).
+        boolean newAndVisible = isNew && visible;
+        boolean completedHere = nowCompleted;
+        AgentId takenHolder = takenBy;
+        later(() -> {
+            if (withdrawn != null) {
+                withdrawn.run();
+            }
+            if (newAndVisible) {
+                Optional<Object> value = decodeValue(full.record());
+                if (value.isPresent()) {
+                    writtenThenTaken(entryId, value.get(), full.record(), takenHolder);
+                } else if (full.record().payload() == null && isBulkRef(full.record())) {
+                    // LB-E-03: a bulk entry fires its WRITTEN once the artifact is complete here.
+                    EntryRecord record = full.record();
+                    if (seamFor(record.payloadRef()) != null) {
+                        awaitingPayload.put(entryId, Boolean.TRUE);
+                        ensureBulk(record, () -> payloadArrived(entryId, record, takenHolder));
+                    }
+                } else if (full.record().payload() == null && full.record().payloadRef() != null
+                        && blocks != null) {
+                    // A content-addressed entry whose block has not landed: fetch it now
+                    // and fire the deferred WRITTEN when it does, so a notify subscriber
+                    // learns of large entries without anyone having to read (a poll was
+                    // the only way before; the flagships all polled for this reason).
+                    EntryRecord record = full.record();
+                    awaitingPayload.put(entryId, Boolean.TRUE);
+                    fetchInBackground(record, () -> payloadArrived(entryId, record, takenHolder));
                 }
-            } else if (dto.record().payload() == null && dto.record().payloadRef() != null
-                    && blocks != null) {
-                // A content-addressed entry whose block has not landed: fetch it now
-                // and fire the deferred WRITTEN when it does, so a notify subscriber
-                // learns of large entries without anyone having to read (a poll was
-                // the only way before; the flagships all polled for this reason).
-                EntryRecord record = dto.record();
-                fetchInBackground(record, () -> decodeValue(record).ifPresent(v ->
-                        fire(SpaceEvent.Kind.WRITTEN, entryId, v, record.issuer(),
-                                record.issuer(), record)));
             }
-        }
-        if (nowCompleted) {
-            AgentId completer;
-            synchronized (lock) {
-                SpaceWire.SignedClaim claim = claims.get(entryId);
-                completer = claim == null ? dto.record().issuer() : claim.claim().holder();
+            if (completedHere) {
+                AgentId completer;
+                synchronized (lock) {
+                    SpaceWire.SignedClaim claim = heldClaim(entryId);
+                    completer = claim == null ? full.record().issuer() : claim.claim().holder();
+                }
+                Optional<Object> value = decodeValue(full.record());
+                if (value.isPresent()) {
+                    // Raised here, so a deferred arrival still owed for this entry raises nothing more.
+                    awaitingPayload.remove(entryId);
+                    fire(SpaceEvent.Kind.COMPLETED, entryId, value.get(), full.record().issuer(), completer,
+                            full.record());
+                }
+                // Without the value, an entry whose payload fetch is still owed hears its COMPLETED when the payload
+                // lands (payloadArrived); one first learned completed raises nothing (SPEC §7.2, completed on arrival).
+                valueCache.remove(entryId); // #11: stop pinning a completed entry's decoded value
             }
-            decodeValue(full.record()).ifPresent(value ->
-                    fire(SpaceEvent.Kind.COMPLETED, entryId, value, full.record().issuer(), completer,
-                            full.record()));
-            valueCache.remove(entryId); // #11: stop pinning a completed entry's decoded value
-        }
+        });
         if (hadRecord) {
-            applyPending(entryId);
+            changed |= applyPending(entryId);
+        }
+        return changed;
+    }
+
+    /**
+     * Fires the WRITTEN of an entry learned from a received state and, when a claim on it merged before its record, the
+     * TAKEN of that claim right after it.
+     *
+     * @param takenBy the holder of the claim in force when the record merged, or null when there was none
+     */
+    private void writtenThenTaken(EntryId entryId, Object value, EntryRecord record, AgentId takenBy) {
+        fire(SpaceEvent.Kind.WRITTEN, entryId, value, record.issuer(), record.issuer(), record);
+        if (takenBy != null) {
+            fire(SpaceEvent.Kind.TAKEN, entryId, value, record.issuer(), takenBy, record);
+        }
+    }
+
+    /**
+     * The event a merge deferred until a content-addressed or bulk payload landed. The entry was present when its state
+     * merged, but the fetch takes time, and in that time the entry may have completed, been withdrawn or lapsed. So the
+     * state is read again now: a live entry raises its WRITTEN (and the TAKEN of a claim that came first); an entry that
+     * completed meanwhile raises COMPLETED alone, since its completion merged while the value could not be decoded and
+     * so raised nothing then; an entry that left in another way raises nothing, as no reader here saw it live (decision
+     * 21 of srad/replication-by-entry.md). The {@link #awaitingPayload} key makes this run at most once and lets a
+     * completion that could decode the value claim the event first.
+     *
+     * @param takenBy the holder of the claim in force when the record merged, or null when there was none
+     */
+    private void payloadArrived(EntryId entryId, EntryRecord record, AgentId takenBy) {
+        if (awaitingPayload.remove(entryId) == null) {
+            return;
+        }
+        Optional<Object> value = decodeValue(record);
+        if (value.isEmpty()) {
+            return;
+        }
+        boolean live;
+        boolean completed;
+        AgentId completer = null;
+        synchronized (lock) {
+            EntryState state = crdt.state(entryId).orElse(null);
+            live = state != null && state.present() && state.lease().value().expiresAtMillis() > nowMillis();
+            completed = state != null && state.completed();
+            if (completed) {
+                SpaceWire.SignedClaim claim = heldClaim(entryId);
+                completer = claim == null ? record.issuer() : claim.claim().holder();
+            }
+        }
+        if (live) {
+            writtenThenTaken(entryId, value.get(), record, takenBy);
+        } else if (completed) {
+            fire(SpaceEvent.Kind.COMPLETED, entryId, value.get(), record.issuer(), completer, record);
+            valueCache.remove(entryId); // #11: stop pinning a completed entry's decoded value
+        } else {
+            valueCache.remove(entryId); // withdrawn or lapsed: no event, and nothing to keep decoded
         }
     }
 
@@ -2402,25 +3655,28 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             EntryId eldest = pendingStates.keySet().iterator().next();
             pendingStates.remove(eldest);
         }
-        pendingStates.put(entryId, new PendingState(dto, nowMillis()));
+        long now = nowMillis();
+        pendingStates.put(entryId, new PendingState(dto, now));
+        pendingDueMillis = Math.min(pendingDueMillis, now + PENDING_STATE_TTL_MILLIS + 1); // the sweep's next look
         recordlessHeld.incrementAndGet();
     }
 
     /** Merges the recordless state that waited for an entry's record, once the record is here (PD-L-02). */
-    private void applyPending(EntryId entryId) {
+    private boolean applyPending(EntryId entryId) {
         PendingState pending;
         EntryRecord held;
         synchronized (lock) {
             pending = pendingStates.remove(entryId);
             if (pending == null) {
-                return;
+                return false;
             }
             held = crdt.state(entryId).map(EntryState::record).orElse(null);
         }
         if (held != null) {
             recordlessMerged.incrementAndGet();
-            mergeState(pending.dto().withRecord(held));
+            return mergeState(pending.dto().withRecord(held));
         }
+        return false;
     }
 
     /**
@@ -2442,8 +3698,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         EntryRecord record = dto.record();
         if (credentialRule != null && credentialSchema.equals(record.type())
                 && !credentialRule.issuer().equals(record.issuer().peer())) {
-            runtime.reportMisbehavior(record.issuer().peer(),
-                    "space credential signed by a non-issuer for space '" + name + "'");
+            report(record.issuer().peer(), "space credential signed by a non-issuer for space '" + name + "'");
             return false;
         }
         AgentId actor = record.issuer();
@@ -2452,7 +3707,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             EntryState local = crdt.state(record.entryId()).orElse(null);
             if (local != null) {
                 if (dto.completed() && !local.completed()) {
-                    SpaceWire.SignedClaim claim = claims.get(record.entryId());
+                    SpaceWire.SignedClaim claim = heldClaim(record.entryId());
                     if (claim == null) {
                         return false; // verifyState guarantees a holder; defensive
                     }
@@ -2471,7 +3726,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (admission.strikesOnRefusal()) {
             // The record (or claim) is authentic, so the refusal is attributable,
             // and the rule rests on local configuration that cannot be late.
-            runtime.reportMisbehavior(actor.peer(), (scope == SpaceAdmission.Scope.TAKE
+            report(actor.peer(), (scope == SpaceAdmission.Scope.TAKE
                     ? "completion by unadmitted agent" : "record from unadmitted issuer")
                     + " for space '" + name + "'");
         }
@@ -2601,19 +3856,20 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         synchronized (lock) {
             if (!issuedAtFault && dto.completed()) {
                 // verifyState found the holder's claim; null only if collected since.
-                SpaceWire.SignedClaim claim = claims.get(record.entryId());
+                SpaceWire.SignedClaim claim = heldClaim(record.entryId());
                 signer = claim == null ? null : claim.claim().holder().peer();
             }
             first = rejectedOffers.add(stateOfferKey(dto));
-            if (refusedAck.put("e:" + record.entryId().value() + "=" + stateHash(dto.toState()),
-                    Boolean.TRUE) == null) {
-                generation++;
+            String line = "e:" + record.entryId().value() + "=" + stateHash(dto.toState());
+            if (acknowledge(record.entryId(), line)) {
+                bump();
             }
+            forgetRefusedAfter(line, SpaceStateCrdt.collectionHorizon(dto.toState(), maxLeaseMillis()));
         }
         if (first) {
             counter.incrementAndGet();
             if (signer != null) {
-                runtime.reportMisbehavior(signer, violation + " in a state for entry " + record.entryId());
+                report(signer, violation + " in a state for entry " + record.entryId());
             }
         }
     }
@@ -2693,17 +3949,29 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 + LOGICAL_VIOLATION + ": " + claim.stamp());
     }
 
-    private void mergeClaim(EntryId entryId, SpaceWire.SignedClaim claim) {
+    /**
+     * Merges one received, verified claim.
+     *
+     * @return whether the held claim changed: false when the claim was refused, deferred, or already held
+     */
+    private boolean mergeClaim(EntryId entryId, SpaceWire.SignedClaim claim) {
+        if (dropsControlId(entryId)) {
+            return false; // annex I.6: an id holding a control character never enters the audited set
+        }
         if (runtime.revocationView().refuses(claim.claim().holder(), claimKey(claim), null)) {
             // ASF-047: a revoked peer takes nothing, however its claim arrives.
             // v0.1.13 (review M-1): nor does a revoked agent or agent key, whatever
             // the claim's stamp, since a renewal keeps it; its take lapses.
             synchronized (lock) {
-                refusedAck.put("c:" + entryId.value() + "=" + claimHash(claim.claim()), Boolean.TRUE);
-                generation++;
+                String line = "c:" + entryId.value() + "=" + claimHash(claim.claim());
+                acknowledge(entryId, line);
+                // a claim lapses at its expiry and an orphaned one is gone by the lapse grace after it
+                forgetRefusedAfter(line, claim.claim().expiresAtMillis()
+                        + SpaceStateCrdt.lapsedKeepMillis(maxLeaseMillis()));
+                bump();
                 refusedClaimEntries.add(entryId);
             }
-            return;
+            return false;
         }
         // Spec §7.5: a claim needs the TAKE scope. Judged before the lock, since
         // an AUTHORIZER rule may consult a cache; under a rule whose evidence
@@ -2711,11 +3979,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // anti-entropy re-offers it once the evidence is here.
         boolean admitted = admits(claim.claim().holder(), SpaceAdmission.Scope.TAKE, nowMillis());
         if (!admitted && !admission.strikesOnRefusal()) {
-            return;
+            return false;
         }
         String violation = null;
         boolean firstRejection = false;
         boolean firstDeferral = false;
+        boolean changed = false;
         EntryRecord takenRecord = null;
         AgentId takenHolder = null;
         synchronized (lock) {
@@ -2762,28 +4031,38 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             boolean deferred = violation == null && lead == Lead.DEFERRED;
             Long decided = logDecidedEpochs.get(entryId);
             if (!deferred && violation == null && decided != null && offered.epoch() <= decided
-                    && !offered.equals(current)) {
+                    && !offered.equals(current) && !renews(offered, current)) {
                 // QA4 A4-5: the ordered log already decided this epoch. A different
                 // gossip claim at the same or a lower epoch is not a contender;
-                // only the identical claim (an attestation upgrade) may merge.
-                return;
+                // only the identical claim (an attestation upgrade) or the decided
+                // holder's own renewal of it may merge. Refusing the renewal let a
+                // voter's copy of the lease run out while the holder still held the
+                // entry, so the log committed a rival's next epoch (the PetClinic
+                // booking log, 2026-11-15).
+                return false;
             }
             if (deferred) {
                 firstDeferral = deferredOffers.add(claimOfferKey(offered, entryId));
             } else if (violation == null) {
-                claims.merge(entryId, claim, SpaceWire.SignedClaim::merge);
-                generation++;
+                SpaceWire.SignedClaim held = heldClaim(entryId);
+                // The merge returns one of its two arguments, so an unchanged claim is the same object.
+                changed = mergeHeldClaim(entryId, claim) != held;
+                if (changed) {
+                    bump(entryId);
+                }
                 hlc.update(offered.stamp()); // spec §11: bounded-drift regime
                 observeLease(offered.expiresAtMillis() - offered.stamp().physical());
                 // A watcher's TAKEN (spiral 2 S2-H-01): the claim now in force, once per epoch, so a replica
                 // that never takes still hears who took what; a race settles as a later claim at the same
                 // epoch, which fires again with the winner as the actor.
                 TakeClaim merged = claimOf(entryId);
-                if (merged != null && !merged.expired(now)
+                EntryState known = crdt.state(entryId).orElse(null);
+                // A claim on an entry not held here yet waits for its record: mergeState fires its TAKEN after the
+                // WRITTEN, so marking the epoch heard now would lose it (R1 probe P2).
+                if (merged != null && !merged.expired(now) && known != null
                         && !Long.valueOf(merged.epoch()).equals(takenEpochs.get(entryId))) {
                     takenEpochs.put(entryId, merged.epoch());
-                    takenRecord = crdt.state(entryId).filter(EntryState::present).map(EntryState::record)
-                            .orElse(null);
+                    takenRecord = known.present() ? known.record() : null;
                     takenHolder = merged.holder();
                 }
             } else {
@@ -2796,8 +4075,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (takenRecord != null) {
             EntryRecord record = takenRecord;
             AgentId holder = takenHolder;
-            decodeValue(record).ifPresent(value -> fire(SpaceEvent.Kind.TAKEN, entryId, value, record.issuer(),
-                    holder, record));
+            later(() -> decodeValue(record).ifPresent(value -> fire(SpaceEvent.Kind.TAKEN, entryId, value,
+                    record.issuer(), holder, record)));
         }
         if (violation != null && firstRejection) {
             if (LOGICAL_VIOLATION.equals(violation)) {
@@ -2810,9 +4089,27 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // misbehavior — report it toward local quarantine (WS5). Once per
             // distinct claim: an honest lagging replica re-offering the same
             // contested claim every round must not quarantine its holder.
-            runtime.reportMisbehavior(claim.claim().holder().peer(),
-                    violation + " for entry " + entryId);
+            report(claim.claim().holder().peer(), violation + " for entry " + entryId);
         }
+        return changed;
+    }
+
+    /**
+     * Whether {@code offered} renews {@code current}: the same claim in every field (entry, space, epoch, stamp,
+     * holder and bid) but a later expiry. {@link TakeClaim#merge} orders such a pair by expiry alone, so a renewal can
+     * extend the holder's lease and never displace the holder, which is why the log-decided rule (QA4 A4-5) lets it
+     * through. Only the holder can sign one: {@code verifyClaim} binds the signature to the holder's own key before a
+     * claim reaches the merge.
+     */
+    private static boolean renews(TakeClaim offered, TakeClaim current) {
+        return current != null
+                && offered.expiresAtMillis() > current.expiresAtMillis()
+                && offered.epoch() == current.epoch()
+                && offered.entryId().equals(current.entryId())
+                && offered.spaceId().equals(current.spaceId())
+                && offered.stamp().equals(current.stamp())
+                && offered.holder().equals(current.holder())
+                && Double.compare(offered.bid(), current.bid()) == 0;
     }
 
     /**
@@ -2828,7 +4125,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         boolean refused;
         ai.badmonkey.agentspaces.api.security.RevocationView view = runtime.revocationView();
         synchronized (lock) {
-            SpaceWire.SignedClaim claim = claims.get(entryId);
+            SpaceWire.SignedClaim claim = heldClaim(entryId);
             if (dto.completed()) {
                 refused = claim == null
                         ? refusedClaimEntries.contains(entryId)
@@ -2849,8 +4146,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                                         stateSigningTime(dto, null)));
             }
             if (refused) {
-                refusedAck.put("e:" + entryId.value() + "=" + stateHash(dto.toState()), Boolean.TRUE);
-                generation++;
+                String line = "e:" + entryId.value() + "=" + stateHash(dto.toState());
+                acknowledge(entryId, line);
+                forgetRefusedAfter(line, SpaceStateCrdt.collectionHorizon(dto.toState(), maxLeaseMillis()));
+                bump();
             }
         }
         return refused;
@@ -2872,8 +4171,200 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     private TakeClaim claimOf(EntryId entryId) {
-        SpaceWire.SignedClaim signed = claims.get(entryId);
+        SpaceWire.SignedClaim signed = heldClaim(entryId);
         return signed == null ? null : signed.claim();
+    }
+
+    // ---- the slots of the map (RE-M-04, RE-M-07): every change to them goes through these, under the lock
+
+    /** The signed claim held for an entry, from its slot, or null. Callers hold {@link #lock}. */
+    private SpaceWire.SignedClaim heldClaim(EntryId entryId) {
+        return (SpaceWire.SignedClaim) crdt.claim(entryId);
+    }
+
+    /**
+     * Merges a claim into the one held for its entry by the claim lattice, as the claim map's {@code merge} did, and
+     * returns the claim now held: the held one, unchanged, when it wins. Callers hold {@link #lock}.
+     */
+    private SpaceWire.SignedClaim mergeHeldClaim(EntryId entryId, SpaceWire.SignedClaim claim) {
+        SpaceWire.SignedClaim held = heldClaim(entryId);
+        SpaceWire.SignedClaim merged = held == null ? claim : SpaceWire.SignedClaim.merge(held, claim);
+        if (merged != held) {
+            crdt = crdt.withClaim(entryId, merged, claimHash(merged.claim()));
+        }
+        return merged;
+    }
+
+    /**
+     * Acknowledges a refused line in its entry's slot, so partners stop re-offering it (ASF-047), and forgets the
+     * least recently refused line past {@link #REFUSED_ACK_CAP}. Refusing a line again makes it the most recent.
+     * Callers hold {@link #lock}.
+     *
+     * @return whether the line is new here
+     */
+    private boolean acknowledge(EntryId entryId, String line) {
+        if (refusedAckOrder.put(line, entryId) != null) {
+            return false;
+        }
+        crdt = crdt.withAck(entryId, line);
+        if (refusedAckOrder.size() > REFUSED_ACK_CAP) {
+            Iterator<Map.Entry<String, EntryId>> eldest = refusedAckOrder.entrySet().iterator();
+            Map.Entry<String, EntryId> gone = eldest.next();
+            eldest.remove();
+            crdt = crdt.withoutAck(gone.getValue(), gone.getKey());
+            collectedAcks.remove(gone.getKey());
+            unscheduleRefused(gone.getKey());
+        }
+        return true;
+    }
+
+    /**
+     * Acknowledges a re-offered state the door refused as a collectable tombstone (RE-H-03, SPEC §7.3), when this
+     * replica holds no state for its entry: it collected the entry already, or never held it. Without the line a member
+     * that keeps tombstones longer (one that saw a longer lease, or an older implementation) offers the same state on
+     * every round until it collects it too. The line goes under {@link #REFUSED_ACK_CAP} with the other refusals, and
+     * is forgotten {@link #COLLECTED_ACK_HOLD_MILLIS} after the last refusal, so a lingering line cannot keep this
+     * replica's digest apart from its partners' once the offerer has collected too; a member still holding the state
+     * then offers it once more and earns the line again. Only an authentic state reaches here.
+     */
+    private void acknowledgeCollected(EntryId entryId, SpaceWire.EntryStateDto dto) {
+        String line = "e:" + entryId.value() + "=" + stateHash(dto.toState());
+        synchronized (lock) {
+            if (crdt.state(entryId).isPresent()) {
+                return; // still held here: its own sweep collects it, and the merge would change nothing
+            }
+            boolean added = acknowledge(entryId, line);
+            collectedAcks.remove(line);
+            collectedAcks.put(line, nowMillis() + COLLECTED_ACK_HOLD_MILLIS);
+            if (added) {
+                collectedReoffersAcknowledged.incrementAndGet();
+                bump();
+            }
+        }
+    }
+
+    /**
+     * Schedules a door acknowledgement to be forgotten once what it refused is past its collection horizon, and never
+     * sooner than {@link #COLLECTED_ACK_HOLD_MILLIS} from now: a member that keeps the state longer (it saw a longer
+     * lease) then offers it again at most once per hold and earns the line again, as a collected tombstone's re-offer
+     * does (RE-H-03). Refusing the line again moves its time. Callers hold {@link #lock}.
+     */
+    private void forgetRefusedAfter(String line, long horizon) {
+        if (!refusedAckOrder.containsKey(line)) {
+            return; // the cap already let it go
+        }
+        long at = Math.max(horizon, nowMillis() + COLLECTED_ACK_HOLD_MILLIS);
+        unscheduleRefused(line);
+        refusedForgetAt.put(line, at);
+        refusedForgetBy.computeIfAbsent(at, k -> new java.util.LinkedHashSet<>()).add(line);
+    }
+
+    /** Drops a door acknowledgement's schedule. Callers hold {@link #lock}. */
+    private void unscheduleRefused(String line) {
+        Long at = refusedForgetAt.remove(line);
+        if (at != null) {
+            Set<String> lines = refusedForgetBy.get(at);
+            if (lines != null) {
+                lines.remove(line);
+                if (lines.isEmpty()) {
+                    refusedForgetBy.remove(at);
+                }
+            }
+        }
+    }
+
+    /** Forgets the door acknowledgements whose time has come (P6). Callers hold {@link #lock}. */
+    private void forgetRefusedAcks(long now) {
+        boolean dropped = false;
+        while (!refusedForgetBy.isEmpty() && refusedForgetBy.firstKey() <= now) {
+            for (String line : refusedForgetBy.pollFirstEntry().getValue()) {
+                refusedForgetAt.remove(line);
+                EntryId entryId = refusedAckOrder.remove(line);
+                if (entryId != null) {
+                    crdt = crdt.withoutAck(entryId, line);
+                    collectedAcks.remove(line);
+                    dropped = true;
+                }
+            }
+        }
+        if (dropped) {
+            generation++;
+        }
+    }
+
+    /**
+     * Forgets the acknowledgements of collected tombstones whose hold has passed (RE-H-03). They are held in refusal
+     * order with one hold each, so the oldest come first. Callers hold {@link #lock}.
+     */
+    private void forgetCollectedAcks(long now) {
+        boolean dropped = false;
+        Iterator<Map.Entry<String, Long>> held = collectedAcks.entrySet().iterator();
+        while (held.hasNext()) {
+            Map.Entry<String, Long> next = held.next();
+            if (next.getValue() > now) {
+                break;
+            }
+            held.remove();
+            EntryId entryId = refusedAckOrder.remove(next.getKey());
+            if (entryId != null) {
+                crdt = crdt.withoutAck(entryId, next.getKey());
+                dropped = true;
+            }
+        }
+        if (dropped) {
+            generation++;
+        }
+    }
+
+    /**
+     * Remembers the state line of an out-of-shard entry in its slot, so partners stop offering it, and forgets the
+     * oldest past {@link #SHARD_DROPPED_CAP}. Callers hold {@link #lock}.
+     */
+    private void dropShard(EntryId entryId, String hash) {
+        shardDroppedOrder.put(entryId, Boolean.TRUE);
+        crdt = crdt.withDropped(entryId, hash);
+        if (shardDroppedOrder.size() > SHARD_DROPPED_CAP) {
+            Iterator<EntryId> eldest = shardDroppedOrder.keySet().iterator();
+            EntryId gone = eldest.next();
+            eldest.remove();
+            crdt = crdt.withDropped(gone, null);
+        }
+    }
+
+    /** Forgets an entry's shard-dropped line. Callers hold {@link #lock}. */
+    private void forgetShardDropped(EntryId entryId) {
+        if (shardDroppedOrder.remove(entryId) != null) {
+            crdt = crdt.withDropped(entryId, null);
+        }
+    }
+
+    /** Sets the map after a change to one entry's state, and keeps the live index in step. Callers hold {@link #lock}. */
+    private void setCrdt(SpaceStateCrdt next, EntryId changed) {
+        crdt = next;
+        refreshLive(changed);
+    }
+
+    /** Files an entry in the live index while it is present, and takes it out otherwise. Callers hold {@link #lock}. */
+    private void refreshLive(EntryId entryId) {
+        EntryState state = crdt.state(entryId).orElse(null);
+        if (state != null && state.present()) {
+            liveIndex.put(SpaceStateCrdt.liveRecord(state));
+        } else {
+            liveIndex.remove(entryId);
+        }
+    }
+
+    /** Whether the live index holds exactly the map's present entries; for the tests of RE-M-04. */
+    boolean liveIndexMatchesForTest() {
+        synchronized (lock) {
+            Map<EntryId, EntryRecord> expected = new HashMap<>();
+            for (EntryRecord record : crdt.liveRecords()) {
+                expected.put(record.entryId(), record);
+            }
+            Map<EntryId, EntryRecord> held = new HashMap<>();
+            liveIndex.forEach(record -> held.put(record.entryId(), record));
+            return held.size() == liveIndex.size() && expected.equals(held);
+        }
     }
 
     /**
@@ -2929,7 +4420,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     public Optional<SpaceWire.SignedClaim> claimProof(EntryId entryId) {
         Objects.requireNonNull(entryId, "entryId");
         synchronized (lock) {
-            return Optional.ofNullable(claims.get(entryId));
+            return Optional.ofNullable(heldClaim(entryId));
         }
     }
 
@@ -2952,11 +4443,26 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     // ------------------------------------------------------------- anti-entropy
 
     byte[] digest() { // package-private for tests
-        sweepNow(); // spec §7.3: collect tombstones before advertising what we hold
+        return digest(true);
+    }
+
+    /**
+     * The digest, counting the ask in the full-digest pair only when {@code fullAsk}: {@link #digestHash()} passes
+     * false, so a hash ask is counted once, in its own pair, and a reader that adds the two pairs does not count one
+     * rebuild twice. {@link #digestComputations} counts the rebuilds of both.
+     */
+    private byte[] digest(boolean fullAsk) {
+        sweepIfDue(); // spec §7.3: collect tombstones before advertising what we hold, when any are due
         long at;
         synchronized (lock) {
             if (digestCache != null && digestGeneration == generation) {
+                if (fullAsk) {
+                    digestCacheHits++;
+                }
                 return digestCache; // nothing changed since the last round (PERF2 §3.2)
+            }
+            if (fullAsk) {
+                digestCacheMisses++;
             }
             at = generation;
         }
@@ -2965,10 +4471,112 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (generation == at) {
                 digestCache = computed;
                 digestGeneration = at;
+                digestHashCache = null; // taken over the digest just replaced
+                digestHashOf = null;
             }
             digestComputations++;
         }
         return computed;
+    }
+
+    /**
+     * The SHA-256 of {@link #digest()}, what a probe and the opening of a hashed anti-entropy round carry per stream
+     * (SPEC §5.2, §5.3). Cached beside the digest under the same generation, so an unchanged space answers with the
+     * hash it already took (IDLE-WORK item 3). Callers must not modify the returned array.
+     */
+    byte[] digestHash() { // package-private for tests
+        byte[] digest = digest(false);
+        synchronized (lock) {
+            if (digestHashOf == digest && digestHashCache != null) {
+                digestHashHits++;
+                return digestHashCache;
+            }
+            digestHashMisses++;
+        }
+        byte[] hash = Digests.sha256(digest);
+        synchronized (lock) {
+            if (digestCache == digest) {
+                digestHashCache = hash;
+                digestHashOf = digest;
+            }
+        }
+        return hash;
+    }
+
+    /**
+     * Merges a prepared state in one step, for tests only: a benchmark seeds a hundred thousand entries without
+     * paying one copy of the whole map per entry, which is what seeding them through writes or deltas costs.
+     */
+    void mergeForTest(SpaceStateCrdt state) {
+        mergeForTest(state, Map.of(), Set.of());
+    }
+
+    /**
+     * {@link #mergeForTest(SpaceStateCrdt)} with the side tables a merged state brings, for the test that pins the
+     * digest's bytes: an issuer key for every entry, as a merge or a write files one (the digest lists a tombstone
+     * only through it), the given take claims, and the given refused-and-acknowledged lines (ASF-047), so the pinned
+     * digest carries every kind of line it can carry.
+     */
+    void mergeForTest(SpaceStateCrdt state, Map<EntryId, SpaceWire.SignedClaim> seededClaims,
+                      Set<String> refusedLines) {
+        synchronized (lock) {
+            crdt = crdt.merge(state);
+            for (EntryId entryId : state.entryIds()) {
+                issuerKeys.putIfAbsent(entryId, identity.rawPublicKey());
+                refreshLive(entryId);
+            }
+            for (Map.Entry<EntryId, SpaceWire.SignedClaim> e : seededClaims.entrySet()) {
+                crdt = crdt.withClaim(e.getKey(), e.getValue(), claimHash(e.getValue().claim()));
+            }
+            for (String line : refusedLines) {
+                // The id runs from after the kind to the last '=': a state hash is hex and a claim hash holds none.
+                acknowledge(EntryId.of(line.substring(2, line.lastIndexOf('='))), line);
+            }
+            long now = nowMillis();
+            for (EntryId entryId : state.entryIds()) {
+                reindex(entryId, now);
+            }
+            for (EntryId entryId : seededClaims.keySet()) {
+                reindex(entryId, now);
+            }
+            bump();
+        }
+    }
+
+    /**
+     * {@link #mergeForTest(SpaceStateCrdt)} with the signed state each entry would carry, for the benchmark of
+     * {@link #deltaFor}: that method forwards only states held signed, so a seeded space without them offers nothing.
+     * The states are stored as given and not verified.
+     */
+    void mergeForTest(SpaceStateCrdt state, java.util.Collection<SpaceWire.EntryStateDto> signed) {
+        mergeForTest(state);
+        synchronized (lock) {
+            for (SpaceWire.EntryStateDto dto : signed) {
+                EntryId entryId = dto.record().entryId();
+                signedStates.put(entryId, dto);
+                issuerKeys.put(entryId, dto.issuerPublicKey());
+            }
+            bump();
+        }
+    }
+
+    /** Marks the digest stale without changing anything, so a benchmark can time a rebuild of an unchanged space. */
+    void invalidateDigestForTest() {
+        synchronized (lock) {
+            bump();
+        }
+    }
+
+    /** How many times a blocking read or take has tried; for tests. */
+    long waitingPolls() {
+        return waitingPolls.get();
+    }
+
+    /** How many entry ids the sweep has evaluated, for the test that an unchanged space visits none. */
+    long sweepVisits() {
+        synchronized (lock) {
+            return sweepVisits;
+        }
     }
 
     /** How many times the digest was rebuilt (for tests of the cache). */
@@ -2978,40 +4586,361 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
     }
 
+    /**
+     * The text digest, collected from the slots of the map and sorted (RE-M-06): the same lines in the same order as
+     * the summary this method used to build from the map, the claims, the shard-dropped lines and the acknowledged
+     * lines one table at a time, since each of those now lives in the slot of its entry. The map is immutable, so it is
+     * read under the lock and the digest is built outside it.
+     */
     private byte[] computeDigest() {
-        TreeMap<String, String> summary = new TreeMap<>();
+        SpaceStateCrdt snapshot;
         synchronized (lock) {
-            for (EntryRecord record : allRecords()) {
-                EntryState state = crdt.state(record.entryId()).orElseThrow();
-                summary.put("e:" + record.entryId().value(), stateHash(state));
-            }
-            for (Map.Entry<EntryId, SpaceWire.SignedClaim> e : claims.entrySet()) {
-                summary.put("c:" + e.getKey().value(), claimHash(e.getValue().claim()));
-            }
-            for (Map.Entry<EntryId, String> e : shardDropped.entrySet()) {
-                summary.putIfAbsent("e:" + e.getKey().value(), e.getValue());
-            }
+            snapshot = crdt;
         }
-        StringBuilder sb = new StringBuilder();
-        summary.forEach((k, v) -> sb.append(k).append('=').append(v).append('\n'));
-        synchronized (lock) {
-            // ASF-047: refused-and-acknowledged lines, so partners stop re-offering them.
-            new TreeSet<>(refusedAck.keySet()).forEach(line ->
-                    sb.append("a:").append(line).append('\n'));
-        }
-        return sb.toString().getBytes(StandardCharsets.UTF_8);
+        return snapshot.legacyDigest();
     }
 
-    byte[] deltaFor(byte[] remoteDigest) { // package-private for tests
-        sweepNow(); // spec §7.3: never offer a tombstone we would collect ourselves
+    /**
+     * The stream hash of SPEC annex I.6 over this space's audited set: what a probe and the opening of a round carry
+     * for this space toward a member on {@code wire.ae=2}. The sweep runs first when anything is due, so an entry
+     * whose lease lapsed by this replica's clock is out of the set (RE-T-06) and a collectable tombstone is gone, as
+     * the text digest has them. The trie memoizes the hash, so an unchanged space answers with no hashing.
+     */
+    byte[] streamHash() { // package-private for tests
+        sweepIfDue();
+        SpaceStateCrdt snapshot;
+        synchronized (lock) {
+            snapshot = crdt;
+        }
+        return snapshot.streamHash();
+    }
+
+    /** The audited node of annex I.6 at a path, for the audit's {@code tree} answers. */
+    ai.badmonkey.agentspaces.space.crdt.AuditNode auditNode(byte[] path) { // package-private for tests
+        sweepIfDue();
+        SpaceStateCrdt snapshot;
+        synchronized (lock) {
+            snapshot = crdt;
+        }
+        return snapshot.node(path);
+    }
+
+    /** Every audited line under a path, joined as a leaf's preimage (annex I.6), whatever the count there. */
+    byte[] auditLines(byte[] path) { // package-private for tests
+        sweepIfDue();
+        SpaceStateCrdt snapshot;
+        synchronized (lock) {
+            snapshot = crdt;
+        }
+        return snapshot.auditLines(path);
+    }
+
+    /** {@link #auditLines(byte[])} when the lines hold at most {@code maxBytes} bytes, else null, gathered no further. */
+    byte[] auditLines(byte[] path, long maxBytes) { // package-private for tests
+        sweepIfDue();
+        SpaceStateCrdt snapshot;
+        synchronized (lock) {
+            snapshot = crdt;
+        }
+        return snapshot.auditLines(path, maxBytes);
+    }
+
+    /** Which of a partner's lines under a path this replica holds, each read in the one slot it names. */
+    java.util.Set<String> auditHeld(byte[] path, java.util.Collection<String> lines) { // package-private for tests
+        sweepIfDue();
+        SpaceStateCrdt snapshot;
+        synchronized (lock) {
+            snapshot = crdt;
+        }
+        return snapshot.auditHeld(path, lines);
+    }
+
+    /**
+     * The answer to a fetch by id (annex I.6, <em>The fetch</em>): the signed state of each named entry this replica
+     * holds and its claim when it holds one, in the delta format of {@link #deltaFor}, present entries before
+     * tombstones. An id not held is left out. This is the whole answer, for an asker that sent no budget; one that did
+     * is answered by {@link #statesFor(java.util.Collection, long, boolean)}.
+     */
+    byte[] statesFor(java.util.Collection<String> ids) { // package-private for tests
+        sweepIfDue(); // spec §7.3: never offer a tombstone this replica would collect itself
+        List<SpaceWire.EntryStateDto> states = new ArrayList<>();
+        List<SpaceWire.EntryStateDto> tombstones = new ArrayList<>();
+        Map<String, SpaceWire.SignedClaim> claims = new HashMap<>();
+        synchronized (lock) {
+            for (String id : ids) {
+                EntryId entryId = EntryId.of(id);
+                EntryState state = crdt.state(entryId).orElse(null);
+                if (state != null) {
+                    SpaceWire.EntryStateDto signed = signedStates.get(entryId);
+                    if (signed != null) {
+                        (state.present() ? states : tombstones).add(signed);
+                    }
+                }
+                SpaceWire.SignedClaim claim = heldClaim(entryId);
+                if (claim != null) {
+                    claims.put(id, claim);
+                }
+            }
+        }
+        states.addAll(tombstones);
+        if (states.isEmpty() && claims.isEmpty()) {
+            return new byte[0];
+        }
+        syncStatesSent.addAndGet(states.size());
+        syncClaimsSent.addAndGet(claims.size());
+        return codec.toBytes(new SpaceWire.SyncDelta(states, claims));
+    }
+
+    /**
+     * The answer to a fetch by id cut to a budget (annex I.6, <em>The fetch</em> and <em>The budget</em>; RE-I-01,
+     * RE-I-06): the signed state of each named entry this replica holds with its claim, in {@link #OFFER_ORDER}, up to
+     * {@code budget} bytes of delta, the first item always when {@code first}. An id not held is left out unmarked.
+     *
+     * @return the delta and the count of held items left out for the budget
+     */
+    ReconcilableState.Bounded statesFor(java.util.Collection<String> ids, long budget, boolean first) {
+        sweepIfDue(); // spec §7.3: never offer a tombstone this replica would collect itself
+        List<Offer> offers = new ArrayList<>();
+        synchronized (lock) {
+            for (String id : ids) {
+                EntryId entryId;
+                try {
+                    entryId = EntryId.of(id);
+                } catch (IllegalArgumentException e) {
+                    continue; // no such id is held
+                }
+                EntryState state = crdt.state(entryId).orElse(null);
+                SpaceWire.EntryStateDto signed = state == null ? null : signedStates.get(entryId);
+                SpaceWire.SignedClaim claim = heldClaim(entryId);
+                if (signed != null || claim != null) {
+                    offers.add(new Offer(entryId, signed, state != null && state.present(), claim));
+                }
+            }
+        }
+        return bounded(offers, budget, first);
+    }
+
+    /**
+     * The answer to a text digest cut to a budget, as {@link #statesFor(java.util.Collection, long, boolean)} cuts a
+     * fetch: a budgeted get-space draws the newest present states first (annex I.6, <em>The budget</em>; RE-I-04). The
+     * partner's lines are evidence as in {@link #deltaFor(byte[])}.
+     *
+     * @return the delta and the count of held items left out for the budget
+     */
+    ReconcilableState.Bounded deltaFor(byte[] remoteDigest, long budget, boolean first) {
+        sweepIfDue(); // spec §7.3: never offer a tombstone we would collect ourselves
+        Set<String> remote = remoteLines(remoteDigest);
+        List<Offer> offers = new ArrayList<>();
+        synchronized (lock) {
+            crdt.forEachHeld((entryId, state, stateHash, claim, claimHash) -> {
+                SpaceWire.EntryStateDto signed = null;
+                if (state != null) {
+                    String key = "e:" + entryId.value() + "=" + stateHash;
+                    if (!remote.contains(key) && !remote.contains("a:" + key)) {
+                        signed = signedStates.get(entryId); // a relay forwards only what it holds signed
+                    }
+                }
+                SpaceWire.SignedClaim missing = null;
+                if (claim != null) {
+                    String key = "c:" + entryId.value() + "=" + claimHash;
+                    if (!remote.contains(key) && !remote.contains("a:" + key)) {
+                        missing = (SpaceWire.SignedClaim) claim;
+                    }
+                }
+                if (signed != null || missing != null) {
+                    offers.add(new Offer(entryId, signed, state != null && state.present(), missing));
+                }
+            });
+        }
+        return bounded(offers, budget, first);
+    }
+
+    /**
+     * One item of a budgeted answer: an entry's signed state with the claim that travels with it (RE-I-06), or a claim
+     * alone when the asker holds the state already.
+     */
+    private record Offer(EntryId entryId, SpaceWire.EntryStateDto state, boolean present,
+                         SpaceWire.SignedClaim claim) {
+
+        /** Present states first, then tombstones, then claims alone. */
+        int rank() {
+            return state == null ? 2 : present ? 0 : 1;
+        }
+
+        HlcTimestamp stamp() {
+            return state != null ? state.leaseStamp() : claim != null ? claim.claim().stamp() : null;
+        }
+    }
+
+    /**
+     * The order of a budgeted answer (annex I.6; RE-I-06): a present state before a tombstone, so that when a budget
+     * splits a replacement (a new revision and the old one's cancel) the new revision goes in the earlier answer and a
+     * reader's view is never empty; then newest first by the lease stamp in the stamp order of §7.3; equal stamps in
+     * ascending order of their ids' UTF-8 bytes.
+     */
+    private static final java.util.Comparator<Offer> OFFER_ORDER = (a, b) -> {
+        int rank = Integer.compare(a.rank(), b.rank());
+        if (rank != 0) {
+            return rank;
+        }
+        HlcTimestamp sa = a.stamp();
+        HlcTimestamp sb = b.stamp();
+        if (sa != null && sb != null) {
+            int newer = sb.compareTo(sa);
+            if (newer != 0) {
+                return newer;
+            }
+        } else if (sa != null || sb != null) {
+            return sa != null ? -1 : 1;
+        }
+        return compareUtf8(a.entryId().value(), b.entryId().value());
+    };
+
+    /** Compares two texts by their UTF-8 bytes, which is the order of their code points. */
+    private static int compareUtf8(String a, String b) {
+        int i = 0;
+        int j = 0;
+        while (i < a.length() && j < b.length()) {
+            int ca = a.codePointAt(i);
+            int cb = b.codePointAt(j);
+            if (ca != cb) {
+                return Integer.compare(ca, cb);
+            }
+            i += Character.charCount(ca);
+            j += Character.charCount(cb);
+        }
+        return Integer.compare(a.length() - i, b.length() - j);
+    }
+
+    /** Bytes of a delta beside its items: the record's two field names and the heads of its list and map. */
+    private static final long DELTA_BASE = 32;
+
+    /**
+     * Fills a delta in {@link #OFFER_ORDER} up to the budget: it stops before the item that would take the delta past
+     * it, except that with {@code first} the first item goes in whatever its size (annex I.6, <em>The budget</em>), so
+     * a state larger than the budget still travels alone and nobody re-asks for it for ever. Each item's size is its
+     * own encoding, which a delta's list and map carry unchanged.
+     */
+    private ReconcilableState.Bounded bounded(List<Offer> offers, long budget, boolean first) {
+        offers.sort(OFFER_ORDER);
+        List<SpaceWire.EntryStateDto> states = new ArrayList<>();
+        Map<String, SpaceWire.SignedClaim> claims = new HashMap<>();
+        long used = DELTA_BASE;
+        int taken = 0;
+        for (Offer offer : offers) {
+            long size = 0;
+            if (offer.state() != null) {
+                size += codec.toBytes(offer.state()).length;
+            }
+            if (offer.claim() != null) {
+                // the claim, and its key in the map: the id as CBOR text
+                size += codec.toBytes(offer.claim()).length
+                        + offer.entryId().value().getBytes(StandardCharsets.UTF_8).length + 9;
+            }
+            if (used + size > budget && !(first && taken == 0)) {
+                break;
+            }
+            used += size;
+            taken++;
+            if (offer.state() != null) {
+                states.add(offer.state());
+            }
+            if (offer.claim() != null) {
+                claims.put(offer.entryId().value(), offer.claim());
+            }
+        }
+        long left = offers.size() - taken;
+        if (taken == 0) {
+            return new ReconcilableState.Bounded(new byte[0], left);
+        }
+        syncStatesSent.addAndGet(states.size());
+        syncClaimsSent.addAndGet(claims.size());
+        return new ReconcilableState.Bounded(codec.toBytes(new SpaceWire.SyncDelta(states, claims)), left);
+    }
+
+    /**
+     * A partner's audit answered these lines (PD-L-01): a state line naming an entry this replica holds is evidence the
+     * partner holds its record, as a line of its text digest was.
+     */
+    private void linesSeen(String lines) {
+        synchronized (lock) {
+            for (String line : lines.split("\n")) {
+                if (!line.startsWith("e:")) {
+                    continue;
+                }
+                int eq = line.lastIndexOf('=');
+                if (eq <= 2) {
+                    continue;
+                }
+                EntryId listed = EntryId.of(line.substring(2, eq));
+                if (crdt.state(listed).isPresent()) {
+                    replicated.add(listed);
+                    ownWrites.remove(listed);
+                }
+            }
+        }
+    }
+
+    /**
+     * A partner's audit showed its node at a path equal to this replica's (PD-L-01): it holds every line this replica
+     * holds under the path, so each own write whose key lies there has replicated, as {@link #digestMatched} judges a
+     * whole stream that matched.
+     */
+    private void matchedUnder(byte[] path) {
+        synchronized (lock) {
+            if (ownWrites.isEmpty()) {
+                return;
+            }
+            for (EntryId entryId : new ArrayList<>(ownWrites.keySet())) {
+                if (keyStartsWith(entryId, path) && crdt.state(entryId).isPresent()) {
+                    replicated.add(entryId);
+                    ownWrites.remove(entryId);
+                }
+            }
+        }
+    }
+
+    /** Whether an entry's key in the trie, SHA-256 of its id read as nibbles, begins with the path (annex I.6). */
+    private static boolean keyStartsWith(EntryId entryId, byte[] path) {
+        byte[] key = Digests.sha256(entryId.value().getBytes(StandardCharsets.UTF_8));
+        for (int i = 0; i < path.length; i++) {
+            int nibble = (i & 1) == 0 ? (key[i >> 1] >> 4) & 0xF : key[i >> 1] & 0xF;
+            if (nibble != path[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether an entry id holds a control character (U+0000 to U+001F, U+007F), which annex I.6 keeps out of the
+     * audited set: under {@code wire.ae=2} such a state or claim is dropped uncounted and unacknowledged (RE-T-06),
+     * since an id holding LF would let two different sets join to the same bytes.
+     */
+    private boolean dropsControlId(EntryId entryId) {
+        if (entryId == null || !runtime.gossip().auditing()) {
+            return false;
+        }
+        String value = entryId.value();
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch < 0x20 || ch == 0x7F) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The lines of a partner's text digest, each a state or claim line or an acknowledgement, after taking the state
+     * lines as evidence (PD-L-01): a remote line naming an entry this replica holds shows the remote holds its record,
+     * whatever state hash it names.
+     */
+    private Set<String> remoteLines(byte[] remoteDigest) {
         Set<String> remote = new HashSet<>(List.of(
                 new String(remoteDigest, StandardCharsets.UTF_8).split("\n")));
-        List<SpaceWire.EntryStateDto> states = new ArrayList<>();
-        Map<String, SpaceWire.SignedClaim> missingClaims = new HashMap<>();
         synchronized (lock) {
             for (String line : remote) {
-                // PD-L-01: a remote line naming an entry this replica holds is evidence the
-                // remote holds its record, whatever state hash it names.
                 if (line.startsWith("e:")) {
                     int eq = line.indexOf('=');
                     if (eq > 2) {
@@ -3023,35 +4952,75 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     }
                 }
             }
-            for (EntryRecord record : allRecords()) {
-                EntryState state = crdt.state(record.entryId()).orElseThrow();
-                String key = "e:" + record.entryId().value() + "=" + stateHash(state);
-                if (!remote.contains(key) && !remote.contains("a:" + key)) {
-                    // Forward the stored actor signature; a relay cannot re-sign
-                    // state it did not author, so an entry we never saw a signed
-                    // DTO for (should not happen for authentic entries) is skipped.
-                    SpaceWire.EntryStateDto signed = signedStates.get(record.entryId());
-                    if (signed != null) {
-                        states.add(signed);
+        }
+        return remote;
+    }
+
+    byte[] deltaFor(byte[] remoteDigest) { // package-private for tests
+        sweepIfDue(); // spec §7.3: never offer a tombstone we would collect ourselves
+        Set<String> remote = remoteLines(remoteDigest);
+        List<SpaceWire.EntryStateDto> states = new ArrayList<>();
+        Map<String, SpaceWire.SignedClaim> missingClaims = new HashMap<>();
+        synchronized (lock) {
+            // One walk over the slots: each state and each claim the partner's digest does not list. Present entries
+            // go first and tombstones after, the order the walk over the live records and then the known ids gave.
+            List<SpaceWire.EntryStateDto> tombstones = new ArrayList<>();
+            crdt.forEachHeld((entryId, state, stateHash, claim, claimHash) -> {
+                if (state != null) {
+                    String key = "e:" + entryId.value() + "=" + stateHash;
+                    if (!remote.contains(key) && !remote.contains("a:" + key)) {
+                        // Forward the stored actor signature; a relay cannot re-sign
+                        // state it did not author, so an entry we never saw a signed
+                        // DTO for (should not happen for authentic entries) is skipped.
+                        SpaceWire.EntryStateDto signed = signedStates.get(entryId);
+                        if (signed != null) {
+                            (state.present() ? states : tombstones).add(signed);
+                        }
                     }
                 }
-            }
-            for (Map.Entry<EntryId, SpaceWire.SignedClaim> e : claims.entrySet()) {
-                String key = "c:" + e.getKey().value() + "=" + claimHash(e.getValue().claim());
-                if (!remote.contains(key) && !remote.contains("a:" + key)) {
-                    missingClaims.put(e.getKey().value(), e.getValue());
+                if (claim != null) {
+                    String key = "c:" + entryId.value() + "=" + claimHash;
+                    if (!remote.contains(key) && !remote.contains("a:" + key)) {
+                        missingClaims.put(entryId.value(), (SpaceWire.SignedClaim) claim);
+                    }
                 }
-            }
+            });
+            states.addAll(tombstones);
         }
         if (states.isEmpty() && missingClaims.isEmpty()) {
             return new byte[0];
         }
+        syncStatesSent.addAndGet(states.size());
+        syncClaimsSent.addAndGet(missingClaims.size());
         return codec.toBytes(new SpaceWire.SyncDelta(states, missingClaims));
     }
 
-    private void applySyncDelta(byte[] delta) {
+    /**
+     * Applies an anti-entropy delta.
+     *
+     * @return whether anything in it changed this replica: a delta whose every state and claim was refused or
+     *         already held is no activity, so the gossip bus does not reset its backoff for it (IDLE-WORK item 8)
+     */
+    boolean applySyncDelta(byte[] delta) { // package-private for tests
+        return applySync(delta, null);
+    }
+
+    /** Applies an anti-entropy delta and names every state and claim it carried (a fetch's answer, RE-I-03). */
+    ReconcilableState.Applied applySyncDeltaNamed(byte[] delta) { // package-private for tests
+        Set<String> named = new HashSet<>();
+        boolean changed = applySync(delta, named);
+        return new ReconcilableState.Applied(changed, named);
+    }
+
+    /**
+     * Applies an anti-entropy delta, as {@link #applySyncDelta}, and adds to {@code named} the id of every state and
+     * claim it carried, taken or refused, which a fetch's asker reads to tell what the partner left out (RE-I-03).
+     *
+     * @param named where the ids go, or null
+     */
+    private boolean applySync(byte[] delta, Set<String> named) {
         if (delta.length == 0) {
-            return;
+            return false;
         }
         SpaceWire.SyncDelta sync;
         try {
@@ -3059,54 +5028,324 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             sync = codec.fromWire(delta, SpaceWire.SyncDelta.class);
         } catch (RuntimeException e) {
             deltasUndecodable.incrementAndGet(); // HLC canonical stamps, 2026-11-08
-            return;
+            return false;
         }
         if (sync == null) {
             deltasUndecodable.incrementAndGet();
-            return;
+            return false;
         }
-        // Claims before states: a completed state authenticates against the
-        // holder's claim, so the claim must be merged first.
-        if (sync.claims() != null) {
-            for (Map.Entry<String, SpaceWire.SignedClaim> e : sync.claims().entrySet()) {
-                EntryId claimEntry = EntryId.of(e.getKey());
-                if (verifyClaim(claimEntry, e.getValue())) {
-                    mergeClaim(claimEntry, e.getValue());
+        syncClaimsReceived.addAndGet(sync.claims() == null ? 0 : sync.claims().size());
+        syncStatesReceived.addAndGet(sync.states() == null ? 0 : sync.states().size());
+        List<Map.Entry<String, SpaceWire.SignedClaim>> claimList = sync.claims() == null ? List.of()
+                : new ArrayList<>(sync.claims().entrySet());
+        List<SpaceWire.EntryStateDto> stateList = sync.states() == null ? List.of() : sync.states();
+        if (named != null) {
+            for (Map.Entry<String, SpaceWire.SignedClaim> claim : claimList) {
+                named.add(claim.getKey());
+            }
+            for (SpaceWire.EntryStateDto dto : stateList) {
+                EntryId entryId = dto == null ? null : dto.entryIdOf();
+                if (entryId != null) {
+                    named.add(entryId.value());
                 }
             }
         }
-        if (sync.states() != null) {
-            sync.states().forEach(this::mergeState);
+
+        // Before the lock (RE-M-08): every check that reads nothing of this replica, which is where the time goes
+        // (an Ed25519 verification per record and per state), and an AUTHORIZER rule's answers, which may consult
+        // something outside this node. Under the lock each merge then judges the rest exactly as one delta at a time
+        // did, in the same order, so a claim still lands before the completion it authenticates and a credential
+        // before the writes it admits.
+        // The checks of a large batch run on the verification pool, in parallel (RE-Q-PRF-03): each reads only its own
+        // item and the maps built before it, and the merge below takes the results in the batch's own order.
+        boolean[] claimVerified = new boolean[claimList.size()];
+        inParallel(claimList.size(), i ->
+                claimVerified[i] = verifyClaim(EntryId.of(claimList.get(i).getKey()), claimList.get(i).getValue()));
+        // A completion is checked against the claim it should meet under the lock: the merge of the claim held now
+        // with a verified claim the delta carries for its entry, which is what mergeClaim keeps unless it refuses or
+        // defers that claim. The held claims are read in one short hold; a guess that proves wrong is checked again
+        // under the lock, so it costs time, never a wrong answer.
+        Map<String, SpaceWire.SignedClaim> deltaClaims = new HashMap<>();
+        for (int i = 0; i < claimList.size(); i++) {
+            if (claimVerified[i]) {
+                deltaClaims.put(claimList.get(i).getKey(), claimList.get(i).getValue());
+            }
         }
+        Map<EntryId, SpaceWire.SignedClaim> heldNow = heldClaimsOfCompletions(stateList);
+        Prechecked[] checked = new Prechecked[stateList.size()];
+        inParallel(stateList.size(), i -> {
+            SpaceWire.EntryStateDto dto = stateList.get(i);
+            SpaceWire.SignedClaim fromDelta = null;
+            SpaceWire.SignedClaim expected = null;
+            if (dto != null && dto.completed() && dto.record() != null && dto.record().entryId() != null) {
+                EntryId entryId = dto.record().entryId();
+                fromDelta = deltaClaims.get(entryId.value());
+                expected = SpaceWire.SignedClaim.merge(heldNow.get(entryId), fromDelta);
+            }
+            checked[i] = precheck(dto, expected, expected != null && expected == fromDelta);
+        });
+        Map<String, Boolean> admitted = askAuthorizer(claimList, claimVerified, stateList, checked);
+
+        // Claims before states: a completed state authenticates against the
+        // holder's claim, so the claim must be merged first.
+        boolean changed = false;
+        Batch running = new Batch(admitted);
+        // Completions the merge dropped while the delta carried a verified claim for their entry: an outbid
+        // holder's completion may be among them (see outbidCompletions), judged after the lock.
+        List<Integer> droppedCompletions = new ArrayList<>();
+        try {
+            synchronized (lock) {
+                batch = running;
+                long lockedFrom = System.nanoTime();
+                try {
+                    for (int i = 0; i < claimList.size(); i++) {
+                        if (claimVerified[i]) {
+                            changed |= mergeClaim(EntryId.of(claimList.get(i).getKey()), claimList.get(i).getValue());
+                        }
+                    }
+                    for (int i = 0; i < stateList.size(); i++) {
+                        boolean merged = mergeState(stateList.get(i), checked[i]);
+                        changed |= merged;
+                        SpaceWire.EntryStateDto dto = stateList.get(i);
+                        // Under either strategy (SPEC §7.4, the settle guarantee): a claim later than the window
+                        // displaces a holder that already judged itself the winner, under LEASE_RACE as under AUCTION.
+                        if (!merged && dto != null && dto.completed()) {
+                            droppedCompletions.add(i);
+                        }
+                    }
+                } finally {
+                    batch = null;
+                    if (running.changed) {
+                        generation++; // once for the whole delta
+                        signal();
+                    }
+                    lastBatchLockedNanos = System.nanoTime() - lockedFrom;
+                }
+            }
+        } finally {
+            Boolean outer = DELIVERING_BATCH.get();
+            DELIVERING_BATCH.set(Boolean.TRUE);
+            try {
+                for (Runnable work : running.after) {
+                    // The events, in the order the merges raised them, after the batch. Each runs whatever an earlier
+                    // one did: the states are merged already, so an event skipped here would never fire. fire()
+                    // isolates the listeners themselves while DELIVERING_BATCH is set; this keeps a failure anywhere
+                    // else in one event to that event.
+                    try {
+                        work.run();
+                    } catch (RuntimeException e) {
+                        LOG.log(System.Logger.Level.WARNING, "delivering an event of space '" + name
+                                + "' after an anti-entropy batch failed", e);
+                    }
+                }
+            } finally {
+                if (outer == null) {
+                    DELIVERING_BATCH.remove();
+                } else {
+                    DELIVERING_BATCH.set(outer);
+                }
+            }
+        }
+        for (int i : droppedCompletions) {
+            SpaceWire.EntryStateDto dto = stateList.get(i);
+            EntryId entryId = dto.entryIdOf();
+            SpaceWire.SignedClaim proof = entryId == null ? null : deltaClaims.get(entryId.value());
+            if (proof != null) {
+                noteOutbidCompletion(entryId, proof, dto);
+            }
+        }
+        return changed;
+    }
+
+    /** A batch smaller than this is checked on the thread that applies it: handing it off would cost more. */
+    static final int PARALLEL_FROM = 32;
+
+    /**
+     * The pool that checks a large batch's signatures before its merge (RE-Q-PRF-03): about 500 microseconds a state
+     * of decoding and two Ed25519 verifications, which made a join of 100,000 states take most of a minute on one
+     * thread. Sized from the available cores less one, at most 16, shared by every space of the process, and its
+     * threads end when idle. The thread that applies the batch, a transport's reader or the tick, waits for it.
+     */
+    private static final class VerifyPool {
+        static final int THREADS = Math.max(1, Math.min(16, Runtime.getRuntime().availableProcessors() - 1));
+        static final String PREFIX = "space-verify-";
+        static final java.util.concurrent.ThreadPoolExecutor EXECUTOR;
+
+        static {
+            java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger();
+            EXECUTOR = new java.util.concurrent.ThreadPoolExecutor(THREADS, THREADS, 30,
+                    java.util.concurrent.TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>(), r -> {
+                        Thread thread = new Thread(r, PREFIX + count.incrementAndGet());
+                        thread.setDaemon(true);
+                        return thread;
+                    });
+            EXECUTOR.allowCoreThreadTimeOut(true);
+        }
+
+        private VerifyPool() {
+        }
+    }
+
+    /**
+     * Runs {@code work} for each index below {@code n}: on the verification pool in about as many slices as it has
+     * threads when the batch is large, here otherwise. Returns when every index ran; a failure in any slice is thrown
+     * here once all have ended, so no slice still writes a result the caller reads.
+     */
+    private static void inParallel(int n, java.util.function.IntConsumer work) {
+        int threads = VerifyPool.THREADS;
+        if (n < PARALLEL_FROM || threads < 2 || Thread.currentThread().getName().startsWith(VerifyPool.PREFIX)) {
+            for (int i = 0; i < n; i++) {
+                work.accept(i);
+            }
+            return;
+        }
+        int slices = Math.min(threads, (n + 15) / 16);
+        List<java.util.concurrent.Future<?>> futures = new ArrayList<>(slices);
+        for (int slice = 0; slice < slices; slice++) {
+            int from = (int) ((long) n * slice / slices);
+            int to = (int) ((long) n * (slice + 1) / slices);
+            futures.add(VerifyPool.EXECUTOR.submit(() -> {
+                for (int i = from; i < to; i++) {
+                    work.accept(i);
+                }
+            }));
+        }
+        boolean interrupted = false;
+        Throwable failed = null;
+        for (java.util.concurrent.Future<?> future : futures) {
+            while (true) {
+                try {
+                    future.get();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true; // the slices write into the caller's arrays: wait for them all regardless
+                } catch (java.util.concurrent.ExecutionException e) {
+                    if (failed == null) {
+                        failed = e.getCause();
+                    }
+                    break;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        if (failed instanceof RuntimeException e) {
+            throw e;
+        }
+        if (failed instanceof Error e) {
+            throw e;
+        }
+        if (failed != null) {
+            throw new IllegalStateException(failed);
+        }
+    }
+
+    /** The claims held now for the entries a delta completes, read in one short hold of the lock. */
+    private Map<EntryId, SpaceWire.SignedClaim> heldClaimsOfCompletions(List<SpaceWire.EntryStateDto> stateList) {
+        Map<EntryId, SpaceWire.SignedClaim> held = new HashMap<>();
+        List<EntryId> completed = new ArrayList<>();
+        for (SpaceWire.EntryStateDto dto : stateList) {
+            if (dto != null && dto.completed() && dto.record() != null && dto.record().entryId() != null) {
+                completed.add(dto.record().entryId());
+            }
+        }
+        if (!completed.isEmpty()) {
+            synchronized (lock) {
+                for (EntryId entryId : completed) {
+                    held.put(entryId, heldClaim(entryId));
+                }
+            }
+        }
+        return held;
+    }
+
+    /**
+     * Whether two claim proofs are the same: the same object, or the same claim under the same key, signature and
+     * certificate. A completion's check depends on nothing else of the claim, so its answer carries from one to the
+     * other.
+     */
+    private static boolean sameProof(SpaceWire.SignedClaim a, SpaceWire.SignedClaim b) {
+        if (a == b) {
+            return true;
+        }
+        return a != null && b != null && Objects.equals(a.claim(), b.claim())
+                && Arrays.equals(a.holderKey(), b.holderKey()) && Arrays.equals(a.signature(), b.signature())
+                && Objects.equals(a.holderCertificate(), b.holderCertificate());
+    }
+
+    /**
+     * The signature checks of a received state made before the batch's lock: its record's signature, and the state's
+     * own signature, a completion's against the claim it is expected to meet at merge time. Null when the state carries
+     * no record (a recordless state is merged over the record held here) or fails a check that {@link #mergeState}
+     * makes first anyway, so nothing is verified for a state that would be dropped unverified.
+     *
+     * @param expected      the claim a completion is checked against, or null
+     * @param claimVerified whether that claim's own signature was verified already (one the delta carries)
+     */
+    private Prechecked precheck(SpaceWire.EntryStateDto dto, SpaceWire.SignedClaim expected, boolean claimVerified) {
+        if (dto == null || dto.record() == null || dto.issuerPublicKey() == null
+                || dto.leaseStamp() == null || dto.leaseValue() == null
+                || (dto.adds() != null && dto.adds().size() > MAX_DOTS_PER_STATE)
+                || (dto.removes() != null && dto.removes().size() > MAX_DOTS_PER_STATE)
+                || dto.adds() == null || dto.removes() == null
+                || !id.equals(dto.record().spaceId()) || !dotsBoundToIssuer(dto)) {
+            return null;
+        }
+        boolean record = verifyRecord(dto.record(), dto.issuerPublicKey(), dto.agentCertificate());
+        boolean state = record && verifyState(dto, expected, claimVerified);
+        return new Prechecked(record, state, dto.completed() ? expected : null);
+    }
+
+    /**
+     * An AUTHORIZER rule's answers for the agents a delta names, asked before the batch takes the lock: the issuer of
+     * each state for WRITE, and the holder of each claim, and of the claim a completion answers, for TAKE. Null under
+     * any other rule, whose answer is local and may move within the batch (a credential merged earlier in it).
+     */
+    private Map<String, Boolean> askAuthorizer(List<Map.Entry<String, SpaceWire.SignedClaim>> claimList,
+                                               boolean[] claimVerified, List<SpaceWire.EntryStateDto> stateList,
+                                               Prechecked[] checked) {
+        if (admission.rule() != SpaceAdvertisement.Admission.AUTHORIZER) {
+            return null;
+        }
+        long now = nowMillis();
+        Map<String, Boolean> answers = new HashMap<>();
+        Map<String, AgentId> holders = new HashMap<>();
+        for (int i = 0; i < claimList.size(); i++) {
+            if (claimVerified[i]) {
+                AgentId holder = claimList.get(i).getValue().claim().holder();
+                holders.put(claimList.get(i).getKey(), holder);
+                answers.computeIfAbsent(admissionKey(holder, SpaceAdmission.Scope.TAKE),
+                        k -> admission.admits(holder, SpaceAdmission.Scope.TAKE, now));
+            }
+        }
+        for (int i = 0; i < stateList.size(); i++) {
+            SpaceWire.EntryStateDto dto = stateList.get(i);
+            if (checked[i] == null || !checked[i].record()) {
+                continue;
+            }
+            AgentId issuer = dto.record().issuer();
+            answers.computeIfAbsent(admissionKey(issuer, SpaceAdmission.Scope.WRITE),
+                    k -> admission.admits(issuer, SpaceAdmission.Scope.WRITE, now));
+            if (dto.completed()) {
+                AgentId holder = holders.get(dto.record().entryId().value());
+                if (holder == null) {
+                    synchronized (lock) {
+                        SpaceWire.SignedClaim held = heldClaim(dto.record().entryId());
+                        holder = held == null ? null : held.claim().holder();
+                    }
+                }
+                if (holder != null) {
+                    AgentId taker = holder;
+                    answers.computeIfAbsent(admissionKey(taker, SpaceAdmission.Scope.TAKE),
+                            k -> admission.admits(taker, SpaceAdmission.Scope.TAKE, now));
+                }
+            }
+        }
+        return answers;
     }
 
     // ---------------------------------------------------------------- internals
-
-    private List<EntryRecord> allRecords() {
-        List<EntryRecord> records = new ArrayList<>(crdt.liveRecords());
-        // liveRecords omits completed entries; digests must include tombstones so
-        // completion propagates. Walk known ids through claims and value cache.
-        // The live ids are a set: a scan of the live list per known id was the
-        // product of the two counts on every digest and delta under the lock,
-        // and the known ids grow with every lapsed entry until the GC horizon
-        // (a space updated every second cost a core after ten minutes, 2026-11-07).
-        Set<EntryId> live = new HashSet<>(records.size() * 2);
-        for (EntryRecord r : records) {
-            live.add(r.entryId());
-        }
-        for (EntryId known : knownIds()) {
-            if (!live.contains(known)) {
-                crdt.state(known).map(EntryState::record).ifPresent(records::add);
-            }
-        }
-        return records;
-    }
-
-    private Set<EntryId> knownIds() {
-        Set<EntryId> ids = new HashSet<>(issuerKeys.keySet());
-        ids.addAll(claims.keySet());
-        return ids;
-    }
 
     private List<EntryRecord> liveRecords() {
         return liveRecords(null);
@@ -3121,16 +5360,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      */
     private List<EntryRecord> liveRecords(String typeName) {
         List<EntryRecord> live = new ArrayList<>();
-        for (EntryRecord record : crdt.liveRecords()) {
+        java.time.Instant now = clock.instant();
+        liveIndex.forEach(record -> { // RE-M-04: the present entries alone, not every entry the map holds
             if (typeName != null && !typeName.equals(record.type())) {
-                continue;
+                return;
             }
             LeaseInfo lease = record.lease();
-            if (lease.kind() == LeaseKind.WRITE && lease.expired(clock.instant())) {
-                continue;
+            if (lease.kind() == LeaseKind.WRITE && lease.expired(now)) {
+                return;
             }
             live.add(record);
-        }
+        });
         return live;
     }
 
@@ -3393,6 +5633,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             seam.ensure(ref, record.issuer().peer(), () -> {
                 fetching.remove(ref);
                 bulkRetries.remove(ref);
+                signalArrival(); // a read or take waiting on this artifact may decode it now
                 onArrival.run();
             }, () -> {
                 fetching.remove(ref);
@@ -3420,9 +5661,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             String ref = entry.getKey();
             ai.badmonkey.agentspaces.api.spi.BulkPayloads seam = seamFor(ref);
-            if (seam == null || seam.local(ref).isPresent()
-                    || recordOf(retry.record().entryId(), true).isEmpty()) {
-                bulkRetries.remove(ref, retry);
+            if (seam != null && seam.local(ref).isPresent()) {
+                // Complete here by another way; the arrival this retry carried is still owed, as for a block.
+                if (bulkRetries.remove(ref, retry)) {
+                    retry.onArrival().run();
+                }
+                continue;
+            }
+            if (seam == null || recordOf(retry.record().entryId(), true).isEmpty()) {
+                if (bulkRetries.remove(ref, retry)) {
+                    awaitingPayload.remove(retry.record().entryId());
+                }
                 continue;
             }
             if (bulkRetries.remove(ref, retry)) {
@@ -3476,6 +5725,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             if (landed) {
                 blockRetries.remove(cid);
+                signalArrival(); // a read or take waiting on this payload may decode it now
                 onArrival.run();
             } else {
                 long delay = BLOCK_RETRY_DELAYS_MILLIS[Math.min(attempt, BLOCK_RETRY_DELAYS_MILLIS.length - 1)];
@@ -3500,9 +5750,18 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 continue;
             }
             String cid = entry.getKey();
-            if (blocks.local(cid).isPresent()
-                    || recordOf(retry.record().entryId(), true).isEmpty()) {
-                blockRetries.remove(cid, retry);
+            if (blocks.local(cid).isPresent()) {
+                // The block landed another way, a read's fetch most often; the arrival this retry carried is still
+                // owed, or a deferred event would be lost for good.
+                if (blockRetries.remove(cid, retry)) {
+                    retry.onArrival().run();
+                }
+                continue;
+            }
+            if (recordOf(retry.record().entryId(), true).isEmpty()) {
+                if (blockRetries.remove(cid, retry)) {
+                    awaitingPayload.remove(retry.record().entryId());
+                }
                 continue;
             }
             if (blockRetries.remove(cid, retry)) {
@@ -3535,19 +5794,62 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * write lease has lapsed, unless a cancel already raised it (core cancel
      * events, 2026-11-09), {@code REAPPEARED} once per lapsed claim epoch,
      * which is the same per-entry dedup the WRITTEN and COMPLETED paths use.
-     * Then tombstones (completed, withdrawn, or lapsed entries whose lease
-     * expired more than twice the maximum lease ago) are collected, along with
+     * Then tombstones (completed, withdrawn, or lapsed entries past their
+     * horizon, {@link SpaceStateCrdt#keepMillis}) are collected, along with
      * every side table keyed by their id, so digests stop advertising them.
+     *
+     * <p>The sweep visits only the entries the expiry index files at or before
+     * {@code now} (IDLE-WORK item 4), in the order the full pass took its steps:
+     * lapses and reappearances, then orphaned claims, then collection. What it
+     * does is exactly what a pass over every entry would do, since an entry the
+     * index does not name has nothing due; {@link #fullScanPlan} is that pass,
+     * kept for the property test that holds the two together.
      */
-    private List<Runnable> sweepLocked() {
+    private List<Runnable> sweepLocked(long now) {
         List<Runnable> events = new ArrayList<>();
-        long now = nowMillis();
+        if (now < indexedAtMillis) {
+            rebuildIndexLocked(now); // the clock stepped back: what is due was judged from a later time
+        }
         // PD-L-02: a recordless state whose record never came is dropped after its TTL.
-        pendingStates.values().removeIf(pending -> now - pending.sinceMillis() > PENDING_STATE_TTL_MILLIS);
-        for (EntryRecord record : crdt.liveRecords()) {
-            EntryId entryId = record.entryId();
+        if (now >= pendingDueMillis) {
+            pendingStates.values().removeIf(pending -> now - pending.sinceMillis() > PENDING_STATE_TTL_MILLIS);
+            long next = Long.MAX_VALUE;
+            for (PendingState pending : pendingStates.values()) {
+                next = Math.min(next, pending.sinceMillis() + PENDING_STATE_TTL_MILLIS + 1);
+            }
+            pendingDueMillis = next;
+        }
+        if (credentialRule != null) {
+            credentialRule.index().expire(now); // spec §7.5: a lapsed credential stops admitting
+        }
+        forgetCollectedAcks(now);
+        forgetRefusedAcks(now);
+        Set<EntryId> due = new java.util.LinkedHashSet<>();
+        java.util.NavigableMap<Long, Set<EntryId>> head = dueByTime.headMap(now, true);
+        for (Set<EntryId> ids : head.values()) {
+            due.addAll(ids);
+        }
+        head.clear();
+        due.forEach(dueOf::remove);
+        if (now > indexedAtMillis) {
+            indexedAtMillis = now;
+        }
+        if (due.isEmpty()) {
+            lastSweep = SweepActions.NONE;
+            return events;
+        }
+        sweepVisits += due.size();
+        Set<EntryId> expired = new HashSet<>();
+        Map<EntryId, Long> reappeared = new HashMap<>();
+        for (EntryId entryId : due) {
+            EntryState state = crdt.state(entryId).orElse(null);
+            if (state == null || !state.present()) {
+                continue;
+            }
+            EntryRecord record = state.record().withLease(state.lease().value());
             if (record.lease().expiresAtMillis() <= now) {
                 if (expiredFired.add(entryId)) {
+                    expired.add(entryId);
                     events.add(expiredEvent(entryId, record));
                 }
                 continue;
@@ -3556,14 +5858,20 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (claim != null && claim.expired(now)
                     && !Long.valueOf(claim.epoch()).equals(reappearedEpochs.get(entryId))) {
                 reappearedEpochs.put(entryId, claim.epoch());
+                reappeared.put(entryId, claim.epoch());
                 deferredEvent(events, SpaceEvent.Kind.REAPPEARED, record);
             }
         }
-        if (credentialRule != null) {
-            credentialRule.index().expire(now); // spec §7.5: a lapsed credential stops admitting
+        Set<EntryId> orphans = dropOrphanedClaims(due, now);
+        Set<EntryId> collected = new HashSet<>();
+        long maxLease = maxLeaseMillis();
+        SpaceStateCrdt.Horizon rule = horizon(now);
+        for (EntryId entryId : due) {
+            EntryState state = crdt.state(entryId).orElse(null);
+            if (state != null && collectableHere(state, now, rule)) {
+                collected.add(entryId);
+            }
         }
-        dropOrphanedClaims(now);
-        Set<EntryId> collected = crdt.collectable(now, maxLeaseMillis());
         if (!collected.isEmpty()) {
             if (blocks != null || bulk != null) {
                 for (EntryId entryId : collected) {
@@ -3581,7 +5889,22 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                             });
                 }
             }
+            if (!awaitingWriter.isEmpty()) {
+                for (EntryId entryId : collected) {
+                    crdt.state(entryId).ifPresent(state -> {
+                        for (Dot add : state.adds()) {
+                            Set<EntryId> waiting = awaitingWriter.get(add.replica());
+                            if (waiting != null && waiting.remove(entryId) && waiting.isEmpty()) {
+                                awaitingWriter.remove(add.replica());
+                            }
+                        }
+                    });
+                }
+            }
             crdt = crdt.without(collected);
+            for (EntryId entryId : collected) {
+                refreshLive(entryId); // a present entry whose lease lapsed past its grace leaves the live index here
+            }
             generation++;
             for (EntryId entryId : collected) {
                 if (credentialRule != null) {
@@ -3590,11 +5913,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 issuerKeys.remove(entryId);
                 issuerCertificates.remove(entryId);
                 logDecidedEpochs.remove(entryId);
-                claims.remove(entryId);
+                crdt = crdt.withoutClaim(entryId);
                 generation++;
                 signedStates.remove(entryId);
                 valueCache.remove(entryId);
-                shardDropped.remove(entryId);
+                awaitingPayload.remove(entryId);
+                forgetShardDropped(entryId);
                 replicated.remove(entryId);
                 ownWrites.remove(entryId);
                 pendingStates.remove(entryId);
@@ -3602,8 +5926,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 expiredFired.remove(entryId);
                 reappearedEpochs.remove(entryId);
                 takenEpochs.remove(entryId);
+                outbidCompletions.remove(entryId);
+                completedHere.remove(entryId);
             }
         }
+        for (EntryId entryId : due) {
+            if (!collected.contains(entryId)) {
+                reindex(entryId, now); // its next due time, if it has one
+            }
+        }
+        if (!reappeared.isEmpty() || !orphans.isEmpty() || !collected.isEmpty()) {
+            signal(); // a lapsed claim makes its entry takeable, and a waiting take hears of it now
+        }
+        lastSweep = new SweepActions(expired, reappeared, orphans, collected);
         return events;
     }
 
@@ -3614,18 +5949,283 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * never follows; kept, every such claim stayed for good. A live claim stays, and an
      * anti-entropy partner that holds the entry offers its claim again with the state. Callers
      * hold {@link #lock}.
+     *
+     * @param due the entries the expiry index names as due; a lapsed orphaned claim is filed under its lapse
+     * @return the entries whose claim was dropped
      */
-    private void dropOrphanedClaims(long now) {
-        java.util.Iterator<Map.Entry<EntryId, SpaceWire.SignedClaim>> it = claims.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<EntryId, SpaceWire.SignedClaim> e = it.next();
-            if (e.getValue().claim().expired(now) && crdt.state(e.getKey()).isEmpty()) {
-                it.remove();
-                logDecidedEpochs.remove(e.getKey());
-                takenEpochs.remove(e.getKey());
-                reappearedEpochs.remove(e.getKey());
+    private Set<EntryId> dropOrphanedClaims(Set<EntryId> due, long now) {
+        Set<EntryId> dropped = new HashSet<>();
+        for (EntryId entryId : due) {
+            SpaceWire.SignedClaim claim = heldClaim(entryId);
+            if (claim != null && claim.claim().expired(now) && crdt.state(entryId).isEmpty()) {
+                crdt = crdt.withoutClaim(entryId);
+                logDecidedEpochs.remove(entryId);
+                takenEpochs.remove(entryId);
+                reappearedEpochs.remove(entryId);
                 generation++;
+                dropped.add(entryId);
             }
+        }
+        return dropped;
+    }
+
+    // ---------------------------------------------------------------- the expiry index (IDLE-WORK item 4)
+
+    /** The earliest time the sweep has anything to do. Callers hold {@link #lock}. */
+    private long nextDueLocked() {
+        long next = dueByTime.isEmpty() ? Long.MAX_VALUE : dueByTime.firstKey();
+        if (!collectedAcks.isEmpty()) {
+            next = Math.min(next, collectedAcks.values().iterator().next()); // RE-H-03: the oldest hold ends first
+        }
+        if (!refusedForgetBy.isEmpty()) {
+            next = Math.min(next, refusedForgetBy.firstKey()); // P6: a door acknowledgement's time to be forgotten
+        }
+        return Math.min(next, pendingDueMillis);
+    }
+
+    /**
+     * Files an entry under the earliest time at or after {@code now} the sweep would do something for it, or takes it
+     * out of the index when nothing ever would; called under {@link #lock} after every change to the entry's state,
+     * its claim, or the sweep's bookkeeping for it.
+     */
+    private void reindex(EntryId entryId, long now) {
+        markLapse(entryId, now);
+        long due = dueAt(entryId, now);
+        Long filed = dueOf.get(entryId);
+        if (filed != null) {
+            if (filed == due) {
+                return;
+            }
+            Set<EntryId> at = dueByTime.get(filed);
+            if (at != null && at.remove(entryId) && at.isEmpty()) {
+                dueByTime.remove(filed);
+            }
+            dueOf.remove(entryId);
+        }
+        if (due != Long.MAX_VALUE) {
+            dueOf.put(entryId, due);
+            dueByTime.computeIfAbsent(due, t -> new HashSet<>()).add(entryId);
+        }
+        if (now > indexedAtMillis) {
+            indexedAtMillis = now;
+        }
+    }
+
+    /**
+     * The earliest time at or after {@code now} at which the sweep acts on an entry, given its state as it is, or
+     * {@link Long#MAX_VALUE} for never. Each case mirrors one step of the sweep:
+     * <ul>
+     *   <li>a present entry raises EXPIRED once its write lease lapses, unless it already did;</li>
+     *   <li>a present entry raises REAPPEARED once per claim epoch when its claim lapses while its lease still runs,
+     *       so only a claim that lapses before the lease is due; once the lease lapses first, the lapse wins;</li>
+     *   <li>a lapsed claim on an entry this replica does not hold is dropped;</li>
+     *   <li>a tombstone is collected at its horizon ({@link SpaceStateCrdt#collectionHorizon}), which is never before
+     *       a present entry's lease lapses.</li>
+     * </ul>
+     * The maximum lease only grows, so a horizon judged earlier is never late: at worst the entry is visited early,
+     * found not yet collectable, and filed again.
+     */
+    private long dueAt(EntryId entryId, long now) {
+        EntryState state = crdt.state(entryId).orElse(null);
+        TakeClaim claim = claimOf(entryId);
+        if (state == null) {
+            return claim == null ? Long.MAX_VALUE : Math.max(claim.expiresAtMillis(), now);
+        }
+        long due = Long.MAX_VALUE;
+        long leaseExpiry = state.lease().value().expiresAtMillis();
+        if (state.present()) {
+            // A present entry is also due at its expiry while its lapse mark is unset (RE-T-06): one renewed after its
+            // EXPIRED fired here lapses again at the new expiry, and the sweep's visit then sets the mark.
+            if (!expiredFired.contains(entryId) || !crdt.lapsed(entryId)) {
+                due = Math.max(leaseExpiry, now);
+            }
+            if (claim != null && !Long.valueOf(claim.epoch()).equals(reappearedEpochs.get(entryId))) {
+                long from = Math.max(claim.expiresAtMillis(), now);
+                if (from < leaseExpiry) {
+                    due = Math.min(due, from);
+                }
+            }
+        }
+        SpaceStateCrdt.Horizon mode = filedHorizon();
+        SpaceStateCrdt.Horizon rule = ruleFor(state, mode, now);
+        long horizon = horizonHere(state, mode, rule);
+        if (mode == SpaceStateCrdt.Horizon.PER_ENTRY && rule == SpaceStateCrdt.Horizon.LEGACY) {
+            // A withdrawal whose writer is in view but not yet long enough is due once the writer's wait is over, if
+            // that comes before its horizon now. A visit that finds the writer gone files it again, no earlier.
+            long wait = writerWaitMillis(state, now);
+            if (wait != Long.MAX_VALUE) {
+                long perEntry = SpaceStateCrdt.collectionHorizon(state, maxLeaseMillis(), mode);
+                long trusted = now > Long.MAX_VALUE - wait ? Long.MAX_VALUE : now + wait;
+                horizon = Math.min(horizon, Math.max(perEntry, trusted));
+            } else {
+                String writer = absentWriter(state);
+                if (writer != null) {
+                    awaitingWriter.computeIfAbsent(writer, w -> new HashSet<>()).add(entryId);
+                }
+            }
+        }
+        if (horizon != Long.MAX_VALUE) {
+            due = Math.min(due, Math.max(horizon, now));
+        }
+        return due;
+    }
+
+    /**
+     * Keeps the entry's lapse mark in step with this replica's clock (RE-T-06, annex I.6): a present entry whose write
+     * lease has run out contributes neither its state line nor its claim line to the audited set, and one renewed or
+     * replaced by a state that has not lapsed contributes them again. Run wherever the expiry index is, so the mark
+     * follows every change; the sweep visits a present entry at its lease expiry to set it. Callers hold {@link #lock}.
+     */
+    private void markLapse(EntryId entryId, long now) {
+        EntryState state = crdt.state(entryId).orElse(null);
+        boolean lapsed = state != null && state.present() && state.lease().value().expiresAtMillis() <= now;
+        if (crdt.lapsed(entryId) != lapsed) {
+            crdt = crdt.withLapsed(entryId, lapsed);
+        }
+    }
+
+    /**
+     * Judges the horizon's mode at {@code now} and, when the per-entry horizon has just come into force or has just
+     * gone out of force, files every entry afresh (RE-H-04): coming into force, its withdrawals fall due earlier than
+     * the index filed them, since the per-entry horizon is never later than the legacy one (both keep at least the
+     * drift floor of SPEC §7.3); going out of force, they wait longer, and filing afresh spares the sweep early
+     * visits. Once per settlement or disengagement, so the pass over every entry is rare. Then it files again the
+     * withdrawals of writers that were out of view and are back. Callers hold {@link #lock}.
+     */
+    private void refileIfHorizonMoved(long now) {
+        horizon(now);
+        if (horizonRefile) {
+            horizonRefile = false;
+            rebuildIndexLocked(now);
+            return;
+        }
+        if (awaitingWriter.isEmpty() || filedHorizon() != SpaceStateCrdt.Horizon.PER_ENTRY) {
+            return;
+        }
+        // A writer that was out of view and is back: its withdrawals now have a wait that ends, so file them again.
+        for (Iterator<Map.Entry<String, Set<EntryId>>> it = awaitingWriter.entrySet().iterator();
+             it.hasNext(); ) {
+            Map.Entry<String, Set<EntryId>> waiting = it.next();
+            long inView;
+            try {
+                inView = runtime.hintedWriterInViewMillis(PeerId.of(waiting.getKey()));
+            } catch (IllegalArgumentException malformed) {
+                it.remove(); // never readable, so never trusted: the legacy horizon they are filed at stands
+                continue;
+            }
+            if (inView >= 0) {
+                it.remove();
+                for (EntryId entryId : waiting.getValue()) {
+                    reindex(entryId, now);
+                }
+            }
+        }
+    }
+
+    /** Files every known entry and claim afresh, judged from {@code now}. Callers hold {@link #lock}. */
+    private void rebuildIndexLocked(long now) {
+        dueByTime.clear();
+        dueOf.clear();
+        awaitingWriter.clear(); // the pass below files every withdrawal again, and notes the writers still away
+        writerStays.keySet().removeIf(writer -> writerInViewSince(writer, now) == Long.MAX_VALUE);
+        indexedAtMillis = now;
+        // Every id holding a state or a claim, each once: the slots of the map hold both.
+        crdt.forEachHeld((entryId, state, stateHash, claim, claimHash) -> reindex(entryId, now));
+    }
+
+    /**
+     * The state of an entry or its claim changed: the digest cache is stale, the entry's place in the expiry index
+     * moves, and a waiting take or read may now succeed. Callers hold {@link #lock}.
+     */
+    private void bump(EntryId entryId) {
+        reindex(entryId, nowMillis());
+        bump();
+    }
+
+    /**
+     * The reconciled state changed in a way that moves no entry in the expiry index. Callers hold {@link #lock}. Inside
+     * a batch ({@link #applySyncDelta}) the generation moves once, when the batch ends (RE-M-08), so no reader of the
+     * digest cache can see a delta half applied, and nobody waiting can run before the lock is released anyway.
+     */
+    private void bump() {
+        Batch running = batch;
+        if (running != null && running.owner == Thread.currentThread()) {
+            running.changed = true;
+            return;
+        }
+        generation++;
+        signal();
+    }
+
+    /** Wakes the takes and reads waiting for a change. Callers hold {@link #lock}. */
+    private void signal() {
+        signals++;
+        if (waiters > 0) {
+            lock.notifyAll();
+        }
+    }
+
+    /** {@link #signal()} from outside the lock: a block or an artifact landed, so a waiting read may decode now. */
+    private void signalArrival() {
+        synchronized (lock) {
+            signal();
+        }
+    }
+
+    /**
+     * What one sweep did, for the property test that holds the indexed sweep to the full pass: the entries it raised
+     * EXPIRED for, the claim epochs it raised REAPPEARED for, the orphaned claims it dropped, and the entries it
+     * collected.
+     */
+    record SweepActions(Set<EntryId> expired, Map<EntryId, Long> reappeared, Set<EntryId> orphanClaims,
+                        Set<EntryId> collected) {
+        static final SweepActions NONE = new SweepActions(Set.of(), Map.of(), Set.of(), Set.of());
+    }
+
+    /** What the last sweep did. */
+    SweepActions lastSweepActions() { // package-private for tests
+        synchronized (lock) {
+            return lastSweep;
+        }
+    }
+
+    /**
+     * What a sweep at {@code now} would do if it visited every entry, as the sweep did before the expiry index;
+     * changes nothing. The property test compares it with what the indexed sweep then does.
+     */
+    SweepActions fullScanPlan(long now) { // package-private for tests
+        synchronized (lock) {
+            Set<EntryId> expired = new HashSet<>();
+            Map<EntryId, Long> reappeared = new HashMap<>();
+            for (EntryRecord record : crdt.liveRecords()) {
+                EntryId entryId = record.entryId();
+                if (record.lease().expiresAtMillis() <= now) {
+                    if (!expiredFired.contains(entryId)) {
+                        expired.add(entryId);
+                    }
+                    continue;
+                }
+                TakeClaim claim = claimOf(entryId);
+                if (claim != null && claim.expired(now)
+                        && !Long.valueOf(claim.epoch()).equals(reappearedEpochs.get(entryId))) {
+                    reappeared.put(entryId, claim.epoch());
+                }
+            }
+            Set<EntryId> orphans = new HashSet<>();
+            crdt.forEachHeld((entryId, state, stateHash, claim, claimHash) -> {
+                if (state == null && ((SpaceWire.SignedClaim) claim).claim().expired(now)) {
+                    orphans.add(entryId);
+                }
+            });
+            Set<EntryId> collected = new HashSet<>();
+            long maxLease = maxLeaseMillis();
+            SpaceStateCrdt.Horizon rule = horizon(now);
+            crdt.forEachHeld((entryId, state, stateHash, claim, claimHash) -> {
+                if (state != null && collectableHere(state, now, rule)) {
+                    collected.add(entryId);
+                }
+            });
+            return new SweepActions(expired, reappeared, orphans, collected);
         }
     }
 
@@ -3876,6 +6476,23 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * removal, or a lease that would make a signed entry vanish.
      */
     private boolean verifyState(SpaceWire.EntryStateDto dto) {
+        SpaceWire.SignedClaim claim = null;
+        if (dto.completed() && dto.stateSig() != null) {
+            synchronized (lock) {
+                claim = heldClaim(dto.record().entryId());
+            }
+        }
+        return verifyState(dto, claim, false);
+    }
+
+    /**
+     * Verifies a state as {@link #verifyState(SpaceWire.EntryStateDto)} does, a completion against the given claim
+     * rather than the one held now, so the check can run before the lock with the claim it will meet.
+     *
+     * @param claim         the claim a completion is judged against; ignored for any other state
+     * @param claimVerified whether that claim's own signature was verified already
+     */
+    private boolean verifyState(SpaceWire.EntryStateDto dto, SpaceWire.SignedClaim claim, boolean claimVerified) {
         if (dto.stateSig() == null) {
             return false;
         }
@@ -3887,11 +6504,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         boolean partyAttested;
         if (dto.completed()) {
             EntryId entryId = dto.record().entryId();
-            SpaceWire.SignedClaim claim;
-            synchronized (lock) {
-                claim = claims.get(entryId);
-            }
-            if (claim == null || !verifyClaim(entryId, claim)) {
+            if (claim == null || !(claimVerified || verifyClaim(entryId, claim))) {
                 return false; // no authenticated holder to attribute the completion to
             }
             signerKey = claim.holderKey();
@@ -3954,6 +6567,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     private void publishDelta(SpaceWire.Delta delta, String itemId) {
+        if (local) {
+            return; // a writer-local space tells nobody (Builder.local)
+        }
         runtime.gossip().publish(streamId, itemId, codec.toBytes(delta));
     }
 
@@ -3972,6 +6588,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (value == null) {
             return;
         }
+        boolean isolated = Boolean.TRUE.equals(DELIVERING_BATCH.get()); // an event a batch deferred (RE-M-08)
         EntryView<Object> details = null;
         for (Sub sub : subscriptions) {
             if (!sub.closed && sub.template.matchesTags(record.tags()) && sub.template.matchesType(record.type())
@@ -3984,14 +6601,47 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     details = EntryView.of(record, value, attested
                             ? Attestation.AGENT_ATTESTED : Attestation.PEER_ASSERTED);
                 }
-                sub.listener.onEvent(new SpaceEvent(kind, entryId, value, writer, actor, details));
+                SpaceEvent event = new SpaceEvent(kind, entryId, value, writer, actor, details);
+                if (!isolated) {
+                    sub.listener.onEvent(event); // a direct call: the listener's exception reaches the caller
+                    continue;
+                }
+                // A listener's own calls into a space are direct calls again, so they fire as direct calls do.
+                DELIVERING_BATCH.remove();
+                try {
+                    sub.listener.onEvent(event);
+                } catch (RuntimeException e) {
+                    listenerFailed(sub, kind, entryId, e); // an Error, an assertion's included, is not caught
+                } finally {
+                    DELIVERING_BATCH.set(Boolean.TRUE);
+                }
             }
         }
     }
 
+    /**
+     * A listener threw on an event an anti-entropy batch deferred (RE-M-08). Its failure is its own: the entry is merged
+     * already and nothing fires its event again, so the other listeners of this event, and the later events of the same
+     * batch, still get theirs.
+     * Each failure is counted; the first of each subscription is logged with its cause, the rest only counted.
+     */
+    private void listenerFailed(Sub sub, SpaceEvent.Kind kind, EntryId entryId, Throwable failure) {
+        listenerFailures.incrementAndGet();
+        if (sub.failureLogged.compareAndSet(false, true)) {
+            LOG.log(System.Logger.Level.WARNING, "a listener of space '" + name + "' threw on " + kind + " of "
+                    + entryId.value() + "; it keeps its subscription, and later failures of it are only counted",
+                    failure);
+        }
+    }
+
+    /** How many times a listener of this space threw; for tests and status. */
+    long listenerFailures() {
+        return listenerFailures.get();
+    }
+
+    /** The hash a digest's state line names; the map keeps it in each slot, so the two never differ. */
     private static String stateHash(EntryState state) {
-        return Integer.toHexString(Objects.hash(state.adds(), state.removes(),
-                state.lease().stamp(), state.completed()));
+        return SpaceStateCrdt.stateHash(state);
     }
 
     private static String claimHash(TakeClaim claim) {
@@ -4003,26 +6653,104 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         return clock.instant().toEpochMilli();
     }
 
-    private static void sleep(Duration duration) {
-        if (duration.isZero()) {
+    /**
+     * Waits out the whole settle window, even when interrupted, and keeps the interrupt for the caller. The race is
+     * judged when the window ends; a take whose wait an interrupt cut short judged a claim the others had not had
+     * time to answer and could win next to a rival, which is the duplicate the window is there to prevent. A closing
+     * binding interrupts its take, so this is the path a take in flight at close goes through. The window is short
+     * and bounded, so waiting it out keeps the stop prompt.
+     */
+    private static void settle(Duration window) {
+        if (window.isZero()) {
             return;
         }
+        long deadline = System.nanoTime() + window.toNanos();
+        boolean interrupted = false;
         try {
-            Thread.sleep(duration.toMillis());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            for (long left = window.toNanos(); left > 0; left = deadline - System.nanoTime()) {
+                try {
+                    java.util.concurrent.TimeUnit.NANOSECONDS.sleep(left);
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
+    /**
+     * Tries {@code poll} until it answers or the timeout passes, as a blocking read or take does. Between tries it
+     * waits on the space's change signal ({@link #signal()}): a write, a merge, a renewal, a cancel, a claim, a sweep
+     * that lapses a claim or collects, a block or an artifact landing. Every waiter wakes on a change and tries
+     * again, as every poller used to try every 20 ms, so the order in which waiters win is what it was. A wait also
+     * ends when a claim lapses by the clock (the expiry index knows when) and after {@link #WAIT_SLICE_MILLIS} at
+     * most, for what does not signal.
+     */
     private <V> Optional<V> awaiting(Duration timeout, java.util.function.Supplier<Optional<V>> poll) {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (true) {
+            long seen;
+            synchronized (lock) {
+                seen = signals;
+            }
             Optional<V> result = poll.get();
-            if (result.isPresent() || System.nanoTime() >= deadline) {
+            waitingPolls.incrementAndGet();
+            // An interrupt ends the wait after the poll in hand, with the status kept, as on a LocalSpace: a closing
+            // binding interrupts its take, and a take that waited on through its timeout could still claim and
+            // return an entry written after the binding closed.
+            if (result.isPresent() || System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) {
                 return result;
             }
-            sleep(Duration.ofMillis(20));
+            awaitSignal(seen, deadline);
         }
+    }
+
+    /**
+     * Waits until a change is signalled after {@code seen}, the deadline passes, the next due time of the expiry
+     * index comes, or a slice ends. An interrupt ends the wait and is kept for the caller, which then returns after
+     * one more poll ({@link #awaiting}) rather than spinning on the kept status.
+     */
+    private void awaitSignal(long seen, long deadlineNanos) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            synchronized (lock) {
+                if (signals != seen) {
+                    return;
+                }
+                long leftMillis = (deadlineNanos - System.nanoTime() + 999_999) / 1_000_000;
+                if (leftMillis <= 0) {
+                    return;
+                }
+                long wait = Math.min(leftMillis, WAIT_SLICE_MILLIS);
+                long untilDue = nextDueLocked() - nowMillis();
+                if (untilDue > 0 && untilDue < wait) {
+                    wait = untilDue; // a claim lapsing by the clock makes its entry takeable without a signal
+                }
+                waiters++;
+                try {
+                    lock.wait(wait);
+                } finally {
+                    waiters--;
+                }
+            }
+        } catch (InterruptedException e) {
+            interrupted = true;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * A handle on an entry held by another actor than its writer, for the tests of the issuer rule (SPEC §7.2): the
+     * API hands a handle only to the entry's writer, so no caller reaches this case any other way.
+     */
+    EntryHandle handleAs(EntryId entryId, AgentIdentity actor) { // package-private for tests
+        return new Handle(entryId, actor);
     }
 
     private final class Handle implements EntryHandle {
@@ -4050,10 +6778,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     throw new LeaseExpiredException("write lease lapsed for entry " + entryId);
                 }
                 requireIssuerActs(entryId, state.record(), actor);
-                LeaseInfo renewed = new LeaseInfo(actor.id(),
-                        nowMillis() + extension.toMillis(), LeaseKind.WRITE);
-                crdt = crdt.setLease(entryId, new LwwRegister<>(hlc.now(), renewed));
-                generation++;
+                long now = nowMillis();
+                long current = state.lease().value().expiresAtMillis();
+                noteShortening(entryId, "write", current, SpaceStateCrdt.renewedExpiry(Long.MIN_VALUE, now,
+                        extension.toMillis()));
+                long expiry = SpaceStateCrdt.renewedExpiry(current, now, extension.toMillis());
+                if (expiry == current) {
+                    // RE-H-02: the lease already runs at least that long, and a renewal never shortens it, so
+                    // nothing changes and nothing goes out.
+                    return;
+                }
+                LeaseInfo renewed = new LeaseInfo(actor.id(), expiry, LeaseKind.WRITE);
+                setCrdt(crdt.setLease(entryId, new LwwRegister<>(hlc.now(), renewed)), entryId);
+                bump(entryId);
                 indexCredential(entryId);
                 dto = signedDto(entryId,
                         issuerKeys.getOrDefault(entryId, identity.rawPublicKey()), actor);
@@ -4073,12 +6810,15 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 // holder's completion as the state this replica forwards.
                 if (state != null && state.present()) {
                     requireIssuerActs(entryId, state.record(), actor);
-                    crdt = crdt.remove(entryId);
-                    generation++;
+                    setCrdt(crdt.remove(entryId), entryId);
+                    bump(entryId);
                     indexCredential(entryId);
                     dto = signedDto(entryId,
                             issuerKeys.getOrDefault(entryId, identity.rawPublicKey()), actor);
                     expired = withdrawnEvent(entryId, true);
+                    // IDLE-WORK 5a(e): a withdrawn entry is read by nobody again, so its decoded value goes now, not
+                    // at its collection two maximum leases on (the EXPIRED above already carries it out).
+                    valueCache.remove(entryId);
                 }
             }
             if (dto != null) {
@@ -4128,11 +6868,18 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     throw new LeaseExpiredException("take lease of entry " + entryId + " cannot be renewed: "
                             + actor.id().encoded() + " is revoked in this group");
                 }
+                long now = nowMillis();
+                noteShortening(entryId, "take", current.expiresAtMillis(),
+                        SpaceStateCrdt.renewedExpiry(Long.MIN_VALUE, now, extension.toMillis()));
+                long expiry = SpaceStateCrdt.renewedExpiry(current.expiresAtMillis(), now, extension.toMillis());
+                if (expiry == current.expiresAtMillis()) {
+                    return; // RE-H-02, as for the write lease: the hold already runs that long, so nothing changes
+                }
                 renewed = new TakeClaim(current.entryId(), current.spaceId(),
                         current.epoch(), current.stamp(), actor.id(),
-                        current.bid(), nowMillis() + extension.toMillis());
-                claims.merge(entryId, sign(renewed, actor), SpaceWire.SignedClaim::merge);
-                generation++;
+                        current.bid(), expiry);
+                mergeHeldClaim(entryId, sign(renewed, actor));
+                bump(entryId);
             }
             publishDelta(new SpaceWire.Delta(null, entryId, sign(renewed, actor)),
                     "c:" + entryId + ":renew:" + nowMillis());
@@ -4145,6 +6892,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         private final SpaceListener listener;
         private volatile long expiryMillis;
         private volatile boolean closed;
+        /** Whether a throw of this listener was logged; later ones are only counted. */
+        private final AtomicBoolean failureLogged = new AtomicBoolean();
 
         private Sub(Template<?> template, SpaceListener<?> listener, long expiryMillis) {
             this.template = template;
@@ -4153,12 +6902,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
 
         @Override
-        public void renew(Duration extension) {
+        public synchronized void renew(Duration extension) {
+            // Synchronized so that two renewals at once cannot both read the old expiry and the shorter one write
+            // last: the max rule promises the lease never shortens, and the read and the write must be one step.
             Objects.requireNonNull(extension, "extension");
-            if (closed || expiryMillis <= nowMillis()) {
+            long now = nowMillis();
+            if (closed || expiryMillis <= now) {
                 throw new LeaseExpiredException("subscription lease already lapsed");
             }
-            expiryMillis = nowMillis() + extension.toMillis();
+            // The same reading of renew as an entry's lease: at least the extension from now, never shorter. Close the
+            // subscription to stop it sooner.
+            expiryMillis = SpaceStateCrdt.renewedExpiry(expiryMillis, now, extension.toMillis());
         }
 
         @Override

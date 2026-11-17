@@ -1,0 +1,110 @@
+package legacy060;
+
+import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
+import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
+import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
+import ai.badmonkey.agentspaces.api.space.EntryHandle;
+import ai.badmonkey.agentspaces.api.space.Lease;
+import ai.badmonkey.agentspaces.api.space.Template;
+import ai.badmonkey.agentspaces.common.id.GroupId;
+import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
+import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
+import ai.badmonkey.agentspaces.peering.node.PeerNode;
+import ai.badmonkey.agentspaces.peering.transport.TcpTransport;
+import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
+import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * A member built from the released 0.6.0 jars alone (MixedRelease060Test compiles this file against them at test time,
+ * so a call the release lacks fails the compile rather than linking to newer code). Every method takes and returns JDK
+ * types only, since the test reaches it through another class loader.
+ */
+public final class Legacy060Member implements AutoCloseable {
+
+    private final PeerNode node;
+    private final GroupRuntime runtime;
+    private final ReplicatedSpace space;
+    private final Map<String, EntryHandle> handles = new ConcurrentHashMap<>();
+
+    private Legacy060Member(PeerNode node, GroupRuntime runtime, ReplicatedSpace space) {
+        this.node = node;
+        this.runtime = runtime;
+        this.space = space;
+    }
+
+    /** Starts a member listening on the bind address and joining through the seed, or alone when the seed is null. */
+    public static Legacy060Member start(String founding, String founder, String bind, String seed) throws Exception {
+        GroupId groupId = GroupId.fromFounding(founding.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        GroupAdvertisement groupAd = new GroupAdvertisement("aspace://" + groupId.value(), PeerId.of(founder), groupId,
+                Instant.EPOCH, Duration.ofDays(1), "mixed-release", GroupAdvertisement.MembershipPolicy.OPEN,
+                ConflictStrategyType.LEASE_RACE, GroupAdvertisement.GossipParameters.defaults());
+        PeerIdentity identity = PeerIdentity.generate();
+        PeerNode node = PeerNode.builder(identity).build();
+        node.listen(new TcpTransport(), bind);
+        List<PeerAdvertisement.Endpoint> seeds = seed == null ? List.of()
+                : List.of(new PeerAdvertisement.Endpoint("tcp", seed, 0));
+        GroupRuntime runtime = node.joinGroup(groupAd, GroupMembership.Config.defaults(), seeds);
+        ReplicatedSpace space = ReplicatedSpace.builder(runtime, "tasks", identity, "worker")
+                .settleWindow(Duration.ZERO).build();
+        node.startTicking(Duration.ofMillis(200));
+        return new Legacy060Member(node, runtime, space);
+    }
+
+    public String peerId() {
+        return node.peerId().value();
+    }
+
+    public String write(String topic, long leaseMillis) {
+        EntryHandle handle = space.write(new TaskEntry(topic, 1), Lease.of(Duration.ofMillis(leaseMillis)));
+        handles.put(handle.entryId().value(), handle);
+        return handle.entryId().value();
+    }
+
+    public void cancel(String entryId) {
+        handles.remove(entryId).cancel();
+    }
+
+    public List<String> topics() {
+        List<String> out = new ArrayList<>();
+        for (TaskEntry entry : space.readAll(Template.of(TaskEntry.class), 10_000)) {
+            out.add(entry.topic());
+        }
+        return out;
+    }
+
+    public int known() {
+        return space.knownEntries();
+    }
+
+    public int members() {
+        return runtime.membership().allMembers().size();
+    }
+
+    /** Whether this release's strict card reader took the other member's card and read its hints. */
+    public boolean readsRecordlessHintOf(String peer) {
+        return node.advertisesRecordless(PeerId.of(peer));
+    }
+
+    public Map<String, String> ownWireHints() {
+        return Map.copyOf(node.wireHints());
+    }
+
+    public long antiEntropyRounds() {
+        return runtime.gossip().antiEntropyRounds();
+    }
+
+    @Override
+    public void close() {
+        space.close();
+        node.close();
+    }
+}

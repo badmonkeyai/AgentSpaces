@@ -34,6 +34,7 @@ import java.util.Random;
 import java.util.function.UnaryOperator;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Pins the CRDT laws the spec depends on (§7.3): merge commutativity,
@@ -233,6 +234,53 @@ class SpaceStateCrdtTest {
         assertThat(a.merge(b).merge(c)).isEqualTo(a.merge(b.merge(c)));
         assertThat(a.merge(a)).isEqualTo(a);
         assertThat(a.merge(SpaceStateCrdt.empty())).isEqualTo(a);
+    }
+
+    /**
+     * RE-M-02 (srad/replication-by-entry.md): a state owns the map it was built with instead of copying it a second
+     * time, so nothing a caller holds may reach that map. The views refuse mutation, a set of ids handed to
+     * {@code without} is read and not kept, and a merge leaves both of its inputs as they were.
+     */
+    @Test
+    void aStateOwnsItsMapAndLetsNoCallerChangeIt() {
+        EntryRecord first = record("e1");
+        EntryRecord second = record("e2");
+        SpaceStateCrdt state = SpaceStateCrdt.empty()
+                .add(first, new Dot("r1", 1), lease(10, "r1", 5_000))
+                .add(second, new Dot("r1", 2), lease(11, "r1", 6_000));
+
+        assertThatThrownBy(() -> state.entryIds().remove(first.entryId()))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> state.entryIds().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> state.entryIds().add(EntryId.of("entry-x")))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> state.entryIds().iterator().remove()).isInstanceOf(
+                UnsupportedOperationException.class);
+        assertThatThrownBy(() -> state.liveRecords().clear()).isInstanceOf(UnsupportedOperationException.class);
+        for (SpaceStateCrdt changed : List.of(state.remove(first.entryId()), state.complete(first.entryId()),
+                state.setLease(first.entryId(), lease(20, "r1", 9_000)), state.merge(SpaceStateCrdt.empty()),
+                state.without(java.util.Set.of(first.entryId())), SpaceStateCrdt.of(first.entryId(),
+                        state.state(first.entryId()).orElseThrow()))) {
+            assertThatThrownBy(() -> changed.entryIds().clear())
+                    .as("every path that builds a state hands out an unmodifiable view")
+                    .isInstanceOf(UnsupportedOperationException.class);
+        }
+
+        java.util.Set<EntryId> dropped = new java.util.HashSet<>(java.util.Set.of(first.entryId()));
+        SpaceStateCrdt reduced = state.without(dropped);
+        dropped.add(second.entryId());
+        dropped.clear();
+        assertThat(reduced.entryIds()).as("the caller's set was read, not kept").containsExactly(second.entryId());
+
+        SpaceStateCrdt other = SpaceStateCrdt.empty().add(record("e3"), new Dot("r2", 1), lease(12, "r2", 7_000));
+        SpaceStateCrdt merged = state.merge(other);
+        assertThat(merged.knownEntries()).isEqualTo(3);
+        assertThat(state.knownEntries()).as("the merge took a fresh map, not this state's").isEqualTo(2);
+        assertThat(other.knownEntries()).as("nor the other state's").isEqualTo(1);
+        SpaceStateCrdt grown = merged.add(record("e4"), new Dot("r2", 2), lease(13, "r2", 8_000));
+        assertThat(merged.knownEntries()).as("a later change builds its own map").isEqualTo(3);
+        assertThat(grown.knownEntries()).isEqualTo(4);
+        assertThat(merged).isEqualTo(state.merge(other)).hasSameHashCodeAs(state.merge(other));
     }
 
     // ------------------------------------------------------------------ helpers

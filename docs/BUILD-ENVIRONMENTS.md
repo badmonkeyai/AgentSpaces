@@ -41,13 +41,19 @@ Maven assembles. From the repository root, after a `mvn -q install -DskipTests` 
 and `target/classes` exists:
 
 ```
-mvn -q -pl agentspaces-capabilities dependency:build-classpath \
-    -Dmdep.outputFile=/tmp/golden-cp.txt
+mvn -q -pl agentspaces-pdt dependency:build-classpath \
+    -Dmdep.outputFile=/tmp/golden-cp.txt    # agentspaces-pdt's, which carries zstd-jni for the PDT 2 vectors
 CP="agentspaces-capabilities/target/classes:agentspaces-pdt/target/classes:agentspaces-content/target/classes:agentspaces-agent/target/classes:$(cat /tmp/golden-cp.txt)"
 javac -cp "$CP" -d /tmp/golden tools/golden/GoldenVectors.java
 java -cp "/tmp/golden:$CP" GoldenVectors ../agentspaces-spec/golden.json
 ../agentspaces-spec/sync-golden.sh          # refresh the vendored copies in every consumer
 ```
+
+The classpath comes from `agentspaces-pdt` (2026-11-12): the capabilities module's lacks `zstd-jni`, and the
+PDT 2 vectors stop with "zstd made no frame" without it. The generator keeps the previous file's order for the
+entries it already holds (the clients pin the order of the PDT 2 entries) and carries the two sketch vectors
+forward; add `agentspaces-store/target/classes` to `CP` to regenerate the content store vectors instead of carrying
+them.
 
 The argument is the output path; the clients tree sits beside this repository
 at the workspace root (`agentspaces-spec/`, the specification and conformance kit), and the vendored copies (`tools/golden/golden.json` here, and in the Python and TypeScript clients) must

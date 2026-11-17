@@ -473,8 +473,22 @@ public final class GossipBus {
     static final int SETTLING_EVERY = 4;
     /** Items a probe carries at most. */
     static final int PIGGYBACK_ITEMS = 32;
-    /** Streams a probe carries digests for; above this it carries the root hash alone. */
-    static final int PROBE_DIGEST_STREAMS = 16;
+    /**
+     * Streams a probe carries per-stream hashes for by default; above the bound it carries the root hash alone
+     * (RE-T-07 of srad/replication-by-entry.md, {@code agentspaces.gossip.probe-hash-streams}). It was sixteen. A
+     * hub member that holds many spaces carries about twenty streams, so above sixteen its root never matched that of a
+     * member holding fewer streams, and every probe between them opened a targeted round. Per-stream hashes compare
+     * only the streams both hold. Every implementation's PING and ACK reader takes a hashes map of any size.
+     */
+    public static final int PROBE_DIGEST_STREAMS = 32;
+    /** The lowest probe-hash bound: zero, the root alone on every probe. */
+    public static final int PROBE_DIGEST_STREAMS_FLOOR = 0;
+    /**
+     * The highest probe-hash bound (RE-F-03): 33 bytes and a stream name per stream, so a probe at the ceiling stays
+     * a few tens of kilobytes at most.
+     */
+    public static final int PROBE_DIGEST_STREAMS_CEILING = 256;
+    private volatile int probeDigestStreams = PROBE_DIGEST_STREAMS;
     private volatile long lastTopologyChangeTick = Long.MIN_VALUE / 2;
     /** The tick each member was admitted at: a member is told only of items forwarded since. */
     private final Map<PeerId, Long> admittedAtTick = new ConcurrentHashMap<>();
@@ -577,53 +591,191 @@ public final class GossipBus {
     }
 
     /**
-     * A 32-byte hash per stream for a probe to carry, when the node has few streams, else null
-     * (the root goes instead). A stream's anti-entropy digest is a full state summary that
-     * grows with the state (a busy space's runs to a hundred kilobytes), so a probe carries its
-     * hash, which is enough to tell two states apart.
+     * Sets how many streams a probe carries per-stream hashes for; above it a probe carries the root alone (RE-T-07,
+     * RE-F-03). A runtime setter, so an operator or a later pacing adjuster can move it while the node runs.
+     *
+     * @param streams the bound, from {@link #PROBE_DIGEST_STREAMS_FLOOR} to {@link #PROBE_DIGEST_STREAMS_CEILING}
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void probeDigestStreams(int streams) {
+        if (streams < PROBE_DIGEST_STREAMS_FLOOR || streams > PROBE_DIGEST_STREAMS_CEILING) {
+            throw new IllegalArgumentException("probe-hash-streams must be from " + PROBE_DIGEST_STREAMS_FLOOR
+                    + " to " + PROBE_DIGEST_STREAMS_CEILING + ", not " + streams);
+        }
+        this.probeDigestStreams = streams;
+    }
+
+    /** How many streams a probe carries per-stream hashes for ({@link #probeDigestStreams(int)}). */
+    public int probeDigestStreams() {
+        return probeDigestStreams;
+    }
+
+    /**
+     * A 32-byte hash per stream for a probe to carry, when the node holds at most
+     * {@link #probeDigestStreams()} streams, else null (the root goes instead). A stream's anti-entropy digest is a
+     * full state summary that grows with the state (a busy space's runs to a hundred kilobytes), so a probe carries
+     * its hash, which is enough to tell two states apart. These are the text digests' hashes, what every member
+     * without {@code wire.ae=2} compares.
      */
     public Map<String, byte[]> probeHashes() {
-        if (states.isEmpty() || states.size() > PROBE_DIGEST_STREAMS) {
+        return probeHashes(false);
+    }
+
+    /**
+     * {@link #probeHashes()} for one kind of partner (SPEC annex I.6): toward a member whose current card carries
+     * {@code wire.ae=2}, each audited stream's hash is its trie's stream hash, and every other stream keeps its text
+     * digest's hash, so the receiver compares like with like.
+     *
+     * @param trie whether the partner is on {@code wire.ae=2}, as {@link #audits} judges it
+     */
+    public Map<String, byte[]> probeHashes(boolean trie) {
+        if (states.isEmpty() || states.size() > probeDigestStreams) {
             return null;
         }
         Map<String, byte[]> hashes = new java.util.TreeMap<>();
         for (Map.Entry<String, ReconcilableState> e : states.entrySet()) {
-            hashes.put(e.getKey(), Digests.sha256(e.getValue().digest()));
+            hashes.put(e.getKey(), streamHashOf(e.getValue(), trie));
         }
         return hashes;
     }
 
+    /** The per-stream hash toward a partner of one kind: the trie's stream hash where there is one, else the text's. */
+    private static byte[] streamHashOf(ReconcilableState state, boolean trie) {
+        if (trie) {
+            byte[] hash = state.streamHash();
+            if (hash != null) {
+                return hash;
+            }
+        }
+        return state.digestHash();
+    }
+
+    /** The last root hash and what it was taken over, stream ids and their hashes in stream-id order. */
+    private record RootHash(List<String> streams, List<byte[]> hashes, byte[] root) {
+    }
+
+    /**
+     * The last root hash of each kind (IDLE-WORK item 3): while no stream's hash moved, the root is the one already
+     * taken, and each stream's hash is itself cached by its state, so a node of twenty unchanged streams answers a probe
+     * with twenty cache reads and no hashing at all. A node whose view mixes members with and without
+     * {@code wire.ae=2} holds two roots and never compares one kind with the other (annex I.6).
+     */
+    private volatile RootHash rootHash;
+    private volatile RootHash trieRootHash;
+
     /** SHA-256 over the stream ids and digest hashes in stream-id order; null without streams. */
     public byte[] rootDigest() {
+        return rootDigest(false);
+    }
+
+    /**
+     * {@link #rootDigest()} for one kind of partner: over the hashes {@link #probeHashes(boolean)} would send it.
+     *
+     * @param trie whether the partner is on {@code wire.ae=2}
+     */
+    public byte[] rootDigest(boolean trie) {
         if (states.isEmpty()) {
             return null;
         }
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        List<String> streams = new ArrayList<>();
+        List<byte[]> hashes = new ArrayList<>();
         for (Map.Entry<String, ReconcilableState> e : new java.util.TreeMap<>(states).entrySet()) {
-            out.writeBytes(e.getKey().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            streams.add(e.getKey());
+            hashes.add(streamHashOf(e.getValue(), trie));
+        }
+        RootHash cached = trie ? trieRootHash : rootHash;
+        if (cached != null && cached.streams().equals(streams) && sameHashes(cached.hashes(), hashes)) {
+            return cached.root();
+        }
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < streams.size(); i++) {
+            out.writeBytes(streams.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8));
             out.write(0);
-            out.writeBytes(Digests.sha256(e.getValue().digest()));
+            out.writeBytes(hashes.get(i));
             out.write(0);
         }
-        return Digests.sha256(out.toByteArray());
+        byte[] root = Digests.sha256(out.toByteArray());
+        if (trie) {
+            trieRootHash = new RootHash(streams, hashes, root);
+        } else {
+            rootHash = new RootHash(streams, hashes, root);
+        }
+        return root;
     }
 
-    /** Whether a probe's stream hashes differ from this node's on any stream both hold. */
+    private static boolean sameHashes(List<byte[]> a, List<byte[]> b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.size(); i++) {
+            if (!java.util.Arrays.equals(a.get(i), b.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether a probe's stream hashes differ from this node's text hashes on any stream both hold. */
     public boolean differs(Map<String, byte[]> theirHashes) {
+        return differs(theirHashes, false);
+    }
+
+    /**
+     * Whether a probe's stream hashes differ from this node's on any stream both hold, compared in the kind the sender
+     * used toward this node.
+     *
+     * @param theirHashes the probe's hashes
+     * @param trie        whether the sender is on {@code wire.ae=2}, as {@link #audits} judges it
+     */
+    public boolean differs(Map<String, byte[]> theirHashes, boolean trie) {
         for (Map.Entry<String, byte[]> e : theirHashes.entrySet()) {
             ReconcilableState state = states.get(e.getKey());
-            if (state != null && e.getValue() != null
-                    && !java.util.Arrays.equals(Digests.sha256(state.digest()), e.getValue())) {
+            if (state != null && e.getValue() != null && !sameStream(state, trie, e.getValue())) {
                 return true;
             }
         }
         return false;
     }
 
-    /** Whether a probe's root hash differs from this node's. */
+    /**
+     * Whether a stream hash a member sent names this node's own set: compared first in the kind this node expects from
+     * it, then in the other kind. Which kind the sender used follows from the sender's view of this node's card, not
+     * from this node's view of the sender's, and the two disagree until both cards have spread (a member that just
+     * joined, a card that changed). Read in one kind alone, two equal sets would compare unequal for as long as the
+     * views differ. A hash of one kind never names a different set in the other: a text digest that is not empty
+     * ends with an LF and holds no zero byte, while a leaf's preimage never ends with an LF and an inner node's always
+     * holds a zero byte (annex I.6), so equal hashes in either kind mean equal sets, short of a SHA-256 collision.
+     */
+    private static boolean sameStream(ReconcilableState state, boolean trie, byte[] theirs) {
+        if (java.util.Arrays.equals(streamHashOf(state, trie), theirs)) {
+            return true;
+        }
+        if (trie) {
+            return java.util.Arrays.equals(state.digestHash(), theirs);
+        }
+        byte[] audited = state.streamHash();
+        return audited != null && java.util.Arrays.equals(audited, theirs);
+    }
+
+    /** Whether a probe's root hash differs from this node's text root. */
     public boolean differs(byte[] theirRoot) {
-        byte[] own = rootDigest();
-        return own != null && theirRoot != null && !java.util.Arrays.equals(own, theirRoot);
+        return differs(theirRoot, false);
+    }
+
+    /**
+     * Whether a probe's root hash differs from this node's root of the kind the sender used toward this node.
+     *
+     * @param theirRoot the probe's root, or null
+     * @param trie      whether the sender is on {@code wire.ae=2}
+     */
+    public boolean differs(byte[] theirRoot, boolean trie) {
+        if (theirRoot == null) {
+            return false; // a probe without a root says nothing, so this node's own root is not worth taking
+        }
+        byte[] own = rootDigest(trie);
+        // The other kind's root too, for a sender whose view of this node's card differs from this node's of its card.
+        return own != null && !java.util.Arrays.equals(own, theirRoot)
+                && !java.util.Arrays.equals(rootDigest(!trie), theirRoot);
     }
 
     /** Rumor frames sent per stream, for diagnostics ({@code TrafficAudit}). */
@@ -682,6 +834,10 @@ public final class GossipBus {
         }
         this.fanout = fanout;
         this.defaultHops = defaultHops;
+        // The audit's own random source spreads the fetch retries' backoff (ROBUSTNESS.md §10). It is seeded apart from
+        // the node's source, so drawing from it never moves the partner choices a seeded test relies on.
+        this.audit = new TrieAudit(states, sender, codec, clock,
+                new java.util.Random(clock.getAsLong() ^ System.identityHashCode(this)));
     }
 
     /**
@@ -792,16 +948,39 @@ public final class GossipBus {
      * @param itemId   unique item id
      * @param payload  the payload
      */
-    /** Set when anything moved since the last anti-entropy round: a rumor in or out, a delta either way. */
+    /**
+     * Set when something this node holds moved since the last anti-entropy round: a rumor published, a first copy
+     * of a rumor on a stream it holds, a delta sent, a pulled delta that changed something (IDLE-WORK 5a(b), item 8).
+     */
     private volatile boolean activity = true;
 
     /**
-     * Whether anything happened on this bus since the last call (a rumor published or received, a
-     * delta sent or applied). The runtime stretches the anti-entropy period while nothing does.
+     * Set when any gossip moved since the last tick, held here or not: every first copy of a rumor, every pulled
+     * delta, as {@link #activity} was counted before the honest backoff. The membership probe's quiet rule (SPEC
+     * §5.2, "no gossip activity since the last tick") reads this one, so a member that only forwards a busy stream
+     * it does not hold keeps probing at the base period and the failure detector keeps its speed there; only the
+     * anti-entropy period, which is about what this node holds, reads the honest flag.
+     */
+    private volatile boolean traffic = true;
+
+    /**
+     * Whether something this node holds moved since the last call (a rumor published, a first copy received on a
+     * stream it holds, a delta sent, or a pulled delta that changed its state). The runtime stretches the
+     * anti-entropy period while nothing does.
      */
     public boolean consumeActivity() {
         boolean was = activity;
         activity = false;
+        return was;
+    }
+
+    /**
+     * Whether any gossip moved since the last call, on a stream this node holds or not (see {@link #traffic}). The
+     * runtime stretches the membership probe period while nothing does.
+     */
+    public boolean consumeTraffic() {
+        boolean was = traffic;
+        traffic = false;
         return was;
     }
 
@@ -816,7 +995,11 @@ public final class GossipBus {
             return java.util.Optional.empty();
         }
         expectedPullPartners.clear();
+        syncAuditPaces(); // a lowering whose hold has ended takes effect at the round's start
         digestTo(partner.get(0));
+        // The fetch queue's turn (RE-I-03): ids a partner left out go to the next member in view once their backoff
+        // passes, and fetch bodies whose answer never came are asked of another member.
+        audit.retry(sampler.members());
         return java.util.Optional.of(partner.get(0));
     }
 
@@ -843,6 +1026,101 @@ public final class GossipBus {
         return rounds.get();
     }
 
+    /**
+     * Runs a targeted anti-entropy round that a member's probe asked for (SPEC §5.2): the owning node calls it when a
+     * probe's hashes or root differ from this node's, and the bus counts the round by what the probe carried, since a
+     * root alone cannot say which stream differs and so costs a round whenever any stream does (RE-F-03).
+     *
+     * @param partner  the member whose probe differed
+     * @param rootOnly whether the probe carried the root hash alone, not a hash per stream
+     */
+    public void antiEntropyFromProbe(PeerId partner, boolean rootOnly) {
+        (rootOnly ? probeRoundsRootOnly : probeRoundsHashes).incrementAndGet();
+        antiEntropyWith(partner);
+    }
+
+    // ---- pacing signals (RE-F-03, srad/replication-by-entry.md): what anti-entropy costs, for a status page and,
+    // later, an adjuster of the paces. Counters only; nothing here changes what the bus sends.
+    private final java.util.concurrent.atomic.AtomicLong hashedOpeningsSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong hashedOpeningStreamsSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong wantsReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong wantedStreamsReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong hashedOpeningsReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong wantsSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong probeRoundsHashes = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong probeRoundsRootOnly = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong digestTextBytesSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong digestTextBytesReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespDeltasSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespBytesSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespDeltasReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespBytesReceived = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pullRespUnsolicited = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * The pacing signals so far, a snapshot of counters that each only grow.
+     *
+     * @param hashedOpeningsSent       hashed anti-entropy openings this bus sent (one per round toward a hinted member)
+     * @param hashedOpeningStreamsSent stream hashes those openings carried
+     * @param wantsReceived            answers to them naming streams that differ, from the member the round was opened
+     *                                 with
+     * @param wantedStreamsReceived    streams those answers named
+     * @param hashedOpeningsReceived   hashed openings from members
+     * @param wantsSent                of those, the ones this bus answered with a want
+     * @param probeRoundsHashes        targeted rounds opened because a probe's per-stream hashes differed
+     * @param probeRoundsRootOnly      targeted rounds opened because a probe's root differed (it carried no hash per
+     *                                 stream)
+     * @param digestTextBytesSent      bytes of full digest text sent, in plain rounds and in answer to a want
+     * @param digestTextBytesReceived  bytes of full digest text received
+     * @param pullRespSent             PULL_RESP frames sent
+     * @param pullRespDeltasSent       stream deltas they carried
+     * @param pullRespBytesSent        delta bytes they carried
+     * @param pullRespReceived         PULL_RESP frames applied (from a member a round was opened with)
+     * @param pullRespDeltasReceived   stream deltas they carried
+     * @param pullRespBytesReceived    delta bytes they carried
+     * @param pullRespUnsolicited      PULL_RESP frames dropped as unsolicited (ASF-003)
+     */
+    public record PacingSignals(long hashedOpeningsSent, long hashedOpeningStreamsSent,
+                                long wantsReceived, long wantedStreamsReceived,
+                                long hashedOpeningsReceived, long wantsSent,
+                                long probeRoundsHashes, long probeRoundsRootOnly,
+                                long digestTextBytesSent, long digestTextBytesReceived,
+                                long pullRespSent, long pullRespDeltasSent, long pullRespBytesSent,
+                                long pullRespReceived, long pullRespDeltasReceived, long pullRespBytesReceived,
+                                long pullRespUnsolicited) {
+        /** The share of this bus's hashed openings that were answered with a want; zero before the first opening. */
+        public double wantFraction() {
+            return hashedOpeningsSent == 0 ? 0.0 : (double) wantsReceived / hashedOpeningsSent;
+        }
+
+        /** Every targeted round opened from a probe. */
+        public long probeRounds() {
+            return probeRoundsHashes + probeRoundsRootOnly;
+        }
+    }
+
+    /** A snapshot of the pacing signals (RE-F-03). */
+    public PacingSignals pacingSignals() {
+        return new PacingSignals(hashedOpeningsSent.get(), hashedOpeningStreamsSent.get(),
+                wantsReceived.get(), wantedStreamsReceived.get(),
+                hashedOpeningsReceived.get(), wantsSent.get(),
+                probeRoundsHashes.get(), probeRoundsRootOnly.get(),
+                digestTextBytesSent.get(), digestTextBytesReceived.get(),
+                pullRespSent.get(), pullRespDeltasSent.get(), pullRespBytesSent.get(),
+                pullRespReceived.get(), pullRespDeltasReceived.get(), pullRespBytesReceived.get(),
+                pullRespUnsolicited.get());
+    }
+
+    private static long byteCount(Map<String, byte[]> digests) {
+        long bytes = 0;
+        for (byte[] digest : digests.values()) {
+            bytes += digest == null ? 0 : digest.length;
+        }
+        return bytes;
+    }
+
     /** Which members understand the hashed DIGEST form; the owning node judges it from the wire hint. */
     private volatile java.util.function.Predicate<PeerId> hashedDigests = p -> false;
 
@@ -857,8 +1135,479 @@ public final class GossipBus {
         this.hashedDigests = Objects.requireNonNull(capable, "capable");
     }
 
-    private void digestTo(PeerId partner) {
-        rounds.incrementAndGet();
+    // ---- the form per partner, the paces, and the status figures (srad/replication-by-entry.md RE-F-03,
+    // RE-Q-MNT-02, RE-Q-REL-09)
+
+    /** The anti-entropy form a round toward a member takes, read from the member's current card. */
+    public enum Form {
+        /** {@code wire.ae=2}: trie hashes, the audit, and the fetch by id (annex I.6). */
+        TREE("ae"),
+        /** {@code wire.hashes=1} alone: a hash per stream, then the text of the streams that differ (v0.1.17). */
+        HASHED("hashes"),
+        /** Neither hint: the full text digest of every stream (§5.3). */
+        TEXT("text");
+
+        private final String label;
+
+        Form(String label) {
+            this.label = label;
+        }
+
+        /** The short name a status page shows. */
+        public String label() {
+            return label;
+        }
+    }
+
+    /** The form of each partner's last round, bounded like the other per-partner maps. */
+    private final Map<PeerId, Form> lastForm = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<PeerId, Form> eldest) {
+                    return size() > 4096;
+                }
+            });
+    private final java.util.concurrent.atomic.AtomicLong formChanges = new java.util.concurrent.atomic.AtomicLong();
+
+    private void noteForm(PeerId partner, Form form) {
+        Form before = lastForm.put(partner, form);
+        if (before != null && before != form) {
+            formChanges.incrementAndGet();
+        }
+    }
+
+    /**
+     * The form a round toward a member would take now, read from its current card: what {@link #audits} and the
+     * hashed-digest predicate say. It changes only when the card does (RE-Q-REL-09).
+     *
+     * @param peer the member
+     * @return the form
+     */
+    public Form formToward(PeerId peer) {
+        return audit.audits(peer) ? Form.TREE : hashedDigests.test(peer) ? Form.HASHED : Form.TEXT;
+    }
+
+    /** The form of the last round this bus opened with a member, or null before the first. */
+    public Form lastFormToward(PeerId peer) {
+        return lastForm.get(peer);
+    }
+
+    /**
+     * How many times a round toward a member took another form than the round before it. Each change follows a change
+     * of that member's card, so this never grows faster than the cards do (RE-Q-REL-09).
+     */
+    public long formChanges() {
+        return formChanges.get();
+    }
+
+    /** The members in view by the form a round toward each would take now. Every form is listed, zero included. */
+    public Map<Form, Integer> partnersByForm() {
+        Map<Form, Integer> out = new java.util.EnumMap<>(Form.class);
+        for (Form form : Form.values()) {
+            out.put(form, 0);
+        }
+        for (PeerId member : sampler.members()) {
+            out.merge(formToward(member), 1, Integer::sum);
+        }
+        return out;
+    }
+
+    /** The least base period of anti-entropy a setter may ask for. */
+    public static final long ANTI_ENTROPY_PERIOD_FLOOR_MILLIS = 100;
+    /** The greatest base period of anti-entropy a setter may ask for. */
+    public static final long ANTI_ENTROPY_PERIOD_CEILING_MILLIS = 60_000;
+    /** The greatest stretch of an idle group's anti-entropy, as a multiple of the base period (SPEC §5.3). */
+    public static final int ANTI_ENTROPY_STRETCH_CEILING = 32;
+
+    /**
+     * The anti-entropy base period: the group's founding names it, a runtime setter moves it (RE-F-03). Its own hold
+     * is its value, so a raised period serves at least one period at that value before it comes down.
+     */
+    private volatile Pace antiEntropyPeriod = new Pace("anti-entropy-period", ANTI_ENTROPY_PERIOD_FLOOR_MILLIS,
+            ANTI_ENTROPY_PERIOD_CEILING_MILLIS, 1_000, this::clockMillis, this::paceHoldMillis);
+    /** The most an idle group's anti-entropy period stretches to, as a multiple of the base: 1 never stretches. */
+    private final Pace antiEntropyStretch = new Pace("anti-entropy-stretch", 1, ANTI_ENTROPY_STRETCH_CEILING,
+            ANTI_ENTROPY_STRETCH_CEILING, this::clockMillis, this::paceHoldMillis);
+    private final Pace auditBudgetPace = new Pace("audit-budget", TrieAudit.BUDGET_FLOOR, TrieAudit.BUDGET_CEILING,
+            TrieAudit.BUDGET_DEFAULT, this::clockMillis, this::paceHoldMillis);
+    private final Pace auditSessionsPace = new Pace("audit-sessions", TrieAudit.SESSIONS_FLOOR,
+            TrieAudit.SESSIONS_CEILING, TrieAudit.SESSIONS_DEFAULT, this::clockMillis, this::paceHoldMillis);
+
+    private long clockMillis() {
+        return clock.getAsLong();
+    }
+
+    /** One anti-entropy period, the hold of every pace here (RE-Q-REL-09). */
+    private long paceHoldMillis() {
+        Pace period = antiEntropyPeriod;
+        return period == null ? 1_000 : period.get();
+    }
+
+    /** Applies a lowering of the audit's budget or sessions whose hold has ended. */
+    private void syncAuditPaces() {
+        long budget = auditBudgetPace.get();
+        if (audit.budget() != budget) {
+            audit.budget(budget);
+        }
+        int sessions = (int) auditSessionsPace.get();
+        if (audit.sessionsMax() != sessions) {
+            audit.sessionsMax(sessions);
+        }
+    }
+
+    /**
+     * Starts the anti-entropy period at the group's founding value; the owning runtime calls it once, before any
+     * round. The founding value may lie outside the setter's bounds.
+     *
+     * @param millis the founding's gossip period
+     */
+    public void antiEntropyBase(long millis) {
+        antiEntropyPeriod = new Pace("anti-entropy-period", ANTI_ENTROPY_PERIOD_FLOOR_MILLIS,
+                ANTI_ENTROPY_PERIOD_CEILING_MILLIS, millis, this::clockMillis, this::paceHoldMillis);
+    }
+
+    /**
+     * Sets the anti-entropy base period (RE-F-03); a runtime setter. A raise takes effect at once; a lowering waits
+     * until the raised period has served one period (RE-Q-REL-09).
+     *
+     * @param period from {@value #ANTI_ENTROPY_PERIOD_FLOOR_MILLIS} ms to {@value #ANTI_ENTROPY_PERIOD_CEILING_MILLIS}
+     *               ms
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void antiEntropyPeriod(java.time.Duration period) {
+        antiEntropyPeriod.set(period.toMillis());
+    }
+
+    /** The anti-entropy base period in effect. */
+    public java.time.Duration antiEntropyPeriod() {
+        return java.time.Duration.ofMillis(antiEntropyPeriod.get());
+    }
+
+    /**
+     * Sets how far an idle group's anti-entropy period may stretch, as a multiple of the base (RE-F-03); a runtime
+     * setter. The rounds never stop: SPEC §5.3's floor keeps at least one round per 32 periods.
+     *
+     * @param multiple from 1 (never stretch) to {@value #ANTI_ENTROPY_STRETCH_CEILING}
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void antiEntropyStretch(int multiple) {
+        antiEntropyStretch.set(multiple);
+    }
+
+    /** How far an idle group's anti-entropy period may stretch, as a multiple of the base. */
+    public int antiEntropyStretch() {
+        return (int) antiEntropyStretch.get();
+    }
+
+    /** Every pace this bus keeps, as a status page or an adjuster reads them. */
+    public List<Pace.Snapshot> paces() {
+        syncAuditPaces();
+        return List.of(antiEntropyPeriod.snapshot(), antiEntropyStretch.snapshot(), auditBudgetPace.snapshot(),
+                auditSessionsPace.snapshot(), new Pace.Snapshot("fetch-window", fetchWindow(),
+                        TrieAudit.FETCH_WINDOW_FLOOR, TrieAudit.FETCH_WINDOW_CEILING, null, null, null, 0, 0, 0),
+                new Pace.Snapshot("fetch-wait-floor", fetchWaitFloor(), TrieAudit.FETCH_WAIT_FLOOR_MIN_MILLIS,
+                        TrieAudit.LATE_COPY_MILLIS, null, null, null, 0, 0, 0));
+    }
+
+    /**
+     * One stream's status (RE-Q-MNT-02).
+     *
+     * @param stream        the stream id
+     * @param figures       what the stream's state reports, or null for a state that keeps no figures
+     * @param auditRounds   audit rounds of the stream as either side
+     * @param auditBytes    preimage bytes of the audit's answers for the stream, both ways
+     * @param fetchRequeued the stream's fetched ids queued for another member
+     */
+    public record StreamStatus(String stream, ReconcilableState.Figures figures, long auditRounds, long auditBytes,
+                               long fetchRequeued) {
+    }
+
+    /**
+     * A member's replication status for one group (RE-Q-MNT-02, RE-F-03): the members by form, each stream's figures,
+     * the paces, and the signals an adjuster reads. {@link #toMap()} gives it in the shape a feed's {@code /healthz} and
+     * the console's panel render.
+     *
+     * @param partnersByForm the members in view by the form a round toward each takes now
+     * @param formChanges    rounds that took another form toward a member than the round before
+     * @param streams        each stream's status, in stream-id order
+     * @param paces          every pace
+     * @param rounds         anti-entropy rounds started
+     * @param audit          the audit's signals
+     * @param pacing         the pacing signals
+     */
+    public record ReplicationStatus(Map<Form, Integer> partnersByForm, long formChanges, List<StreamStatus> streams,
+                                    List<Pace.Snapshot> paces, long rounds, AuditSignals audit,
+                                    PacingSignals pacing) {
+
+        /** Text-digest and {@code PULL_RESP} bytes sent per anti-entropy round, and the audit's answer bytes. */
+        public Map<String, Double> costPerRound() {
+            double n = Math.max(1, rounds);
+            Map<String, Double> out = new java.util.LinkedHashMap<>();
+            out.put("digestTextBytes", pacing.digestTextBytesSent() / n);
+            out.put("pullRespBytes", pacing.pullRespBytesSent() / n);
+            out.put("auditAnswerBytes", (audit.answerBytesSent() + audit.answerBytesReceived()) / n);
+            return out;
+        }
+
+        /** The status as nested maps and lists of plain values, for JSON. */
+        public Map<String, Object> toMap() {
+            Map<String, Object> doc = new java.util.LinkedHashMap<>();
+            Map<String, Integer> forms = new java.util.LinkedHashMap<>();
+            partnersByForm.forEach((form, n) -> forms.put(form.label(), n));
+            doc.put("partnersByForm", forms);
+            doc.put("formChanges", formChanges);
+            List<Map<String, Object>> rows = new ArrayList<>();
+            for (StreamStatus stream : streams) {
+                Map<String, Object> row = new java.util.LinkedHashMap<>();
+                row.put("stream", stream.stream());
+                if (stream.figures() != null) {
+                    row.put("live", stream.figures().live());
+                    row.put("tombstones", stream.figures().tombstones());
+                    row.put("tombstonesPastExpiry", new java.util.LinkedHashMap<>(stream.figures().tombstonesPastExpiry()));
+                    row.put("trieDepth", stream.figures().trieDepth());
+                }
+                row.put("auditRounds", stream.auditRounds());
+                row.put("auditBytes", stream.auditBytes());
+                row.put("fetchRequeued", stream.fetchRequeued());
+                rows.add(row);
+            }
+            doc.put("streams", rows);
+            List<Map<String, Object>> paceRows = new ArrayList<>();
+            for (Pace.Snapshot pace : paces) {
+                Map<String, Object> row = new java.util.LinkedHashMap<>();
+                row.put("name", pace.name());
+                row.put("value", pace.value());
+                row.put("floor", pace.floor());
+                row.put("ceiling", pace.ceiling());
+                if (pace.pending() != null) {
+                    row.put("pending", pace.pending());
+                    row.put("heldUntil", pace.heldUntil());
+                }
+                paceRows.add(row);
+            }
+            doc.put("paces", paceRows);
+            Map<String, Object> signals = new java.util.LinkedHashMap<>();
+            signals.put("rounds", rounds);
+            signals.put("costPerRound", costPerRound());
+            signals.put("wantFraction", pacing.wantFraction());
+            signals.put("auditRounds", audit.roundsAudited());
+            signals.put("idsFetched", audit.idsFetched());
+            signals.put("fetchRequeued", audit.fetchRequeued());
+            signals.put("fetchTimedOut", audit.fetchTimedOut());
+            signals.put("fetchParked", audit.fetchParked());
+            signals.put("fetchQueued", audit.fetchQueued());
+            signals.put("refusals", new java.util.TreeMap<>(audit.refusals()));
+            signals.put("pullRespUnsolicited", pacing.pullRespUnsolicited());
+            doc.put("signals", signals);
+            return doc;
+        }
+    }
+
+    /**
+     * This bus's replication status now (RE-Q-MNT-02). Each stream's figures come from its state, which may walk what
+     * it holds to answer, so this is for a status page, not for every round.
+     *
+     * @return the status
+     */
+    public ReplicationStatus replicationStatus() {
+        List<StreamStatus> rows = new ArrayList<>();
+        for (Map.Entry<String, ReconcilableState> e : new java.util.TreeMap<>(states).entrySet()) {
+            TrieAudit.StreamAudit counts = audit.streamAudit(e.getKey());
+            ReconcilableState.Figures figures;
+            try {
+                figures = e.getValue().figures();
+            } catch (RuntimeException failed) {
+                figures = null; // a status page shows what it can; a state that cannot answer shows its counters
+            }
+            rows.add(new StreamStatus(e.getKey(), figures, counts.rounds(),
+                    counts.bytesSent() + counts.bytesReceived(), counts.requeued()));
+        }
+        return new ReplicationStatus(partnersByForm(), formChanges.get(), rows, paces(), rounds.get(),
+                auditSignals(), pacingSignals());
+    }
+
+    /** The trie audit of annex I.6, both halves; idle until {@link #audit} enables it. */
+    private final TrieAudit audit;
+
+    /**
+     * Enables the trie audit of SPEC annex I.6 (v0.1.35, {@code wire.ae=2}) toward the members {@code capable}
+     * accepts, which the owning node judges from each member's current card, so the form a partner gets changes only
+     * when its card does (RE-T-03, RE-Q-REL-09). Toward such a member a round opens with each audited stream's trie
+     * hash, the partner answers the streams that differ with their roots, and the two descend to the entries that
+     * differ. Null turns the audit off: this node then reads a body carrying the audit's fields as a member without
+     * the hint does, and drops it.
+     *
+     * @param capable which members are on {@code wire.ae=2}, or null for none
+     */
+    public void audit(java.util.function.Predicate<PeerId> capable) {
+        audit.capable(capable);
+    }
+
+    /** The trie audit itself, for the tests of its fetch queue in this package. */
+    TrieAudit auditForTest() {
+        return audit;
+    }
+
+    /** Whether this node takes part in the trie audit at all ({@link #audit}). */
+    public boolean auditing() {
+        return audit.enabled();
+    }
+
+    /**
+     * Whether this node audits with a member: it takes part, and the member's current card carries
+     * {@code wire.ae=2}.
+     *
+     * @param peer the member
+     */
+    public boolean audits(PeerId peer) {
+        return audit.audits(peer);
+    }
+
+    /**
+     * Sets how many audit sessions this node keeps open per asker (RE-F-03, {@code agentspaces.gossip.audit-sessions});
+     * a runtime setter.
+     *
+     * @param sessions from 1 to 4, the bound of annex I.6
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void auditSessions(int sessions) {
+        audit.sessionsMax((int) auditSessionsPace.set(sessions));
+    }
+
+    /** How many audit sessions this node keeps open per asker. */
+    public int auditSessions() {
+        syncAuditPaces();
+        return audit.sessionsMax();
+    }
+
+    /**
+     * Sets the budget this node puts on its audit requests (RE-F-03, {@code agentspaces.gossip.audit-budget}); a
+     * runtime setter.
+     *
+     * @param bytes from 4 KiB to 4 MiB
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void auditBudget(long bytes) {
+        audit.budget(auditBudgetPace.set(bytes));
+    }
+
+    /** The budget this node puts on its audit requests, in bytes. */
+    public long auditBudget() {
+        syncAuditPaces();
+        return audit.budget();
+    }
+
+    /**
+     * Sets how many fetch bodies this node keeps in flight per partner (RE-F-03): the next goes out as each answer
+     * lands. A runtime setter; the default is four.
+     *
+     * @param bodies from 1 to 16
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void fetchWindow(int bodies) {
+        audit.fetchWindow(bodies);
+    }
+
+    /** How many fetch bodies this node keeps in flight per partner. */
+    public int fetchWindow() {
+        return audit.fetchWindow();
+    }
+
+    /**
+     * Sets the shortest wait for a fetch's answer before its ids are asked of another member (RE-F-03). The wait is
+     * four times the partner's last answer time when that is longer, up to the time a late copy is still taken. A
+     * runtime setter; the default is five seconds.
+     *
+     * @param millis from 1,000 to 60,000
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void fetchWaitFloor(long millis) {
+        audit.fetchWaitFloor(millis);
+    }
+
+    /** The shortest wait for a fetch's answer, in milliseconds. */
+    public long fetchWaitFloor() {
+        return audit.fetchWaitFloor();
+    }
+
+    /**
+     * The trie audit's signals: rounds, sessions, nodes and bytes each way, ids fetched, and the refusals and
+     * fallbacks by reason (RE-F-03, RE-Q-MNT-02, RE-Q-MNT-03). A snapshot.
+     *
+     * @return the signals
+     */
+    public AuditSignals auditSignals() {
+        TrieAudit.Signals s = audit.signals();
+        return new AuditSignals(s.roundsAudited(), s.sessionsOpened(), s.rootsAnswered(), s.requestsAnswered(),
+                s.nodesAnswered(), s.answerBytesSent(), s.requestsSent(), s.answersReceived(),
+                s.answerBytesReceived(), s.idsFetched(), s.fetchesAnswered(), s.openSessions(), s.refusals(),
+                s.fetchContinued(), s.fetchRequeued(), s.fetchTimedOut(), s.fetchParked(), s.fetchQueueFull(),
+                s.fetchQueued(), pullContinued.get(), budgetedAnswers.get(), remainderSent.get(),
+                remainderReceived.get(), s.fingerprintsChecked());
+    }
+
+    /**
+     * The trie audit's signals (see {@link #auditSignals()}).
+     *
+     * @param roundsAudited       openings this node answered with at least one root
+     * @param sessionsOpened      sessions it opened as the partner
+     * @param rootsAnswered       roots it answered
+     * @param requestsAnswered    request bodies it answered within a session
+     * @param nodesAnswered       nodes those answers carried
+     * @param answerBytesSent     preimage bytes of every answer it sent
+     * @param requestsSent        request bodies it sent as the asker
+     * @param answersReceived     answer nodes it accepted as the asker
+     * @param answerBytesReceived preimage bytes of those answers
+     * @param idsFetched          entry ids it asked for in fetch bodies, each ask counted
+     * @param fetchesAnswered     fetch bodies it answered
+     * @param openSessions        sessions open now, as the partner
+     * @param refusals            refusals and fallbacks by reason, one key each
+     * @param fetchContinued      fetched ids a budgeted answer left out, asked of the same partner at once
+     * @param fetchRequeued       fetched ids a partner did not hold, or whose answer never came, queued for another
+     *                            member after a jittered backoff (RE-I-03)
+     * @param fetchTimedOut       fetch bodies whose answer did not come within the wait
+     * @param fetchParked         ids every member in view left out, waiting for an audit to name them again
+     * @param fetchQueueFull      ids the fetch queue's bound turned away or pushed out
+     * @param fetchQueued         ids the fetch queue holds now
+     * @param pullContinued       budgeted text pulls continued at once because an answer carried a remainder
+     * @param budgetedAnswers     {@code PULL_RESP} answers this node cut to an asker's budget
+     * @param remainderSent       states those answers left out for the budget, summed
+     * @param remainderReceived   states the answers this node received left out, summed
+     * @param fingerprintsChecked fingerprints this node computed as an asker, checking answers and comparing its own
+     *                            children with them
+     */
+    public record AuditSignals(long roundsAudited, long sessionsOpened, long rootsAnswered, long requestsAnswered,
+                               long nodesAnswered, long answerBytesSent, long requestsSent, long answersReceived,
+                               long answerBytesReceived, long idsFetched, long fetchesAnswered, int openSessions,
+                               Map<String, Long> refusals, long fetchContinued, long fetchRequeued,
+                               long fetchTimedOut, long fetchParked, long fetchQueueFull, long fetchQueued,
+                               long pullContinued, long budgetedAnswers, long remainderSent,
+                               long remainderReceived, long fingerprintsChecked) {
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong pullContinued = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong budgetedAnswers = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong remainderSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong remainderReceived =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** Budgeted text pulls continued per partner since this node last opened a round with it; bounded per round. */
+    private final Map<PeerId, Integer> continuations = new ConcurrentHashMap<>();
+
+    /**
+     * Counts a {@code DIGEST} or {@code PULL_RESP} from a member that did not decode, and logs it once per member
+     * (RE-T-08, RE-Q-REL-07, RE-Q-MNT-03). The usual cause is a stale card: the sender read a hint this node no longer
+     * carries, or this node carries one its reader does not know. Neither side is at fault, so nobody is struck; the
+     * sender reads the card again before its next round and falls back to the form it names.
+     *
+     * @param from the sender
+     * @param kind the frame's kind
+     */
+    public void undecodable(PeerId from, String kind) {
+        audit.refuse(from, kind, "undecodable");
+    }
+
+    /** Notes that a partner's PULL_RESP is expected, the eldest expectation going first past the bound. */
+    private void expectPull(PeerId partner) {
         synchronized (expectedPullPartners) {
             while (expectedPullPartners.size() >= PULL_PARTNERS_CAPACITY) {
                 java.util.Iterator<PeerId> eldest = expectedPullPartners.iterator();
@@ -867,15 +1616,32 @@ public final class GossipBus {
             }
             expectedPullPartners.add(partner);
         }
-        if (hashedDigests.test(partner)) {
+    }
+
+    private void digestTo(PeerId partner) {
+        rounds.incrementAndGet();
+        continuations.remove(partner);
+        expectPull(partner);
+        boolean trie = audit.audits(partner);
+        noteForm(partner, trie ? Form.TREE : hashedDigests.test(partner) ? Form.HASHED : Form.TEXT);
+        if (trie || hashedDigests.test(partner)) {
+            // Toward a member on wire.ae=2 each audited stream's hash is its trie's (annex I.6); every other stream,
+            // and every stream toward a member on wire.hashes=1 alone, carries its text digest's hash as since v0.1.17.
             Map<String, byte[]> hashes = new HashMap<>();
             for (Map.Entry<String, ReconcilableState> e : states.entrySet()) {
-                hashes.put(e.getKey(), Digests.sha256(e.getValue().digest()));
+                hashes.put(e.getKey(), streamHashOf(e.getValue(), trie));
             }
+            if (trie) {
+                audit.opening(partner);
+            }
+            hashedOpeningsSent.incrementAndGet();
+            hashedOpeningStreamsSent.addAndGet(hashes.size());
             sender.sendDigest(partner, new Bodies.Digest(null, hashes, null));
             return;
         }
-        sender.sendDigest(partner, new Bodies.Digest(fullDigests(states.keySet())));
+        Map<String, byte[]> digests = fullDigests(states.keySet());
+        digestTextBytesSent.addAndGet(byteCount(digests));
+        sender.sendDigest(partner, new Bodies.Digest(digests));
     }
 
     private Map<String, byte[]> fullDigests(java.util.Collection<String> streams) {
@@ -890,87 +1656,310 @@ public final class GossipBus {
     }
 
     /**
-     * Handles an inbound DIGEST: compute deltas the asker is missing and reply.
+     * Handles an inbound DIGEST. Each field is handled on its own (annex I.6): {@code hashes} opens a round and is
+     * answered with {@code want} for the streams compared by their text and with {@code tree} roots for the streams
+     * audited by their trie; {@code want} asks this node, which opened the round, for full digests; {@code tree}
+     * carries an audit's requests or answers; {@code digests} and {@code ids} draw one {@code PULL_RESP} between them.
+     * A body carrying a field of annex I.6 reaches a node that does not audit only from a sender that read a stale
+     * card; it is dropped whole and counted, as a member without the hint drops it.
      *
      * @param from   the asking peer
      * @param digest the asker's digests
      */
     public void onDigest(PeerId from, Bodies.Digest digest) {
-        if (digest.hashes() != null) {
-            // Opening of a hashed round: name the streams both hold whose hashes differ.
-            List<String> want = new ArrayList<>();
-            for (Map.Entry<String, byte[]> e : digest.hashes().entrySet()) {
-                ReconcilableState state = states.get(e.getKey());
-                if (state == null || e.getValue() == null) {
-                    continue;
-                }
-                if (!java.util.Arrays.equals(Digests.sha256(state.digest()), e.getValue())) {
-                    want.add(e.getKey());
-                } else {
-                    state.matched(from); // the partner holds this stream whole (PD-L-01 evidence)
-                }
-            }
-            if (!want.isEmpty()) {
-                java.util.Collections.sort(want);
-                sender.sendDigest(from, new Bodies.Digest(null, null, want));
-            }
+        if (digest.carriesAudit() && !audit.enabled()) {
+            audit.refuse(from, null, "lacks-hint");
             return;
+        }
+        // Taken before want is answered, since a synchronous transport delivers that answer's PULL_RESP, which settles
+        // the round, before this body's tree is read.
+        boolean textRound = !audit.audits(from) && expectedPullPartners.contains(from);
+        if (digest.hashes() != null) {
+            onOpening(from, digest.hashes());
         }
         if (digest.want() != null) {
             // The partner this node opened a round with asks for the full digests of the streams
             // that differ; nobody else is answered, so a stranger cannot make this node send them.
-            if (!expectedPullPartners.contains(from) || digest.want().isEmpty()) {
-                return;
+            if (expectedPullPartners.contains(from) && !digest.want().isEmpty()) {
+                wantsReceived.incrementAndGet();
+                wantedStreamsReceived.addAndGet(digest.want().size());
+                Map<String, byte[]> digests = fullDigests(digest.want());
+                if (!digests.isEmpty()) {
+                    digestTextBytesSent.addAndGet(byteCount(digests));
+                    sender.sendDigest(from, textPull(from, digests));
+                }
             }
-            Map<String, byte[]> digests = fullDigests(digest.want());
-            if (!digests.isEmpty()) {
-                sender.sendDigest(from, new Bodies.Digest(digests));
+        }
+        if (digest.tree() != null && !digest.tree().isEmpty()) {
+            List<String> fallback = audit.onTree(from, digest.tree(), digest.budget(), textRound);
+            if (!fallback.isEmpty()) {
+                // A stream this node keeps no trie for came back as a root: pull it by the text form, as a want would.
+                Map<String, byte[]> digests = fullDigests(fallback);
+                if (!digests.isEmpty()) {
+                    expectPull(from);
+                    digestTextBytesSent.addAndGet(byteCount(digests));
+                    sender.sendDigest(from, textPull(from, digests));
+                }
             }
+        }
+        // sketch is reserved (annex I.6, RE-F-01): never sent, and ignored when received.
+        if (digest.digests() == null && digest.ids() == null) {
             return;
         }
-        if (digest.digests() == null) {
-            return;
-        }
+        answerPull(from, digest);
+    }
+
+    /** Bytes of a {@code PULL_RESP} body beside its deltas: the record's field names and its map and list heads. */
+    private static final long PULL_RESP_BASE = 32;
+
+    /** Bytes one stream adds to a {@code PULL_RESP} body beside its delta: its name twice, a byte head and a count. */
+    private static long streamOverhead(String streamId) {
+        return 2L * (streamId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 9) + 9;
+    }
+
+    /**
+     * The {@code PULL_RESP} a body's {@code digests} and {@code ids} draw, in one answer (annex I.6). With no
+     * {@code budget} it is as before v0.1.35: every delta whole, no remainder. With one, the answer is cut to the
+     * smaller of the asker's budget and this node's own cap: the streams in registration order, so a revocation registry
+     * goes before the spaces whose records it judges, each stream's states in the annex's order, the first item always
+     * carried; and {@code remainder} counts per stream what was held and left out. A budgeted fetch is always answered,
+     * even with nothing held, so the asker learns at once to ask another member.
+     */
+    private void answerPull(PeerId from, Bodies.Digest digest) {
+        Long asked = digest.budget();
+        long cap = asked == null ? -1 : Math.min(asked, TrieAudit.BUDGET_CEILING);
         Map<String, byte[]> deltas = new HashMap<>();
-        for (Map.Entry<String, byte[]> e : digest.digests().entrySet()) {
-            ReconcilableState state = states.get(e.getKey());
-            if (state == null) {
+        Map<String, Long> remainder = asked == null ? null : new java.util.TreeMap<>();
+        long[] used = {PULL_RESP_BASE};
+        Map<String, byte[]> texts = digest.digests() == null ? Map.of() : digest.digests();
+        Map<String, List<String>> ids = digest.ids() == null ? Map.of() : digest.ids();
+        if (!texts.isEmpty()) {
+            digestTextBytesReceived.addAndGet(byteCount(texts));
+        }
+        for (String streamId : answerOrder(texts.keySet(), ids.keySet())) {
+            ReconcilableState state = states.get(streamId);
+            byte[] text = texts.get(streamId);
+            List<String> named = ids.get(streamId);
+            boolean fetch = state != null && named != null && !named.isEmpty() && state.streamHash() != null;
+            if (state == null || (text == null && !fetch)) {
+                if (remainder != null && named != null) {
+                    // Nothing of this stream is held here: a zero remainder tells the asker so at once, and it asks
+                    // the next member rather than waiting out its fetch.
+                    remainder.put(streamId, 0L);
+                }
                 continue;
             }
-            byte[] delta = state.deltaFor(e.getValue());
-            if (delta.length > 0) {
-                deltas.put(e.getKey(), delta);
+            ReconcilableState.Bounded answer;
+            if (cap < 0) {
+                byte[] delta = text != null ? state.deltaFor(text) : state.statesFor(named);
+                answer = new ReconcilableState.Bounded(delta, 0);
+            } else {
+                long room = cap - used[0] - streamOverhead(streamId);
+                answer = text != null ? state.deltaFor(text, room, deltas.isEmpty())
+                        : state.statesFor(named, room, deltas.isEmpty());
+                remainder.put(streamId, Math.max(0, answer.left()));
+                remainderSent.addAndGet(Math.max(0, answer.left()));
+            }
+            if (answer.delta().length > 0) {
+                deltas.put(streamId, answer.delta());
+                used[0] += answer.delta().length + streamOverhead(streamId);
+            }
+            if (text == null) {
+                audit.fetchAnswered();
             }
         }
-        if (!deltas.isEmpty()) {
-            activity = true;
-            sender.sendPullResp(from, new Bodies.PullResp(deltas));
+        boolean fetched = !ids.isEmpty();
+        if (deltas.isEmpty() && !(fetched && asked != null)) {
+            return;
         }
+        activity = true;
+        traffic = true;
+        pullRespSent.incrementAndGet();
+        pullRespDeltasSent.addAndGet(deltas.size());
+        pullRespBytesSent.addAndGet(byteCount(deltas));
+        if (asked != null) {
+            budgetedAnswers.incrementAndGet();
+        }
+        sender.sendPullResp(from, new Bodies.PullResp(deltas, remainder));
+    }
+
+    /**
+     * The streams of a pull's answer: those this node registered, in registration order, then any other it was asked
+     * for. A stream asked both by text and by ids is answered by its text, which covers the ids.
+     */
+    private List<String> answerOrder(java.util.Set<String> texts, java.util.Set<String> ids) {
+        List<String> order = new ArrayList<>();
+        for (String streamId : registrationOrder) {
+            if (texts.contains(streamId) || ids.contains(streamId)) {
+                order.add(streamId);
+            }
+        }
+        java.util.Set<String> rest = new java.util.TreeSet<>(texts);
+        rest.addAll(ids);
+        rest.removeAll(order);
+        order.addAll(rest);
+        return order;
+    }
+
+    /**
+     * A body asking for full text digests: under this node's budget toward a member on {@code wire.ae=2}, which reads a
+     * {@code PULL_RESP} carrying {@code remainder}, and as since v0.1.17 toward any other.
+     */
+    private Bodies.Digest textPull(PeerId to, Map<String, byte[]> digests) {
+        if (!audit.audits(to)) {
+            return new Bodies.Digest(digests);
+        }
+        return new Bodies.Digest(digests, null, null, null, null, audit.budget(), null);
+    }
+
+    /**
+     * The opening of a hashed round: name the streams both hold whose hashes differ. A stream this node audits with
+     * the asker is compared by its trie's stream hash and answered with its root, a session permitting; any other is
+     * compared by its text digest's hash and named in {@code want}, as since v0.1.17. Both go in one body.
+     */
+    private void onOpening(PeerId from, Map<String, byte[]> theirs) {
+        hashedOpeningsReceived.incrementAndGet();
+        boolean trie = audit.audits(from);
+        List<String> want = new ArrayList<>();
+        List<String> differs = new ArrayList<>();
+        List<String> equal = new ArrayList<>();
+        for (Map.Entry<String, byte[]> e : new java.util.TreeMap<>(theirs).entrySet()) {
+            ReconcilableState state = states.get(e.getKey());
+            if (state == null || e.getValue() == null) {
+                continue;
+            }
+            boolean audited = trie && state.streamHash() != null;
+            if (!sameStream(state, audited, e.getValue())) {
+                (audited ? differs : want).add(e.getKey());
+            } else {
+                state.matched(from); // the partner holds this stream whole (PD-L-01 evidence)
+                if (audited) {
+                    equal.add(e.getKey());
+                }
+            }
+        }
+        Map<String, List<Bodies.TreeNode>> tree = differs.isEmpty() && equal.isEmpty() ? Map.of()
+                : audit.roots(from, differs, equal);
+        if (want.isEmpty() && tree.isEmpty()) {
+            return;
+        }
+        if (!want.isEmpty()) {
+            wantsSent.incrementAndGet();
+        }
+        sender.sendDigest(from, new Bodies.Digest(null, null, want.isEmpty() ? null : want,
+                tree.isEmpty() ? null : tree, null, null, null));
     }
 
     /**
      * Handles an inbound PULL_RESP: apply the deltas, in the order the streams
-     * were registered, but only from a partner this bus sent a digest to and has not heard
+     * were registered, but only from a partner this bus sent a digest or a fetch to and has not heard
      * back from. Anti-entropy is strictly request-response; an unsolicited PULL_RESP is a
-     * delta-injection attempt and is dropped (ASF-003).
+     * delta-injection attempt and is dropped (ASF-003). A fetch's answer is awaited for
+     * {@link TrieAudit#LATE_COPY_MILLIS}, so a copy that arrives late is still applied, and the merge keeps
+     * whichever state is newer (RE-Q-REL-02).
      *
      * @param from the sending peer
      * @param resp the deltas
      */
     public void onPullResp(PeerId from, Bodies.PullResp resp) {
-        if (!expectedPullPartners.remove(from)) {
+        Map<String, byte[]> deltas = resp.deltas() == null ? Map.of() : resp.deltas();
+        java.util.Set<String> named = new java.util.HashSet<>(deltas.keySet());
+        if (resp.remainder() != null) {
+            named.addAll(resp.remainder().keySet());
+        }
+        // A fetch's answer first: it names the stream of a body in flight, which no round's answer does, since this
+        // node asks a space it audits by ids alone. Anything else must answer a round this node opened.
+        String fetchStream = audit.fetchAnswer(from, named);
+        if (fetchStream == null && !expectedPullPartners.remove(from)) {
+            pullRespUnsolicited.incrementAndGet();
             return;
         }
+        pullRespReceived.incrementAndGet();
+        pullRespDeltasReceived.addAndGet(deltas.size());
+        pullRespBytesReceived.addAndGet(byteCount(deltas));
+        if (resp.remainder() != null) {
+            for (Long left : resp.remainder().values()) {
+                remainderReceived.addAndGet(left);
+            }
+        }
+        java.util.Set<String> received = java.util.Set.of();
         // In registration order, not wire order: the canonical map order of wire
         // v3 sorts shorter stream ids first, which would apply "space:x" before
         // "credential-revocations"; the revocation registries registered first.
         for (String streamId : registrationOrder) {
-            byte[] delta = resp.deltas().get(streamId);
+            byte[] delta = deltas.get(streamId);
             ReconcilableState state = delta == null ? null : states.get(streamId);
+            // Activity only when the delta changed something (IDLE-WORK item 8): a partner re-offering states
+            // this replica refuses or already holds is no news, and counting it held a quiet group's anti-entropy
+            // at its base period for good.
             if (state != null) {
-                activity = true;
-                state.applyDelta(delta);
+                traffic = true;
+                boolean changed;
+                if (streamId.equals(fetchStream)) {
+                    ReconcilableState.Applied applied = state.applyDeltaNamed(delta);
+                    changed = applied.changed();
+                    received = applied.ids();
+                } else {
+                    changed = state.applyDeltaChanged(delta);
+                }
+                if (changed) {
+                    activity = true;
+                }
             }
+        }
+        if (fetchStream != null) {
+            // Which body the answer settles is read from what it carried (TrieAudit.settle), not from arrival order.
+            TrieAudit.Batch fetch = audit.settle(from, fetchStream, received);
+            if (fetch != null) {
+                Long left = resp.remainder() == null ? null : resp.remainder().get(fetchStream);
+                audit.fetched(from, fetch, received, left == null ? 0 : left);
+            }
+        } else if (resp.remainder() != null) {
+            continuePull(from, resp.remainder());
+        }
+    }
+
+    /** Budgeted text pulls a partner continues at once in one round, at most: the session bound of annex I.6. */
+    static final int PULL_CONTINUATIONS_MAX = 64;
+
+    /**
+     * A budgeted text pull came back with a remainder: continue it at once rather than a round later (RE-Q-PRF-03),
+     * with this node's own text digest under the same budget, which now lists what the answer brought, so the partner
+     * sends the next states. A stream this node audits continues by an audit instead, whose fetch is bounded per body,
+     * since the text of a large space could pass the frame. At most {@link #PULL_CONTINUATIONS_MAX} per partner per
+     * round, after which the next round carries on.
+     */
+    private void continuePull(PeerId from, Map<String, Long> remainder) {
+        List<String> text = new ArrayList<>();
+        boolean reopen = false;
+        for (Map.Entry<String, Long> e : remainder.entrySet()) {
+            ReconcilableState state = states.get(e.getKey());
+            if (state == null || e.getValue() == null || e.getValue() <= 0) {
+                continue;
+            }
+            if (audit.audits(from) && state.streamHash() != null) {
+                reopen = true;
+            } else {
+                text.add(e.getKey());
+            }
+        }
+        if (text.isEmpty() && !reopen) {
+            return;
+        }
+        if (continuations.merge(from, 1, Integer::sum) > PULL_CONTINUATIONS_MAX) {
+            return; // the next round carries on
+        }
+        pullContinued.incrementAndGet();
+        if (!text.isEmpty()) {
+            Map<String, byte[]> digests = fullDigests(text);
+            expectPull(from);
+            digestTextBytesSent.addAndGet(byteCount(digests));
+            sender.sendDigest(from, textPull(from, digests));
+        }
+        if (reopen) {
+            int sofar = continuations.getOrDefault(from, 0);
+            digestTo(from); // an audit opening; it resets the count, so keep it
+            continuations.put(from, sofar);
         }
     }
 
@@ -996,6 +1985,7 @@ public final class GossipBus {
     public void publish(String streamId, String itemId, byte[] payload) {
         if (!directStreams.contains(streamId)) {
             activity = true; // a direct stream (the peer advertisement) is liveness, not data
+            traffic = true;
         }
         byte[] hash = Digests.sha256(payload);
         String key = key(streamId, hash);
@@ -1062,8 +2052,15 @@ public final class GossipBus {
             }
             return;
         }
+        // A first copy of an item on a stream this node holds is news. One on a stream it does not hold (another
+        // member's space this node never opened) is still forwarded below exactly as before, but nothing here
+        // changed, so it does not keep this node's anti-entropy at its base period (IDLE-WORK 5a(b)): a single
+        // busy space held by a few members used to hold every member of the group at full rate.
         if (!directStreams.contains(rumor.streamId())) {
-            activity = true;
+            traffic = true;
+            if (handlers.containsKey(rumor.streamId()) || states.containsKey(rumor.streamId())) {
+                activity = true;
+            }
         }
         Missing arrived;
         synchronized (missing) {

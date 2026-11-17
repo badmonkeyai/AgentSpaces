@@ -136,7 +136,13 @@ class CouncilCrossLanguageTest {
                 Outcome outcome = CouncilFleet.act(council, 3, TASKS, 20.0, Duration.ofSeconds(90));
 
                 Set<String> workers = outcome.findings().stream().map(Finding::worker).collect(Collectors.toSet());
-                assertThat(outcome.findings()).as("every task found").hasSizeGreaterThanOrEqualTo(TASKS);
+                // Counted by topic: a count of findings passed with two topics found twice and two
+                // still in flight (R2, 2026-11-16). LEASE_RACE may let two workers both complete one
+                // task when their claims cross after the settle window (SPEC §7.4); research is
+                // idempotent, so a topic found twice is allowed, and every topic must be found.
+                Set<String> topics = CouncilFleet.topics(outcome.findings());
+                assertThat(topics).as("every task found").hasSize(TASKS);
+                assertThat(topics).as("only the act's tasks").allMatch(t -> t.startsWith("council-topic-"));
                 assertThat(workers).as("every worker took tasks").contains("py-worker", "ts-worker", "rb-worker");
 
                 assertThat(outcome.decision()).as("the council decided").isPresent();

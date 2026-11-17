@@ -22,6 +22,8 @@ import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.identity.ChannelTrust;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.identity.ServingCredential;
+import ai.badmonkey.agentspaces.measure.Measure;
+import ai.badmonkey.agentspaces.measure.Wait;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.membership.RevocationRegistry.RevocationValidator;
 import ai.badmonkey.agentspaces.peering.transport.TlsTcpTransport;
@@ -58,14 +60,13 @@ class CaRootedRevocationFabricTest {
         }
     }
 
-    private static void await(String what, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("timed out waiting for " + what);
-            }
-            Thread.sleep(50);
-        }
+    /**
+     * A liveness wait on a real TLS fabric, measured (srad/feature-measurements.md §3.5): it keeps its 50 ms poll.
+     * fm: (a) ceiling 30 s (policy), each wait typically well under a second.
+     */
+    private static void await(String metric, String what, BooleanSupplier condition) {
+        Measure.await(metric, Duration.ofSeconds(30), condition,
+                Wait.with().poll(Duration.ofMillis(50)).diagnostics(() -> "waiting for " + what));
     }
 
     @Test
@@ -117,7 +118,7 @@ class CaRootedRevocationFabricTest {
             for (PeerNode node : nodes) {
                 node.startTicking(Duration.ofMillis(200));
             }
-            await("the fleet to converge", () -> atObserver.membership().member(victimId.peerId()).isPresent()
+            await("peering.ca-revocation.converge", "the fleet to converge", () -> atObserver.membership().member(victimId.peerId()).isPresent()
                     && atObserver.membership().member(bystanderId.peerId()).isPresent()
                     && atBystander.membership().member(observerId.peerId()).isPresent());
 
@@ -126,16 +127,78 @@ class CaRootedRevocationFabricTest {
                     List.of(ca.crl(Instant.now().minusSeconds(1), Instant.now().plus(Duration.ofDays(1)),
                             CRLReason.KEY_COMPROMISE, victimLeaf.certificate()))));
 
-            await("the observer to root the revocation in the CA",
+            await("peering.ca-revocation.root", "the observer to root the revocation in the CA",
                     () -> atObserver.revocations().revoked(victimId.peerId()));
-            await("the bystander to accept it on the evidence alone",
+            await("peering.ca-revocation.accept", "the bystander to accept it on the evidence alone",
                     () -> atBystander.revocations().revoked(victimId.peerId()));
-            await("both to evict the victim", () -> atObserver.membership().member(victimId.peerId()).isEmpty()
+            await("peering.ca-revocation.evict", "both to evict the victim", () -> atObserver.membership().member(victimId.peerId()).isEmpty()
                     && atBystander.membership().member(victimId.peerId()).isEmpty());
             assertThat(atBystander.revocations().revoked(observerId.peerId())).isFalse();
             assertThat(atBystander.membership().member(observerId.peerId())).isPresent();
         } finally {
             new ArrayList<>(nodes).forEach(PeerNode::close);
+        }
+    }
+
+    /**
+     * A link is judged before it is read. The far end writes its first frames as soon as its
+     * handshake ends; when the node started the reader before judging the presented chain, those
+     * frames reached the node in the moment before the cut, and a frame queued before a cut was
+     * still delivered after it. This judge is slow on purpose, so the old order fails every time.
+     */
+    @Test
+    @Timeout(90)
+    void aLinkPresentingARevokedLeafIsCutBeforeAnyOfItsFramesIsRead() throws Exception {
+        PeerIdentity founderId = PeerIdentity.generate();
+        PeerIdentity memberId = PeerIdentity.generate();
+        GroupId groupId = GroupId.fromFounding("judged-first".getBytes(StandardCharsets.UTF_8));
+        GroupAdvertisement groupAd = new GroupAdvertisement("aspace://" + groupId.value(), founderId.peerId(),
+                groupId, Instant.EPOCH, Duration.ofDays(1), "judged", GroupAdvertisement.MembershipPolicy.OPEN,
+                ConflictStrategyType.LEASE_RACE, GroupAdvertisement.GossipParameters.defaults());
+        GroupMembership.Config slow = new GroupMembership.Config(Duration.ofMinutes(10), Duration.ofMinutes(5), 1);
+        ChannelTrust anchorsOnly = ChannelTrust.of(List.of(ca.certificate()));
+        TestCa.Issued founderLeaf = ca.issue(founderId.rawPublicKey());
+        TestCa.Issued memberLeaf = ca.issue(memberId.rawPublicKey());
+        ChannelTrust withCrl = ChannelTrust.withCrls(List.of(ca.certificate()),
+                List.of(ca.crl(Instant.now().minusSeconds(1), Instant.now().plus(Duration.ofDays(1)),
+                        CRLReason.KEY_COMPROMISE, memberLeaf.certificate())));
+        java.util.concurrent.atomic.AtomicInteger judged = new java.util.concurrent.atomic.AtomicInteger();
+        PeerNode founder = PeerNode.builder(founderId).requireAttestation(true)
+                .channelTrust(() -> {
+                    try {
+                        Thread.sleep(300);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    judged.incrementAndGet();
+                    return withCrl;
+                })
+                .build();
+        PeerNode member = PeerNode.builder(memberId).requireAttestation(true).build();
+        try {
+            int founderPort = freePort();
+            founder.listen(new TlsTcpTransport(founderId,
+                    new ServingCredential(founderLeaf.key().getPrivate(), founderLeaf.chain(ca)), anchorsOnly),
+                    "127.0.0.1:" + founderPort);
+            member.listen(new TlsTcpTransport(memberId,
+                    new ServingCredential(memberLeaf.key().getPrivate(), memberLeaf.chain(ca)), anchorsOnly),
+                    "127.0.0.1:" + freePort());
+            GroupRuntime atFounder = founder.joinGroup(groupAd, slow, List.of());
+            long start = System.nanoTime();
+            member.joinGroup(groupAd, slow,
+                    List.of(new PeerAdvertisement.Endpoint("tls", "127.0.0.1:" + founderPort, 0)));
+            await("peering.revoked-leaf.judged-cut", "the founder to judge the member's link and root the revocation",
+                    () -> judged.get() > 0 && atFounder.revocations().revoked(memberId.peerId()));
+            System.out.printf("judged and cut in %d ms%n", (System.nanoTime() - start) / 1_000_000);
+            // fm: (fixed sleep) an absence check with no positive marker to wait on: the node counts no cut link and
+            // the cut connection delivers nothing more, so the window stays as it was (srad/feature-measurements.md
+            // §3.9, "if no counter exists, the hard bound stays until one does")
+            Thread.sleep(500); // anything the link had read would be delivered by now
+            assertThat(founder.traffic().framesReceived()).as("frames read off the revoked link").isZero();
+            assertThat(founder.traffic().bytesReceived()).isZero();
+        } finally {
+            founder.close();
+            member.close();
         }
     }
 
@@ -168,13 +231,13 @@ class CaRootedRevocationFabricTest {
                     List.of(new PeerAdvertisement.Endpoint("tls", "127.0.0.1:" + founderPort, 0)));
             founder.startTicking(Duration.ofMillis(200));
             member.startTicking(Duration.ofMillis(200));
-            await("membership", () -> atFounder.membership().member(memberId.peerId()).isPresent()
+            await("peering.revoked-leaf.membership", "membership", () -> atFounder.membership().member(memberId.peerId()).isPresent()
                     && atMember.membership().member(founderId.peerId()).isPresent());
             List<String> news = new java.util.concurrent.CopyOnWriteArrayList<>();
             atFounder.gossip().onStream("news", (from, id, payload) ->
                     news.add(new String(payload, StandardCharsets.UTF_8)));
             atMember.gossip().publish("news", "n1", "before".getBytes(StandardCharsets.UTF_8));
-            await("a frame before the revocation", () -> news.contains("before"));
+            await("peering.revoked-leaf.first-frame", "a frame before the revocation", () -> news.contains("before"));
 
             byte[] fingerprint = ai.badmonkey.agentspaces.common.crypto.Digests.sha256(
                     memberLeaf.certificate().getEncoded());
@@ -184,6 +247,7 @@ class CaRootedRevocationFabricTest {
                     ai.badmonkey.agentspaces.api.ad.CredentialRevocation.KEY_COMPROMISE, null)).isPresent();
             Thread.sleep(1000);
             atMember.gossip().publish("news", "n2", "after".getBytes(StandardCharsets.UTF_8));
+            // fm: (fixed sleep) an absence window, as above: no counter shows the redials being cut
             Thread.sleep(3000); // the member redials meanwhile; each new link is cut on attach
             assertThat(news).containsExactly("before");
         } finally {

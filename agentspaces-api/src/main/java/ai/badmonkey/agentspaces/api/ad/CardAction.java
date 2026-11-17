@@ -104,8 +104,18 @@ public record CardAction(
     public static final String BALLOT = "ballot";
     /** An {@code @OnDecision} reaction to a closed vote. */
     public static final String ON_DECISION = "on-decision";
-    /** An Embabel {@code @Action}. */
+    /**
+     * An Embabel {@code @Action} with no space annotation of its own, served by an implied take
+     * (reviews/embabel-agentspaces-review-2026-11-12.md §7.3): invocable by writing the consumed
+     * entry into its {@code space} tagged {@code aspace.action=<agent>.<action>}. A card from
+     * before that convention carries the same kind with no space and is invoked untagged.
+     */
     public static final String EMBABEL_ACTION = "embabel-action";
+    /**
+     * An action the agent can perform but that is not invoked by writing one entry (several
+     * entry inputs, no entry result, a precondition on local state): advertised, never invocable.
+     */
+    public static final String LOCAL = "local";
     /**
      * A {@code @SpaceJoin} fan-in (issue #16): consumes every part's schema, is
      * never invocable by writing one entry.
@@ -120,7 +130,7 @@ public record CardAction(
 
     /** The recognized kinds. */
     public static final Set<String> KINDS =
-            Set.of(TAKE, NOTIFY, ORDERED_TAKE, BALLOT, ON_DECISION, EMBABEL_ACTION);
+            Set.of(TAKE, NOTIFY, ORDERED_TAKE, BALLOT, ON_DECISION, EMBABEL_ACTION, LOCAL);
 
     /** The kinds a remote caller can invoke by writing the consumed entry. */
     public static final Set<String> INVOCABLE = Set.of(TAKE, NOTIFY, ORDERED_TAKE, EMBABEL_ACTION);

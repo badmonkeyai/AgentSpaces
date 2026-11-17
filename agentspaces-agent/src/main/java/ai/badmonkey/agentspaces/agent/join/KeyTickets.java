@@ -38,11 +38,30 @@ import java.util.Optional;
  * The per-key ticket a fan-in or a fold serializes on, shared by
  * {@link JoinBinding} and the reduce binding (ISSUE-SpaceReduce §9.3). A
  * {@link JoinTicket} is written when a key needs serving, once per writer per
- * ticket lease, and the younger of two tickets written in the same instant is
- * withdrawn, so a duplicate needs a partition and never just a race. Under
- * {@code ORDERED} the ordered log's commit order decides which ticket is the
- * key's first: the committed claims are resolved to keys in order, waiting for
- * a claim's record to replicate, so every member decides identically.
+ * ticket lease. Outside {@code ORDERED}, a writer that then sees an older
+ * ticket for the key withdraws its own; under {@code ORDERED} no ticket is
+ * withdrawn, since the log decides among them.
+ *
+ * <p>Outside {@code ORDERED} that rule, and the take of the ticket, only resolve
+ * what this replica has heard: two writers each withdraw in favour of the older
+ * ticket only once each holds the other's, and a ticket's take is a LEASE_RACE
+ * claim judged at the end of the space's settle window (SPEC §7.4). A ticket or
+ * a claim that reaches a writer after it decided leaves two live tickets, or two
+ * takers that each judged themselves the winner, and so two holders of one key.
+ * No partition is needed for that: gossip delivers late and out of order by
+ * design (ROBUSTNESS.md §10), and a message that comes by the lazy-push repair
+ * already waits at least half a second, longer than a typical settle window.
+ * The duplicate lasts until one side hears the other (the reduce's older-ticket
+ * check backs off then) or its take lease lapses. Use it where a second holder
+ * costs only repeated work.
+ *
+ * <p>Under {@code ORDERED} the ordered log's commit order decides which ticket
+ * is the key's first: the committed claims are resolved to keys in order,
+ * waiting for a claim's record to replicate, so every member decides
+ * identically however late its messages come. That decision needs a quorum of
+ * the log's voters, and it holds while the holder renews its ticket within the
+ * take lease: a holder that cannot, through a stall or a partition from the
+ * quorum, loses the key to the next generation when the lease lapses.
  */
 public final class KeyTickets implements AutoCloseable {
 
@@ -136,8 +155,8 @@ public final class KeyTickets implements AutoCloseable {
 
     /**
      * Writes a ticket for the key unless this writer wrote one within the
-     * ticket lease or another writer's ticket is already visible; withdraws
-     * its own when an older one exists.
+     * ticket lease or another writer's ticket is already visible; outside
+     * {@code ORDERED}, withdraws its own when an older one exists.
      *
      * @return whether a ticket for the key is live here afterwards, as far as
      *         this writer can see
@@ -157,10 +176,21 @@ public final class KeyTickets implements AutoCloseable {
                 return true; // another writer asked first and its ticket replicated here
             }
             EntryHandle mine = space.write(new JoinTicket(name, key), ticketLease, tags(key));
+            if (coordinator != null) {
+                // ORDERED keeps a duplicate: the log's order already decides which ticket counts, and the binding
+                // completes the others. Withdrawing one could race a rival's claim on it: the log commits that
+                // claim, the withdrawn ticket is neither live nor completed anywhere, and every member's
+                // resolution of the key's claims stalled behind it until PENDING_CLAIM_MAX_AGE (30 s, measured in
+                // AgentBinderReduceClusterTest on 2026-11-15, in 4 of 10 runs).
+                LOG.log(System.Logger.Level.DEBUG, name + ": ticket written for key '" + key + "'");
+                return true;
+            }
             // Two writers that saw the key at the same moment both wrote a ticket
             // before either could see the other's. The later one withdraws: the
-            // oldest ticket by issue stamp stands, so a duplicate needs a
-            // partition, never just a race.
+            // oldest ticket by issue stamp stands. This sees only the tickets that
+            // have reached this replica by now, so a ticket delivered later than
+            // this read still leaves two (see the class comment); the take that
+            // follows, and under ORDERED the log, decide between them.
             Space.Entry<?> own = null;
             Space.Entry<?> oldest = null;
             for (Space.Entry<JoinTicket> ticket : space.readAllEntries(template(key), READ_LIMIT)) {

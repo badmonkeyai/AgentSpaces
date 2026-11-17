@@ -26,11 +26,13 @@ import java.lang.annotation.Target;
  * elements' space. The method takes the current accumulator ({@code null} on
  * a key's first step) and one element and returns the new accumulator; the
  * binder takes the element under a lease, invokes the method, and completes
- * the element with the new accumulator as the result, in one atomic step, so
- * an element is never folded twice. A {@link ai.badmonkey.agentspaces.agent.join.JoinTicket}
- * per key serializes the steps of one key, so no update is lost, and the
- * accumulator's lease is the key's idle timeout: every step rewrites it, a
- * quiet key lapses, and the lapse is an {@code EXPIRED} event.
+ * the element with the new accumulator as the result, in one atomic step. A
+ * {@link ai.badmonkey.agentspaces.agent.join.JoinTicket} per key serializes the
+ * steps of one key, and the accumulator's lease is the key's idle timeout:
+ * every step rewrites it, a quiet key lapses, and the lapse is an
+ * {@code EXPIRED} event. How strongly the steps are serialized across the fleet
+ * is the {@link Mode}'s promise: only {@link Mode#ORDERED} folds each element
+ * once with no update lost, whatever the network does.
  *
  * <pre>{@code
  * @SpaceReduce(space = "payments", key = "claimant", accumulatorLease = "24h")
@@ -57,9 +59,24 @@ public @interface SpaceReduce {
 
     /** How a key's steps are serialized across the fleet. */
     enum Mode {
-        /** The key's ticket is taken under a lease through the space: a duplicate drain needs a partition. */
+        /**
+         * The key's ticket and the elements are taken through the space's claim race (LEASE_RACE, SPEC §7.4),
+         * which is judged at the end of the settle window. Within one replica, and whenever every ticket and claim
+         * arrives within that window, one reducer drains a key at a time and each element is folded once. A ticket
+         * or claim that arrives later, which gossip does without any partition (a lazy-push repair alone waits at
+         * least half a second), leaves two reducers that each believe they hold the key: both fold from the same
+         * accumulator, so a step can be lost or an element folded twice, until one hears the other or its lease
+         * lapses. Choose it for folds where that is harmless, such as an idempotent or best-effort tally, and
+         * {@link #ORDERED} where a shared outcome must be exact.
+         */
         LEASED,
-        /** The ticket and every take go through the ordered log: one reducer per key, fleet-wide. */
+        /**
+         * The ticket and every take go through the space's ordered-log coordinator, whose commit order decides
+         * each claim identically on every member however late the gossip: one reducer drains a key at a time
+         * fleet-wide, and each element is folded once. It costs a quorum of the log's voters (a minority folds
+         * nothing until it rejoins), and it holds while the drain renews its ticket within the take lease: a
+         * reducer that stalls past the lease loses the key to the next one.
+         */
         ORDERED
     }
 

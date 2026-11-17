@@ -46,6 +46,7 @@ class PdtBindingsTest {
     void theStoreHalfRunsOnDtls(@TempDir Path dir) throws Exception {
         StoreHalf.Report report = StoreHalf.run(dir, "dtls", FREE_UDP, StoreHalf.Sizes.bindings(), System.out);
         System.out.print(report.summary());
+        StoreAndGraphTest.recordStoreHalf(report, "bindings");
         assertThat(report.binding()).isEqualTo("dtls");
         StoreAndGraphTest.assertStoreHalf(report, StoreHalf.Sizes.bindings());
     }

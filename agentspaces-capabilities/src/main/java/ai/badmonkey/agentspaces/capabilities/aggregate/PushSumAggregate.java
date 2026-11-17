@@ -365,8 +365,10 @@ public final class PushSumAggregate implements CapabilityProvider {
      * When an estimate counts as settled: unchanged, within a relative
      * tolerance of the larger of one and the last value, for a number of
      * settle steps. A step is a gossip round this node took part in after it
-     * first heard the epoch, or the epoch going quiet; rounds run about once a
-     * second. {@link #FIRST} fires on the first estimate present.
+     * first heard the epoch; rounds run about once a second. An epoch that has
+     * gone quiet after being heard settles at once, but only when its silence
+     * has lasted as long as the steps the rule asks for. {@link #FIRST} fires on
+     * the first estimate present.
      */
     public record Settle(int ticks, double tolerance) {
         public static final Settle FIRST = new Settle(0, 0);
@@ -714,6 +716,19 @@ public final class PushSumAggregate implements CapabilityProvider {
         return q != null && q.stableTicks >= quietAfterTicks;
     }
 
+    /** How many ticks a key has gone silent for: its unchanged ticks once quiet, else zero. */
+    private long silentTicks(String key) {
+        Quiet q = quiet.get(key);
+        if (q == null) {
+            return 0;
+        }
+        int stable;
+        synchronized (q) {
+            stable = q.stableTicks;
+        }
+        return stable >= quietAfterTicks ? stable : 0;
+    }
+
     /** Observes a key's state; returns true when it should be gossiped this tick, evicting it when due. */
     private boolean active(String key, Object fingerprint, Runnable evict) {
         return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(fingerprint), evict);
@@ -861,23 +876,31 @@ public final class PushSumAggregate implements CapabilityProvider {
                 if (track.fired || now.isEmpty()) {
                     continue;
                 }
-                boolean settledAfterHearing = receipts > 0 && quiet(epochId);
+                // Silence settles a watch only once it is as long as the rule. The epoch goes quiet after
+                // quietAfterTicks (30 s under a 250 ms driver), and taking that as the whole streak cut a
+                // longer rule short: example 18's supervisor asks for 40 rounds so that it outlasts the
+                // gap between the first and the last priced claim, and it reported a plateau of 0.0 after
+                // 30 s while the claims that would move it were still on their way (R1, 2026-11-14).
+                boolean settledAfterHearing = receipts > 0
+                        && silentTicks(epochId) >= (long) watch.settle.ticks() * roundEveryTicks;
                 boolean roundHeard = receipts > 0 && round;
                 if (!roundHeard && !alone && !settledAfterHearing) {
                     continue; // between rounds, or never heard: the streak neither grows nor resets
                 }
                 // A step of the streak is a round this node took part in, once it has heard the
                 // epoch at all (the annotation's "consecutive protocol ticks", with rounds paced
-                // to the gossip period since v0.1.16), or an epoch heard and since gone quiet,
-                // which is the full streak. Counting receipts made the streak depend on fan-in
-                // (several frames a round fired on a short plateau; none, once quiet, starved it),
+                // to the gossip period since v0.1.16), or an epoch heard and silent for at least
+                // the rule's span, which is the full streak. Counting receipts made the streak
+                // depend on fan-in (several frames a round fired on a short plateau; none, once
+                // quiet, starved it),
                 // and counting receipts and rounds both double-counted (found by example 18 and
                 // the LangChain4j passthrough test, 2026-10-12).
                 track.seenReceipts = receipts;
                 double value = now.getAsDouble();
                 track.stable = watch.settle.unchanged(value, track.last) ? track.stable + 1 : 0;
                 if (settledAfterHearing && watch.settle.unchanged(value, track.last)) {
-                    track.stable = Math.max(track.stable, watch.settle.ticks()); // quiet is settled: fire now, not after more silence
+                    // A silence as long as the rule is settled: fire now, not after more silence.
+                    track.stable = Math.max(track.stable, watch.settle.ticks());
                 }
                 track.last = value;
                 if (track.stable >= watch.settle.ticks()) {

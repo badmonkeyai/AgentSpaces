@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Bad Monkey, Inc.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+       https://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>ai.badmonkey.agentspaces</groupId>
+    <artifactId>agentspaces</artifactId>
+    <version>0.7.0-SNAPSHOT</version>
+  </parent>
+  <artifactId>agentspaces-spoilers</artifactId>
+  <name>AgentSpaces :: Spoiler Peers (test only)</name>
+  <description>
+    Spoiler peers (srad/spoiler-peers.md): real members whose traffic follows a deterministic
+    script of misbehaviours keyed to observed frames, decoded items, events and counters, so a
+    race that load found at a rate reproduces every run. Test scope only: never deployed, absent
+    from the BOM, and no shipped artifact depends on it. App projects resolve it from the local
+    ~/.m2 after a core install.
+  </description>
+
+  <properties>
+    <!-- SP-G-01: never deployed, never signed, never published. -->
+    <maven.deploy.skip>true</maven.deploy.skip>
+    <skipPublishing>true</skipPublishing>
+    <gpg.skip>true</gpg.skip>
+    <maven.source.skip>true</maven.source.skip>
+    <maven.javadoc.skip>true</maven.javadoc.skip>
+    <!-- A test harness: its scenarios exercise the product, the product carries the coverage burden. -->
+    <jacoco.line.minimum>0.00</jacoco.line.minimum>
+  </properties>
+
+  <dependencies>
+    <!-- The LinkFilter, FrameDecoder, ItemDecoder and FleetProbe interfaces the harness implements. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-support</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-common</artifactId>
+    </dependency>
+    <!-- The decoders read envelopes, space deltas, pipe frames and PDT nodes as the shipped code writes them. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-peering</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-space</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-content</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-pdt</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-capabilities</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- The space scenarios of phase 2 (SC-A1, B1, B4, H5) bind agents and reducers as an application does. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-agent</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- SP-G-02: the rule that no main-scope class of any module uses a spoiler package. -->
+    <dependency>
+      <groupId>com.tngtech.archunit</groupId>
+      <artifactId>archunit</artifactId>
+      <version>1.4.1</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Measured waits (srad/feature-measurements.md §3.5): test scope only. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-measure</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <profiles>
+    <!-- The fleets of peering and pdt and ForgeSupport of space, shared through test-jars rather than
+         moved (SP-C-01, SP-Q-MNT-01). Active unless the release profile is: activeByDefault yields to
+         any other profile of this POM, and central-publish below is the only other one. -->
+    <profile>
+      <id>spoiler-test-jars</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      <dependencies>
+        <dependency>
+          <groupId>ai.badmonkey.agentspaces</groupId>
+          <artifactId>agentspaces-peering</artifactId>
+          <version>${project.version}</version>
+          <type>test-jar</type>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>ai.badmonkey.agentspaces</groupId>
+          <artifactId>agentspaces-space</artifactId>
+          <version>${project.version}</version>
+          <type>test-jar</type>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>ai.badmonkey.agentspaces</groupId>
+          <artifactId>agentspaces-pdt</artifactId>
+          <version>${project.version}</version>
+          <type>test-jar</type>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+    <!-- Under the release profile the test-jars are not attached (root agentspaces.testjars.skip), so the
+         scenarios cannot compile there; they skip, and this module is not deployed in any case. -->
+    <profile>
+      <id>central-publish</id>
+      <properties>
+        <maven.test.skip>true</maven.test.skip>
+      </properties>
+    </profile>
+  </profiles>
+</project>

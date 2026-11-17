@@ -26,6 +26,14 @@ import ai.badmonkey.agentspaces.examples.workflow.Claims.PricedClaim;
  * space, so every take carries the taker's bid and the lowest bid fleet-wide
  * wins. A senior adjuster is cheap for severe claims and dear for simple ones;
  * a junior adjuster is the reverse. One bidder per space per peer.
+ *
+ * <p>An auction awards a claim to one adjuster only while every bid reaches every
+ * rival within the settle window (SPEC §7.4). Beyond it two adjusters can each price
+ * the same claim, so the completion is idempotent: the price is a pure function of
+ * the assessment, the two priced claims agree, the space counts the second as a
+ * duplicate, and every reader keys on the claim (the vote opens once per claim, the
+ * reserve sensor adds each claim once). The one step that must happen once, the
+ * payment, goes through the ordered log.
  */
 public final class Pricing {
 

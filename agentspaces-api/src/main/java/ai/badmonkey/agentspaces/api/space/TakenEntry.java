@@ -36,9 +36,11 @@ public interface TakenEntry<T> {
     EntryId entryId();
 
     /**
-     * Extends the TAKE lease by the given duration from now.
+     * Extends the TAKE lease to at least the given duration from now. Like an entry's write lease, it never
+     * shortens: the new expiry is the later of the current one and now plus {@code extension}. To give the entry
+     * back early, let the lease lapse.
      *
-     * @param extension how much longer the hold should last
+     * @param extension how long from now the hold should last at least
      * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the lease already lapsed
      */
     void renew(Duration extension);

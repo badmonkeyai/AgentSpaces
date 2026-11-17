@@ -122,6 +122,20 @@ public class AgentSpacesProperties {
     private Discovery discovery = new Discovery();
 
     /**
+     * {@code agentspaces.gossip.*}: the gossip paces of srad/replication-by-entry.md appendix D. Bound as a map of the
+     * keys as written, so a key this starter does not know is refused at start with its name
+     * ({@link #refuseUnknownKeys()}, RE-Q-MNT-04) rather than silently ignored, as a misspelt pace would be.
+     */
+    private java.util.Map<String, String> gossip = new java.util.LinkedHashMap<>();
+    /** {@code agentspaces.space.*}: the space settings of the same appendix, strict in the same way. */
+    private java.util.Map<String, String> space = new java.util.LinkedHashMap<>();
+
+    /** The keys each strict block knows, in their kebab form. Phases 4 and 5 add the audit and horizon keys here. */
+    static final java.util.Map<String, java.util.List<String>> STRICT_KEYS = java.util.Map.of(
+            "agentspaces.gossip", java.util.List.of("probe-hash-streams", "audit", "audit-sessions", "audit-budget"),
+            "agentspaces.space", java.util.List.of("renew-shortening-log", "horizon"));
+
+    /**
      * {@code agentspaces.discovery.*} (SPEC §6.3 and §6.1a.5, v0.1.32; AppCard origin and formats, 2026-11-09): the
      * two bounds of every group's advertisement cache and the largest parts document a stub's resolution fetches. An
      * unset cache bound takes the default, times four on a RENDEZVOUS peer; a set one applies as given.
@@ -191,6 +205,199 @@ public class AgentSpacesProperties {
 
     public void setDiscovery(Discovery discovery) {
         this.discovery = discovery;
+    }
+
+    public java.util.Map<String, String> getGossip() {
+        return gossip;
+    }
+
+    public void setGossip(java.util.Map<String, String> gossip) {
+        this.gossip = gossip == null ? new java.util.LinkedHashMap<>() : gossip;
+    }
+
+    public java.util.Map<String, String> getSpace() {
+        return space;
+    }
+
+    public void setSpace(java.util.Map<String, String> space) {
+        this.space = space == null ? new java.util.LinkedHashMap<>() : space;
+    }
+
+    /**
+     * Refuses a key of {@code agentspaces.gossip} or {@code agentspaces.space} that this starter does not know,
+     * naming it and the keys the block takes (RE-Q-MNT-04). The starter calls it before it builds the node, so a
+     * misspelt pace stops the application at start. A key matches in any of Spring's relaxed forms
+     * ({@code probe-hash-streams}, {@code probeHashStreams}, {@code probe_hash_streams}, the environment's
+     * {@code PROBEHASHSTREAMS}).
+     *
+     * @throws IllegalStateException naming the first unknown key
+     */
+    public void refuseUnknownKeys() {
+        refuseUnknown("agentspaces.gossip", gossip);
+        refuseUnknown("agentspaces.space", space);
+    }
+
+    private static void refuseUnknown(String block, java.util.Map<String, String> keys) {
+        for (String key : keys.keySet()) {
+            if (canonical(block, key) == null) {
+                throw new IllegalStateException(block + "." + key + " is not a property this starter knows; "
+                        + block + " takes " + String.join(", ", STRICT_KEYS.get(block)));
+            }
+        }
+    }
+
+    /** The known kebab-form key a written key stands for, or null when it stands for none. */
+    private static String canonical(String block, String key) {
+        String folded = fold(key);
+        for (String known : STRICT_KEYS.get(block)) {
+            if (fold(known).equals(folded)) {
+                return known;
+            }
+        }
+        return null;
+    }
+
+    /** A key with its dashes and underscores dropped and its case folded, the forms relaxed binding equates. */
+    private static String fold(String key) {
+        return key.replace("-", "").replace("_", "").toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** The value written for a known key of a strict block, under any of its relaxed forms, or null. */
+    private static String valueOf(String block, java.util.Map<String, String> keys, String known) {
+        for (java.util.Map.Entry<String, String> entry : keys.entrySet()) {
+            if (known.equals(canonical(block, entry.getKey()))) {
+                return entry.getValue() == null ? null : entry.getValue().trim();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * {@code agentspaces.gossip.probe-hash-streams}: per-stream probe hashes up to this many streams, the root alone
+     * above it (RE-T-07); default 32, from 0 to 256.
+     *
+     * @return the bound
+     * @throws IllegalStateException naming the key when the value is not a whole number in range
+     */
+    public int probeHashStreams() {
+        String value = valueOf("agentspaces.gossip", gossip, "probe-hash-streams");
+        if (value == null || value.isEmpty()) {
+            return ai.badmonkey.agentspaces.peering.gossip.GossipBus.PROBE_DIGEST_STREAMS;
+        }
+        int streams;
+        try {
+            streams = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("agentspaces.gossip.probe-hash-streams must be a whole number, not '"
+                    + value + "'", e);
+        }
+        if (streams < ai.badmonkey.agentspaces.peering.gossip.GossipBus.PROBE_DIGEST_STREAMS_FLOOR
+                || streams > ai.badmonkey.agentspaces.peering.gossip.GossipBus.PROBE_DIGEST_STREAMS_CEILING) {
+            throw new IllegalStateException("agentspaces.gossip.probe-hash-streams must be from "
+                    + ai.badmonkey.agentspaces.peering.gossip.GossipBus.PROBE_DIGEST_STREAMS_FLOOR + " to "
+                    + ai.badmonkey.agentspaces.peering.gossip.GossipBus.PROBE_DIGEST_STREAMS_CEILING + ", not "
+                    + streams);
+        }
+        return streams;
+    }
+
+    /**
+     * {@code agentspaces.gossip.audit}: whether the node advertises {@code wire.ae=2} and audits spaces by their
+     * fingerprinted tries toward members that do (SPEC annex I.6, srad/replication-by-entry.md RE-T-02); default true.
+     *
+     * @return whether to audit
+     * @throws IllegalStateException naming the key when the value is not true or false
+     */
+    public boolean audit() {
+        String value = valueOf("agentspaces.gossip", gossip, "audit");
+        if (value == null || value.isEmpty()) {
+            return true;
+        }
+        if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) {
+            return Boolean.parseBoolean(value);
+        }
+        throw new IllegalStateException("agentspaces.gossip.audit must be true or false, not '" + value + "'");
+    }
+
+    /**
+     * {@code agentspaces.gossip.audit-sessions}: the audit sessions the node keeps open per asker (annex I.6,
+     * RE-T-05); default 4, from 1 to 4.
+     *
+     * @return the bound
+     * @throws IllegalStateException naming the key when the value is not a whole number in range
+     */
+    public int auditSessions() {
+        return (int) wholeNumber("audit-sessions", 4, 1, 4);
+    }
+
+    /**
+     * {@code agentspaces.gossip.audit-budget}: the bytes the node asks each audit answer to hold at most (annex I.6,
+     * <em>The budget</em>); default 1048576, from 4096 to 4194304.
+     *
+     * @return the budget in bytes
+     * @throws IllegalStateException naming the key when the value is not a whole number in range
+     */
+    public long auditBudget() {
+        return wholeNumber("audit-budget", 1L << 20, 4L << 10, 4L << 20);
+    }
+
+    /** A whole-number key of {@code agentspaces.gossip}: its default when unset, else the value within its bounds. */
+    private long wholeNumber(String key, long fallback, long floor, long ceiling) {
+        String value = valueOf("agentspaces.gossip", gossip, key);
+        if (value == null || value.isEmpty()) {
+            return fallback;
+        }
+        long number;
+        try {
+            number = Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("agentspaces.gossip." + key + " must be a whole number, not '" + value
+                    + "'", e);
+        }
+        if (number < floor || number > ceiling) {
+            throw new IllegalStateException("agentspaces.gossip." + key + " must be from " + floor + " to " + ceiling
+                    + ", not " + number);
+        }
+        return number;
+    }
+
+    /**
+     * {@code agentspaces.space.renew-shortening-log}: whether each space logs, once, the first renewal that asks for
+     * less than its lease has left (RE-H-01); default true.
+     *
+     * @return whether to log it
+     * @throws IllegalStateException naming the key when the value is not true or false
+     */
+    public boolean renewShorteningLog() {
+        String value = valueOf("agentspaces.space", space, "renew-shortening-log");
+        if (value == null || value.isEmpty()) {
+            return true;
+        }
+        if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) {
+            return Boolean.parseBoolean(value);
+        }
+        throw new IllegalStateException("agentspaces.space.renew-shortening-log must be true or false, not '"
+                + value + "'");
+    }
+
+    /**
+     * {@code agentspaces.space.horizon}: {@code per-entry} (the default) advertises {@code wire.horizon=1}, so a space
+     * whose whole view advertises it collects a withdrawn entry by the entry's own lease (SPEC §7.3, RE-H-04);
+     * {@code legacy} advertises nothing and keeps {@code 2 x maxLease}. Set {@code legacy} on a node that renews for
+     * an identity another node renews for at the same time, since the hint promises one renewing node per identity.
+     *
+     * @return true for {@code per-entry}
+     * @throws IllegalStateException naming the key when the value is neither
+     */
+    public boolean horizonPerEntry() {
+        String value = valueOf("agentspaces.space", space, "horizon");
+        if (value == null || value.isEmpty() || value.equalsIgnoreCase("per-entry")) {
+            return true;
+        }
+        if (value.equalsIgnoreCase("legacy")) {
+            return false;
+        }
+        throw new IllegalStateException("agentspaces.space.horizon must be per-entry or legacy, not '" + value + "'");
     }
 
     /** {@code agentspaces.content.*}: the content swarm (srad/large-networks-bulk-data.md appendix D). */
@@ -2520,6 +2727,167 @@ public class AgentSpacesProperties {
         private String remoteAgentName = "remoteFleet";
         private String remoteAgentDescription =
                 "Capabilities other fleet members advertise through AgentCards";
+        // reviews/embabel-agentspaces-review-2026-11-12.md §7: the bridge's second generation.
+        /** The groups the bridge spans (§7.7): empty for the first configured group, {@code *} for every group. */
+        private List<String> groups = new ArrayList<>();
+        /** {@code agent}: the card is named by {@code @Agent(name)}; {@code class}: by the class, as before (§7.2). */
+        private String cardName = "agent";
+        /** Whether an unbound map-of-1 {@code @Action} gets an implied take (§7.3). */
+        private boolean serveActions = true;
+        /** The implied takes' space; empty for the group's sole space (§7.3). */
+        private String actionSpace = "";
+        /** The implied takes' lease (§7.3). */
+        private String actionLease = "PT1M";
+        /** {@code local}, {@code invocable} or {@code omit}: what an action the binder cannot serve becomes (§7.3). */
+        private String advertiseUnserved = "local";
+        /** {@code fire-once} or {@code default}: the generated actions' retry policy (§7.5). */
+        private String remoteActionRetry = "fire-once";
+        /** {@code withdraw} or {@code leave}: the input entry after a timeout (§7.5). */
+        private String onTimeout = "withdraw";
+        /** The cost a generated action carries when its card names none, 0 to 1 (§7.6). */
+        private double remoteActionDefaultCost = 0.5;
+        /** {@code none}, {@code pre} or {@code pre-post}: which contract terms the generated actions carry (§7.6). */
+        private String carryConditions = "pre";
+        /** Quiet time before a changed action set deploys (§7.9). */
+        private long deployDebounceMillis = 250;
+        /** Least time between two generations (§7.9). */
+        private long deployMinIntervalMillis = 5_000;
+        /** How long a vanished action stays in the deployed generation (§7.9). */
+        private long absenceGraceMillis = 30_000;
+        /** {@code auto}, {@code direct} or {@code platform}: how a worker action runs (§7.8). */
+        private String takeMode = "auto";
+        /** The longest a platform-served task may run before it is killed (§7.8). */
+        private String servedMaxRun = "PT10M";
+        /** The most fleet hops a served task may make before it is refused (§7.8). */
+        private int maxHops = 4;
+
+        public List<String> getGroups() {
+            return groups;
+        }
+
+        public void setGroups(List<String> groups) {
+            this.groups = groups == null ? new ArrayList<>() : groups;
+        }
+
+        public String getCardName() {
+            return cardName;
+        }
+
+        public void setCardName(String cardName) {
+            this.cardName = cardName;
+        }
+
+        public boolean isServeActions() {
+            return serveActions;
+        }
+
+        public void setServeActions(boolean serveActions) {
+            this.serveActions = serveActions;
+        }
+
+        public String getActionSpace() {
+            return actionSpace;
+        }
+
+        public void setActionSpace(String actionSpace) {
+            this.actionSpace = actionSpace;
+        }
+
+        public String getActionLease() {
+            return actionLease;
+        }
+
+        public void setActionLease(String actionLease) {
+            this.actionLease = actionLease;
+        }
+
+        public String getAdvertiseUnserved() {
+            return advertiseUnserved;
+        }
+
+        public void setAdvertiseUnserved(String advertiseUnserved) {
+            this.advertiseUnserved = advertiseUnserved;
+        }
+
+        public String getRemoteActionRetry() {
+            return remoteActionRetry;
+        }
+
+        public void setRemoteActionRetry(String remoteActionRetry) {
+            this.remoteActionRetry = remoteActionRetry;
+        }
+
+        public String getOnTimeout() {
+            return onTimeout;
+        }
+
+        public void setOnTimeout(String onTimeout) {
+            this.onTimeout = onTimeout;
+        }
+
+        public double getRemoteActionDefaultCost() {
+            return remoteActionDefaultCost;
+        }
+
+        public void setRemoteActionDefaultCost(double remoteActionDefaultCost) {
+            this.remoteActionDefaultCost = remoteActionDefaultCost;
+        }
+
+        public String getCarryConditions() {
+            return carryConditions;
+        }
+
+        public void setCarryConditions(String carryConditions) {
+            this.carryConditions = carryConditions;
+        }
+
+        public long getDeployDebounceMillis() {
+            return deployDebounceMillis;
+        }
+
+        public void setDeployDebounceMillis(long deployDebounceMillis) {
+            this.deployDebounceMillis = deployDebounceMillis;
+        }
+
+        public long getDeployMinIntervalMillis() {
+            return deployMinIntervalMillis;
+        }
+
+        public void setDeployMinIntervalMillis(long deployMinIntervalMillis) {
+            this.deployMinIntervalMillis = deployMinIntervalMillis;
+        }
+
+        public long getAbsenceGraceMillis() {
+            return absenceGraceMillis;
+        }
+
+        public void setAbsenceGraceMillis(long absenceGraceMillis) {
+            this.absenceGraceMillis = absenceGraceMillis;
+        }
+
+        public String getTakeMode() {
+            return takeMode;
+        }
+
+        public void setTakeMode(String takeMode) {
+            this.takeMode = takeMode;
+        }
+
+        public String getServedMaxRun() {
+            return servedMaxRun;
+        }
+
+        public void setServedMaxRun(String servedMaxRun) {
+            this.servedMaxRun = servedMaxRun;
+        }
+
+        public int getMaxHops() {
+            return maxHops;
+        }
+
+        public void setMaxHops(int maxHops) {
+            this.maxHops = maxHops;
+        }
 
         public boolean isRemoteActionsEnabled() {
             return remoteActionsEnabled;

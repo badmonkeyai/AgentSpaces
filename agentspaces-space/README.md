@@ -39,6 +39,35 @@ idiom: state you stop renewing goes away.
 - **Claims first, then states.** On any delta the claim merges before the state, because a
   completion authenticates against the stored claim; the ordered log installs claims with the
   holder's own proof for the same reason (QA4 A4-5).
+- **Expiry index (2026-11-13).** Each entry is filed at the earliest time the sweep has
+  something to do for it: its lease lapse, its claim's lapse, or its collection horizon. The
+  digest, the delta and the group tick sweep only when the first of these is due, and visit
+  only the due entries, so an unchanged space answers a probe in O(1) instead of a pass over
+  every entry it has held. The digest's SHA-256 is cached beside the digest.
+  `ExpiryIndexPropertyTest` holds the indexed sweep to the old full pass on random histories,
+  at every tick, digest and delta sweep as well as at its own check points, and
+  `DigestBytesPinTest` pins the digest bytes against the released 0.6.0 jars over a fixture
+  with every kind of digest line (live entries, tombstones, claims, acknowledgements).
+- **The per-entry horizon (SPEC §7.3, v0.1.35).** While this node and every member of the
+  space's view advertise `wire.horizon=1` (`PeerNode.Builder.horizon`, on by default), a
+  withdrawn entry is collected `max(5 min, MAX_DRIFT)`, ten minutes, after its own lease
+  expiry instead of `max(2 x maxLease, MAX_DRIFT)`; completed and lapsed entries keep their
+  horizons. Under either rule a withdrawal is never collected before `MAX_DRIFT` past its
+  lease (the drift floor), so a replica whose clock trails cannot show it live again. The space reads the rule
+  from its view: an unhinted member in view turns it off at once, and it comes back only after
+  three fully hinted rounds and one maximum lease plus five minutes more
+  (`horizonMode()`, `horizonEngageRounds(int)`). The argument is in
+  `docs/proofs/per-entry-horizon.md`.
+- **Waiting takes sleep (2026-11-13).** A `take` or `read` with a timeout waits on the
+  space's change signal (a write, merge, renewal, cancel, claim, a sweep that lapses a claim,
+  a block landing), bounded by its deadline and a one-second slice, instead of polling every
+  20 ms.
+- **Writer-local spaces (2026-11-13).** `Builder.local()` is for a space only its own
+  writer reads. It registers nothing on the gossip bus, so it has no digest and no
+  anti-entropy, and its writes publish no rumor. It publishes no space advertisement either,
+  even with `advertise(...)` set, since an advertisement says the space replicates, and a
+  `FRESH` read on it starts no anti-entropy round. Leases, events and the sweep work as on a
+  replicated space, with the sweep run from the tick. Other members never see its entries.
 - **Refuse at the door.** A foreign `spaceId`, an issuer key that does not hash to the issuing
   peer, a dot not minted by the issuer, an inflated dot set, a claim past the epoch-jump or
   hold bounds, a certificate that does not cover the signing time (the record's issue stamp,
@@ -56,3 +85,4 @@ idiom: state you stop renewing goes away.
   (then `../../agentspaces-spec/golden.json`); run with `-Dgolden.required=true`.
 - `ReplicatedSpace` is one replica per space name per node by design; opening a name twice
   refuses (QA4 A4-9). Several agents on one node share it through views.
+  A writer-local space skips the bus registration, so a second handle for its name is not refused.

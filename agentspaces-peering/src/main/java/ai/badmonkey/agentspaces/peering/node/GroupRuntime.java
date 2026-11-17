@@ -88,6 +88,7 @@ public final class GroupRuntime implements AutoCloseable {
         this.advertisement = advertisement;
         this.membership = membership;
         this.gossip = gossip;
+        gossip.antiEntropyBase(advertisement.gossip().period().toMillis()); // RE-F-03: the founding's period, settable
         this.revocations = revocations;
         this.credentialRevocations = java.util.Objects.requireNonNull(credentialRevocations,
                 "credentialRevocations");
@@ -159,8 +160,10 @@ public final class GroupRuntime implements AutoCloseable {
         if (active) {
             quietRounds = 0;
         }
-        long base = advertisement.gossip().period().toMillis();
-        long period = base * Math.min(MAX_BACKOFF_MULTIPLIER, 1L << Math.min(quietRounds, 5));
+        // RE-F-03: the base period and the stretch are runtime paces on the bus; the founding sets the first base.
+        long base = gossip.antiEntropyPeriod().toMillis();
+        long period = base * Math.min(Math.min(MAX_BACKOFF_MULTIPLIER, gossip.antiEntropyStretch()),
+                1L << Math.min(quietRounds, 5));
         Long last = lastAntiEntropyMillis;
         if (last != null && nowMillis - last < period) {
             return false;
@@ -187,9 +190,33 @@ public final class GroupRuntime implements AutoCloseable {
         return membership;
     }
 
+    /**
+     * Whether the spaces of this group log, once each, the first renewal that asks for less than its lease has left
+     * (RE-H-01, {@code agentspaces.space.renew-shortening-log}); a node setting, on by default.
+     */
+    public boolean renewShorteningLog() {
+        return node == null || node.renewShorteningLog();
+    }
+
     /** Returns the group's gossip bus. */
     public GossipBus gossip() {
         return gossip;
+    }
+
+    /**
+     * This member's replication status for the group (srad/replication-by-entry.md RE-Q-MNT-02, RE-F-03): the bus's
+     * status with the membership probe's paces beside the bus's own. {@code toMap()} gives the shape a feed's
+     * {@code /healthz} and the console's panel render. For a status page: each space walks what it holds to answer.
+     *
+     * @return the status
+     */
+    public GossipBus.ReplicationStatus replicationStatus() {
+        GossipBus.ReplicationStatus bus = gossip.replicationStatus();
+        java.util.List<ai.badmonkey.agentspaces.peering.gossip.Pace.Snapshot> paces =
+                new java.util.ArrayList<>(bus.paces());
+        paces.addAll(membership.paces());
+        return new GossipBus.ReplicationStatus(bus.partnersByForm(), bus.formChanges(), bus.streams(),
+                java.util.List.copyOf(paces), bus.rounds(), bus.audit(), bus.pacing());
     }
 
     /** Returns the group's peer sampler (spec §5.2), backed by live membership. */
@@ -222,6 +249,61 @@ public final class GroupRuntime implements AutoCloseable {
             }
         }
         return true;
+    }
+
+    /**
+     * Whether this node and every member of this group's current view advertise {@link PeerNode#HORIZON_HINT}
+     * (SPEC §7.3, v0.1.35; srad/replication-by-entry.md RE-H-04): the precondition under which a space may collect a
+     * withdrawn entry by its own lease. A member whose advertisement has not arrived counts as unhinted, so a newcomer
+     * turns the answer false the moment it enters the view. An empty view answers this node's own setting: a lone
+     * node's tombstones are judged by its own conforming writers alone.
+     *
+     * <p>The answer is read live on every call; the space applies its own hysteresis on top (RE-Q-REL-09).
+     *
+     * @return true when the per-entry horizon's precondition holds for this view now
+     */
+    public boolean viewAdvertisesHorizon() {
+        if (node == null || !node.horizonPerEntry()) {
+            return false;
+        }
+        for (GroupMembership.Member member : membership.allMembers()) {
+            if (!node.advertisesHorizon(member.id())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether a member's current advertisement carries {@link PeerNode#HORIZON_HINT} (RE-H-04).
+     *
+     * @param peer the member
+     * @return true when it does
+     */
+    public boolean advertisesHorizon(PeerId peer) {
+        return node != null && node.advertisesHorizon(peer);
+    }
+
+    /**
+     * For how long a writer's promise behind {@link PeerNode#HORIZON_HINT} can be read here (RE-H-04):
+     * {@link Long#MAX_VALUE} for this node when it advertises the hint; for a member of this group's current view
+     * whose current card carries it, the time since it entered the view, on the node's clock; and -1 otherwise. A
+     * writer outside the view, on the far side of a partition or gone since, answers -1: what this node knew of its
+     * card says nothing about what it renewed while out of sight. A space trusts a writer only once this exceeds its
+     * longest lease plus the grace, so that whatever the writer renewed out of sight has lapsed and passed its own
+     * lapse horizon first.
+     *
+     * @param peer the node that wrote the entry
+     * @return milliseconds the writer has been in view and hinted, {@link Long#MAX_VALUE} for this node, or -1
+     */
+    public long hintedWriterInViewMillis(PeerId peer) {
+        if (node == null || peer == null) {
+            return -1;
+        }
+        if (peer.equals(node.identity().peerId())) {
+            return node.horizonPerEntry() ? Long.MAX_VALUE : -1;
+        }
+        return node.advertisesHorizon(peer) ? membership.inViewForMillis(peer) : -1;
     }
 
     /**

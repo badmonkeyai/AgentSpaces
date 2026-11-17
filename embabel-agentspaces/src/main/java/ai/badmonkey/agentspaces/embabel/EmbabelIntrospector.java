@@ -78,7 +78,8 @@ public final class EmbabelIntrospector {
      * @return the Embabel metadata, or empty when the class carries no
      *         {@code @Agent} annotation
      */
-    public static Optional<EmbabelAgent> introspect(Class<?> type) {
+    public static Optional<EmbabelAgent> introspect(Class<?> proxied) {
+        Class<?> type = userClass(proxied);
         Annotation agent = annotationNamed(type.getAnnotations(), AGENT_ANNOTATION);
         if (agent == null) {
             return Optional.empty();
@@ -139,6 +140,63 @@ public final class EmbabelIntrospector {
             // the attribute does not exist in this version
         }
         return ai.badmonkey.agentspaces.api.ad.CardAction.Contract.of(pre, post, cost);
+    }
+
+    /** A proxy's user class (review §7.2, X18): a CGLIB or ByteBuddy {@code $$} subclass reads as the class it proxies. */
+    public static Class<?> userClass(Class<?> type) {
+        Class<?> at = type;
+        while (at.getName().contains("$$") && at.getSuperclass() != null && at.getSuperclass() != Object.class) {
+            at = at.getSuperclass();
+        }
+        return at;
+    }
+
+    /** Whether a type is an entry type: not primitive, not a string, not one of Embabel's own. */
+    public static boolean isEntryType(Class<?> type) {
+        return type != void.class && !type.isPrimitive() && type != String.class
+                && !type.getName().startsWith("com.embabel.") && !type.getName().startsWith("java.");
+    }
+
+    /** Whether a method carries Embabel's {@code @Action}. */
+    public static boolean isAction(Method method) {
+        return annotationNamed(method.getAnnotations(), ACTION_ANNOTATION) != null;
+    }
+
+    /** Whether a method carries a space annotation of its own, so the core binder binds it under that kind. */
+    public static boolean hasOwnBinding(Method method) {
+        for (Annotation annotation : method.getAnnotations()) {
+            if (annotation.annotationType().getName().startsWith("ai.badmonkey.agentspaces.agent.annotation.")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a method takes a parameter Embabel resolves ({@code OperationContext}, {@code Ai}, …). */
+    public static boolean hasEmbabelParameters(Method method) {
+        for (Class<?> parameter : method.getParameterTypes()) {
+            if (parameter.getName().startsWith("com.embabel.")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether an action is a "map of 1" (review §7.3): exactly one entry parameter first, an entry result, and no
+     * parameter other than Embabel's own after the entry.
+     */
+    public static boolean isMapOfOne(Method method) {
+        Class<?>[] parameters = method.getParameterTypes();
+        if (parameters.length == 0 || !isEntryType(parameters[0]) || !isEntryType(method.getReturnType())) {
+            return false;
+        }
+        for (int i = 1; i < parameters.length; i++) {
+            if (!parameters[i].getName().startsWith("com.embabel.")) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static java.util.List<String> stringsAttribute(Annotation annotation, String attribute) {

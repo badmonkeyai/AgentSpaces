@@ -123,8 +123,20 @@ public final class Settlement {
     @AgentSpec(name = "reserve-sensor", description = "Contributes each reserve to the fleet's average",
             goals = {"sense reserves"})
     public static final class ReserveSensor {
+        /**
+         * The claims this peer has contributed. Pricing is an AUCTION, which picks one adjuster per claim only
+         * while every bid reaches every rival within the settle window (SPEC §7.4): beyond it two adjusters can
+         * each price a claim. The price is a pure function of the assessment, so the two priced claims agree, and
+         * keying the contribution on the claim makes it idempotent: a second priced claim adds nothing to the
+         * average.
+         */
+        private final java.util.Set<String> sensed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
         @SpaceNotify(space = Pricing.SPACE)
         public Contribution sense(PricedClaim priced) {
+            if (!sensed.add(priced.claimId())) {
+                return null; // this claim's reserve is already in the average
+            }
             return Contribution.to(RESERVE_EPOCH, priced.reserve());
         }
     }

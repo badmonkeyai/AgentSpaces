@@ -110,7 +110,7 @@ class AgentCardUiTest {
         CborCodec codec = CborCodec.defaultCodec();
         AppCard app = new AppCard("aspace://zApps/app/zPeerA/drafted-desk", PeerId.of("zPeerA"), GroupId.of("zApps"), Instant.parse("2026-11-05T10:00:00Z"),
                 Duration.ofMinutes(15), "drafted-desk", "fed", "a2ui", "desk", List.of("zApps/conversations"), List.of("open"), "", "", "", "1",
-                List.of("conversations"), new AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets"), "desk", "views", List.of("desk-1"), declaration().components()));
+                List.of("conversations"), new AppCard.Ui("a2ui", "1.0", List.of("example-widgets"), "desk", "views", List.of("desk-1"), declaration().components()));
         byte[] bytes = codec.toBytes(app);
         assertThat(codec.fromBytes(bytes, AppCard.class)).isEqualTo(app);
         @SuppressWarnings("unchecked")
@@ -118,7 +118,7 @@ class AgentCardUiTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> ui = (Map<String, Object>) keys.get("ui");
         assertThat(ui).containsKey("components");
-        AppCard plain = app.withUi(new AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets"), "desk", "views", List.of("desk-1")));
+        AppCard plain = app.withUi(new AppCard.Ui("a2ui", "1.0", List.of("example-widgets"), "desk", "views", List.of("desk-1")));
         @SuppressWarnings("unchecked")
         Map<String, Object> plainUi = (Map<String, Object>) codec.fromBytes(codec.toBytes(plain), Map.class).get("ui");
         assertThat(plainUi).as("an app card without components is byte-identical to v0.1.25").doesNotContainKey("components");

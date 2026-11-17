@@ -299,6 +299,8 @@ public class AgentSpacesAutoConfiguration {
                               List<PeerNodeCustomizer> customizers,
                               List<PeerNodeConfigurer> configurers,
                               ai.badmonkey.agentspaces.peering.node.RelayPolicy relayPolicy) {
+        // RE-Q-MNT-04: a misspelt gossip pace or space setting stops the start, naming the key, before anything runs.
+        properties.refuseUnknownKeys();
         Set<PeerAdvertisement.PeerRole> roles = rolesOf(properties);
         // The security profile decides the posture (remediation plan §4);
         // explicit transport properties are deliberate deviations from it.
@@ -340,7 +342,13 @@ public class AgentSpacesAutoConfiguration {
                 .coalesce(properties.getCoalesceMillis() > 0
                         ? java.time.Duration.ofMillis(properties.getCoalesceMillis()) : null)
                 .channelAuth(channelAuth)
-                .requireAttestation(requireAttestation);
+                .requireAttestation(requireAttestation)
+                .probeHashStreams(properties.probeHashStreams()) // RE-T-07
+                .audit(properties.audit()) // RE-T-02, annex I.6
+                .auditSessions(properties.auditSessions())
+                .auditBudget(properties.auditBudget())
+                .renewShorteningLog(properties.renewShorteningLog()) // RE-H-01
+                .horizon(properties.horizonPerEntry()); // RE-H-04, wire.horizon=1
         // ISSUE-PeerRobustness-2: the keystore directory is the node's state directory, so a
         // member admitted under an invite delegation is still admitted after a restart (R2-1.5),
         // and the application's RelayPolicy bean, when it declares one, judges each relayed frame.

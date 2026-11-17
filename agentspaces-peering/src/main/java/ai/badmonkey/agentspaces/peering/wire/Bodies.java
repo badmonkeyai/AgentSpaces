@@ -101,26 +101,243 @@ public final class Bodies {
      * sends its full {@code digests} for those streams alone. A full digest grows with the
      * state, so two members in sync exchange one small frame per round instead of two large ones.
      *
+     * <p>Under {@code wire.ae=2} (SPEC annex I.6, v0.1.35) the body gains four fields, each omitted
+     * when absent, so a body without them is byte for byte what v0.1.34 sent: {@code tree}, the
+     * nodes of a trie audit per stream; {@code ids}, the entry ids an asker fetches per stream;
+     * {@code budget}, the bytes each answer the body draws may hold; and {@code sketch}, reserved
+     * for a later reconciliation form, never sent and ignored when received. A sender puts them
+     * only in a body toward a member whose current card carries {@code wire.ae=2}, since a reader
+     * without the hint refuses a field its schema does not name. The form rules of annex I.6 are
+     * checked when the record is made, so a body that breaks one does not decode.
+     *
      * @param digests the asker's full digests by stream, or null
      * @param hashes  SHA-256 of the asker's digest by stream, or null
      * @param want    the streams whose full digests the partner asks for, or null
+     * @param tree    audit nodes by stream, at most {@value #TREE_NODES_MAX} per stream, or null
+     * @param ids     entry ids to fetch by stream, at most {@value #IDS_MAX} distinct per stream, or null
+     * @param budget  the bytes each answer this body draws may hold, positive, or null
+     * @param sketch  reserved (annex H grammar), or null
      */
-        public record Digest(Map<String, byte[]> digests,
+    public record Digest(Map<String, byte[]> digests,
                          @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, byte[]> hashes,
-                         @JsonInclude(JsonInclude.Include.NON_NULL) List<String> want) {
+                         @JsonInclude(JsonInclude.Include.NON_NULL) List<String> want,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, List<TreeNode>> tree,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, List<String>> ids,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) Long budget,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, byte[]> sketch) {
+
+        /** Nodes one stream's {@code tree} holds at most (annex I.6). */
+        public static final int TREE_NODES_MAX = 256;
+        /** Distinct ids one stream's {@code ids} holds at most (annex I.6). */
+        public static final int IDS_MAX = 4096;
+
+        /** Checks the form rules of annex I.6 that a body's own fields carry. */
+        public Digest {
+            if (tree != null) {
+                for (Map.Entry<String, List<TreeNode>> e : tree.entrySet()) {
+                    if (e.getValue().size() > TREE_NODES_MAX) {
+                        throw new IllegalArgumentException("a tree carries at most " + TREE_NODES_MAX
+                                + " nodes per stream, not " + e.getValue().size());
+                    }
+                }
+            }
+            if (ids != null) {
+                for (Map.Entry<String, List<String>> e : ids.entrySet()) {
+                    List<String> named = e.getValue();
+                    if (named.size() > IDS_MAX) {
+                        throw new IllegalArgumentException("a fetch names at most " + IDS_MAX
+                                + " ids per stream, not " + named.size());
+                    }
+                    if (new java.util.HashSet<>(named).size() != named.size()) {
+                        throw new IllegalArgumentException("a fetch names an id twice in one stream");
+                    }
+                    for (String id : named) {
+                        if (id.isEmpty()) {
+                            throw new IllegalArgumentException("an entry id is non-empty text");
+                        }
+                    }
+                }
+            }
+            if (budget != null && budget <= 0) {
+                throw new IllegalArgumentException("a budget is a positive number of bytes, not " + budget);
+            }
+        }
 
         /** A digest as older nodes send it: the full per-stream digests. */
         public Digest(Map<String, byte[]> digests) {
             this(digests, null, null);
         }
+
+        /** A body of the three fields of v0.1.17, as every member reads it. */
+        public Digest(Map<String, byte[]> digests, Map<String, byte[]> hashes, List<String> want) {
+            this(digests, hashes, want, null, null, null, null);
+        }
+
+        /** Whether the body carries a field of annex I.6, which only a member of {@code wire.ae=2} reads. */
+        public boolean carriesAudit() {
+            return tree != null || ids != null || budget != null || sketch != null;
+        }
     }
 
     /**
-     * PULL_RESP body: per-stream deltas the receiver was missing.
+     * One node of a trie audit (SPEC annex I.6, v0.1.35): its path, one nibble per byte, and exactly
+     * one of {@code count}, which marks a request and gives the asker's own count at the path,
+     * {@code nodes}, the 384-byte preimage of an inner node, and {@code lines}, the joined lines
+     * under the path. The form rules are checked here, so a node that breaks one makes its carrier
+     * undecodable and a reader never parses a malformed answer: a path of at most 64 bytes each
+     * from 0 to 15; nodes of exactly 384 bytes whose sixteen counts sum above 32 and whose empty
+     * children carry 16 zero bytes; lines that are empty text or non-empty lines free of control
+     * characters, joined by single LFs in strictly ascending unsigned byte order.
      *
-     * @param deltas stream id to opaque delta bytes
+     * @param path  the node's path, the root's empty
+     * @param count the asker's count at the path, on a request; else null
+     * @param nodes an inner node's preimage, on an answer; else null
+     * @param lines the lines under the path, on an answer; else null
      */
-    public record PullResp(Map<String, byte[]> deltas) {
+    public record TreeNode(byte[] path,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) Long count,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) byte[] nodes,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) String lines) {
+
+        /** Nibbles in a path at most. */
+        public static final int PATH_MAX = 64;
+        /** Bytes of an inner node's preimage: sixteen children of a 16-byte fingerprint and an 8-byte count. */
+        public static final int NODES_BYTES = 384;
+        /** The leaf threshold T: no inner node holds this many slots or fewer. */
+        public static final int LEAF_MAX = 32;
+
+        /** Checks the form rules of annex I.6. */
+        public TreeNode {
+            if (path == null) {
+                throw new IllegalArgumentException("a tree node names its path");
+            }
+            if (path.length > PATH_MAX) {
+                throw new IllegalArgumentException("a path holds at most 64 nibbles, not " + path.length);
+            }
+            for (byte b : path) {
+                if (b < 0 || b > 0x0F) {
+                    throw new IllegalArgumentException("a path byte is a nibble from 0 to 15, not " + (b & 0xFF));
+                }
+            }
+            int set = (count != null ? 1 : 0) + (nodes != null ? 1 : 0) + (lines != null ? 1 : 0);
+            if (set != 1) {
+                throw new IllegalArgumentException("a tree node holds exactly one of count, nodes and lines, not " + set);
+            }
+            if (count != null && count < 0) {
+                throw new IllegalArgumentException("a count is not negative: " + count);
+            }
+            if (nodes != null) {
+                checkNodes(nodes);
+            }
+            if (lines != null) {
+                checkLines(lines);
+            }
+        }
+
+        /** A request for the node at a path, carrying the asker's own count there. */
+        public static TreeNode request(byte[] path, long count) {
+            return new TreeNode(path, count, null, null);
+        }
+
+        /** An answer of an inner node's preimage. */
+        public static TreeNode inner(byte[] path, byte[] nodes) {
+            return new TreeNode(path, null, nodes, null);
+        }
+
+        /** An answer of lines. */
+        public static TreeNode lines(byte[] path, String lines) {
+            return new TreeNode(path, null, null, lines);
+        }
+
+        private static void checkNodes(byte[] nodes) {
+            if (nodes.length != NODES_BYTES) {
+                throw new IllegalArgumentException("nodes are exactly 384 bytes, not " + nodes.length);
+            }
+            long sum = 0;
+            for (int child = 0; child < 16; child++) {
+                int at = child * 24;
+                long count = 0;
+                for (int i = 0; i < 8; i++) {
+                    count = (count << 8) | (nodes[at + 16 + i] & 0xFF);
+                }
+                if (count < 0) {
+                    throw new IllegalArgumentException("a child's count is past every set a member can hold");
+                }
+                if (count == 0) {
+                    for (int i = 0; i < 16; i++) {
+                        if (nodes[at + i] != 0) {
+                            throw new IllegalArgumentException("an empty child carries 16 zero bytes");
+                        }
+                    }
+                }
+                sum += count;
+                if (sum < 0) {
+                    throw new IllegalArgumentException("the children's counts overflow");
+                }
+            }
+            if (sum <= LEAF_MAX) {
+                throw new IllegalArgumentException("an inner node holds more than 32 slots, not " + sum);
+            }
+        }
+
+        private static void checkLines(String lines) {
+            if (lines.isEmpty()) {
+                return;
+            }
+            byte[] previous = null;
+            int from = 0;
+            while (true) {
+                int lf = lines.indexOf('\n', from);
+                String line = lf < 0 ? lines.substring(from) : lines.substring(from, lf);
+                if (line.isEmpty()) {
+                    throw new IllegalArgumentException("lines hold no empty line");
+                }
+                for (int i = 0; i < line.length(); i++) {
+                    char ch = line.charAt(i);
+                    if (ch < 0x20 || ch == 0x7F) {
+                        throw new IllegalArgumentException("a line holds no control character");
+                    }
+                }
+                byte[] bytes = line.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                if (previous != null && java.util.Arrays.compareUnsigned(previous, bytes) >= 0) {
+                    throw new IllegalArgumentException("lines are in strictly ascending order");
+                }
+                previous = bytes;
+                if (lf < 0) {
+                    return;
+                }
+                from = lf + 1;
+            }
+        }
+    }
+
+    /**
+     * PULL_RESP body: per-stream deltas the receiver was missing. Under {@code wire.ae=2} (SPEC
+     * annex I.6) an answer to a body that carried {@code budget} also says, per stream, how many
+     * states the partner held for the request and left out for the budget; the field is omitted
+     * otherwise, so the body is what v0.1.34 sent.
+     *
+     * @param deltas    stream id to opaque delta bytes
+     * @param remainder states left out for the budget by stream, none negative, or null
+     */
+    public record PullResp(Map<String, byte[]> deltas,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) Map<String, Long> remainder) {
+
+        /** Checks that no remainder is negative. */
+        public PullResp {
+            if (remainder != null) {
+                for (Long left : remainder.values()) {
+                    if (left < 0) {
+                        throw new IllegalArgumentException("a remainder is not negative: " + left);
+                    }
+                }
+            }
+        }
+
+        /** A delta answer as every member sends it, with no remainder. */
+        public PullResp(Map<String, byte[]> deltas) {
+            this(deltas, null);
+        }
     }
 
     /**

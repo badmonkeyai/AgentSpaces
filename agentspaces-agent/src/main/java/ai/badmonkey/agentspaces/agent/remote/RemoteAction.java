@@ -63,6 +63,14 @@ public final class RemoteAction {
     RemoteAction(AgentCard card, Class<?> inputType, Class<?> outputType,
                  Space taskSpace, Space resultSpace, Correlation correlation,
                  Lease writeLease, ai.badmonkey.agentspaces.api.ad.CardAction declared) {
+        this(card, inputType, outputType, taskSpace, resultSpace, correlation, writeLease, declared, java.util.Map.of());
+    }
+
+    RemoteAction(AgentCard card, Class<?> inputType, Class<?> outputType,
+                 Space taskSpace, Space resultSpace, Correlation correlation,
+                 Lease writeLease, ai.badmonkey.agentspaces.api.ad.CardAction declared,
+                 java.util.Map<String, String> tags) {
+        this.tags = java.util.Map.copyOf(tags);
         this.declared = declared;
         this.card = card;
         this.inputType = inputType;
@@ -74,8 +82,24 @@ public final class RemoteAction {
     }
 
     /** Returns the advertising agent's card. */
+    /** The tags every input this action writes carries: the address of an implied action (SPEC §10.6), else none. */
+    private final java.util.Map<String, String> tags;
+
+    /** What happens to the input entry when no result arrives in time (review §7.5). */
+    public enum OnTimeout {
+        /** Leave it: a late worker may still do the work, and the entry lapses with its write lease. */
+        LEAVE,
+        /** Withdraw it, unless a worker already holds it under a live take claim. */
+        WITHDRAW
+    }
+
     public AgentCard card() {
         return card;
+    }
+
+    /** The tags every input this action writes carries. */
+    public java.util.Map<String, String> tags() {
+        return tags;
     }
 
     /** Returns the input entry type this action consumes. */
@@ -157,8 +181,23 @@ public final class RemoteAction {
      * @return the result entry, or empty when none arrived within the timeout
      */
     public Optional<Object> invoke(Object input, Duration timeout) {
+        return invoke(input, timeout, OnTimeout.LEAVE);
+    }
+
+    /**
+     * Invokes the action, saying what to do with the input when no result arrives in time (review §7.5):
+     * {@link OnTimeout#WITHDRAW} cancels the written entry, which the space refuses while a worker holds it
+     * under a live take claim, so a withdrawal never robs a worker mid-task.
+     *
+     * @param input     the input entry
+     * @param timeout   how long to wait
+     * @param onTimeout what to do with the input on a timeout
+     * @return the result, or empty when none arrived within the timeout
+     */
+    public Optional<Object> invoke(Object input, Duration timeout, OnTimeout onTimeout) {
         Objects.requireNonNull(input, "input");
         Objects.requireNonNull(timeout, "timeout");
+        Objects.requireNonNull(onTimeout, "onTimeout");
         if (!inputType.isInstance(input)) {
             throw new IllegalArgumentException("input must be a " + inputType.getName()
                     + ": " + input.getClass().getName());
@@ -173,9 +212,12 @@ public final class RemoteAction {
         // the readAll backstop cannot resurrect a stale result.
         List<Object> baseline = new ArrayList<>(resultSpace.readAll(resultTemplate, 1_000));
         Subscription subscription = subscribeResults(observed);
+        ai.badmonkey.agentspaces.api.space.EntryHandle written = null;
         try {
-            taskSpace.write(input, writeLease);
+            written = tags.isEmpty() ? taskSpace.write(input, writeLease) : taskSpace.write(input, writeLease, tags);
             long deadline = System.nanoTime() + timeout.toNanos();
+            // The poll backstop backs off from 100 ms to 2 s (review §7.5, A5); a subscription event resets it.
+            long backoffMillis = 100;
             while (System.nanoTime() < deadline) {
                 Object event;
                 while ((event = observed.poll()) != null) {
@@ -193,7 +235,16 @@ public final class RemoteAction {
                         return Optional.of(candidate);
                     }
                 }
-                sleep(Duration.ofMillis(100));
+                long remaining = Math.max(1, (deadline - System.nanoTime()) / 1_000_000);
+                sleep(Duration.ofMillis(Math.min(backoffMillis, remaining)));
+                backoffMillis = observed.isEmpty() ? Math.min(backoffMillis * 2, 2_000) : 100;
+            }
+            if (onTimeout == OnTimeout.WITHDRAW && stillOffered(written.entryId())) {
+                try {
+                    written.cancel();
+                } catch (RuntimeException e) {
+                    // a withdrawal is best effort: the write lease bounds the entry anyway
+                }
             }
             return Optional.empty();
         } finally {
@@ -228,6 +279,25 @@ public final class RemoteAction {
                 observed.add(spaceEvent.entry());
             }
         }, Lease.of(Duration.ofMinutes(10)));
+    }
+
+    /**
+     * Whether the input is still on offer under its write lease (review §7.5, X8): a space lists a taken entry
+     * under its take lease or not at all, so an entry a worker already holds is never withdrawn from under it.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private boolean stillOffered(ai.badmonkey.agentspaces.api.entry.EntryId entryId) {
+        try {
+            List<Space.Entry<Object>> listed = taskSpace.readAllEntries((Template) Template.of(inputType), 1_000);
+            for (Space.Entry<?> entry : listed) {
+                if (entry.entryId().equals(entryId)) {
+                    return entry.lease().kind() == ai.badmonkey.agentspaces.api.entry.LeaseKind.WRITE;
+                }
+            }
+            return false; // gone, or held under a take claim this replica does not list
+        } catch (UnsupportedOperationException e) {
+            return true; // a space without entry reads: withdraw, as the handle allows
+        }
     }
 
     /** Multiset difference: entries in {@code current} beyond their baseline count. */

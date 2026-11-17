@@ -37,6 +37,8 @@ import ai.badmonkey.agentspaces.content.MemoryPieceStore;
 import ai.badmonkey.agentspaces.discovery.AdCache;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.measure.SimWait;
+import ai.badmonkey.agentspaces.measure.Wait;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
 import ai.badmonkey.agentspaces.pdt.Pdt;
 import ai.badmonkey.agentspaces.pdt.values.Codec;
@@ -245,6 +247,31 @@ final class StoreFleet implements AutoCloseable {
             tickAll();
             Thread.sleep(3);
         }
+        return true;
+    }
+
+    /**
+     * A measured wait on this fleet (srad/feature-measurements.md §3.5, FM-L-03): the clock is fake while the stores'
+     * take loops and fetches run on their own threads, so it keeps the wall ceiling the site had and records the
+     * ticks, the fake milliseconds and the tick rate beside the wall time (FM-H-14). The tick ceiling is left open, so
+     * it never binds earlier than the wall ceiling did; tightening it is a change of its own.
+     *
+     * @return true; a passed ceiling fails with the diagnostics
+     */
+    boolean runUntil(String metric, Duration max, BooleanSupplier until) {
+        return runUntil(metric, max, until, () -> "");
+    }
+
+    boolean runUntil(String metric, Duration max, BooleanSupplier until, java.util.function.Supplier<String> diagnostics) {
+        SimWait.mixed(metric, Integer.MAX_VALUE, max, () -> {
+            tickAll();
+            try {
+                Thread.sleep(3); // the stores' own threads run between ticks, as in runUntil below
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while ticking the store fleet", e);
+            }
+        }, clock::millis, until, Wait.with().diagnostics(diagnostics));
         return true;
     }
 

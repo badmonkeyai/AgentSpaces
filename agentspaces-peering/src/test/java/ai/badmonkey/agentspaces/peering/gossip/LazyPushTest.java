@@ -891,7 +891,7 @@ class LazyPushTest {
     }
 
     @Test
-    void theProbeHashesFollowTheStatesAndTheRootStandsInAboveSixteen() {
+    void theProbeHashesFollowTheStatesAndTheRootStandsInAboveTheBound() {
         assertThat(bus.probeHashes()).isNull();
         assertThat(bus.rootDigest()).isNull();
         bus.reconcile("space:a", state("A"));

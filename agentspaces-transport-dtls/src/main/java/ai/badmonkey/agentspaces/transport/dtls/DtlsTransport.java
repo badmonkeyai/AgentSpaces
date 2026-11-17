@@ -37,8 +37,6 @@ import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCryptoProvider;
 
 import java.io.IOException;
 import java.math.BigInteger;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
@@ -263,11 +261,11 @@ public final class DtlsTransport implements Transport, AutoCloseable {
             throw new IOException("cannot resolve " + address);
         }
         DtlsOptions opts = options;
-        DatagramSocket socket = BcSupport.dialSocket(remote);
+        DialSocket socket = DialSocket.open(remote);
         PeerDatagramTransport path = new PeerDatagramTransport(
-                (buf, off, len, to) -> socket.send(new DatagramPacket(buf, off, len, to)),
+                socket::send,
                 opts.mtu(), remote, socket::close);
-        Thread.ofVirtual().name("dtls-dial-" + remote).start(() -> readLoop(socket, path));
+        socket.start(path, counters, "dtls-dial-" + remote);
         AspaceDtlsClient client = new AspaceDtlsClient(crypto, credential, bcCertificate,
                 BcSupport.versions(opts.protocols()), opts.connectionId(), DIAL_TIMEOUT_MILLIS);
         DTLSTransport dtls;
@@ -276,8 +274,12 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         } catch (IOException | RuntimeException e) {
             counters.handshakesFailed.increment();
             path.close();
+            if (socket.refused()) {
+                throw new IOException("cannot reach " + address + " over DTLS: port unreachable, nothing listens there", e);
+            }
             throw new IOException("cannot reach " + address + " over DTLS: " + e.getMessage(), e);
         }
+        socket.established();
         X509Certificate[] chain = BcSupport.x509(client.presented());
         DtlsAssociation[] self = new DtlsAssociation[1];
         DtlsAssociation association = new DtlsAssociation(RecordLayer.dtls(dtls), path, attest(chain), chain, opts, timers,
@@ -287,32 +289,6 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         track(association);
         association.start();
         return association;
-    }
-
-    /**
-     * A dialer's socket is unconnected, so it keeps working if this host's
-     * address changes (DT-K-05); it accepts datagrams from the dialed peer only.
-     */
-    private void readLoop(DatagramSocket socket, PeerDatagramTransport path) {
-        byte[] buf = new byte[PeerDatagramTransport.RECEIVE_LIMIT];
-        DatagramPacket packet = new DatagramPacket(buf, buf.length);
-        while (!socket.isClosed()) {
-            try {
-                packet.setLength(buf.length);
-                socket.receive(packet);
-            } catch (IOException e) {
-                return;
-            }
-            InetSocketAddress source = (InetSocketAddress) packet.getSocketAddress();
-            if (!source.equals(path.remote())) {
-                counters.datagramsDropped.increment();
-                continue;
-            }
-            byte[] bytes = java.util.Arrays.copyOf(buf, packet.getLength());
-            if (!path.offer(new PeerDatagramTransport.Datagram(bytes, source))) {
-                counters.datagramsDropped.increment();
-            }
-        }
     }
 
     @Override

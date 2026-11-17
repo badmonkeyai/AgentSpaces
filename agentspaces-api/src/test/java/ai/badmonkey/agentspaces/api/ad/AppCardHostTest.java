@@ -45,7 +45,7 @@ class AppCardHostTest {
     static AppCard plain(Instant at) {
         return new AppCard("aspace://zApps/app/zPeerA/support-chat", PeerId.of("zPeerA"), GroupId.of("zApps"), at,
                 Duration.ofMinutes(15), "Support chat", "fed", "a2ui", "support", List.of("zApps/conversations"), List.of("ask"), "", "", "", "1",
-                List.of("conversations"), new AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets", "agentspaces-viz"), "summariser", "views",
+                List.of("conversations"), new AppCard.Ui("a2ui", "1.0", List.of("example-widgets", "agentspaces-viz"), "summariser", "views",
                         List.of("chat-1")));
     }
 

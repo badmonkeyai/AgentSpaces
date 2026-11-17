@@ -89,9 +89,38 @@ class EmbabelFleetPlanningTest {
         }
     }
 
-    /** The Embabel application: its only agent arrives from the fleet. */
+    /** A ping the fleet hands to the Embabel application's own worker. */
+    public record Ping(String text) {
+    }
+
+    /** The echo that worker produces, carrying the Embabel process id it ran under. */
+    public record Echoed(String text, String processId, boolean takeContextSeen) {
+    }
+
+    /**
+     * A worker served through the platform (review §7.8): its @SpaceTake takes OperationContext beside the
+     * entry, so the core take loop cannot call it directly; each taken Ping runs as an Embabel process on this
+     * agent, aimed at an Echoed.
+     */
+    @com.embabel.agent.api.annotation.Agent(name = "echo", description = "Echoes a ping through the platform")
+    public static class Echo {
+        @com.embabel.agent.api.annotation.Action
+        @com.embabel.agent.api.annotation.AchievesGoal(description = "an echo of the ping")
+        @SpaceTake(space = "work", pollTimeout = "PT0.2S", lease = "PT20S")
+        public Echoed echo(Ping ping, com.embabel.agent.api.common.OperationContext context) {
+            return new Echoed(ping.text(), context.getAgentProcess().getId(),
+                    ai.badmonkey.agentspaces.agent.TakeContext.current().isPresent());
+        }
+    }
+
+    /** The Embabel application: one fleet-served worker of its own, and the planner's actions from the fleet. */
     @SpringBootApplication
     public static class PlannerApp {
+
+        @Bean
+        Echo echo() {
+            return new Echo();
+        }
 
         /** A model the platform can resolve; the fleet plan never calls it. */
         @Bean
@@ -192,6 +221,23 @@ class EmbabelFleetPlanningTest {
             Summary summary = AgentInvocation.create(platform, Summary.class)
                     .invoke(new Brief("tuple spaces"));
             assertThat(summary.text()).isEqualTo("summary of tuple spaces");
+
+            // Review §7.8: the application's own worker takes OperationContext, so the fleet's Ping runs as an
+            // Embabel process on the echo agent; the Echoed comes back with that process's id.
+            assertThat(platform.agents()).extracting(a -> a.getName()).contains("echo");
+            worker.work().write(new Ping("hello"), ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofMinutes(1)));
+            deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+            java.util.List<Echoed> echoed = java.util.List.of();
+            while (echoed.isEmpty() && System.nanoTime() < deadline) {
+                Thread.sleep(200);
+                echoed = worker.work().readAll(ai.badmonkey.agentspaces.api.space.Template.of(Echoed.class), 10);
+            }
+            assertThat(echoed).as("the platform-served worker answered").hasSize(1);
+            assertThat(echoed.get(0).text()).isEqualTo("hello");
+            assertThat(echoed.get(0).processId()).isNotBlank();
+            // The take context rides the thread Embabel runs the action on, so renewal and the agent identity of
+            // nested writes are available inside a served action (review §10.2, S6).
+            assertThat(echoed.get(0).takeContextSeen()).isTrue();
         }
     }
 }

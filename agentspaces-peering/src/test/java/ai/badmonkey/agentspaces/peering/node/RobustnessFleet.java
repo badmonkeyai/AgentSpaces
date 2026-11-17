@@ -23,6 +23,8 @@ import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.peering.gossip.ReconcilableState;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
+import ai.badmonkey.agentspaces.test.FleetInvariants;
+import ai.badmonkey.agentspaces.test.FleetProbe;
 import ai.badmonkey.agentspaces.test.SimNetwork;
 import ai.badmonkey.agentspaces.test.TestClock;
 
@@ -34,6 +36,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -184,10 +187,53 @@ final class RobustnessFleet {
             assertThat(runtime.gossip().lazyPeers()).as("%s prunes members only", address)
                     .allSatisfy(peer -> assertThat(expected).contains(peer));
         }
-        String reference = inventories.values().iterator().next().digestString();
-        for (Map.Entry<String, Inventory> entry : inventories.entrySet()) {
-            assertThat(entry.getValue().digestString()).as("%s's inventory converged", entry.getKey()).isEqualTo(reference);
-        }
+        // the shared minimal oracle (srad/spoiler-peers.md SP-O-01): every inventory converged, no honest member
+        // quarantined; the views, connections and lazy peers above are this fleet's fuller set
+        assertThat(FleetInvariants.state(probe(), true)).as("the fleet invariants").isEmpty();
+    }
+
+    /**
+     * This fleet as the shared oracle reads it: each member's inventory as its root, and, as the punished,
+     * the members it quarantines (strikes are left out, as this fleet's invariants always left them out:
+     * several scenarios strike honest members for frames the scenario itself made stale).
+     */
+    FleetProbe probe() {
+        return new FleetProbe() {
+            @Override
+            public Set<String> members() {
+                return Set.copyOf(nodes.keySet());
+            }
+
+            @Override
+            public Map<String, String> roots(String member) {
+                return Map.of("inventory", inventories.get(member).digestString());
+            }
+
+            @Override
+            public Map<String, Long> drops(String member) {
+                PeerNode node = nodes.get(member);
+                return Map.of("stale", node.framesStale(), "replay", node.framesReplayed(),
+                        "undecodable", node.framesDropped(), "logical", node.framesLogicalRefused(),
+                        "farFuture", node.framesFarFuture());
+            }
+
+            @Override
+            public Set<String> punished(String member) {
+                PeerNode node = nodes.get(member);
+                Set<String> out = new java.util.TreeSet<>();
+                nodes.forEach((other, peer) -> {
+                    if (!other.equals(member) && node.quarantined(peer.peerId())) {
+                        out.add(other);
+                    }
+                });
+                return out;
+            }
+
+            @Override
+            public List<Throwable> errors(String member) {
+                return List.of();
+            }
+        };
     }
 
     /** Ticks until the invariants hold or the budget runs out; returns whether they held. */

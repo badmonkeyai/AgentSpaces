@@ -119,26 +119,11 @@ public final class UdpTransport implements Transport, AutoCloseable {
             throw new IOException("cannot resolve " + address);
         }
         DtlsOptions opts = options;
-        DatagramSocket socket = BcSupport.dialSocket(remote);
+        DialSocket socket = DialSocket.open(remote);
         PeerDatagramTransport path = new PeerDatagramTransport(
-                (buf, off, len, to) -> socket.send(new DatagramPacket(buf, off, len, to)),
+                socket::send,
                 opts.mtu(), remote, socket::close);
-        Thread.ofVirtual().name("udp-dial-" + remote).start(() -> {
-            byte[] buf = new byte[PeerDatagramTransport.RECEIVE_LIMIT];
-            DatagramPacket packet = new DatagramPacket(buf, buf.length);
-            while (!socket.isClosed()) {
-                try {
-                    packet.setLength(buf.length);
-                    socket.receive(packet);
-                } catch (IOException e) {
-                    return;
-                }
-                if (packet.getSocketAddress().equals(remote)) {
-                    path.offer(new PeerDatagramTransport.Datagram(
-                            java.util.Arrays.copyOf(buf, packet.getLength()), remote));
-                }
-            }
-        });
+        socket.start(path, counters, "udp-dial-" + remote);
         long nonce = random.nextLong();
         byte[] hello = ByteBuffer.allocate(HELLO_LENGTH).put((byte) Pdu.VERSION).put((byte) HELLO)
                 .putShort((short) 0).putLong(nonce).array();
@@ -165,6 +150,10 @@ public final class UdpTransport implements Transport, AutoCloseable {
             }
         } catch (IOException e) {
             path.close();
+            if (socket.refused()) {
+                counters.handshakesFailed.increment();
+                throw new IOException("cannot reach " + address + " over UDP: port unreachable, nothing listens there", e);
+            }
             throw e;
         }
         if (!answered) {
@@ -172,6 +161,7 @@ public final class UdpTransport implements Transport, AutoCloseable {
             path.close();
             throw new IOException("cannot reach " + address + " over UDP: no HELLO_ACK");
         }
+        socket.established();
         return open(path, token, opts, () -> { });
     }
 

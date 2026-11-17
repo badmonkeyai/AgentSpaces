@@ -18,61 +18,63 @@ package ai.badmonkey.agentspaces.embabel;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.context.SmartLifecycle;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
- * Deploys the generated remote-fleet agent onto the application's Embabel
- * {@code AgentPlatform} bean automatically (spec §10.6). The class doubles as
- * a {@link BeanPostProcessor} so it sees the platform bean the moment Spring
- * initializes it — detected reflectively by type name, exactly as the bridge
- * itself reaches the platform, so the module still compiles with no Embabel
- * artifact — and hands it to the {@link EmbabelRemoteActionsDeployer}; on
- * context start the deployer's watcher begins polling the fleet's cards and
- * (re)deploys whenever the advertised action set changes, and on context stop
- * it stops. Built with no bridge (the remote-actions bridge disabled) the
- * lifecycle is inert.
+ * Deploys the generated remote-fleet agents onto the application's Embabel {@code AgentPlatform} bean
+ * automatically (spec §10.6), one deployer per bridge bean (review §7.7). The class doubles as a
+ * {@link BeanPostProcessor} so it sees the platform bean the moment Spring initializes it, detected
+ * reflectively by type name so the module still compiles with no Embabel artifact, and hands it to every
+ * {@link EmbabelRemoteActionsDeployer}; on context start each deployer's watcher begins polling, and on
+ * context stop it stops. Built with no bridge the lifecycle is inert.
  */
-public final class EmbabelRemoteActionsDeployerLifecycle
-        implements SmartLifecycle, BeanPostProcessor {
+public final class EmbabelRemoteActionsDeployerLifecycle implements SmartLifecycle, BeanPostProcessor {
 
     /** The Embabel platform type the deployer looks for, by name. */
     public static final String AGENT_PLATFORM_TYPE = "com.embabel.agent.core.AgentPlatform";
 
-    private final Supplier<Optional<EmbabelRemoteActionsDeployer>> source;
-    private volatile Optional<EmbabelRemoteActionsDeployer> resolved;
+    private final Supplier<List<EmbabelRemoteActionsDeployer>> source;
+    private volatile List<EmbabelRemoteActionsDeployer> resolved;
     private volatile boolean running;
 
     /**
-     * Creates the lifecycle.
+     * Creates the lifecycle over one deployer, or none.
      *
      * @param deployer the deployer to drive, or empty for an inert lifecycle
      */
     public EmbabelRemoteActionsDeployerLifecycle(Optional<EmbabelRemoteActionsDeployer> deployer) {
-        Optional<EmbabelRemoteActionsDeployer> fixed = Objects.requireNonNull(deployer, "deployer");
+        List<EmbabelRemoteActionsDeployer> fixed = Objects.requireNonNull(deployer, "deployer")
+                .map(List::of).orElse(List.of());
         this.source = () -> fixed;
     }
 
     /**
-     * Creates the lifecycle over a deployer resolved lazily, when the platform
-     * bean appears or the context starts: as a post-processor this bean is
-     * created early, and resolving the bridge then would build the fabric
-     * before the context's other post-processors are registered.
+     * Creates the lifecycle over deployers resolved lazily, when the platform bean appears or the context
+     * starts: as a post-processor this bean is created early, and resolving the bridges then would build the
+     * fabric before the context's other post-processors are registered.
      *
-     * @param deployer supplies the deployer, or empty for an inert lifecycle
+     * @param deployers supplies the deployers, one per bridge; empty for an inert lifecycle
      */
-    public EmbabelRemoteActionsDeployerLifecycle(Supplier<Optional<EmbabelRemoteActionsDeployer>> deployer) {
-        this.source = Objects.requireNonNull(deployer, "deployer");
+    public EmbabelRemoteActionsDeployerLifecycle(Supplier<List<EmbabelRemoteActionsDeployer>> deployers) {
+        this.source = Objects.requireNonNull(deployers, "deployers");
     }
 
-    /** Returns the deployer this lifecycle drives, when the bridge is enabled. */
+    /** Returns the first deployer this lifecycle drives, when any bridge is enabled. */
     public Optional<EmbabelRemoteActionsDeployer> deployer() {
-        Optional<EmbabelRemoteActionsDeployer> current = resolved;
+        List<EmbabelRemoteActionsDeployer> all = deployers();
+        return all.isEmpty() ? Optional.empty() : Optional.of(all.get(0));
+    }
+
+    /** Returns every deployer this lifecycle drives, one per bridge. */
+    public List<EmbabelRemoteActionsDeployer> deployers() {
+        List<EmbabelRemoteActionsDeployer> current = resolved;
         if (current == null) {
             synchronized (this) {
                 if (resolved == null) {
-                    resolved = source.get();
+                    resolved = List.copyOf(source.get());
                 }
                 current = resolved;
             }
@@ -81,8 +83,8 @@ public final class EmbabelRemoteActionsDeployerLifecycle
     }
 
     /**
-     * Whether a bean is an Embabel {@code AgentPlatform}: any supertype or
-     * interface in its hierarchy carries the platform's type name.
+     * Whether a bean is an Embabel {@code AgentPlatform}: any supertype or interface in its hierarchy carries
+     * the platform's type name.
      *
      * @param bean the bean
      * @return true when the bean is a platform
@@ -111,17 +113,17 @@ public final class EmbabelRemoteActionsDeployerLifecycle
     @Override
     public Object postProcessAfterInitialization(Object bean, String beanName) {
         if (isAgentPlatform(bean)) {
-            deployer().ifPresent(deployer -> deployer.deployWhenReady(bean));
+            deployers().forEach(deployer -> deployer.deployWhenReady(bean));
         }
         return bean;
     }
 
     @Override
     public synchronized void start() {
-        if (running || deployer().isEmpty()) {
+        if (running || deployers().isEmpty()) {
             return;
         }
-        deployer().get().start();
+        deployers().forEach(EmbabelRemoteActionsDeployer::start);
         running = true;
     }
 
@@ -131,7 +133,7 @@ public final class EmbabelRemoteActionsDeployerLifecycle
             return;
         }
         running = false;
-        deployer().ifPresent(EmbabelRemoteActionsDeployer::stop);
+        deployers().forEach(EmbabelRemoteActionsDeployer::stop);
     }
 
     @Override

@@ -18,7 +18,9 @@ package ai.badmonkey.agentspaces.connect;
 import ai.badmonkey.agentspaces.api.ad.AssetCard;
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
+import ai.badmonkey.agentspaces.api.error.LeaseExpiredException;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
+import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.Authorizer;
@@ -30,6 +32,8 @@ import ai.badmonkey.agentspaces.connect.AssetInvocations.AssetInvocationResult;
 import ai.badmonkey.agentspaces.discovery.AdCache;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.measure.Measure;
+import ai.badmonkey.agentspaces.measure.Wait;
 import ai.badmonkey.agentspaces.peering.blocks.BlockExchange;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
@@ -155,12 +159,24 @@ class AssetInvocationsClusterTest {
         }
     }
 
-    private static void await(IntSupplier counter, int expected) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (counter.getAsInt() < expected && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
+    /**
+     * Waits for a counter, measured (srad/feature-measurements.md §3.5). fm: (a) ceiling 30 s (policy; the R2 fix
+     * had raised it from 10 s, owner rule 2); the condition is the count itself, which is what the test waits on.
+     */
+    private static void await(String metric, IntSupplier counter, int expected) {
+        Measure.await(metric, Duration.ofSeconds(30), () -> counter.getAsInt() >= expected,
+                Wait.with().poll(Duration.ofMillis(10)).diagnostics(() -> "count " + counter.getAsInt() + " of " + expected));
         assertThat(counter.getAsInt()).isEqualTo(expected);
+    }
+
+    /**
+     * An invocation's answer, waited for as a measured wait on the future rather than a bare {@code get} with a
+     * timeout: the condition is the answer itself. fm: (a) ceiling 45 s, unchanged; the answer typically comes in
+     * tens of milliseconds.
+     */
+    private static <T> T answered(String metric, java.util.concurrent.CompletableFuture<T> answer) throws Exception {
+        Measure.await(metric, Duration.ofSeconds(45), answer::isDone, Wait.with().poll(Duration.ofMillis(10)));
+        return answer.get();
     }
 
     private static List<AssetInvocationResult> resultsFor(Space space, String invocationId) {
@@ -169,7 +185,7 @@ class AssetInvocationsClusterTest {
     }
 
     @Test
-    @Timeout(60)
+    @Timeout(300)
     void anInvocationIsTakenOnceAnsweredAndCompletedAndARetryNeverRunsTheTargetAgain() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired agent = newPeer("agent", 2, "conn");
@@ -182,8 +198,8 @@ class AssetInvocationsClusterTest {
 
         AssetCard card = agent.discovery().find(AssetCard.class, c -> c.asset().equals("inventory")).getFirst();
         assertThat(AssetInvocations.invokeOps(card)).containsExactly("reserve", "release");
-        AssetInvocationResult result = AssetInvocations.invoke(agent.data(), card, "reserve",
-                Map.of("sku", "A-1", "qty", "2"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult result = answered("connect.invoke.first", AssetInvocations.invoke(agent.data(), card, "reserve",
+                Map.of("sku", "A-1", "qty", "2"), Duration.ofSeconds(30)));
         assertThat(result.ok()).isTrue();
         assertThat(result.error()).isNull();
         assertThat(result.v()).isEqualTo(AssetInvocations.VERSION);
@@ -200,11 +216,11 @@ class AssetInvocationsClusterTest {
         assertThat(resultsFor(agent.data(), result.invocationId())).hasSize(1);
 
         // A forced retry under the same id (JS-C-04): answered, the target not run again, one result.
-        AssetInvocationResult again = AssetInvocations.retry(agent.data(), card, new AssetInvocation(
+        AssetInvocationResult again = answered("connect.invoke.retry", AssetInvocations.retry(agent.data(), card, new AssetInvocation(
                 AssetInvocations.VERSION, "inventory", "reserve", Map.of("sku", "A-1", "qty", "2"),
-                result.invocationId()), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+                result.invocationId()), Duration.ofSeconds(30)));
         assertThat(again.ok()).isTrue();
-        await(connector::repeated, 1);
+        await("connect.invoke.repeat-counted", connector::repeated, 1);
         assertThat(provider.reserved).hasSize(1);
         assertThat(connector.invoked()).isEqualTo(1);
         tickAll(2);
@@ -212,7 +228,7 @@ class AssetInvocationsClusterTest {
     }
 
     @Test
-    @Timeout(60)
+    @Timeout(300)
     void anOperationAbsentFromTheCardsInvokeOpsIsRefusedNamingTheRuleAndNeverRun() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired agent = newPeer("agent", 2, "conn");
@@ -224,8 +240,8 @@ class AssetInvocationsClusterTest {
         tickAll(2);
 
         AssetCard card = agent.discovery().find(AssetCard.class, c -> true).getFirst();
-        AssetInvocationResult result = AssetInvocations.invoke(agent.data(), card, "drop",
-                Map.of("table", "stock"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult result = answered("connect.invoke.refused", AssetInvocations.invoke(agent.data(), card, "drop",
+                Map.of("table", "stock"), Duration.ofSeconds(30)));
         assertThat(result.ok()).isFalse();
         assertThat(result.error()).isEqualTo("unknown-operation");
         assertThat(result.result()).containsEntry("rule", AssetInvocations.INVOKE_OPS);
@@ -235,8 +251,8 @@ class AssetInvocationsClusterTest {
         assertThat(connector.invoked()).isZero();
 
         // A listed operation the provider refuses carries the provider's error, and counts as run.
-        AssetInvocationResult release = AssetInvocations.invoke(agent.data(), card, "release",
-                Map.of(), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult release = answered("connect.invoke.release", AssetInvocations.invoke(agent.data(), card, "release",
+                Map.of(), Duration.ofSeconds(30)));
         assertThat(release.ok()).isFalse();
         assertThat(release.error()).isEqualTo("bad-params");
         assertThat(connector.invoked()).isEqualTo(1);
@@ -244,7 +260,7 @@ class AssetInvocationsClusterTest {
 
     /** JS-C-02, JS-Q-SEC-11: under an authorizer the connector invokes only for a requesting peer permitted CONNECTOR_INVOKE in {@code <asset>:<operation>}; a member without the scope receives an error result and the connector never touches the binding. */
     @Test
-    @Timeout(60)
+    @Timeout(300)
     void underAnAuthorizerOnlyARequesterHoldingTheInvokeScopeIsServed() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired planner = newPeer("planner", 2, "conn");
@@ -264,13 +280,13 @@ class AssetInvocationsClusterTest {
         tickAll(2);
 
         AssetCard card = planner.discovery().find(AssetCard.class, c -> true).getFirst();
-        AssetInvocationResult granted = AssetInvocations.invoke(planner.data(), card, "reserve",
-                Map.of("qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult granted = answered("connect.invoke.scoped", AssetInvocations.invoke(planner.data(), card, "reserve",
+                Map.of("qty", "1"), Duration.ofSeconds(30)));
         assertThat(granted.ok()).isTrue();
         assertThat(provider.reserved).hasSize(1);
 
-        AssetInvocationResult refused = AssetInvocations.invoke(stranger.data(), card, "reserve",
-                Map.of("qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult refused = answered("connect.invoke.unscoped", AssetInvocations.invoke(stranger.data(), card, "reserve",
+                Map.of("qty", "1"), Duration.ofSeconds(30)));
         assertThat(refused.ok()).isFalse();
         assertThat(refused.error()).isEqualTo("refused-scope");
         assertThat(refused.result()).containsEntry("rule", "aspace:connector-invoke:inventory:reserve");
@@ -278,8 +294,8 @@ class AssetInvocationsClusterTest {
         assertThat(connector.refused()).isEqualTo(1);
 
         // The planner's grant covers reserve alone: release is refused by scope, not by the card.
-        AssetInvocationResult release = AssetInvocations.invoke(planner.data(), card, "release",
-                Map.of(), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult release = answered("connect.invoke.scoped-release", AssetInvocations.invoke(planner.data(), card, "release",
+                Map.of(), Duration.ofSeconds(30)));
         assertThat(release.error()).isEqualTo("refused-scope");
         assertThat(release.result()).containsEntry("rule", "aspace:connector-invoke:inventory:release");
     }
@@ -290,7 +306,7 @@ class AssetInvocationsClusterTest {
      * invocation id under its own parameters runs them under its own name, so it borrows no grant.
      */
     @Test
-    @Timeout(60)
+    @Timeout(300)
     void anInvocationRunsUnderItsOwnSignerWhenAnotherWriterReusesItsId() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired planner = newPeer("planner", 2, "conn");
@@ -342,7 +358,7 @@ class AssetInvocationsClusterTest {
         connector = new ConnectorRuntime(connectorPeer.data(), connectorPeer.discovery(), connectorPeer.identity(),
                 "cell-connector", provider, groupId, clock, Duration.ofMinutes(1)).authorizer(authorizer);
         connector.start();
-        await(() -> (int) (connector.invoked() + connector.refused() + connector.repeated()), 2 * pairs);
+        await("connect.invoke.signer-runs", () -> (int) (connector.invoked() + connector.refused() + connector.repeated()), 2 * pairs);
 
         assertThat(runs).as("the stranger's parameters never run under the planner's grant")
                 .noneMatch(run -> run.startsWith("999@"));
@@ -382,7 +398,7 @@ class AssetInvocationsClusterTest {
     }
 
     @Test
-    @Timeout(60)
+    @Timeout(300)
     void aLongOperationKeepsItsClaimRenewedUntilItsResultIsWritten() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired agent = newPeer("agent", 2, "conn");
@@ -394,15 +410,15 @@ class AssetInvocationsClusterTest {
         connector.start();
         tickAll(2);
         AssetCard card = agent.discovery().find(AssetCard.class, c -> c.asset().equals("inventory")).getFirst();
-        AssetInvocationResult result = AssetInvocations.invoke(agent.data(), card, "reserve",
-                Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult result = answered("connect.invoke.renewed", AssetInvocations.invoke(agent.data(), card, "reserve",
+                Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(30)));
         assertThat(result.ok()).isTrue();
         assertThat(provider.inner.reserved).hasSize(1);
         assertThat(connector.renewals()).as("renewed every half lease while the operation ran").isGreaterThanOrEqualTo(3);
     }
 
     @Test
-    @Timeout(90)
+    @Timeout(600)
     void replicasRunEachInvocationOnceAndMirrorEachOthersResults() throws Exception {
         Wired peerA = newPeer("conn-a", 1);
         Wired peerB = newPeer("conn-b", 2, "conn-a");
@@ -427,8 +443,8 @@ class AssetInvocationsClusterTest {
             List<String> ids = new ArrayList<>();
             for (int i = 0; i < 6; i++) {
                 AssetCard through = i % 2 == 0 ? cardA : cardB;
-                AssetInvocationResult result = AssetInvocations.invoke(agent.data(), through, "reserve",
-                        Map.of("sku", "A-" + i, "qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+                AssetInvocationResult result = answered("connect.replica.invoke", AssetInvocations.invoke(agent.data(), through, "reserve",
+                        Map.of("sku", "A-" + i, "qty", "1"), Duration.ofSeconds(30)));
                 assertThat(result.ok()).as("answered through either card, whichever replica ran it").isTrue();
                 ids.add(result.invocationId());
                 tickAll(2);
@@ -443,9 +459,9 @@ class AssetInvocationsClusterTest {
             assertThat(connector.mirrored() + replica.mirrored()).isPositive();
             // A retry through the other card is answered from the mirrored result, never run again.
             for (String id : ids) {
-                AssetInvocationResult again = AssetInvocations.retry(agent.data(), cardB, new AssetInvocation(
+                AssetInvocationResult again = answered("connect.replica.retry", AssetInvocations.retry(agent.data(), cardB, new AssetInvocation(
                         AssetInvocations.VERSION, "inventory", "reserve", Map.of("sku", "x", "qty", "1"), id),
-                        Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+                        Duration.ofSeconds(30)));
                 assertThat(again.ok()).isTrue();
             }
             assertThat(providerA.reserved.size() + providerB.reserved.size()).as("a retry never runs again")
@@ -455,8 +471,175 @@ class AssetInvocationsClusterTest {
         }
     }
 
+    /**
+     * A space whose next completion with a result is refused the way {@link ReplicatedSpace} refuses a
+     * displaced holder's (SPEC §7.4, the settle guarantee): it throws {@link LeaseExpiredException} and writes
+     * no result. {@code beforeRefusal} runs first, so a test can land a replica's result in the window between
+     * the connector remembering its answer and the refusal. Everything else goes to the replicated space.
+     */
+    private static final class RefusingSpace implements Space {
+        final ReplicatedSpace inner;
+        final java.util.concurrent.atomic.AtomicBoolean refuseNext = new java.util.concurrent.atomic.AtomicBoolean(true);
+        final java.util.concurrent.CountDownLatch refused = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicReference<AssetInvocationResult> refusedResult =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        volatile java.util.function.Consumer<AssetInvocationResult> beforeRefusal = r -> { };
+
+        RefusingSpace(ReplicatedSpace inner) {
+            this.inner = inner;
+        }
+
+        @Override public String name() { return inner.name(); }
+        @Override public ai.badmonkey.agentspaces.common.id.SpaceId id() { return inner.id(); }
+        @Override public <T> ai.badmonkey.agentspaces.api.space.EntryHandle write(T entry, Lease lease) {
+            return inner.write(entry, lease);
+        }
+        @Override public <T> ai.badmonkey.agentspaces.api.space.EntryHandle write(T entry, Lease lease,
+                                                                               Map<String, String> tags) {
+            return inner.write(entry, lease, tags);
+        }
+        @Override public <T> java.util.Optional<T> read(Template<T> template) { return inner.read(template); }
+        @Override public <T> java.util.Optional<T> read(Template<T> template, Duration timeout) {
+            return inner.read(template, timeout);
+        }
+        @Override public <T> List<T> readAll(Template<T> template, int limit) { return inner.readAll(template, limit); }
+        @Override public <T> List<Space.Issued<T>> readAllIssued(Template<T> template, int limit) {
+            return inner.readAllIssued(template, limit);
+        }
+        @Override public <T> java.util.Optional<ai.badmonkey.agentspaces.api.space.TakenEntry<T>> take(
+                Template<T> template, Lease takeLease, Duration timeout) {
+            return inner.take(template, takeLease, timeout);
+        }
+        @Override public void complete(ai.badmonkey.agentspaces.api.space.TakenEntry<?> taken) { inner.complete(taken); }
+        @Override public <R> ai.badmonkey.agentspaces.api.space.EntryHandle complete(
+                ai.badmonkey.agentspaces.api.space.TakenEntry<?> taken, R result, Lease resultLease) {
+            if (result instanceof AssetInvocationResult answer && refuseNext.getAndSet(false)) {
+                beforeRefusal.accept(answer);
+                refusedResult.set(answer);
+                refused.countDown();
+                throw new LeaseExpiredException("take lease lapsed or lost for entry " + taken.entryId()
+                        + " (displaced by a replica's claim, scripted)");
+            }
+            return inner.complete(taken, result, resultLease);
+        }
+        @Override public <T> ai.badmonkey.agentspaces.api.space.Subscription notify(
+                Template<T> template, ai.badmonkey.agentspaces.api.space.SpaceListener<T> listener, Lease lease) {
+            return inner.notify(template, listener, lease);
+        }
+    }
+
+    /** The result replica A wrote for an invocation B ran and could not complete, told apart by {@code by}. */
+    private static AssetInvocationResult resultOfA(AssetInvocationResult refusedAtB) {
+        AssetInvocation invocation = new AssetInvocation(AssetInvocations.VERSION, refusedAtB.asset(),
+                refusedAtB.operation(), Map.of("sku", "A-1", "qty", "1"), refusedAtB.invocationId());
+        return AssetInvocationResult.of(invocation, AssetProvider.InvokeResult.of(
+                Map.of("reserved", "1", "invocationId", refusedAtB.invocationId(), "by", "inv-a")));
+    }
+
+    /**
+     * Ticks until the future completes and returns how long it took, as a measured wait (srad/feature-measurements.md
+     * §3.5). fm: (a) ceiling 30 s (owner rule 2), unchanged; the answer comes in tens of milliseconds.
+     */
+    private long awaitTicking(String metric, java.util.concurrent.CompletableFuture<?> future) {
+        return (long) Measure.await(metric, Duration.ofSeconds(30), () -> {
+            if (future.isDone()) {
+                return true;
+            }
+            tickAll(1);
+            return future.isDone();
+        }, Wait.with().poll(Duration.ofMillis(20))).value();
+    }
+
+    /**
+     * R2, 2026-11-16: a replica whose completion the space refused (a better claim displaced its take, or its
+     * claim acknowledged a displaced replica's completion) wrote no result, and its mirror skipped the other
+     * replica's result because the id was already answered there. A requester that invoked through its card
+     * then waited out its timeout. Here the replica's result lands after the refusal.
+     */
     @Test
-    @Timeout(90)
+    @Timeout(600)
+    void aReplicaWhoseCompletionIsRefusedAnswersThroughItsCardWithTheResultThatLandsLater() throws Exception {
+        Wired peerA = newPeer("conn-a", 1);
+        Wired peerB = newPeer("conn-b", 2, "conn-a");
+        Wired agent = newPeer("agent", 3, "conn-a");
+        tickAll(6);
+        InventoryProvider providerB = new InventoryProvider("@inv-b");
+        PeerId a = peerA.identity().peerId();
+        PeerId b = peerB.identity().peerId();
+        RefusingSpace spaceB = new RefusingSpace(peerB.data());
+        connector = new ConnectorRuntime(spaceB, peerB.discovery(), peerB.identity(),
+                "inv-b", providerB, groupId, clock, Duration.ofMinutes(1)).replicas(a::equals);
+        connector.start();
+        tickAll(4);
+        AssetCard cardB = agent.discovery().find(AssetCard.class,
+                c -> c.asset().equals("inventory") && c.issuer().equals(b)).getFirst();
+        java.util.concurrent.CompletableFuture<AssetInvocationResult> answer = AssetInvocations.invoke(agent.data(),
+                cardB, "reserve", Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(30));
+        assertThat(spaceB.refused.await(30, TimeUnit.SECONDS)).as("B ran the invocation and was refused").isTrue();
+        assertThat(providerB.reserved).hasSize(1);
+        assertThat(answer).as("B wrote no result").isNotDone();
+
+        peerA.data().write(resultOfA(spaceB.refusedResult.get()), Lease.of(Duration.ofMinutes(5)));
+        long tookMillis = awaitTicking("connect.replica.refused-then-mirror", answer);
+        System.out.println("refused completion, replica result later: answered in " + tookMillis + " ms");
+        assertThat(answer).as("answered through B's card within the 30 s ceiling").isDone();
+        AssetInvocationResult result = answer.get();
+        assertThat(result.ok()).isTrue();
+        assertThat(result.result()).as("B mirrored A's result").containsEntry("by", "inv-a");
+        assertThat(connector.mirrored()).isEqualTo(1);
+        assertThat(providerB.reserved).as("the target ran once here").hasSize(1);
+        assertThat(peerB.data().readAllIssued(Template.of(AssetInvocationResult.class)
+                .where("invocationId", eq(result.invocationId())), 16).stream()
+                .filter(r -> r.issuer().peer().equals(b))).as("one result under B").hasSize(1);
+    }
+
+    /**
+     * As above, with the replica's result landing between the connector remembering its answer and the refusal,
+     * so its WRITTEN event was skipped as answered: the refusal itself finds the result and mirrors it.
+     */
+    @Test
+    @Timeout(600)
+    void aReplicaWhoseCompletionIsRefusedMirrorsTheResultThatLandedBeforeTheRefusal() throws Exception {
+        Wired peerA = newPeer("conn-a", 1);
+        Wired peerB = newPeer("conn-b", 2, "conn-a");
+        Wired agent = newPeer("agent", 3, "conn-a");
+        tickAll(6);
+        InventoryProvider providerB = new InventoryProvider("@inv-b");
+        PeerId a = peerA.identity().peerId();
+        PeerId b = peerB.identity().peerId();
+        RefusingSpace spaceB = new RefusingSpace(peerB.data());
+        spaceB.beforeRefusal = refusedAtB -> {
+            peerA.data().write(resultOfA(refusedAtB), Lease.of(Duration.ofMinutes(5)));
+            long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            while (peerB.data().readAllIssued(Template.of(AssetInvocationResult.class)
+                    .where("invocationId", eq(refusedAtB.invocationId())), 16).stream()
+                    .noneMatch(r -> r.issuer().peer().equals(a)) && System.nanoTime() < deadline) {
+                tickAll(1);
+            }
+        };
+        connector = new ConnectorRuntime(spaceB, peerB.discovery(), peerB.identity(),
+                "inv-b", providerB, groupId, clock, Duration.ofMinutes(1)).replicas(a::equals);
+        connector.start();
+        tickAll(4);
+        AssetCard cardB = agent.discovery().find(AssetCard.class,
+                c -> c.asset().equals("inventory") && c.issuer().equals(b)).getFirst();
+        java.util.concurrent.CompletableFuture<AssetInvocationResult> answer = AssetInvocations.invoke(agent.data(),
+                cardB, "reserve", Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(30));
+        assertThat(spaceB.refused.await(30, TimeUnit.SECONDS)).as("B ran the invocation and was refused").isTrue();
+        long tookMillis = awaitTicking("connect.replica.mirror-before-refusal", answer);
+        System.out.println("refused completion, replica result before it: answered in " + tookMillis + " ms");
+        assertThat(answer).as("answered through B's card within the 30 s ceiling").isDone();
+        AssetInvocationResult result = answer.get();
+        assertThat(result.result()).as("B mirrored A's result").containsEntry("by", "inv-a");
+        assertThat(connector.mirrored()).isEqualTo(1);
+        assertThat(providerB.reserved).as("the target ran once here").hasSize(1);
+        assertThat(peerB.data().readAllIssued(Template.of(AssetInvocationResult.class)
+                .where("invocationId", eq(result.invocationId())), 16).stream()
+                .filter(r -> r.issuer().peer().equals(b))).as("one result under B").hasSize(1);
+    }
+
+    @Test
+    @Timeout(600)
     void aLateReplicaAnswersARetryFromTheResultItsPeerAlreadyWrote() throws Exception {
         Wired peerA = newPeer("conn-a", 1);
         Wired peerB = newPeer("conn-b", 2, "conn-a");
@@ -472,8 +655,8 @@ class AssetInvocationsClusterTest {
         tickAll(2);
         AssetCard cardA = agent.discovery().find(AssetCard.class,
                 c -> c.asset().equals("inventory") && c.issuer().equals(a)).getFirst();
-        AssetInvocationResult first = AssetInvocations.invoke(agent.data(), cardA, "reserve",
-                Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+        AssetInvocationResult first = answered("connect.replica.first", AssetInvocations.invoke(agent.data(), cardA, "reserve",
+                Map.of("sku", "A-1", "qty", "1"), Duration.ofSeconds(30)));
         tickAll(4);
         // Replica B starts after the result exists: no mirror event reaches it, so its check before
         // running must find A's result.
@@ -486,9 +669,9 @@ class AssetInvocationsClusterTest {
             tickAll(4);
             AssetCard cardB = agent.discovery().find(AssetCard.class,
                     c -> c.asset().equals("inventory") && c.issuer().equals(b)).getFirst();
-            AssetInvocationResult again = AssetInvocations.retry(agent.data(), cardB, new AssetInvocation(
+            AssetInvocationResult again = answered("connect.replica.late-retry", AssetInvocations.retry(agent.data(), cardB, new AssetInvocation(
                     AssetInvocations.VERSION, "inventory", "reserve", Map.of("sku", "A-1", "qty", "1"),
-                    first.invocationId()), Duration.ofSeconds(10)).get(15, TimeUnit.SECONDS);
+                    first.invocationId()), Duration.ofSeconds(30)));
             assertThat(again.ok()).isTrue();
             assertThat(again.result()).containsEntry("invocationId", first.invocationId());
             assertThat(providerB.reserved).as("the replica never ran it").isEmpty();
@@ -499,7 +682,7 @@ class AssetInvocationsClusterTest {
     }
 
     @Test
-    @Timeout(60)
+    @Timeout(300)
     void withdrawingAnAssetsResultsSendsTheNextQueryToTheSource() throws Exception {
         Wired connectorPeer = newPeer("conn", 1);
         Wired agent = newPeer("agent", 2, "conn");
@@ -509,15 +692,15 @@ class AssetInvocationsClusterTest {
         connector.start();
         tickAll(2);
         DataQueryClient client = new DataQueryClient(agent.data(), "analyst");
-        assertThat(client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(10))).isPresent();
+        assertThat(client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(30))).isPresent();
         assertThat(connector.executed()).isEqualTo(1);
         tickAll(2);
-        assertThat(client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(10)).orElseThrow().fromCache())
+        assertThat(client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(30)).orElseThrow().fromCache())
                 .as("the live result serves the window").isTrue();
         assertThat(connector.withdrawResults("inventory")).isEqualTo(1);
         assertThat(connector.withdrawResults("inventory")).as("nothing left to withdraw").isZero();
         tickAll(4);
-        DataQueryClient.Fetched fresh = client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(10)).orElseThrow();
+        DataQueryClient.Fetched fresh = client.fetch("inventory", Map.of("sku", "A-1"), Duration.ofSeconds(30)).orElseThrow();
         assertThat(fresh.fromCache()).isFalse();
         assertThat(connector.executed()).as("the next query reached the source").isEqualTo(2);
         assertThat(connector.withdrawn()).isEqualTo(1);

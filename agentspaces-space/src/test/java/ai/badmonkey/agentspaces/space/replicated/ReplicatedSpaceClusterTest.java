@@ -841,6 +841,60 @@ class ReplicatedSpaceClusterTest {
                 assertThat(cl.epoch()).as("the lattice still advances by epoch").isEqualTo(2L));
     }
 
+    /** The claim with its expiry, stamp or bid replaced, re-signed by nobody: the caller signs what it sends. */
+    private static TakeClaim reshaped(TakeClaim claim, long expiresAt, long stampPhysical, double bid) {
+        return new TakeClaim(claim.entryId(), claim.spaceId(), claim.epoch(),
+                new ai.badmonkey.agentspaces.common.hlc.HlcTimestamp(stampPhysical, claim.stamp().logical(),
+                        claim.stamp().node()),
+                claim.holder(), bid, expiresAt);
+    }
+
+    /**
+     * QA4 A4-5 with the renewal rule (the PetClinic booking log, 2026-11-15): the decided holder's
+     * renewal of a log-decided claim (same entry, space, epoch, stamp, holder and bid, later expiry)
+     * merges, so a voter keeps the holder's lease. Anything else from the holder at that epoch is
+     * still refused: a shorter expiry, a lower stamp or a lower bid would each win or reorder the
+     * lattice in a way the log never decided. A rival's same-epoch claim stays refused after the
+     * renewal too.
+     */
+    @Test
+    void aLogDecidedClaimMergesItsHoldersRenewalAndNothingElseAtItsEpoch() throws Exception {
+        Peer a = newPeer("a", 1);
+        Peer b = newPeer("b", 2, "a");
+        Peer c = newPeer("c", 3, "a");
+        tickAll(4);
+        a.space().write(new TaskEntry("renewed", 1), MINUTES_30);
+        tickAll(2);
+        EntryId entryId = a.space().entryIdOf(new TaskEntry("renewed", 1)).orElseThrow();
+        TakeClaim decided = claimBy(b, entryId, 1);
+        a.space().applyAuthorizedClaim(entryId, decided,
+                b.node().identity().rawPublicKey(), signedBy(b, decided));
+        long stamp = decided.stamp().physical();
+
+        // The holder's own shapes that are not a renewal: each is refused at the decided epoch.
+        for (TakeClaim notRenewal : List.of(
+                reshaped(decided, decided.expiresAtMillis() - 60_000, stamp, 0.0),      // shorter hold
+                reshaped(decided, decided.expiresAtMillis() + 60_000, stamp - 1, 0.0),  // lower stamp
+                reshaped(decided, decided.expiresAtMillis() + 60_000, stamp, -1.0))) {  // lower bid
+            gossipClaimFrom(b, entryId, notRenewal, "-" + notRenewal.hashCode());
+            tickAll(3);
+            assertThat(a.space().currentClaim(entryId)).as("refused: " + notRenewal).contains(decided);
+        }
+
+        TakeClaim renewal = reshaped(decided, decided.expiresAtMillis() + 120_000, stamp, 0.0);
+        gossipClaimFrom(b, entryId, renewal, "-renewal");
+        tickAll(3);
+        assertThat(a.space().currentClaim(entryId)).as("the holder's renewal merges").contains(renewal);
+        assertThat(a.space().claimProof(entryId)).hasValueSatisfying(proof ->
+                assertThat(proof.holderAttested()).as("still signed by the holder").isTrue());
+
+        TakeClaim rival = claimBy(c, entryId, 1);
+        gossipClaimFrom(c, entryId, rival);
+        tickAll(3);
+        assertThat(a.space().currentClaim(entryId)).as("a rival at the decided epoch is still refused")
+                .contains(renewal);
+    }
+
     /**
      * QA4 A4-5: an identical claim may still merge, so a replica holding an
      * unattested copy is upgraded by the attested one a completion delta carries.
@@ -872,10 +926,15 @@ class ReplicatedSpaceClusterTest {
     }
 
     private void gossipClaimFrom(Peer sender, EntryId entryId, TakeClaim claim) {
+        gossipClaimFrom(sender, entryId, claim, "");
+    }
+
+    /** As above, with {@code tag} in the rumor id, so several claims of one epoch from one sender are each sent. */
+    private void gossipClaimFrom(Peer sender, EntryId entryId, TakeClaim claim, String tag) {
         SpaceWire.SignedClaim signed = new SpaceWire.SignedClaim(claim,
                 sender.node().identity().rawPublicKey(), signedBy(sender, claim));
         sender.node().group(groupId).orElseThrow().gossip().publish("space:tasks",
-                "claim-" + claim.epoch() + "-" + sender.node().peerId().value(),
+                "claim-" + claim.epoch() + "-" + sender.node().peerId().value() + tag,
                 CODEC.toBytes(new SpaceWire.Delta(null, entryId, signed)));
     }
 

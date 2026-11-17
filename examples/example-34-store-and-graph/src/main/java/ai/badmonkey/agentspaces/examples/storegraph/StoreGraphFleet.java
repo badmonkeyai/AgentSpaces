@@ -112,10 +112,12 @@ public final class StoreGraphFleet {
      * @param maxPackBytes the size at which a pack file closes, so a restart can lose one pack in the middle
      * @param roles        the peer's roles: {@code RELAY} for the peer a dial-only client seeds at, so the client
      *                     reaches the other members through it
+     * @param auditBudget  the bytes one anti-entropy answer carries ({@code PeerNode.Builder.auditBudget}), or 0 for
+     *                     the node's default of 1 MiB; a small one makes a joiner's spaces arrive in many answers
      */
     public record Spec(String founding, Map<String, Integer> listeners, List<String> seeds, Path dir, PeerIdentity identity,
                        String sealing, GroupKey key, StorePolicy store, String storeName, long maxPackBytes,
-                       Set<PeerAdvertisement.PeerRole> roles) {
+                       Set<PeerAdvertisement.PeerRole> roles, long auditBudget) {
 
         public Spec {
             Objects.requireNonNull(founding, "founding");
@@ -129,37 +131,41 @@ public final class StoreGraphFleet {
         /** A plain member on tcp. */
         public static Spec member(String founding, int port, List<String> seeds, Path dir) {
             return new Spec(founding, Map.of("tcp", port), seeds, dir, null, PRef.SEALING_NONE, null, null, null,
-                    PackNodeStore.DEFAULT_MAX_PACK_BYTES, Set.of());
+                    PackNodeStore.DEFAULT_MAX_PACK_BYTES, Set.of(), 0);
         }
 
         public Spec listeners(Map<String, Integer> value) {
-            return new Spec(founding, value, seeds, dir, identity, sealing, key, store, storeName, maxPackBytes, roles);
+            return new Spec(founding, value, seeds, dir, identity, sealing, key, store, storeName, maxPackBytes, roles, auditBudget);
         }
 
         public Spec seeds(List<String> value) {
-            return new Spec(founding, listeners, value, dir, identity, sealing, key, store, storeName, maxPackBytes, roles);
+            return new Spec(founding, listeners, value, dir, identity, sealing, key, store, storeName, maxPackBytes, roles, auditBudget);
         }
 
         public Spec identity(PeerIdentity value) {
-            return new Spec(founding, listeners, seeds, dir, value, sealing, key, store, storeName, maxPackBytes, roles);
+            return new Spec(founding, listeners, seeds, dir, value, sealing, key, store, storeName, maxPackBytes, roles, auditBudget);
         }
 
         /** The sealed-nodes mode under a key, or keyless when the key is null. */
         public Spec sealedNodes(GroupKey value) {
             return new Spec(founding, listeners, seeds, dir, identity, PRef.SEALING_SEALED_NODES, value, store, storeName,
-                    maxPackBytes, roles);
+                    maxPackBytes, roles, auditBudget);
         }
 
         public Spec store(String name, StorePolicy policy) {
-            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, policy, name, maxPackBytes, roles);
+            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, policy, name, maxPackBytes, roles, auditBudget);
         }
 
         public Spec roles(Set<PeerAdvertisement.PeerRole> value) {
-            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, store, storeName, maxPackBytes, value);
+            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, store, storeName, maxPackBytes, value, auditBudget);
         }
 
         public Spec maxPackBytes(long value) {
-            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, store, storeName, value, roles);
+            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, store, storeName, value, roles, auditBudget);
+        }
+
+        public Spec auditBudget(long value) {
+            return new Spec(founding, listeners, seeds, dir, identity, sealing, key, store, storeName, maxPackBytes, roles, value);
         }
     }
 
@@ -293,7 +299,11 @@ public final class StoreGraphFleet {
      */
     public static Peer start(String name, Spec spec) throws IOException {
         PeerIdentity identity = spec.identity() != null ? spec.identity() : PeerIdentity.generate();
-        PeerNode node = PeerNode.builder(identity).roles(spec.roles()).build();
+        PeerNode.Builder nodeBuilder = PeerNode.builder(identity).roles(spec.roles());
+        if (spec.auditBudget() > 0) {
+            nodeBuilder.auditBudget(spec.auditBudget());
+        }
+        PeerNode node = nodeBuilder.build();
         List<AutoCloseable> transports = new ArrayList<>();
         for (Map.Entry<String, Integer> listener : new TreeMap<>(spec.listeners()).entrySet()) {
             Transport transport = transportFor(listener.getKey(), identity);

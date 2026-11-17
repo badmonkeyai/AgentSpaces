@@ -22,7 +22,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces</artifactId>
-    <version>0.6.0</version>
+    <version>0.7.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>agentspaces-space</artifactId>
@@ -57,5 +57,33 @@
       <artifactId>agentspaces-test-support</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- RE-Q-MNT-01: the rule that nothing outside space.crdt touches the trie (TrieConfinementTest) -->
+    <dependency>
+      <groupId>com.tngtech.archunit</groupId>
+      <artifactId>archunit</artifactId>
+      <version>1.4.1</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
+  <build>
+    <plugins>
+      <!-- agentspaces-spoilers reuses ForgeSupport from this test-jar (srad/spoiler-peers.md SP-C-01,
+           SP-G-01); skipped under the release profile, so it never reaches Central. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>spoiler-test-jar</id>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+            <configuration>
+              <skip>${agentspaces.testjars.skip}</skip>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>

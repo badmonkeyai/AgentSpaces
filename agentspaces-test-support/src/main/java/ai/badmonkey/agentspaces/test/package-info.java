@@ -17,5 +17,12 @@
  * Testing utilities for AgentSpaces modules and applications: a manually advanced
  * clock, the SimNetwork deterministic transport fabric with partition control, and
  * shared fixtures. Stability: API (for tests).
+ *
+ * <p>The link filters ({@link ai.badmonkey.agentspaces.test.LinkFilter}, with the
+ * {@link ai.badmonkey.agentspaces.test.FrameDecoder} and {@link ai.badmonkey.agentspaces.test.ItemDecoder}
+ * contracts) and the minimal fleet oracle ({@link ai.badmonkey.agentspaces.test.FleetInvariants} over a
+ * {@link ai.badmonkey.agentspaces.test.FleetProbe}) are the in-process half of the spoiler peers of
+ * srad/spoiler-peers.md: they act on the {@code mem} fabric only. Everything that acts on a real
+ * transport or re-signs lives in the unpublished {@code agentspaces-spoilers} module.
  */
 package ai.badmonkey.agentspaces.test;

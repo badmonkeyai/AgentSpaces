@@ -131,9 +131,22 @@ public final class ConsoleView implements AutoCloseable {
 
     private void onTaskEvent(String name, Watched w, SpaceEvent<?> event) {
         switch (event.kind()) {
-            case WRITTEN -> w.written.incrementAndGet();
-            case COMPLETED -> w.completed.incrementAndGet();
-            case TAKEN -> {
+            case WRITTEN -> {
+                w.written.incrementAndGet();
+                w.opened(event.entryId());
+            }
+            case COMPLETED -> {
+                w.completed.incrementAndGet();
+                if (!w.closed(event.entryId())) {
+                    // RBE regression probe P14, 2026-11-14: an entry completed before this replica learned of it
+                    // arrives completed and fires COMPLETED with no WRITTEN (a late console's first batch). It was
+                    // written all the same; without it, written - completed - queued came out short and the work
+                    // in progress read zero.
+                    w.written.incrementAndGet();
+                }
+            }
+            case EXPIRED -> w.closed(event.entryId());
+            default -> {
             }
         }
         record(name, event.kind().name().toLowerCase(java.util.Locale.ROOT),
@@ -507,9 +520,38 @@ public final class ConsoleView implements AutoCloseable {
         private final AtomicInteger written = new AtomicInteger();
         private final AtomicInteger completed = new AtomicInteger();
         private final Map<String, AtomicInteger> perWorker = new ConcurrentHashMap<>();
+        /**
+         * The entries counted written and not yet completed or withdrawn, so a completion can tell whether its entry
+         * was counted; bounded like the worker map (ASF-031): past the bound the oldest is forgotten, and should that
+         * entry complete later it counts as written once more.
+         */
+        private final java.util.Set<ai.badmonkey.agentspaces.api.entry.EntryId> open =
+                java.util.Collections.newSetFromMap(new LinkedHashMap<>(64, 0.75f, false) {
+                    @Override
+                    protected boolean removeEldestEntry(
+                            Map.Entry<ai.badmonkey.agentspaces.api.entry.EntryId, Boolean> eldest) {
+                        return size() > MAX_OPEN;
+                    }
+                });
 
         private Watched(Space space) {
             this.space = space;
         }
+
+        private void opened(ai.badmonkey.agentspaces.api.entry.EntryId id) {
+            synchronized (open) {
+                open.add(id);
+            }
+        }
+
+        /** Forgets an entry; whether it was counted written. */
+        private boolean closed(ai.badmonkey.agentspaces.api.entry.EntryId id) {
+            synchronized (open) {
+                return open.remove(id);
+            }
+        }
     }
+
+    /** Most open entries remembered per watched space. */
+    private static final int MAX_OPEN = 65_536;
 }

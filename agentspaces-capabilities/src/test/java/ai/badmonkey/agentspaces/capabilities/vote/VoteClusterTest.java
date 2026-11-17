@@ -793,4 +793,49 @@ class VoteClusterTest {
                     .contains("approve");
         }
     }
+
+    /**
+     * Owner decision 23 (srad/replication-by-entry.md, 2026-11-16): a decision listener hears the decisions this
+     * replica already holds when it is registered, as well as later ones, each once. Before, it watched only later
+     * ballot and proposal writes, so a binding made after a quorum closed (a member that joined and bound a moment
+     * after the votes came by rumor) never heard that decision.
+     */
+    @Test
+    void aDecisionListenerHearsHeldAndFutureDecisionsEachOnce() throws Exception {
+        Voter a = newVoter("a", 1);
+        a.vote().propose("rel:held", "ship 0.9?", OPTIONS, 1, HOUR);
+        a.vote().castBallot("rel:held", "reject", HOUR);
+        a.vote().propose("rel:open", "ship 1.0?", OPTIONS, 1, HOUR);
+        a.vote().propose("ops:held", "restart?", OPTIONS, 1, HOUR);
+        a.vote().castBallot("ops:held", "approve", HOUR);
+        assertThat(a.vote().decision("rel:held")).isPresent();
+
+        List<String> heard = new java.util.concurrent.CopyOnWriteArrayList<>();
+        try (var subscription = a.vote().onDecision(id -> id.startsWith("rel:"),
+                d -> heard.add(d.proposalId() + "=" + d.winner()), HOUR)) {
+            assertThat(heard).as("the held decision, heard at registration").containsExactly("rel:held=reject");
+            a.vote().castBallot("rel:open", "approve", HOUR);
+            assertThat(heard).as("and the later one").containsExactly("rel:held=reject", "rel:open=approve");
+            // More writes on decided proposals raise no second hearing.
+            a.vote().propose("rel:held", "ship 0.9?", OPTIONS, 1, HOUR);
+            a.vote().castBallot("rel:open", "approve", HOUR);
+            assertThat(heard).hasSize(2);
+        }
+    }
+
+    /** A voter's own held ballot is what a ballot binding made again after a restart reads to not judge it twice. */
+    @Test
+    void aVoterKnowsItsOwnHeldBallot() throws Exception {
+        Voter a = newVoter("a", 1);
+        a.vote().propose("rel:1", "ship?", OPTIONS, 2, HOUR);
+        a.vote().propose("rel:2", "ship?", OPTIONS, 2, HOUR);
+        assertThat(a.vote().ballotHeld("rel:1")).isFalse();
+        a.vote().castBallot("rel:1", "approve", HOUR);
+        assertThat(a.vote().ballotHeld("rel:1")).isTrue();
+        assertThat(a.vote().ballotHeld("rel:2")).isFalse();
+        // Another agent of the same peer has not voted, whoever wrote ballots beside it.
+        VoteCapability other = a.vote().as(a.space().as(a.identity().agentIdentity("other")),
+                a.identity().agent("other"));
+        assertThat(other.ballotHeld("rel:1")).isFalse();
+    }
 }

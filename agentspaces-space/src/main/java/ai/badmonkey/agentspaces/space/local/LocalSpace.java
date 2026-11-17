@@ -37,6 +37,7 @@ import ai.badmonkey.agentspaces.common.hlc.HybridLogicalClock;
 import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.common.id.SpaceId;
 import ai.badmonkey.agentspaces.space.EntryView;
+import ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt;
 
 import java.time.Duration;
 import java.time.InstantSource;
@@ -51,6 +52,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A complete single-JVM implementation of the {@link Space} API (plan §6): the
@@ -93,6 +96,18 @@ public final class LocalSpace implements Space, AutoCloseable {
     private final SchemaRegistry schemas;
     private final ScheduledExecutorService sweeper;
 
+    private static final System.Logger LOG = System.getLogger(LocalSpace.class.getName());
+
+    /**
+     * Renewals that asked for less than the lease had left (RE-H-01 and RE-H-02, srad/replication-by-entry.md §3.6).
+     * A renewal never shortens a lease (SPEC §7.2), so each such call kept the longer lease.
+     */
+    private final AtomicLong renewShortenings = new AtomicLong();
+    /** Whether the first shortening renewal is logged ({@link Builder#renewShorteningLog}). */
+    private final boolean renewShorteningLog;
+    /** Whether the first shortening renewal of this space was logged; each later one is only counted. */
+    private final AtomicBoolean renewShorteningLogged = new AtomicBoolean();
+
     private final Object lock = new Object();
     private final Map<EntryId, Stored> entries = new HashMap<>();
     /**
@@ -113,6 +128,7 @@ public final class LocalSpace implements Space, AutoCloseable {
         this.hlc = new HybridLogicalClock(builder.clock, builder.issuer.encoded());
         this.codec = CborCodec.defaultCodec();
         this.schemas = builder.schemas;
+        this.renewShorteningLog = builder.renewShorteningLog;
         if (builder.sweepInterval != null) {
             this.sweeper = Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "local-space-sweeper-" + builder.name);
@@ -144,6 +160,7 @@ public final class LocalSpace implements Space, AutoCloseable {
         private InstantSource clock = InstantSource.system();
         private SchemaRegistry schemas = new SimpleSchemaRegistry();
         private Duration sweepInterval;
+        private boolean renewShorteningLog = true;
 
         private Builder(String name, AgentId issuer) {
             this.name = Objects.requireNonNull(name, "name");
@@ -182,6 +199,18 @@ public final class LocalSpace implements Space, AutoCloseable {
          */
         public Builder sweepEvery(Duration interval) {
             this.sweepInterval = Objects.requireNonNull(interval, "interval");
+            return this;
+        }
+
+        /**
+         * Whether the first renewal of this space that asks for less than its lease has left is logged at INFO
+         * ({@code agentspaces.space.renew-shortening-log}, RE-H-01); on by default. The count runs either way.
+         *
+         * @param log whether to log it
+         * @return this builder
+         */
+        public Builder renewShorteningLog(boolean log) {
+            this.renewShorteningLog = log;
             return this;
         }
 
@@ -257,7 +286,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             lock.notifyAll();
         }
         deliver(events);
-        return new Handle(entryId);
+        return new Handle(entryId, writer);
     }
 
     @Override
@@ -508,7 +537,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             if (written != null) {
                 indexPut(resultId, written);
                 events.add(eventsFor(SpaceEvent.Kind.WRITTEN, resultId, written));
-                resultHandle = new Handle(resultId);
+                resultHandle = new Handle(resultId, written.record.issuer());
             }
             lock.notifyAll();
         }
@@ -619,8 +648,10 @@ public final class LocalSpace implements Space, AutoCloseable {
             if (stored.state == State.TAKEN && stored.takeExpiryMillis <= now) {
                 stored.state = State.AVAILABLE;
                 stored.takeToken++;
+                // The write lease is the writer's (buildRecord), not this peer's, so the restored lease names
+                // the record's issuer: a View's agent stays the holder after a take lapses.
                 stored.record = stored.record.withLease(
-                        new LeaseInfo(issuer, stored.writeExpiryMillis, LeaseKind.WRITE));
+                        new LeaseInfo(stored.record.issuer(), stored.writeExpiryMillis, LeaseKind.WRITE));
                 events.add(eventsFor(SpaceEvent.Kind.REAPPEARED, e.getKey(), stored));
             }
         }
@@ -699,17 +730,51 @@ public final class LocalSpace implements Space, AutoCloseable {
         return clock.instant().toEpochMilli();
     }
 
+    /**
+     * Renewals of a write or take lease in this space that asked for less than the lease had left (RE-H-01). A
+     * renewal never shortens a lease (SPEC §7.2, RE-H-02), so each of these kept the longer lease.
+     */
+    public long renewShortenings() {
+        return renewShortenings.get();
+    }
+
+    /** Counts a renewal that asked for less than its lease had left, and logs the first one of this space. */
+    private void noteShortening(EntryId entryId, String lease, long currentExpiryMillis, long requestedExpiryMillis) {
+        if (requestedExpiryMillis >= currentExpiryMillis) {
+            return;
+        }
+        renewShortenings.incrementAndGet();
+        if (renewShorteningLog && renewShorteningLogged.compareAndSet(false, true)) {
+            LOG.log(System.Logger.Level.INFO, "space " + name + ": the " + lease + " lease of entry " + entryId.value()
+                    + " was renewed for " + (currentExpiryMillis - requestedExpiryMillis)
+                    + " ms less than it had left, and kept the longer lease: a renewal never shortens a lease"
+                    + " (SPEC §7.2). Cancel and write again for a shorter one. Logged once for this space;"
+                    + " renewShortenings() counts every such renewal.");
+        }
+    }
+
     private void ensureOpen() {
         if (closed) {
             throw new SpaceClosedException("space '" + name + "' is closed");
         }
     }
 
+    /**
+     * A handle on an entry held by another agent than its writer, for the tests of the issuer rule (SPEC §7.2): the
+     * API hands a handle only to the entry's writer, so no caller reaches this case any other way.
+     */
+    EntryHandle handleAs(EntryId entryId, AgentId agent) { // package-private for tests
+        return new Handle(entryId, agent);
+    }
+
     private final class Handle implements EntryHandle {
         private final EntryId entryId;
+        /** The agent that wrote the entry, the only one that renews it (SPEC §7.2). */
+        private final AgentId writer;
 
-        private Handle(EntryId entryId) {
+        private Handle(EntryId entryId, AgentId writer) {
             this.entryId = entryId;
+            this.writer = writer;
         }
 
         @Override
@@ -725,10 +790,27 @@ public final class LocalSpace implements Space, AutoCloseable {
             synchronized (lock) {
                 events = sweepLocked();
                 Stored stored = entries.get(entryId);
-                if (stored == null) {
+                long now = nowMillis();
+                // SPEC §7.2 (RE-H-02): renewal needs the entry present and unexpired, and its issuer acting, as on a
+                // replicated space. The sweep above drops a lapsed entry, so the second check guards the same rule.
+                if (stored == null || stored.writeExpiryMillis <= now) {
                     throw new LeaseExpiredException("write lease lapsed for entry " + entryId);
                 }
-                stored.writeExpiryMillis = nowMillis() + extension.toMillis();
+                if (!stored.record.issuer().equals(writer)) {
+                    throw new IllegalStateException(writer.encoded() + " cannot act on "
+                            + stored.record.issuer().encoded() + "'s entry " + entryId);
+                }
+                noteShortening(entryId, "write", stored.writeExpiryMillis,
+                        SpaceStateCrdt.renewedExpiry(Long.MIN_VALUE, now, extension.toMillis()));
+                stored.writeExpiryMillis = SpaceStateCrdt.renewedExpiry(stored.writeExpiryMillis, now,
+                        extension.toMillis());
+                // The record carries the lease readers see (readAllEntries, events), so it moves with the expiry;
+                // a taken entry's record shows the take hold instead, and the sweep restores the write lease
+                // from writeExpiryMillis when that hold lapses.
+                if (stored.state == State.AVAILABLE) {
+                    stored.record = stored.record.withLease(new LeaseInfo(stored.record.issuer(),
+                            stored.writeExpiryMillis, LeaseKind.WRITE));
+                }
             }
             deliver(events);
         }
@@ -781,7 +863,11 @@ public final class LocalSpace implements Space, AutoCloseable {
                 if (stored == null || stored.state != State.TAKEN || stored.takeToken != token) {
                     throw new LeaseExpiredException("take lease lapsed for entry " + entryId);
                 }
-                stored.takeExpiryMillis = nowMillis() + extension.toMillis();
+                long now = nowMillis();
+                noteShortening(entryId, "take", stored.takeExpiryMillis,
+                        SpaceStateCrdt.renewedExpiry(Long.MIN_VALUE, now, extension.toMillis()));
+                stored.takeExpiryMillis = SpaceStateCrdt.renewedExpiry(stored.takeExpiryMillis, now,
+                        extension.toMillis());
             }
             deliver(events);
         }
@@ -801,12 +887,16 @@ public final class LocalSpace implements Space, AutoCloseable {
         }
 
         @Override
-        public void renew(Duration extension) {
+        public synchronized void renew(Duration extension) {
+            // Synchronized so that two renewals at once cannot both read the old expiry and the shorter one write
+            // last: the max rule promises the lease never shortens, and the read and the write must be one step.
             Objects.requireNonNull(extension, "extension");
-            if (closedFlag || expiryMillis <= nowMillis()) {
+            long now = nowMillis();
+            if (closedFlag || expiryMillis <= now) {
                 throw new LeaseExpiredException("subscription lease lapsed");
             }
-            expiryMillis = nowMillis() + extension.toMillis();
+            // The same reading of renew as an entry's lease: at least the extension from now, never shorter.
+            expiryMillis = SpaceStateCrdt.renewedExpiry(expiryMillis, now, extension.toMillis());
         }
 
         @Override

@@ -288,7 +288,7 @@ public record AppCard(
                 throw new IllegalArgumentException("an AppCard's ui carries at most " + UiDeclaration.MAX_COMPONENTS + " components");
             }
             protocol = protocol == null || protocol.isBlank() ? "a2ui" : protocol;
-            version = version == null || version.isBlank() ? "v0.9.1" : version;
+            version = version == null || version.isBlank() ? UiDeclaration.VERSION : version;
             catalogIds = catalogIds == null ? List.of() : List.copyOf(catalogIds);
             agent = agent == null ? "" : agent;
             transport = transport == null || transport.isBlank() ? "views" : transport;

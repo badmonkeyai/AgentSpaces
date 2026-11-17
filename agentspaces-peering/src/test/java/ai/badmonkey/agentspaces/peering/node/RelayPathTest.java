@@ -21,6 +21,15 @@ import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.measure.Direction;
+import ai.badmonkey.agentspaces.measure.Kind;
+import ai.badmonkey.agentspaces.measure.Measure;
+import ai.badmonkey.agentspaces.measure.Measurement;
+import ai.badmonkey.agentspaces.measure.Params;
+import ai.badmonkey.agentspaces.measure.Rec;
+import ai.badmonkey.agentspaces.measure.SimWait;
+import ai.badmonkey.agentspaces.measure.Unit;
+import ai.badmonkey.agentspaces.measure.Wait;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.wire.Envelope;
 import ai.badmonkey.agentspaces.test.SimNetwork;
@@ -242,6 +251,47 @@ class RelayPathTest {
         assertThat(f.a1().pinnedPath(groupId, f.b1().peerId())).as("the path is forgotten").isEmpty();
     }
 
+    /**
+     * A signal names a failed step, not a dead relay. a1 reaches rb (a listener) through ra in
+     * one hop, but ra cannot reach rb, so ra signals a1 with rb as the failed hop. The pin to b1
+     * runs ra, hq, rb and never takes the step from ra to rb, so it stays. Forgetting every pin
+     * through rb made the restart test below fail about 1 run in 10: the last frame arrived on
+     * the pin, then a signal about a1's own probe of rb landed in the same tick and wiped it.
+     */
+    @Test
+    void aSignalAboutOneStepKeepsAPinThatReachesTheHopFromElsewhere() throws Exception {
+        Fleet f = nestedNat();
+        f.b1Runtime().onKind(Envelope.Kind.PIPE_DATA, (from, body) -> { });
+        f.a1Runtime().send(f.b1().peerId(), Envelope.Kind.PIPE_DATA, "one".getBytes(StandardCharsets.UTF_8));
+        List<PeerId> toB1 = List.of(f.ra().peerId(), f.hq().peerId(), f.rb().peerId());
+        assertThat(f.a1().pinnedPath(groupId, f.b1().peerId())).contains(toB1);
+
+        // past ra's ten-second signal window for a1 and rb, which the setup's gossip may have used
+        clock.advance(Duration.ofSeconds(11));
+        long signals = f.a1().unreachableSignalsReceived();
+        f.a1Runtime().send(f.rb().peerId(), Envelope.Kind.PIPE_DATA, "probe".getBytes(StandardCharsets.UTF_8));
+        assertThat(f.a1().unreachableSignalsReceived()).as("ra could not reach rb and said so")
+                .isEqualTo(signals + 1);
+        assertThat(f.a1().pinnedPath(groupId, f.rb().peerId())).as("the path to rb is forgotten").isEmpty();
+        assertThat(f.a1().pinnedPath(groupId, f.b1().peerId())).as("the pin to b1 never steps from ra to rb")
+                .contains(toB1);
+    }
+
+    @Test
+    void crossesStepNamesOnlyTheStepFromTheSignallerToTheFailedHop() {
+        PeerId ra = PeerId.of("zRa");
+        PeerId hq = PeerId.of("zHq");
+        PeerId rb = PeerId.of("zRb");
+        PeerId b1 = PeerId.of("zB1");
+        List<PeerId> path = List.of(ra, hq, rb);
+        assertThat(PeerNode.crossesStep(path, b1, ra, hq)).isTrue();
+        assertThat(PeerNode.crossesStep(path, b1, hq, rb)).isTrue();
+        assertThat(PeerNode.crossesStep(path, b1, rb, b1)).as("the last relay to the target").isTrue();
+        assertThat(PeerNode.crossesStep(path, b1, ra, rb)).as("ra never steps to rb here").isFalse();
+        assertThat(PeerNode.crossesStep(path, b1, b1, ra)).as("a signaller off the path").isFalse();
+        assertThat(PeerNode.crossesStep(List.of(ra), rb, ra, rb)).as("a one-hop path").isTrue();
+    }
+
     @Test
     void aMalformedPathIsRefusedAndCounted() throws Exception {
         Fleet f = nestedNat();
@@ -293,23 +343,33 @@ class RelayPathTest {
         hq.listen(network.register("hq"), "hq");
         nodes.add(hq);
         hq.joinGroup(groupAd, GroupMembership.Config.defaults(), seed("ra"));
-        int sent = 50;
-        for (int t = 0; t < 120 && got.size() < 100; t++) {
-            if (sent < 100) {
-                f.a1Runtime().send(f.b1().peerId(), Envelope.Kind.PIPE_DATA, String.valueOf(sent).getBytes(StandardCharsets.UTF_8));
+        int[] sent = {50};
+        // Typically 73 to 81 ticks (median 76 over 160 runs, slowest 125): the restarted hq starts with
+        // an empty view and drops a1's frames for b1 as a non-member's until b1's advertisement reaches
+        // it through rb, and a1 and ra may have let b1 go while hq was down and must admit it again;
+        // after that, one frame a tick, since each frame waits for the one before it. The root cause of
+        // the old failure was a signal about one step wiping a pin that never takes it (the test above).
+        // fm: (a) ceiling 400 ticks (policy: was 120, under the slowest convergences seen; 400 is clearly
+        // broken); the ticks it took are recorded as peering.relay.pin-after-restart.
+        Measurement took = SimWait.ticks("peering.relay.pin-after-restart", 400, () -> {
+            if (sent[0] < 100) {
+                f.a1Runtime().send(f.b1().peerId(), Envelope.Kind.PIPE_DATA,
+                        String.valueOf(sent[0]).getBytes(StandardCharsets.UTF_8));
             }
             tickAll(1);
-            if (sent < 100 && got.contains(sent)) {
-                sent++;
+            if (sent[0] < 100 && got.contains(sent[0])) {
+                sent[0]++;
             }
-        }
+        }, () -> got.size() >= 100, Wait.with().diagnostics(() -> "got " + got.size() + " frames, next to send "
+                + sent[0] + ", pin " + f.a1().pinnedPath(groupId, f.b1().peerId())));
         // a frame sent while the relay was down may be lost; every frame after the repin arrives, and in order
         List<Integer> after = got.subList(50, got.size());
         assertThat(after).isSorted();
         assertThat(got).contains(99);
         assertThat(f.a1().pinnedPath(groupId, f.b1().peerId()))
                 .contains(List.of(f.ra().peerId(), hq.peerId(), f.rb().peerId()));
-        System.out.printf("LB-Q-REL-07: %d frames after the restart, in order, on the repinned path%n", after.size());
+        System.out.printf("LB-Q-REL-07: %d frames after the restart, in order, on the repinned path, in %.0f ticks%n",
+                after.size(), took.value());
     }
 
     /** LB-Q-PRF-07: a path over a graph of 64 relays computes in well under a millisecond. */
@@ -345,6 +405,10 @@ class RelayPathTest {
         double micros = (System.nanoTime() - begin) / 1000.0 / runs;
         System.out.printf("LB-Q-PRF-07: a path over 64 relays in %.1f microseconds (%s)%n", micros,
                 path.map(p -> p.size() + " hops").orElse("no path within four hops"));
+        // fm: (b) a performance claim, recorded as peering.relay.path-compute; the 1 ms of LB-Q-PRF-07 stays as
+        // the requirement's own bound, far above the few microseconds it takes
+        Measure.record("peering.relay.path-compute", Unit.US, Direction.LOWER, micros,
+                Rec.with().kind(Kind.PERF).params(Params.of("relays", 64)));
         assertThat(micros).as("LB-Q-PRF-07").isLessThan(1000.0);
     }
 }

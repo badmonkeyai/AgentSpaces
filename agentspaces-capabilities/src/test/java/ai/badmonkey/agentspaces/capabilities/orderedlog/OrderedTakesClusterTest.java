@@ -32,6 +32,7 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
+import ai.badmonkey.agentspaces.space.replicated.SpaceWire;
 import ai.badmonkey.agentspaces.space.replicated.TakeClaim;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
 import ai.badmonkey.agentspaces.test.SimNetwork;
@@ -91,50 +92,58 @@ class OrderedTakesClusterTest {
     private List<Member> cluster(boolean agentHolders) throws IOException {
         List<PeerIdentity> identities =
                 List.of(PeerIdentity.generate(), PeerIdentity.generate(), PeerIdentity.generate());
-        List<PeerId> memberIds = identities.stream().map(PeerIdentity::peerId).toList();
         List<Member> members = new ArrayList<>();
         for (int i = 0; i < identities.size(); i++) {
-            String address = "n" + i;
-            PeerIdentity identity = identities.get(i);
-            PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(200 + i).build();
-            node.listen(network.register(address), address);
-            GroupRuntime runtime = node.joinGroup(groupAd, GroupMembership.Config.defaults(),
-                    i == 0 ? List.of()
-                            : List.of(new PeerAdvertisement.Endpoint("mem", "n0", 0)));
-            ai.badmonkey.agentspaces.api.spi.AgentIdentity holder = agentHolders
-                    ? identity.renewingSubordinate("taker", Duration.ofHours(1), clock) : null;
-            ReplicatedSpace.Builder spaceBuilder = ReplicatedSpace.builder(runtime, "commits", identity, "taker")
-                    .clock(clock)
-                    .settleWindow(Duration.ZERO);
-            if (holder != null) {
-                spaceBuilder.writer(holder);
-            }
-            ReplicatedSpace space = spaceBuilder.build();
-            AtomicReference<OrderedTakes> ref = new AtomicReference<>();
-            final int memberIndex = i;
-            RaftLog raft = new RaftLog(new CapabilityPipes(runtime, codec), codec,
-                    identity.peerId(), memberIds, clock, 2000 + i, (command, index) -> {
-                OrderedTakes ordered = ref.get();
-                if (ordered != null) {
-                    ordered.onCommand(command, index);
-                }
-                if (memberIndex == 0) {
-                    committedCommands.add(command);
-                    committedIndices.add(index);
-                }
-            });
-            OrderedTakes ordered = holder == null
-                    ? new OrderedTakes(raft, space, identity, "taker", codec, clock)
-                    : new OrderedTakes(raft, space, identity, holder, codec, clock);
-            ref.set(ordered);
-            nodes.add(node);
-            members.add(new Member(node, space, raft, ordered));
+            members.add(start(identities, i, agentHolders));
         }
         for (int i = 0; i < 4; i++) {
             nodes.forEach(PeerNode::tick);
             clock.advance(Duration.ofSeconds(1)); // anti-entropy runs once per gossip period on the node clock
         }
         return members;
+    }
+
+    /**
+     * Starts member {@code i} of a log over every identity given: its node, its space, its Raft log and its ordered
+     * takes. A member started after the others is a late joiner of a log that already counted it as a voter.
+     */
+    private Member start(List<PeerIdentity> identities, int i, boolean agentHolders) throws IOException {
+        List<PeerId> memberIds = identities.stream().map(PeerIdentity::peerId).toList();
+        String address = "n" + i;
+        PeerIdentity identity = identities.get(i);
+        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(200 + i).build();
+        node.listen(network.register(address), address);
+        GroupRuntime runtime = node.joinGroup(groupAd, GroupMembership.Config.defaults(),
+                i == 0 ? List.of()
+                        : List.of(new PeerAdvertisement.Endpoint("mem", "n0", 0)));
+        ai.badmonkey.agentspaces.api.spi.AgentIdentity holder = agentHolders
+                ? identity.renewingSubordinate("taker", Duration.ofHours(1), clock) : null;
+        ReplicatedSpace.Builder spaceBuilder = ReplicatedSpace.builder(runtime, "commits", identity, "taker")
+                .clock(clock)
+                .settleWindow(Duration.ZERO);
+        if (holder != null) {
+            spaceBuilder.writer(holder);
+        }
+        ReplicatedSpace space = spaceBuilder.build();
+        AtomicReference<OrderedTakes> ref = new AtomicReference<>();
+        final int memberIndex = i;
+        RaftLog raft = new RaftLog(new CapabilityPipes(runtime, codec), codec,
+                identity.peerId(), memberIds, clock, 2000 + i, (command, index) -> {
+            OrderedTakes ordered = ref.get();
+            if (ordered != null) {
+                ordered.onCommand(command, index);
+            }
+            if (memberIndex == 0) {
+                committedCommands.add(command);
+                committedIndices.add(index);
+            }
+        });
+        OrderedTakes ordered = holder == null
+                ? new OrderedTakes(raft, space, identity, "taker", codec, clock)
+                : new OrderedTakes(raft, space, identity, holder, codec, clock);
+        ref.set(ordered);
+        nodes.add(node);
+        return new Member(node, space, raft, ordered);
     }
 
     private static void awaitLeader(List<Member> members) {
@@ -358,6 +367,95 @@ class OrderedTakesClusterTest {
         assertThat(seenAtC).doesNotContain(SpaceEvent.Kind.REAPPEARED);
     }
 
+    /**
+     * The ordered-log renewal defect the PetClinic rebuild found (2026-11-15): a holder drains for
+     * longer than its take lease and renews as it goes. Every voter whose log has applied the claim
+     * must merge each renewal, since a renewal is the same holder, stamp, epoch and bid with a later
+     * expiry; the QA4 A4-5 rule refused it there, so the rival's replica saw the lease run out after
+     * one lease length and the log committed the rival's next epoch while the holder still held the
+     * ticket. Here the drain runs four lease lengths, every voter keeps the renewed expiry, and the
+     * rival takes nothing until the holder stops renewing. The rival's take after the lapse shows the
+     * log was live throughout, so the empty takes during the drain are the lease's verdict.
+     */
+    @Test
+    @Timeout(120)
+    void aDrainLongerThanTheTakeLeaseKeepsTheTakeAtEveryVoter() throws Exception {
+        List<Member> members = cluster();
+        awaitLeader(members);
+        Member a = members.get(0);
+        Member b = members.get(1);
+        Member c = members.get(2);
+        Lease takeLease = Lease.of(Duration.ofSeconds(30));
+        a.space().write(new TaskEntry("ticket", 1), MINUTES_30);
+        assertThat(c.space().read(Template.of(TaskEntry.class))).isPresent();
+
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byB = CompletableFuture.supplyAsync(
+                () -> b.ordered().take(Template.of(TaskEntry.class), takeLease, Duration.ofSeconds(20)));
+        tickUntilDone(members, 1500, byB);
+        TakenEntry<TaskEntry> ticket = byB.get().orElseThrow();
+        EntryId id = ticket.entryId();
+        // Every voter's log applies the claim first, so the log-decided rule is in force everywhere
+        // before the first renewal: the order in which the defect showed.
+        for (int i = 0; i < 200 && !members.stream().allMatch(m -> m.space().currentClaim(id).isPresent()); i++) {
+            members.forEach(m -> m.raft().tick());
+            Thread.sleep(15);
+        }
+        long committedExpiry = c.space().currentClaim(id).orElseThrow().expiresAtMillis();
+        long drainStart = clock.millis();
+
+        int maxRounds = 0;
+        for (int step = 0; step < 12; step++) {               // 12 renewals 10 s apart: four lease lengths
+            clock.advance(Duration.ofSeconds(10));             // a step of the drain, then the holder renews
+            ticket.renew(Duration.ofSeconds(30));
+            long renewed = b.space().currentClaim(id).orElseThrow().expiresAtMillis();
+            // A generous ceiling of 19 gossip rounds of 1 s: with the 10 s step that stays inside the 30 s lease.
+            // The rounds used are measured.
+            int rounds = 0;
+            while (rounds < 19 && !members.stream().allMatch(m -> m.space().currentClaim(id)
+                    .map(cl -> cl.expiresAtMillis() == renewed).orElse(false))) {
+                nodes.forEach(PeerNode::tick);
+                clock.advance(Duration.ofSeconds(1));
+                rounds++;
+            }
+            maxRounds = Math.max(maxRounds, rounds);
+            for (Member m : members) {
+                String where = "renewal " + step + " at " + m.node().peerId();
+                TakeClaim held = m.space().currentClaim(id).orElseThrow();
+                assertThat(held.holder()).as(where + ": the holder").isEqualTo(b.ordered().holder());
+                assertThat(held.epoch()).as(where + ": the epoch").isEqualTo(1L);
+                assertThat(held.expiresAtMillis()).as(where + ": the renewed expiry").isEqualTo(renewed);
+            }
+            CompletableFuture<Optional<TakenEntry<TaskEntry>>> byC = CompletableFuture.supplyAsync(
+                    () -> c.ordered().take(Template.of(TaskEntry.class), takeLease, Duration.ofMillis(300)));
+            tickUntilDone(members, 400, byC);
+            assertThat(byC.get()).as("the rival takes nothing while the holder renews (step " + step + ")")
+                    .isEmpty();
+        }
+        long drained = clock.millis() - drainStart;
+        System.out.println("ORDERED-RENEWAL-MEASURE drain " + drained + " ms on the test clock over a "
+                + takeLease.duration().toMillis() + " ms lease; committed expiry passed by "
+                + (clock.millis() - committedExpiry) + " ms; renewal reached every voter in at most "
+                + maxRounds + " gossip rounds");
+        assertThat(drained).as("the drain outlasted the take lease").isGreaterThan(3 * 30_000L);
+
+        // The holder stops renewing. Once its lease runs out, the rival's take goes through the same
+        // log at the next epoch, and the old holder can no longer renew.
+        clock.advance(Duration.ofSeconds(31));
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byC = CompletableFuture.supplyAsync(
+                () -> c.ordered().take(Template.of(TaskEntry.class), takeLease, Duration.ofSeconds(20)));
+        tickUntilDone(members, 1500, byC);
+        TakenEntry<TaskEntry> rival = byC.get().orElseThrow();
+        assertThat(rival.entryId()).isEqualTo(id);
+        for (int i = 0; i < 200 && b.space().currentClaim(id).map(cl -> cl.epoch() != 2).orElse(true); i++) {
+            members.forEach(m -> m.raft().tick());
+            Thread.sleep(15);
+        }
+        assertThat(b.space().currentClaim(id).orElseThrow().epoch()).isEqualTo(2L);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> ticket.renew(Duration.ofSeconds(30)))
+                .isInstanceOf(ai.badmonkey.agentspaces.api.error.LeaseExpiredException.class);
+        c.space().complete(rival);
+    }
+
     @Test
     @Timeout(60)
     void applyingCommittedCommandsIsIndependentOfTheWallClock() throws Exception {
@@ -491,6 +589,214 @@ class OrderedTakesClusterTest {
                 });
         nodes.add(node);
         return new OrderedTakes(raft, replayApplierSpace, identity, "taker", codec, clock);
+    }
+
+    /** One event a late joiner heard: its kind, the entry's topic, and how many entries the replica knew then. */
+    private record Heard(SpaceEvent.Kind kind, String topic, int known) {
+    }
+
+    private static Template<TaskEntry> topic(String topic) {
+        return Template.of(TaskEntry.class).where("topic", ai.badmonkey.agentspaces.api.space.Matchers.eq(topic));
+    }
+
+    /** What the majority did while the late member was cut off: one entry taken and completed, one taken, one open. */
+    private record AwayWork(Member late, List<Member> live, Member taker, EntryId done, EntryId held, EntryId open,
+                            TakenEntry<TaskEntry> heldTake, List<Heard> heard) {
+
+        /** The same work, with a listener on the late member's space recording every event from now on. */
+        AwayWork joinedBy(Member late) {
+            List<Heard> heard = new java.util.concurrent.CopyOnWriteArrayList<>();
+            late.space().notify(Template.of(TaskEntry.class),
+                    e -> heard.add(new Heard(e.kind(), e.entry().topic(), late.space().knownEntries())), MINUTES_30);
+            return new AwayWork(late, live, taker, done, held, open, heldTake, heard);
+        }
+    }
+
+    /**
+     * The late member is a follower cut off from both others before anything is written; the two live members (a log
+     * quorum) do the away work of {@link #workWithout}.
+     */
+    private AwayWork workWhileAway(List<Member> members) throws Exception {
+        Member late = members.stream().filter(m -> !m.raft().isLeader()).findFirst().orElseThrow();
+        List<Member> live = members.stream().filter(m -> m != late).toList();
+        String lateAddress = "n" + members.indexOf(late);
+        for (Member m : live) {
+            network.partition(lateAddress, "n" + members.indexOf(m));
+        }
+        AwayWork away = workWithout(live);
+        assertThat(late.space().knownEntries()).as("the late member heard nothing while away").isZero();
+        assertThat(late.space().currentClaim(away.done())).isEmpty();
+        return away.joinedBy(late);
+    }
+
+    /**
+     * The away work: the first live member writes three entries; the second takes two through the log and completes
+     * one of them.
+     */
+    private AwayWork workWithout(List<Member> live) throws Exception {
+        Member writer = live.get(0);
+        Member taker = live.get(1);
+        writer.space().write(new TaskEntry("done-while-away", 1), MINUTES_30);
+        writer.space().write(new TaskEntry("held-while-away", 2), MINUTES_30);
+        writer.space().write(new TaskEntry("open-while-away", 3), MINUTES_30);
+        EntryId done = writer.space().entryIdOf(new TaskEntry("done-while-away", 1)).orElseThrow();
+        EntryId held = writer.space().entryIdOf(new TaskEntry("held-while-away", 2)).orElseThrow();
+        EntryId open = writer.space().entryIdOf(new TaskEntry("open-while-away", 3)).orElseThrow();
+        assertThat(taker.space().read(topic("held-while-away"))).isPresent();
+
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> first = CompletableFuture.supplyAsync(
+                () -> taker.ordered().take(topic("done-while-away"), MINUTES_10, Duration.ofSeconds(20)));
+        tickUntilDone(live, 1500, first);
+        taker.space().complete(first.get().orElseThrow());
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> second = CompletableFuture.supplyAsync(
+                () -> taker.ordered().take(topic("held-while-away"), MINUTES_10, Duration.ofSeconds(20)));
+        tickUntilDone(live, 1500, second);
+        TakenEntry<TaskEntry> heldTake = second.get().orElseThrow();
+        return new AwayWork(null, live, taker, done, held, open, heldTake, List.of());
+    }
+
+    /** Anti-entropy only: node ticks, no Raft tick, so the log cannot tell the late member anything meanwhile. */
+    private void antiEntropyUntil(java.util.function.BooleanSupplier done, int rounds) {
+        for (int i = 0; i < rounds && !done.getAsBoolean(); i++) {
+            nodes.forEach(PeerNode::tick);
+            clock.advance(Duration.ofSeconds(1));
+        }
+    }
+
+    /**
+     * RBE regression matrix probe P4 (srad/replication-by-entry.md phase 1, RE-M-08): a late joiner learns the whole
+     * space in one {@code PULL_RESP}, the committed claims and the completed state they authenticate together. The
+     * batch merges its claims before its states, so the completion is accepted and drains the entry, the held entry
+     * stays held by the log's winner, and the open one is takeable. The log then catches up: its committed claims
+     * agree with what the batch brought, no second generation is committed, the late member adopts a take of its own
+     * through the log, and nothing reappears when the take leases run out.
+     */
+    @Test
+    @Timeout(90)
+    void aLateJoinerTakesAClaimAndItsCompletionFromOneBatchThenAgreesWithTheLog() throws Exception {
+        // The third voter starts after the work: a member that was never there gets no lazy-push announcement of the
+        // older rumors (they predate its admission), so anti-entropy is its only source and one PULL_RESP carries it all.
+        List<PeerIdentity> identities =
+                List.of(PeerIdentity.generate(), PeerIdentity.generate(), PeerIdentity.generate());
+        List<Member> live = List.of(start(identities, 0, false), start(identities, 1, false));
+        for (int i = 0; i < 4; i++) {
+            nodes.forEach(PeerNode::tick);
+            clock.advance(Duration.ofSeconds(1));
+        }
+        awaitLeader(live);
+        AwayWork work = workWithout(live);
+        Member late = start(identities, 2, false);
+        assertThat(late.space().knownEntries()).isZero();
+        AwayWork away = work.joinedBy(late);
+        List<Member> members = List.of(live.get(0), live.get(1), late);
+
+        antiEntropyUntil(() -> late.space().knownEntries() == 3
+                && late.space().signedState(away.done()).map(SpaceWire.EntryStateDto::completed).orElse(false), 40);
+
+        assertThat(late.space().knownEntries()).isEqualTo(3);
+        assertThat(away.heard()).as("the late member heard the away work").isNotEmpty();
+        assertThat(away.heard()).as("one batch: every event fired after all three entries were in")
+                .allSatisfy(h -> assertThat(h.known()).isEqualTo(3));
+        assertThat(late.space().signedState(away.done()))
+                .as("the completion was accepted beside the claim that authenticates it")
+                .hasValueSatisfying(dto -> assertThat(dto.completed()).isTrue());
+        for (EntryId id : List.of(away.done(), away.held())) {
+            assertThat(late.space().currentClaim(id)).as("the log's claim, by anti-entropy, for " + id)
+                    .hasValueSatisfying(c -> {
+                        assertThat(c.holder().peer()).isEqualTo(away.taker().node().peerId());
+                        assertThat(c.epoch()).isEqualTo(1);
+                    });
+        }
+        assertThat(late.space().read(topic("done-while-away"))).as("completed work is gone").isEmpty();
+        assertThat(late.space().read(topic("held-while-away"))).as("held work is invisible").isEmpty();
+        assertThat(late.space().read(topic("open-while-away"))).as("open work is readable").isPresent();
+        assertThat(away.heard()).extracting(Heard::kind).doesNotContain(SpaceEvent.Kind.REAPPEARED);
+        assertThat(away.heard()).filteredOn(h -> h.topic().equals("done-while-away")).extracting(Heard::kind)
+                .as("a completed entry learned late is no new work").doesNotContain(SpaceEvent.Kind.WRITTEN);
+
+        lateAdoptsAndNothingReappears(members, away);
+    }
+
+    /**
+     * RBE regression matrix probe P4, the other order: the log catches a cut-off member up first, so it holds the
+     * committed claims as claim-only slots with no record (phase 1 keeps a claim in a slot of its own), and replication
+     * then brings the records and the completion. A member that was there before the cut also hears the lazy-push
+     * announcements of the rumors it missed, so the records come by grafted rumors and anti-entropy in whatever mix the
+     * rounds give, not always in one batch: what is pinned is the outcome. The completion must still meet the log's
+     * claim, and the slots must keep their claims beside the records.
+     */
+    @Test
+    @Timeout(90)
+    void aMemberHoldingOnlyTheLogsClaimsAcceptsTheRecordsAndTheCompletionAfter() throws Exception {
+        List<Member> members = cluster();
+        awaitLeader(members);
+        AwayWork away = workWhileAway(members);
+        Member late = away.late();
+
+        network.heal();
+        for (int i = 0; i < 300 && (late.space().currentClaim(away.done()).isEmpty()
+                || late.space().currentClaim(away.held()).isEmpty()); i++) {
+            members.forEach(m -> m.raft().tick());
+            Thread.sleep(10);
+        }
+        assertThat(late.space().currentClaim(away.done())).as("the log installed the claim with no record here")
+                .isPresent();
+        assertThat(late.space().currentClaim(away.held())).isPresent();
+        assertThat(late.space().knownEntries()).as("claims only: no record has arrived").isZero();
+
+        antiEntropyUntil(() -> late.space().knownEntries() == 3
+                && late.space().signedState(away.done()).map(SpaceWire.EntryStateDto::completed).orElse(false), 40);
+
+        assertThat(late.space().knownEntries()).isEqualTo(3);
+        assertThat(late.space().signedState(away.done()))
+                .as("the completion met the claim the log installed")
+                .hasValueSatisfying(dto -> assertThat(dto.completed()).isTrue());
+        assertThat(late.space().currentClaim(away.held()).orElseThrow().holder().peer())
+                .isEqualTo(away.taker().node().peerId());
+        assertThat(late.space().read(topic("done-while-away"))).isEmpty();
+        assertThat(late.space().read(topic("held-while-away"))).isEmpty();
+        assertThat(late.space().read(topic("open-while-away"))).isPresent();
+
+        lateAdoptsAndNothingReappears(members, away);
+    }
+
+    /** The end both orders share: the log agrees, the late member takes the open entry, and nothing comes back. */
+    private void lateAdoptsAndNothingReappears(List<Member> members, AwayWork away) throws Exception {
+        Member late = away.late();
+        for (int i = 0; i < 100; i++) {
+            members.forEach(m -> m.raft().tick());
+        }
+        for (EntryId id : List.of(away.done(), away.held())) {
+            assertThat(late.space().currentClaim(id)).as("the log and the batch agree on " + id)
+                    .hasValueSatisfying(c -> {
+                        assertThat(c.holder().peer()).isEqualTo(away.taker().node().peerId());
+                        assertThat(c.epoch()).as("no second generation").isEqualTo(1);
+                    });
+        }
+
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byLate = CompletableFuture.supplyAsync(
+                () -> late.ordered().take(Template.of(TaskEntry.class), MINUTES_10, Duration.ofSeconds(20)));
+        tickUntilDone(members, 1500, byLate);
+        TakenEntry<TaskEntry> mine = byLate.get().orElseThrow(
+                () -> new AssertionError("the late member adopted no take of its own"));
+        assertThat(mine.entry().topic()).as("only the open entry is takeable").isEqualTo("open-while-away");
+        late.space().complete(mine);
+        away.taker().space().complete(away.heldTake());
+        antiEntropyUntil(() -> late.space().signedState(away.held()).map(SpaceWire.EntryStateDto::completed)
+                .orElse(false), 40);
+        assertThat(late.space().signedState(away.held()))
+                .hasValueSatisfying(dto -> assertThat(dto.completed()).isTrue());
+
+        clock.advance(Duration.ofMinutes(11)); // past every take lease, inside the write leases
+        for (int i = 0; i < 5; i++) {
+            nodes.forEach(PeerNode::tick);
+            clock.advance(Duration.ofSeconds(1));
+        }
+        for (Member m : members) {
+            assertThat(m.space().read(Template.of(TaskEntry.class)))
+                    .as("nothing reappears at " + m.node().peerId()).isEmpty();
+        }
+        assertThat(away.heard()).extracting(Heard::kind).doesNotContain(SpaceEvent.Kind.REAPPEARED);
     }
 
     /** SPEC §8 / §7.4 ORDERED: a partitioned minority takes nothing, commits nothing, and adopts the majority's decision once healed (spec P1). */

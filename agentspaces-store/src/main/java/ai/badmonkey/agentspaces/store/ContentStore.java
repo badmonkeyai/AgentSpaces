@@ -20,6 +20,7 @@ import ai.badmonkey.agentspaces.agent.content.SignedPin;
 import ai.badmonkey.agentspaces.agent.content.StorePin;
 import ai.badmonkey.agentspaces.agent.content.StoreReceipt;
 import ai.badmonkey.agentspaces.api.ad.AssetCard;
+import ai.badmonkey.agentspaces.api.entry.EntryId;
 import ai.badmonkey.agentspaces.api.entry.EntryRecord;
 import ai.badmonkey.agentspaces.api.space.EntryHandle;
 import ai.badmonkey.agentspaces.api.space.Lease;
@@ -47,6 +48,7 @@ import ai.badmonkey.agentspaces.pdt.stores.Stores;
 import ai.badmonkey.agentspaces.pdt.store.MetaStore;
 import ai.badmonkey.agentspaces.planner.StoreChooser;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
+import ai.badmonkey.agentspaces.space.replicated.TakeClaim;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -121,6 +123,17 @@ import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
  * store; a root no requester pinned here stays where it is, since a store holds and charges only what a requester
  * signed for it (F1). The tick reconciles with one other store every {@code reconcile-every}, in turn, and the turn
  * passes on after a reconcile that fails as after one that succeeds.
+ *
+ * <p>A race lost after the completion (store-race, 2026-11-15). Two stores that take one pin across a partition both
+ * hold a claim. Usually the claims meet before either fetch ends, and the loser's completion is refused. But a claim
+ * can reach the other store late: a claim rumor sent while its sender's view was empty reaches nobody, a receiver
+ * drops a frame older than five minutes, and anti-entropy, which repairs both, may end after the fetch. The loser
+ * then completes on its own claim. What happens next follows the settle guarantee (SPEC §7.4). A winner that learns
+ * of the loser's completion before its own acknowledges it and writes no receipt, so the loser's receipt is the
+ * pin's only one and the loser keeps the holding. When both complete before either learns of the other, two
+ * receipts exist and one must go: every holding a store completes is watched until its claim names another peer
+ * that also wrote a receipt for the root; the store then gives the holding up as a lost race: it unpins, withdraws
+ * its receipt and the copy it forwarded, and charges the requester nothing.
  */
 public final class ContentStore implements AssetProvider, AutoCloseable {
 
@@ -180,10 +193,11 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
      * @param roots       the roots held
      * @param byRequester bytes and roots per requester
      * @param byGroup     bytes and roots per group
-     * @param taken       pins taken and completed
+     * @param taken       pins taken and completed, less those given up as a lost race
      * @param refused     pins judged and refused
      * @param released    holdings released
-     * @param abandoned   takes abandoned for a failed or slow fetch, or a root over capacity
+     * @param abandoned   takes abandoned for a failed or slow fetch, or a root over capacity, and completed takes
+     *                    given up when the pin's claim showed another store won the race
      * @param unsigned    pins refused, each once, because their requester did not sign them (F1)
      * @param full        whether the store refuses pins for want of room (P2-Q-AVL-02)
      * @param waiting     whether a grant store waits for an authorizer and takes no pins (F2)
@@ -205,6 +219,13 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         static Consent of(SignedPin signed) {
             return new Consent(signed.pin(), signed.notAfter());
         }
+    }
+
+    /**
+     * A holding this store completed a pin's take for, watched until the pin's claim shows who won (see the class
+     * comment). {@code forwarded} is the pin entry this store wrote for the copies left, or null.
+     */
+    private record Completed(EntryId entryId, String root, PeerId requester, EntryHandle forwarded) {
     }
 
     /** One pin being fetched; {@code signed} is null for a pin asked by invoke, whose signer is the requester. */
@@ -277,6 +298,9 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
     private long reconciledMillis;
     private final Map<String, InFlight> inFlight = new ConcurrentHashMap<>();
     private final Map<String, EntryHandle> receipts = new ConcurrentHashMap<>();
+    /** The completed takes whose claim may still turn out to be another store's, by pin entry. */
+    private final Map<EntryId, Completed> completedTakes = new ConcurrentHashMap<>();
+    private long racesCheckedMillis = Long.MIN_VALUE / 4;
     private final AtomicLong taken = new AtomicLong();
     private final AtomicLong refused = new AtomicLong();
     private final AtomicLong released = new AtomicLong();
@@ -522,6 +546,63 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
             refreshedMillis = now;
             runtime.refreshCards();
         }
+        if (now - racesCheckedMillis >= holdingInterval.toMillis()) {
+            // once a holding interval, as the card: a claim that lost reaches this store by anti-entropy, which is
+            // no faster, and a check per tick would cost a lock per holding on every tick of an idle store
+            racesCheckedMillis = now;
+            driveRaces();
+        }
+    }
+
+    /**
+     * Gives up the holdings whose pin's claim now names another peer: this store completed a take that lost the race
+     * (see the class comment). A claim this replica no longer holds was collected with its entry, after which no later
+     * claim can name anyone, so the watch ends.
+     */
+    private void driveRaces() {
+        if (completedTakes.isEmpty() || !(space instanceof ReplicatedSpace replicated)) {
+            return;
+        }
+        for (Completed c : List.copyOf(completedTakes.values())) {
+            Optional<TakeClaim> claim = replicated.currentClaim(c.entryId());
+            if (claim.isEmpty()) {
+                completedTakes.remove(c.entryId(), c);
+            } else if (!claim.get().holder().peer().equals(self) && receiptFrom(c.root(), claim.get().holder().peer())) {
+                // only a winner that wrote its own receipt did the work too (rule three of the settle guarantee,
+                // SPEC 7.4). A winner that learned of this store's completion first acknowledges it with no result
+                // (rule two), so this store's receipt is the only one and giving it up would leave the pin unheld
+                lostRace(c, claim.get().holder().peer());
+            }
+        }
+    }
+
+    /** Whether {@code holder} wrote a live receipt for {@code root} under its own signature. */
+    private boolean receiptFrom(String root, PeerId holder) {
+        for (Space.Issued<StoreReceipt> issued : space.readAllIssued(Template.of(StoreReceipt.class)
+                .whereTag(StoreReceipt.ROOT_TAG, eq(root)).whereTag(StoreReceipt.HOLDER_TAG, eq(holder.value())), SCAN)) {
+            StoreReceipt receipt = issued.entry();
+            if (receipt.violation().isEmpty() && receipt.root().equals(root) && receipt.holder().equals(holder)
+                    && issued.issuer().peer().equals(holder)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Undoes what {@link #finish} did for a take another store won; the count moves from taken to abandoned. */
+    private void lostRace(Completed c, PeerId winner) {
+        if (!completedTakes.remove(c.entryId(), c)) {
+            return;
+        }
+        Optional<StoreLedger.Held> held = ledger.holding(c.root(), c.requester());
+        if (held.isPresent()) {
+            unhold(held.get());
+        }
+        withdraw(c.forwarded());
+        taken.decrementAndGet();
+        abandoned.incrementAndGet();
+        LOG.log(System.Logger.Level.INFO, "store " + name + " gave up " + c.root() + " for " + c.requester().display()
+                + ": " + winner.display() + " won the pin's take, which this store learned after its own completion");
     }
 
     /**
@@ -1163,13 +1244,18 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         }
         ledger.hold(new StoreLedger.Held(root, pin.kind(), bytes, pin.requester(), until, pin.copies()));
         withdraw(receipts.put(key(root, pin.requester()), handle));
+        EntryHandle forwarded = null;
         if (f.signed != null && f.signed.left() > 1 && f.signed.notAfter() > now) {
             // the requester's own signed terms with one copy fewer left: this store speaks for nobody (F1)
             SignedPin rest = f.signed.forward();
             // the pin's lease caps in seconds first: a lease near Long.MAX_VALUE seconds overflows in milliseconds
             Duration entry = Duration.ofMillis(Math.min(rest.notAfter() - now,
                     Math.min(pin.lease(), Stores.PIN_ENTRY_LEASE.toSeconds()) * 1000));
-            space.write(rest, Lease.of(entry), rest.tags());
+            forwarded = space.write(rest, Lease.of(entry), rest.tags());
+        }
+        if (f.taken != null && !renewal) {
+            // a renewal extends a holding this store had already, which a lost race must not undo
+            completedTakes.put(f.taken.entryId(), new Completed(f.taken.entryId(), root, pin.requester(), forwarded));
         }
         taken.incrementAndGet();
         full = free() <= 0;
@@ -1186,9 +1272,20 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
 
     /** Releases one requester's holding: unpins, withdraws the holding when no requester is left, withdraws the receipt. */
     private void release(StoreLedger.Held held, String why) {
-        if (ledger.release(held.root(), held.requester()).isEmpty()) {
+        if (!unhold(held)) {
             return;
         }
+        released.incrementAndGet();
+        LOG.log(System.Logger.Level.INFO, "store " + name + " released " + held.root() + " for "
+                + held.requester().display() + ": " + why);
+    }
+
+    /** Drops one requester's holding, its pin of the root and its receipt; false when the ledger held none. */
+    private boolean unhold(StoreLedger.Held held) {
+        if (ledger.release(held.root(), held.requester()).isEmpty()) {
+            return false;
+        }
+        completedTakes.values().removeIf(c -> c.root().equals(held.root()) && c.requester().equals(held.requester()));
         if (StorePin.KIND_TREE.equals(held.kind())) {
             pdt.swarm().release(held.root());
         } else if (!ledger.holds(held.root())) {
@@ -1200,10 +1297,8 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         } else {
             withdrawWritten(held);
         }
-        released.incrementAndGet();
         full = free() <= 0;
-        LOG.log(System.Logger.Level.INFO, "store " + name + " released " + held.root() + " for "
-                + held.requester().display() + ": " + why);
+        return true;
     }
 
     private static void withdraw(EntryHandle handle) {

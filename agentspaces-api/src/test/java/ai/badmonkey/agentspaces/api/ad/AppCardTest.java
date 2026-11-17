@@ -45,7 +45,7 @@ class AppCardTest {
         return new AppCard("aspace://zApps/app/zPeerA/adjuster-desk", PeerId.of("zPeerA"), GroupId.of("zApps"), Instant.parse("2026-11-04T10:00:00Z"),
                 Duration.ofMinutes(15), "adjuster-desk", "fed", "web", "claims-ops", List.of("claims-fleet/intake", "claims-fleet/views"),
                 List.of("approve", "escalate"), "adjuster-desk-client", "https://desk.example/", "example-desk", "1.2",
-                List.of("claims", "claim-detail"), new AppCard.Ui("a2ui", "v0.9.1", List.of("https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json", "example-widgets"),
+                List.of("claims", "claim-detail"), new AppCard.Ui("a2ui", "1.0", List.of("https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json", "example-widgets"),
                         "claim-panel", "views", List.of("claim-77", "claim-78")));
     }
 
@@ -78,8 +78,15 @@ class AppCardTest {
                 .hasMessageContaining("a2ui app names its surfaces");
         assertThatThrownBy(() -> new AppCard("a", PeerId.of("zP"), GroupId.of("zG"), Instant.EPOCH, Duration.ofMinutes(1), "x", "robot", "web", "", List.of(), List.of(), "", "", "", "1", List.of(), null))
                 .hasMessageContaining("kind must be one of");
-        assertThatThrownBy(() -> new AppCard.Ui("a2ui", "v0.9.1", List.of(), "agent", "carrier-pigeon", List.of())).hasMessageContaining("transport");
+        assertThatThrownBy(() -> new AppCard.Ui("a2ui", "1.0", List.of(), "agent", "carrier-pigeon", List.of())).hasMessageContaining("transport");
         assertThatThrownBy(() -> new AppCard("a", PeerId.of("zP"), GroupId.of("zG"), Instant.EPOCH, Duration.ofMinutes(1), "x", "fed", "web", "",
                 java.util.Collections.nCopies(AppCard.MAX_TERMS + 1, "g/s"), List.of(), "", "", "", "1", List.of(), null)).hasMessageContaining("at most");
+    }
+
+    @org.junit.jupiter.api.Test
+    void aCardsUiDefaultsToA2uiOnePointZero() {
+        // A2UI 1.0 (srad/agentspaces-geo.md phase 0, 2026-11-12): the wire's version is "1.0", with no v0.9.1 reading kept
+        assertThat(new AppCard.Ui("a2ui", "", java.util.List.of(), "agent", "views", java.util.List.of()).version()).isEqualTo("1.0");
+        assertThat(UiDeclaration.VERSION).isEqualTo("1.0");
     }
 }

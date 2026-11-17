@@ -139,15 +139,47 @@ class DtlsTransportTest {
     void anUnreachablePeerFailsTheDialWithinTheDialTimeout() throws Exception {
         DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate());
         closeables.add(dialer);
+        // A socket that holds the port and never answers: the host sends no port unreachable, so only the
+        // handshake's timeout ends the dial, as for a peer behind a firewall that drops the datagrams.
+        DatagramSocket silent = new DatagramSocket(new java.net.InetSocketAddress("127.0.0.1", 0));
+        closeables.add(silent);
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> dialer.dial("127.0.0.1:" + silent.getLocalPort()))
+                .isInstanceOf(IOException.class).hasMessageContaining("over DTLS")
+                .hasMessageNotContaining("port unreachable");
+        assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(15));
+        assertThat(dialer.counters().handshakesFailed()).isEqualTo(1);
+    }
+
+    /**
+     * A dial to a port nobody holds (a member that left or crashed) fails as soon as the host answers with a port
+     * unreachable, as a TCP dial to a closed port is refused, instead of after the 10 s handshake timeout. A sender that
+     * dials such a member (a node's tick, a gossip forward) used to stall for the whole timeout on every send.
+     */
+    @Test
+    @Timeout(30)
+    void aDialToAPortNobodyHoldsFailsWhenTheHostSaysSo() throws Exception {
+        DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate());
+        closeables.add(dialer);
         int port;
-        try (DatagramSocket nobody = new DatagramSocket(0)) {
+        try (DatagramSocket nobody = new DatagramSocket(new java.net.InetSocketAddress("127.0.0.1", 0))) {
             port = nobody.getLocalPort();
         }
         long start = System.nanoTime();
         assertThatThrownBy(() -> dialer.dial("127.0.0.1:" + port))
-                .isInstanceOf(IOException.class).hasMessageContaining("over DTLS");
-        assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(15));
+                .isInstanceOf(IOException.class).hasMessageContaining("over DTLS: port unreachable");
+        long millis = Duration.ofNanos(System.nanoTime() - start).toMillis();
+        System.out.println("a dtls dial to a closed loopback port failed in " + millis + " ms (the dial timeout is "
+                + DtlsTransport.DIAL_TIMEOUT_MILLIS + " ms)");
         assertThat(dialer.counters().handshakesFailed()).isEqualTo(1);
+
+        // the binding still dials a live listener afterwards, and the association works past the handshake,
+        // when the socket is no longer connected to the peer (DT-K-05)
+        Pair pair = connect();
+        pair.dialed().send("after".getBytes());
+        assertThat(pair.atListener().poll(10, TimeUnit.SECONDS)).isEqualTo("after".getBytes());
+        pair.accepted().send("back".getBytes());
+        assertThat(pair.atDialer().poll(10, TimeUnit.SECONDS)).isEqualTo("back".getBytes());
     }
 
     @Test

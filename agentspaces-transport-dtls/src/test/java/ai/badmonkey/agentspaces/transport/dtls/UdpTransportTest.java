@@ -134,11 +134,26 @@ class UdpTransportTest {
     void anUnansweredHelloFailsTheDial() throws Exception {
         UdpTransport dialer = new UdpTransport();
         closeables.add(dialer);
+        // A socket that holds the port and never answers, so the dial ends at its timeout and not by a port unreachable.
+        DatagramSocket silent = new DatagramSocket(new java.net.InetSocketAddress("127.0.0.1", 0));
+        closeables.add(silent);
+        assertThatThrownBy(() -> dialer.dial("127.0.0.1:" + silent.getLocalPort()))
+                .isInstanceOf(java.io.IOException.class).hasMessageContaining("over UDP: no HELLO_ACK");
+    }
+
+    @Test
+    @Timeout(30)
+    void aDialToAPortNobodyHoldsFailsWhenTheHostSaysSo() throws Exception {
+        UdpTransport dialer = new UdpTransport();
+        closeables.add(dialer);
         int port;
-        try (DatagramSocket nobody = new DatagramSocket(0)) {
+        try (DatagramSocket nobody = new DatagramSocket(new java.net.InetSocketAddress("127.0.0.1", 0))) {
             port = nobody.getLocalPort();
         }
+        long start = System.nanoTime();
         assertThatThrownBy(() -> dialer.dial("127.0.0.1:" + port))
-                .isInstanceOf(java.io.IOException.class).hasMessageContaining("over UDP");
+                .isInstanceOf(java.io.IOException.class).hasMessageContaining("over UDP: port unreachable");
+        System.out.println("a udp dial to a closed loopback port failed in "
+                + java.time.Duration.ofNanos(System.nanoTime() - start).toMillis() + " ms");
     }
 }

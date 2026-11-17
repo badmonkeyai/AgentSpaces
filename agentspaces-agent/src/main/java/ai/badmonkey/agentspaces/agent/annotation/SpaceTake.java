@@ -111,4 +111,11 @@ public @interface SpaceTake {
      * permitted subclasses without this.
      */
     Class<?>[] produces() default {};
+
+    /**
+     * How many take loops run this method at once (reviews/embabel-agentspaces-review-2026-11-12.md
+     * §7.8): each loop takes and serves one entry at a time, so a method whose work takes seconds
+     * serves that many entries in parallel. Default one.
+     */
+    int concurrency() default 1;
 }

@@ -114,6 +114,125 @@ public final class AgentBinder implements AutoCloseable {
     /** Space name to the agent whose @BidFunction prices it (QA4 A4-8): one per space per peer. */
     private final Map<String, String> bidders = new ConcurrentHashMap<>();
     private final List<Bound> bound = new CopyOnWriteArrayList<>();
+
+    // ------------------------------------------------------------------ declaration readers (review §7.2)
+
+    /** The registered readers, by class: loaded once from ServiceLoader, replaced by explicit registration. */
+    private static final Map<Class<?>, ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader> READERS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile boolean readersLoaded;
+    /** Declarations per class, cleared whenever a reader is registered. */
+    private static final Map<Class<?>, Optional<ai.badmonkey.agentspaces.agent.spi.AgentDeclaration>> DECLARATIONS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Registers a reader for every binder in this JVM, replacing a loaded or registered one of the same class
+     * (review §7.2). Call before any bean binds.
+     *
+     * @param reader the reader
+     */
+    public static void registerDeclarationReader(ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader reader) {
+        Objects.requireNonNull(reader, "reader");
+        loadReaders();
+        READERS.put(reader.getClass(), reader);
+        DECLARATIONS.clear();
+    }
+
+    /** Removes a registered reader, for tests. */
+    public static void unregisterDeclarationReader(Class<?> readerClass) {
+        READERS.remove(readerClass);
+        DECLARATIONS.clear();
+    }
+
+    // ------------------------------------------------------------------ take invokers (review §7.8)
+
+    private static final List<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> INVOKERS = new CopyOnWriteArrayList<>();
+
+    /**
+     * Registers a take invoker for every binder in this JVM (review §7.8), replacing one of the same class.
+     *
+     * @param invoker the invoker
+     */
+    public static void registerTakeInvoker(ai.badmonkey.agentspaces.agent.spi.TakeInvoker invoker) {
+        Objects.requireNonNull(invoker, "invoker");
+        INVOKERS.removeIf(existing -> existing.getClass() == invoker.getClass());
+        INVOKERS.add(invoker);
+    }
+
+    /** Removes a registered invoker, for tests. */
+    public static void unregisterTakeInvoker(Class<?> invokerClass) {
+        INVOKERS.removeIf(existing -> existing.getClass() == invokerClass);
+    }
+
+    /** The invoker that claims a method, if any. */
+    private static Optional<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invokerFor(Object bean, Method method) {
+        for (ai.badmonkey.agentspaces.agent.spi.TakeInvoker invoker : INVOKERS) {
+            if (invoker.claims(bean, method)) {
+                return Optional.of(invoker);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static void loadReaders() {
+        if (readersLoaded) {
+            return;
+        }
+        synchronized (READERS) {
+            if (readersLoaded) {
+                return;
+            }
+            for (ClassLoader loader : readerLoaders()) {
+                try {
+                    for (ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader reader
+                            : java.util.ServiceLoader.load(ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader.class, loader)) {
+                        READERS.putIfAbsent(reader.getClass(), reader);
+                    }
+                } catch (java.util.ServiceConfigurationError e) {
+                    LOG.log(System.Logger.Level.WARNING, "a declaration reader failed to load", e);
+                }
+            }
+            readersLoaded = true;
+        }
+    }
+
+    private static List<ClassLoader> readerLoaders() {
+        List<ClassLoader> loaders = new ArrayList<>();
+        loaders.add(AgentBinder.class.getClassLoader());
+        ClassLoader context = Thread.currentThread().getContextClassLoader();
+        if (context != null && !loaders.contains(context)) {
+            loaders.add(context);
+        }
+        return loaders;
+    }
+
+    /**
+     * The declaration a reader finds on a class (review §7.2): the first reader, in order, that answers.
+     *
+     * @param type the class
+     * @return the declaration, or empty when no reader recognises the class
+     */
+    public static Optional<ai.badmonkey.agentspaces.agent.spi.AgentDeclaration> declarationOf(Class<?> type) {
+        loadReaders();
+        if (READERS.isEmpty()) {
+            return Optional.empty();
+        }
+        return DECLARATIONS.computeIfAbsent(type, t -> READERS.values().stream()
+                .sorted(java.util.Comparator.comparingInt(ai.badmonkey.agentspaces.agent.spi.AgentDeclarationReader::order))
+                .map(reader -> reader.read(userClass(t)))
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .findFirst());
+    }
+
+    /** A proxy's user class: a CGLIB or ByteBuddy {@code $$} subclass reads as the class it proxies. */
+    static Class<?> userClass(Class<?> type) {
+        Class<?> at = type;
+        while (at.getName().contains("$$") && at.getSuperclass() != null && at.getSuperclass() != Object.class) {
+            at = at.getSuperclass();
+        }
+        return at;
+    }
     /** Vote capabilities by vote-space name, for {@code @Ballot} and {@code @OnDecision}. */
     private final Map<String, VoteCapability> votes = new ConcurrentHashMap<>();
     /** Ordered-take coordinators by space name, for {@code @OrderedTake}. */
@@ -350,7 +469,9 @@ public final class AgentBinder implements AutoCloseable {
      * @return whether the class can be bound here
      */
     public boolean satisfies(Class<?> type) {
-        List<Declared> declared = declaredBindings(type);
+        // Review §7.3 (X46): an implied binding never decides group membership; a class whose only
+        // bindings are implied binds into every group, as a class with none does.
+        List<Declared> declared = declaredBindings(type).stream().filter(d -> !d.implied()).toList();
         if (declared.isEmpty()) {
             return true;
         }
@@ -525,15 +646,38 @@ public final class AgentBinder implements AutoCloseable {
                     + " for agent '" + name + "' of peer " + identity.peerId().display());
         }
         AgentId agentId = agentIdentity.id();
+        // Review §7.2 (X20): two agents under one name on one peer would publish one card id twice, and
+        // the ad-cache keeps the newest, so the card would flap between them. Refuse here, by name.
+        for (Bound prior : bound) {
+            if (prior.running && prior.agentId.localName().equals(name) && prior.boundClass != null
+                    && prior.boundClass != type) {
+                throw new IllegalStateException("an agent named '" + name + "' is already bound on this peer by "
+                        + prior.boundClass.getName() + " (" + prior.agentId.encoded() + "); bind "
+                        + type.getName() + " under another name");
+            }
+        }
+        Optional<ai.badmonkey.agentspaces.agent.spi.AgentDeclaration> declaration = declarationOf(type);
+        // Review §7.3: the implied takes a declaration reader asks for, as @SpaceTake annotations scoped by tag.
+        Map<Method, SpaceTake> impliedTakes = new java.util.HashMap<>();
+        Map<Method, ai.badmonkey.agentspaces.agent.spi.ImpliedBinding> impliedBindings = new java.util.HashMap<>();
+        final String agentName = name;
+        declaration.ifPresent(d -> d.implied().forEach(implied -> {
+            impliedTakes.put(implied.method(), impliedTake(implied, agentName));
+            impliedBindings.put(implied.method(), implied);
+        }));
 
         injectSpaceRefs(agent, type, agentIdentity);
         injectCapabilityRefs(agent, type);
         injectPdtRefs(agent, type);
 
         Bound handle = new Bound(agentIdentity);
+        handle.boundClass = type;
         Set<String> consumes = new LinkedHashSet<>();
         Set<String> produces = new LinkedHashSet<>();
         Map<String, String> spaceBindings = new LinkedHashMap<>();
+        // Review §7.4: where a binding writes its results when that is not its take space, keyed by the
+        // produced schema; merged after the consumed bindings, which win on a shared schema.
+        Map<String, String> producedBindings = new LinkedHashMap<>();
         List<CardAction> actions = new ArrayList<>();
 
         // Bid functions first, so AUCTION spaces are priced before any take runs.
@@ -567,19 +711,56 @@ public final class AgentBinder implements AutoCloseable {
 
         for (Method method : type.getMethods()) {
             SpaceTake take = annotationOf(method, SpaceTake.class);
+            boolean implied = false;
+            if (take == null && impliedTakes.containsKey(method)) {
+                take = impliedTakes.get(method);
+                implied = true;
+                if (!impliedTakeBindsHere(take)) {
+                    // Review §7.3 (X46): nowhere to bind in this group; advertised, not served here.
+                    ai.badmonkey.agentspaces.agent.spi.ImpliedBinding binding = impliedBindings.get(method);
+                    LOG.log(System.Logger.Level.INFO, agentName + "." + method.getName() + ": no space for the implied"
+                            + " take in group " + groupName + " (spaces " + spaces.keySet()
+                            + "); advertised as local, not served here");
+                    CardAction local = localAction(method, binding);
+                    actions.add(local);
+                    consumes.addAll(local.consumes());
+                    produces.addAll(local.produces());
+                    take = null;
+                }
+            }
             if (take != null && owns(take.group())) {
-                requireSignature(method, 1, "a @SpaceTake method takes the entry parameter");
+                Optional<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invoker = invokerFor(agent, method);
+                if (invoker.isPresent()) {
+                    // Review §7.8: the invoker owns every parameter after the entry.
+                    if (method.getParameterCount() < 1) {
+                        throw new IllegalArgumentException("a @SpaceTake method takes the entry parameter: " + method);
+                    }
+                    invoker.get().validate(agent, method);
+                    LOG.log(System.Logger.Level.INFO, agentName + "." + method.getName() + ": served through "
+                            + invoker.get().getClass().getSimpleName());
+                } else {
+                    requireSignature(method, 1, "a @SpaceTake method takes the entry parameter");
+                }
                 Class<?> entryType = method.getParameterTypes()[0];
                 String schema = schemas.register(entryType);
                 consumes.add(schema);
-                spaceBindings.put(schema, resolveSpaceName(take.space(), method));
+                String takeSpace = resolveSpaceName(take.space(), method);
+                spaceBindings.put(schema, takeSpace);
+                String resultSpace = take.resultSpace().isEmpty() ? takeSpace : resolveSpaceName(take.resultSpace(), method);
                 for (Class<?> produced : producedTypes(method, take.produces())) {
-                    produces.add(schemas.register(produced));
+                    String producedSchema = schemas.register(produced);
+                    produces.add(producedSchema);
+                    if (!resultSpace.equals(takeSpace)) {
+                        producedBindings.putIfAbsent(producedSchema, resultSpace);
+                    }
                 }
                 actions.add(action(method, take.produces(), take.description(), List.of(schema),
-                        resolveSpaceName(take.space(), method), CardAction.TAKE,
+                        takeSpace, implied ? CardAction.EMBABEL_ACTION : CardAction.TAKE,
                         CardAction.Contract.of(List.of(take.pre()), List.of(take.post()), take.cost())));
-                handle.threads.add(startTakeLoop(agent, method, take, handle));
+                int loops = Math.max(1, take.concurrency());
+                for (int i = 0; i < loops; i++) {
+                    handle.threads.add(startTakeLoop(agent, method, take, handle));
+                }
             }
             SpaceNotify notify = annotationOf(method, SpaceNotify.class);
             if (notify != null && owns(notify.group())) {
@@ -587,12 +768,19 @@ public final class AgentBinder implements AutoCloseable {
                 Class<?> entryType = method.getParameterTypes()[0];
                 String schema = schemas.register(entryType);
                 consumes.add(schema);
-                spaceBindings.putIfAbsent(schema, resolveSpaceName(notify.space(), method));
+                String notifySpace = resolveSpaceName(notify.space(), method);
+                spaceBindings.putIfAbsent(schema, notifySpace);
+                String notifyResult = notify.resultSpace().isEmpty() ? notifySpace
+                        : resolveSpaceName(notify.resultSpace(), method);
                 for (Class<?> produced : producedTypes(method, notify.produces())) {
-                    produces.add(schemas.register(produced));
+                    String producedSchema = schemas.register(produced);
+                    produces.add(producedSchema);
+                    if (!notifyResult.equals(notifySpace)) {
+                        producedBindings.putIfAbsent(producedSchema, notifyResult);
+                    }
                 }
                 actions.add(action(method, notify.produces(), notify.description(), List.of(schema),
-                        resolveSpaceName(notify.space(), method), CardAction.NOTIFY));
+                        notifySpace, CardAction.NOTIFY));
                 handle.subscriptions.add(subscribe(agent, method, notify, entryType, handle));
             }
             Ballot ballot = annotationOf(method, Ballot.class);
@@ -635,9 +823,16 @@ public final class AgentBinder implements AutoCloseable {
                 Class<?> entryType = method.getParameterTypes()[0];
                 String schema = schemas.register(entryType);
                 consumes.add(schema);
-                spaceBindings.put(schema, resolveCoordinatedSpaceName(orderedTake.space(), method));
+                String orderedSpace = resolveCoordinatedSpaceName(orderedTake.space(), method);
+                spaceBindings.put(schema, orderedSpace);
+                String orderedResult = orderedTake.resultSpace().isEmpty() ? orderedSpace
+                        : resolveSpaceName(orderedTake.resultSpace(), method);
                 for (Class<?> produced : producedTypes(method, orderedTake.produces())) {
-                    produces.add(schemas.register(produced));
+                    String producedSchema = schemas.register(produced);
+                    produces.add(producedSchema);
+                    if (!orderedResult.equals(orderedSpace)) {
+                        producedBindings.putIfAbsent(producedSchema, orderedResult);
+                    }
                 }
                 actions.add(action(method, orderedTake.produces(), orderedTake.description(), List.of(schema),
                         resolveCoordinatedSpaceName(orderedTake.space(), method),
@@ -745,7 +940,34 @@ public final class AgentBinder implements AutoCloseable {
             }
         }
 
-        handle.card = buildCard(agentIdentity, spec, consumes, produces, spaceBindings)
+        // Review §7.4: a produced schema's space, after the consumed bindings, which win on a shared schema.
+        producedBindings.forEach(spaceBindings::putIfAbsent);
+        // Review §7.2: the actions a declaration advertises without binding, unless the binder bound the method.
+        declaration.ifPresent(d -> {
+            Set<String> boundNames = new java.util.HashSet<>();
+            actions.forEach(a -> boundNames.add(a.name()));
+            for (ai.badmonkey.agentspaces.agent.spi.ExtraAction extra : d.extraActions()) {
+                if (boundNames.contains(extra.method().getName())) {
+                    continue;
+                }
+                List<String> consumed = new ArrayList<>();
+                for (Class<?> parameter : extra.method().getParameterTypes()) {
+                    if (isEntryParameter(parameter)) {
+                        consumed.add(schemas.register(parameter));
+                    }
+                }
+                List<String> produced = new ArrayList<>();
+                for (Class<?> producedType : producedTypes(extra.method(), new Class<?>[0])) {
+                    produced.add(schemas.register(producedType));
+                }
+                actions.add(new CardAction(extra.method().getName(), extra.description(), consumed, produced, null,
+                        extra.kind(), extra.contract()));
+                consumes.addAll(consumed);
+                produces.addAll(produced);
+            }
+        });
+        handle.card = buildCard(agentIdentity, spec, consumes, produces, spaceBindings,
+                declaration.map(ai.badmonkey.agentspaces.agent.spi.AgentDeclaration::meta).orElse(Map.of()))
                 .withActions(declared(actions))
                 .withUi(uiDeclaration(type));   // v0.1.26 (ISSUE-UiComponents): what the agent can show, or null
         publishCard(handle);
@@ -860,6 +1082,8 @@ public final class AgentBinder implements AutoCloseable {
         private final List<AutoCloseable> closeables = new ArrayList<>();
         private volatile boolean running = true;
         private volatile AgentCard card;
+        /** The class bound, for the same-name check (review §7.2, X20); null for an adopted card. */
+        private volatile Class<?> boundClass;
         /** Tags every record this binding writes carries (a manifest's flow and version). */
         final Map<String, String> recordTags = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -1000,6 +1224,21 @@ public final class AgentBinder implements AutoCloseable {
         }
     }
 
+    /** Runs a taken entry through its invoker (review §7.8), the take context bound on this thread meanwhile. */
+    private static Object invokeThrough(ai.badmonkey.agentspaces.agent.spi.TakeInvoker invoker, TakeContext context,
+                                        Object agent, Method method, Object entry) {
+        TakeContext.bind(context);
+        try {
+            return invoker.invoke(agent, method, entry, context);
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException(method.getName() + " failed through " + invoker.getClass().getSimpleName(), e);
+        } finally {
+            TakeContext.unbind();
+        }
+    }
+
     private Thread startTakeLoop(Object agent, Method method, SpaceTake take, Bound handle) {
         Space space = spaceFor(handle.identity, take.space(), method);
         Space resultSpace = take.resultSpace().isEmpty() ? space
@@ -1032,9 +1271,11 @@ public final class AgentBinder implements AutoCloseable {
                     continue;
                 }
                 try {
-                    Object result = invokeWithin(new TakeContext(taken.get(),
-                            takeLease.duration(), handle.agentId, space.name()),
-                            agent, method, taken.get().entry());
+                    TakeContext context = new TakeContext(taken.get(), takeLease.duration(), handle.agentId, space.name());
+                    Optional<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invoker = invokerFor(agent, method);
+                    Object result = invoker.isPresent()
+                            ? invokeThrough(invoker.get(), context, agent, method, taken.get().entry())
+                            : invokeWithin(context, agent, method, taken.get().entry());
                     dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
                 } catch (RuntimeException | Error e) {
                     // The crash idiom: no complete, the TAKE lease lapses, and the
@@ -1371,6 +1612,12 @@ public final class AgentBinder implements AutoCloseable {
     private AgentCard buildCard(ai.badmonkey.agentspaces.api.spi.AgentIdentity agentIdentity, Spec spec,
                                 Set<String> consumes, Set<String> produces,
                                 Map<String, String> spaceBindings) {
+        return buildCard(agentIdentity, spec, consumes, produces, spaceBindings, Map.of());
+    }
+
+    private AgentCard buildCard(ai.badmonkey.agentspaces.api.spi.AgentIdentity agentIdentity, Spec spec,
+                                Set<String> consumes, Set<String> produces,
+                                Map<String, String> spaceBindings, Map<String, String> costHints) {
         AgentId agentId = agentIdentity.id();
         java.time.Instant issuedAt = clock.instant();
         AgentCard card = new AgentCard(
@@ -1380,7 +1627,7 @@ public final class AgentBinder implements AutoCloseable {
                 agentId,
                 spec == null ? "" : spec.description(),
                 spec == null ? List.of() : spec.goals(),
-                List.copyOf(consumes), List.copyOf(produces), Map.of(),
+                List.copyOf(consumes), List.copyOf(produces), Map.copyOf(costHints),
                 Map.copyOf(spaceBindings),
                 // The card says which key the agent signs with only when that key is
                 // the agent's own; a peer-signed agent's card is byte-identical to before.
@@ -1427,14 +1674,73 @@ public final class AgentBinder implements AutoCloseable {
         return findSpec(type) != null;
     }
 
+    /**
+     * A {@code @SpaceTake} for an implied binding (review §7.3): the binding's space, lease and poll, and the
+     * one tag that addresses entries to this action, so the loop never claims another stage's entries.
+     */
+    private static SpaceTake impliedTake(ai.badmonkey.agentspaces.agent.spi.ImpliedBinding binding, String agentName) {
+        Map<String, Object> values = new java.util.HashMap<>();
+        values.put("space", binding.space());
+        values.put("lease", binding.lease());
+        values.put("pollTimeout", binding.pollTimeout());
+        values.put("description", binding.description());
+        values.put("tags", new String[]{ai.badmonkey.agentspaces.agent.spi.ImpliedBinding.tagFor(agentName,
+                binding.method().getName())});
+        values.put("pre", binding.pre().toArray(String[]::new));
+        values.put("post", binding.post().toArray(String[]::new));
+        values.put("cost", binding.cost());
+        return (SpaceTake) java.lang.reflect.Proxy.newProxyInstance(SpaceTake.class.getClassLoader(),
+                new Class<?>[]{SpaceTake.class}, (proxy, m, args) -> {
+                    switch (m.getName()) {
+                        case "annotationType": return SpaceTake.class;
+                        case "toString": return "@SpaceTake(implied " + values + ")";
+                        case "hashCode": return System.identityHashCode(proxy);
+                        case "equals": return proxy == args[0];
+                        default:
+                            Object value = values.get(m.getName());
+                            return value != null ? value : m.getDefaultValue();
+                    }
+                });
+    }
+
+    /** An entry parameter of an advertised action: not primitive, not a string, not a framework's own type. */
+    private static boolean isEntryParameter(Class<?> type) {
+        String name = type.getName();
+        return !type.isPrimitive() && type != String.class && !name.startsWith("java.")
+                && !name.startsWith("com.embabel.") && !name.startsWith("ai.badmonkey.agentspaces.agent.");
+    }
+
+    /** Whether an implied take's space resolves in this group: the named space, or the sole space. */
+    private boolean impliedTakeBindsHere(SpaceTake take) {
+        return take.space().isEmpty() ? spaces.size() == 1 : spaces.containsKey(take.space());
+    }
+
+    /** The card action for an implied take that cannot bind in this group: advertised, never invocable. */
+    private CardAction localAction(Method method, ai.badmonkey.agentspaces.agent.spi.ImpliedBinding binding) {
+        List<String> consumed = List.of(schemas.register(method.getParameterTypes()[0]));
+        List<String> produced = new ArrayList<>();
+        for (Class<?> type : producedTypes(method, new Class<?>[0])) {
+            produced.add(schemas.register(type));
+        }
+        return new CardAction(method.getName(), binding.description(), consumed, produced, null, CardAction.LOCAL,
+                CardAction.Contract.of(binding.pre(), binding.post(), binding.cost()));
+    }
+
     private static Spec findSpec(Class<?> type) {
         for (Class<?> candidate : supertypes(type)) {
             Spec spec = declaredSpec(candidate);
             if (spec != null) {
+                declarationOf(type).filter(d -> !d.name().isEmpty() && !d.name().equals(spec.name()))
+                        .ifPresent(d -> LOG.log(System.Logger.Level.WARNING, type.getName()
+                                + " declares both an @AgentSpec name '" + spec.name() + "' and a framework name '"
+                                + d.name() + "'; the @AgentSpec name wins"));
                 return spec;
             }
         }
-        return null;
+        // Review §7.2: a framework's own declaration, read by a registered reader, names the one card.
+        return declarationOf(type)
+                .map(d -> new Spec(d.name(), d.description(), d.goals()))
+                .orElse(null);
     }
 
     private static Spec declaredSpec(Class<?> type) {
@@ -1695,7 +2001,10 @@ public final class AgentBinder implements AutoCloseable {
         return registered;
     }
 
-    /** The {@code @Ballot} binding: one ballot per proposal, cast as the agent, off the delivery thread. */
+    /**
+     * The {@code @Ballot} binding: one ballot per proposal, held and future (owner decision 23, SPEC §10), cast as the
+     * agent, off the delivery thread.
+     */
     private Subscription castBallots(Object agent, Method method, Ballot ballot, Bound handle) {
         String spaceName = resolveVoteSpaceName(ballot.space(), method);
         VoteCapability voter = voteFor(handle.identity, spaceName);
@@ -1703,16 +2012,16 @@ public final class AgentBinder implements AutoCloseable {
         Lease ballotLease = Lease.of(Durations.parse(ballot.lease()));
         String label = handle.agentId.localName() + "." + method.getName();
         Set<String> voted = java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
-        Subscription subscription = voteSpace.notify(Template.of(VoteCapability.Proposal.class), event -> {
-            if (event.kind() != SpaceEvent.Kind.WRITTEN) {
-                return;
-            }
-            VoteCapability.Proposal proposal = event.entry();
+        java.util.function.Consumer<VoteCapability.Proposal> consider = proposal -> {
             if (!proposal.proposalId().startsWith(ballot.prefix()) || !voted.add(proposal.proposalId())) {
                 return;
             }
             Thread.ofVirtual().name("space-ballot-" + label).start(() -> {
                 try {
+                    // A binding made again after a restart finds the ballot its agent cast before: judged once.
+                    if (voter.ballotHeld(proposal.proposalId())) {
+                        return;
+                    }
                     Object option = invoke(agent, method, proposal);
                     if (option != null) {
                         voter.castBallot(proposal.proposalId(), (String) option, ballotLease);
@@ -1722,12 +2031,25 @@ public final class AgentBinder implements AutoCloseable {
                     LOG.log(System.Logger.Level.WARNING, label + ": ballot failed", e);
                 }
             });
+        };
+        Subscription subscription = voteSpace.notify(Template.of(VoteCapability.Proposal.class), event -> {
+            if (event.kind() == SpaceEvent.Kind.WRITTEN) {
+                consider.accept(event.entry());
+            }
         }, Lease.of(Duration.ofHours(1)));
+        // A proposal that folded before this binding existed raises no WRITTEN for it, and a pull with this replica's
+        // own digest never sends it again: a member whose proposal came by rumor a moment before its agent bound never
+        // voted (R2's council). So the binding reads the open proposals it already holds. The watch is in place first,
+        // so a proposal folding meanwhile is seen by one path or the other and the voted set lets it through once.
+        for (VoteCapability.Proposal held : voteSpace.readAll(Template.of(VoteCapability.Proposal.class),
+                VoteCapability.BIND_SWEEP_LIMIT)) {
+            consider.accept(held);
+        }
         renewWhileBound(subscription, Duration.ofHours(1), handle, "space-ballot-renew-" + label);
         return subscription;
     }
 
-    /** The {@code @OnDecision} binding: once per proposal when the quorum closes here. */
+    /** The {@code @OnDecision} binding: once per proposal when the quorum closes here, held and future. */
     private Subscription watchDecisions(Object agent, Method method, OnDecision onDecision, Bound handle) {
         String spaceName = resolveVoteSpaceName(onDecision.space(), method);
         VoteCapability vote = votes.get(spaceName);
@@ -1889,9 +2211,13 @@ public final class AgentBinder implements AutoCloseable {
 
     /** One binding annotation's group and the space names it references. */
     /** One binding: its group, the spaces it names, and whether it takes {@code @PdtRef} handles (P2-X-03). */
-    private record Declared(String group, List<String> spaceNames, boolean refs) {
+    private record Declared(String group, List<String> spaceNames, boolean refs, boolean implied) {
         Declared(String group, List<String> spaceNames) {
-            this(group, spaceNames, false);
+            this(group, spaceNames, false, false);
+        }
+
+        Declared(String group, List<String> spaceNames, boolean refs) {
+            this(group, spaceNames, refs, false);
         }
     }
 
@@ -1981,6 +2307,9 @@ public final class AgentBinder implements AutoCloseable {
                 }
             }
         }
+        // Review §7.3: the bindings a declaration reader implies for methods with no space annotation.
+        declarationOf(type).ifPresent(d -> d.implied().forEach(implied ->
+                declared.add(new Declared("", List.of(implied.space()), false, true))));
         return declared;
     }
 

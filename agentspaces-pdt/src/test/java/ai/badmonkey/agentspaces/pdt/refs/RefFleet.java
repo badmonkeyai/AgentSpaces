@@ -31,6 +31,8 @@ import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.content.Content;
 import ai.badmonkey.agentspaces.content.MemoryPieceStore;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.measure.SimWait;
+import ai.badmonkey.agentspaces.measure.Wait;
 import ai.badmonkey.agentspaces.pdt.NodeStore;
 import ai.badmonkey.agentspaces.pdt.Pdt;
 import ai.badmonkey.agentspaces.pdt.values.Codec;
@@ -72,7 +74,10 @@ class RefFleet {
     static final String REF_SPACE = "refs";
 
     final TestClock clock = TestClock.create();
-    final SimNetwork network = new SimNetwork();
+    // the fabric's delays and spoiler holds run on the fleet clock (srad/spoiler-peers.md SP-N-02)
+    final SimNetwork network = new SimNetwork().clock(clock);
+    /** Work run after each {@link #tickAll} on the test thread, such as a spoiler script's time triggers. */
+    final List<Runnable> afterTick = new java.util.concurrent.CopyOnWriteArrayList<>();
     final List<Peer> peers = new ArrayList<>();
     final CborCodec codec = CborCodec.defaultCodec();
     final GroupId groupId = GroupId.of("zPdtRefs");
@@ -130,6 +135,19 @@ class RefFleet {
         });
     }
 
+    /** Whether the fleet's members run the trie audit of annex I.6 ({@code wire.ae=2}); on, the node's default. */
+    private boolean audit = true;
+
+    /**
+     * Sets whether the members created after this run the trie audit (srad/replication-by-entry.md phase 4). Off, a
+     * fleet repairs by the text form of §5.3, whose answer carries the states in the map's order; on, a repair fetches
+     * by id and an answer carries them in the order of annex I.6 (RE-I-06), newest first.
+     */
+    RefFleet audit(boolean on) {
+        this.audit = on;
+        return this;
+    }
+
     Peer newPeer(String address, long seed, String... seedAddresses) throws IOException {
         return newPeer(address, seed, Spec.defaults(), seedAddresses);
     }
@@ -139,7 +157,8 @@ class RefFleet {
         // SESSION test fleets (ROBUSTNESS.md §10.10): one signed SESSION_HELLO per connection, then a MAC per frame
         // (SPEC §5.6), where SIGNED spent most of the fleet's CPU on Ed25519 frame signatures; the fabric attests
         // nobody, so no frame travels bare (RefFleetSessionTest)
-        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).channelAuth(PeerNode.ChannelAuth.SESSION).build();
+        PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).channelAuth(PeerNode.ChannelAuth.SESSION)
+                .audit(audit).build();
         node.listen(network.register(address), address);
         List<PeerAdvertisement.Endpoint> seeds = new ArrayList<>();
         for (String s : seedAddresses) {
@@ -199,7 +218,62 @@ class RefFleet {
             }
         }
         ticks.incrementAndGet();
-        clock.advance(Duration.ofMillis(250));
+        clock.advance(Duration.ofMillis(PERIOD_MILLIS));
+        network.pump(); // frames a link delays are due on the fleet clock, never on the wall
+        for (Runnable r : afterTick) {
+            r.run();
+        }
+    }
+
+    /** One fleet tick's span of fleet clock: the gossip period a spoiler's ceilings count in. */
+    static final long PERIOD_MILLIS = 250;
+
+    /** One writer's operation per round of {@link #stepOnBarrier}. */
+    @FunctionalInterface
+    interface WriterStep {
+        void step(int round) throws Exception;
+    }
+
+    /**
+     * Steps writers on a barrier (srad/spoiler-peers.md §3.4.4, SP-T-01): each writer runs on its own thread, as
+     * the concurrent writers of {@code ConcurrentHeadsTest} do, but does exactly one operation per round; when every
+     * writer's operation of the round is done, the fleet ticks once. The scheduler then decides only the order of
+     * the operations inside a round, never how many land between two ticks, so the fork shape no longer depends on
+     * how long a writer's busy wait happened to sleep.
+     *
+     * @param writers the writers' operations
+     * @param rounds  the rounds
+     * @return the failures the writers raised, empty when none
+     */
+    List<Throwable> stepOnBarrier(List<WriterStep> writers, int rounds) throws InterruptedException {
+        java.util.concurrent.Phaser phaser = new java.util.concurrent.Phaser(writers.size() + 1);
+        List<Throwable> failures = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<Thread> threads = new ArrayList<>();
+        for (int w = 0; w < writers.size(); w++) {
+            WriterStep step = writers.get(w);
+            threads.add(Thread.ofVirtual().name("barrier-writer-" + w).start(() -> {
+                for (int round = 0; round < rounds; round++) {
+                    phaser.arriveAndAwaitAdvance(); // the round starts for every writer at once
+                    try {
+                        step.step(round);
+                    } catch (Throwable t) {
+                        failures.add(t);
+                    }
+                    phaser.arriveAndAwaitAdvance(); // every operation of the round is done
+                }
+                phaser.arriveAndDeregister();
+            }));
+        }
+        for (int round = 0; round < rounds; round++) {
+            phaser.arriveAndAwaitAdvance();
+            phaser.arriveAndAwaitAdvance();
+            tickAll();
+        }
+        phaser.arriveAndDeregister();
+        for (Thread t : threads) {
+            t.join();
+        }
+        return failures;
     }
 
     void settle(int ticks) {
@@ -217,6 +291,24 @@ class RefFleet {
             tickAll();
             Thread.sleep(2);
         }
+        return true;
+    }
+
+    /**
+     * {@link #runUntil(Duration, BooleanSupplier)} as a measured wait (srad/feature-measurements.md §3.5): the clock is
+     * fake while fetches run on their own threads, so it keeps the wall ceiling and records the ticks, the fake
+     * milliseconds and the tick rate beside it. The tick ceiling is left open (FM-H-14).
+     */
+    boolean runUntil(String metric, Duration max, BooleanSupplier until) {
+        SimWait.mixed(metric, Integer.MAX_VALUE, max, () -> {
+            tickAll();
+            try {
+                Thread.sleep(2);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while ticking the fleet", e);
+            }
+        }, clock::millis, until, Wait.with());
         return true;
     }
 

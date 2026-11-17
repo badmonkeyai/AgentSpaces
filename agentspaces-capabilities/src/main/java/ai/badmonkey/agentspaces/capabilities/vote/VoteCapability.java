@@ -118,6 +118,12 @@ public final class VoteCapability implements CapabilityProvider {
     /** The default electorate: every authenticated ballot issuer counts. */
     public static final Predicate<AgentId> ANY_AUTHENTICATED_ISSUER = agent -> true;
 
+    /**
+     * How many held proposals a listener or a binding reads when it starts (owner decision 23): far past any vote
+     * space in practice, and a bound on the work a start does. The Python, Ruby and TypeScript binders read as many.
+     */
+    public static final int BIND_SWEEP_LIMIT = 10_000;
+
     private final Space voteSpace;
     private final AgentId self;
     private final PeerId selfPeer;
@@ -262,8 +268,12 @@ public final class VoteCapability implements CapabilityProvider {
      * tally meets the proposal's quorum. Underneath, the vote space's ballot and
      * proposal writes are watched and the decision recomputed on each, so a
      * replica that learns of a vote late still fires exactly once, on its first
-     * qualifying ballot. The returned subscription is leased like any other; renew
-     * it for as long as the listener should keep running.
+     * qualifying ballot. A decision this replica already holds when the listener
+     * is registered is heard too, held and future (owner decision 23, SPEC §10):
+     * once both watches are in place the held proposals are judged, at most
+     * {@link #BIND_SWEEP_LIMIT}, so such a listener runs on the registering
+     * thread before this method returns. The returned subscription is leased
+     * like any other; renew it for as long as the listener should keep running.
      *
      * @param proposals which proposal ids to watch (e.g. a prefix test)
      * @param listener  receives each decision once
@@ -298,6 +308,13 @@ public final class VoteCapability implements CapabilityProvider {
                 check.accept(event.entry().proposalId());
             }
         }, lease);
+        // A quorum that closed on ballots folded before this listener existed raises no event for it again, and a
+        // pull with this replica's own digest never sends those entries back, so the held proposals are judged here.
+        // The watches are in place first, so a decision closing meanwhile is seen by one path or the other and the
+        // decided set lets it through once.
+        for (Proposal held : voteSpace.readAll(Template.of(Proposal.class), BIND_SWEEP_LIMIT)) {
+            check.accept(held.proposalId());
+        }
         return new Subscription() {
             @Override
             public void renew(java.time.Duration extension) {
@@ -382,6 +399,25 @@ public final class VoteCapability implements CapabilityProvider {
                     + "'; its ballot would count for nothing");
         }
         voteSpace.write(new Ballot(proposalId, option, self.encoded()), lease);
+    }
+
+    /**
+     * Whether this replica holds a ballot for the proposal cast by this capability's voter: one whose declared voter
+     * is the voter and whose authenticated writer is the voter too, so a ballot forged in its name does not count. A
+     * ballot binding made again after a restart reads it so as not to judge a proposal its agent already voted on.
+     *
+     * @param proposalId the proposal
+     * @return whether the voter's own ballot is held
+     */
+    public boolean ballotHeld(String proposalId) {
+        String voter = self.encoded();
+        for (Space.Issued<Ballot> issued : voteSpace.readAllIssued(Template.of(Ballot.class)
+                .where("proposalId", eq(proposalId)).where("voter", eq(voter)), BIND_SWEEP_LIMIT)) {
+            if (issued.issuer().encoded().equals(voter)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -181,9 +181,14 @@ public final class ConstraintGate implements AutoCloseable {
     }
 
     private void onLane(SpaceEvent<Object> ev) {
+        // A completion counts as the take it ends (RBE regression probe P9, 2026-11-14): a member that joins after an
+        // entry was taken and completed learns it already completed, so it hears COMPLETED and never WRITTEN or TAKEN.
+        // Ignoring it left that gate without the entry, and a precedence's B behind a consumed A was refused there
+        // while every member that watched it live admitted it. Where the TAKEN was heard, this is the same event again
+        // and is not recorded twice.
         Event.Kind kind = switch (ev.kind()) {
             case WRITTEN, REAPPEARED -> Event.Kind.WRITTEN;
-            case TAKEN -> Event.Kind.CLAIMED;
+            case TAKEN, COMPLETED -> Event.Kind.CLAIMED;
             default -> null;
         };
         if (kind == null) {
@@ -198,7 +203,9 @@ public final class ConstraintGate implements AutoCloseable {
             String wire = ev.entry() == null ? "" : ev.entry().getClass().getName();
             e = Event.of(wire, ev.entryId().value(), now, ev.entry(), ev.tags(), kind);
         }
-        if (kind == Event.Kind.CLAIMED) {
+        if (ev.kind() == SpaceEvent.Kind.TAKEN) {
+            // a take is stamped when it is heard; a completion heard alone keeps its entry's issue stamp, the one place
+            // in issue order a gate that watched the entry live would have its WRITTEN
             e = new Event(e.type(), e.wireType(), e.entryId(), now, e.fields(), e.tags(), kind);
         }
         record(e, ev.entryId().value());

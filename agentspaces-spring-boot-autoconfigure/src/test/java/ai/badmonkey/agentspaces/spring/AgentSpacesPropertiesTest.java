@@ -22,6 +22,7 @@ import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** The property blocks bind and read back as plain beans (what Boot's binder does from YAML). */
 class AgentSpacesPropertiesTest {
@@ -195,5 +196,185 @@ class AgentSpacesPropertiesTest {
         assertThat(t.getTls().isRequireAttestation()).isTrue();
         assertThat(t.getTls().getRevocationValidator()).isEqualTo("crl");
         assertThat(t.getTls().getCrlRefresh()).isEqualTo(Duration.ofMinutes(5));
+    }
+
+    /**
+     * Probe P45, phase 2 part (srad/replication-by-entry.md appendix D, RE-Q-MNT-04): the two keys this phase adds
+     * bind, with their defaults, in any of Spring's relaxed forms, and reach the node the starter builds; a misspelt
+     * key, or a value of the wrong kind, refuses at start with a message naming the key.
+     */
+    @Test
+    void theReplicationByEntryKeysBindAndAMisspeltKeyRefusesAtStartNamingIt() throws Exception {
+        AgentSpacesProperties defaults = new AgentSpacesProperties();
+        assertThat(defaults.probeHashStreams()).isEqualTo(32);
+        assertThat(defaults.renewShorteningLog()).isTrue();
+        defaults.refuseUnknownKeys();
+
+        AgentSpacesProperties p = new AgentSpacesProperties();
+        p.getGossip().put("probe-hash-streams", "24");
+        p.getSpace().put("renew-shortening-log", "false");
+        p.refuseUnknownKeys();
+        assertThat(p.probeHashStreams()).isEqualTo(24);
+        assertThat(p.renewShorteningLog()).isFalse();
+        AgentSpacesProperties relaxed = new AgentSpacesProperties();
+        relaxed.getGossip().put("probeHashStreams", "20");
+        relaxed.getSpace().put("RENEW_SHORTENING_LOG", "true");
+        relaxed.refuseUnknownKeys();
+        assertThat(relaxed.probeHashStreams()).isEqualTo(20);
+        assertThat(relaxed.renewShorteningLog()).isTrue();
+
+        AgentSpacesAutoConfiguration autoConfig = new AgentSpacesAutoConfiguration();
+        ai.badmonkey.agentspaces.identity.PeerIdentity identity = ai.badmonkey.agentspaces.identity.PeerIdentity.generate();
+        ai.badmonkey.agentspaces.peering.node.PeerNode node = autoConfig.buildNode(p, identity, List.of(), List.of(),
+                List.of(), null);
+        try {
+            ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime = node.joinGroup(
+                    new ai.badmonkey.agentspaces.api.ad.GroupAdvertisement("aspace://zKeys", identity.peerId(),
+                            ai.badmonkey.agentspaces.common.id.GroupId.of("zKeys"), java.time.Instant.EPOCH,
+                            Duration.ofDays(1), "keys",
+                            ai.badmonkey.agentspaces.api.ad.GroupAdvertisement.MembershipPolicy.OPEN,
+                            ai.badmonkey.agentspaces.api.space.ConflictStrategyType.LEASE_RACE,
+                            ai.badmonkey.agentspaces.api.ad.GroupAdvertisement.GossipParameters.defaults()),
+                    ai.badmonkey.agentspaces.peering.membership.GroupMembership.Config.defaults(), List.of());
+            assertThat(runtime.gossip().probeDigestStreams()).as("the bound reaches every group's bus").isEqualTo(24);
+            assertThat(runtime.renewShorteningLog()).as("the log setting reaches the group's spaces").isFalse();
+        } finally {
+            node.close();
+        }
+
+        AgentSpacesProperties misspelt = new AgentSpacesProperties();
+        misspelt.getGossip().put("probe-hash-stream", "24");
+        assertThatThrownBy(misspelt::refuseUnknownKeys).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.gossip.probe-hash-stream ")
+                .hasMessageContaining("probe-hash-streams");
+        assertThatThrownBy(() -> autoConfig.buildNode(misspelt, identity, List.of(), List.of(), List.of(), null))
+                .as("the starter refuses before it builds the node")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.gossip.probe-hash-stream ");
+        AgentSpacesProperties misspeltSpace = new AgentSpacesProperties();
+        misspeltSpace.getSpace().put("renew-shortenings-log", "false");
+        assertThatThrownBy(misspeltSpace::refuseUnknownKeys).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.space.renew-shortenings-log");
+
+        AgentSpacesProperties wrongKind = new AgentSpacesProperties();
+        wrongKind.getGossip().put("probe-hash-streams", "lots");
+        wrongKind.getSpace().put("renew-shortening-log", "sometimes");
+        assertThatThrownBy(wrongKind::probeHashStreams).hasMessageContaining("agentspaces.gossip.probe-hash-streams");
+        assertThatThrownBy(wrongKind::renewShorteningLog).hasMessageContaining("agentspaces.space.renew-shortening-log");
+        AgentSpacesProperties outOfRange = new AgentSpacesProperties();
+        outOfRange.getGossip().put("probe-hash-streams", "257");
+        assertThatThrownBy(outOfRange::probeHashStreams).hasMessageContaining("from 0 to 256");
+    }
+
+    /**
+     * Probe P45, phase 4 part (srad/replication-by-entry.md appendix D, RE-Q-MNT-04): the audit keys bind with their
+     * defaults in Spring's relaxed forms and reach the node and its buses; a misspelt key or a value out of range
+     * refuses naming the key.
+     */
+    @Test
+    void theAuditKeysBindReachTheNodeAndRefuseMisspellings() throws Exception {
+        AgentSpacesProperties defaults = new AgentSpacesProperties();
+        assertThat(defaults.audit()).isTrue();
+        assertThat(defaults.auditSessions()).isEqualTo(4);
+        assertThat(defaults.auditBudget()).isEqualTo(1L << 20);
+
+        AgentSpacesProperties p = new AgentSpacesProperties();
+        p.getGossip().put("audit-sessions", "2");
+        p.getGossip().put("auditBudget", "65536");
+        p.refuseUnknownKeys();
+        assertThat(p.auditSessions()).isEqualTo(2);
+        assertThat(p.auditBudget()).isEqualTo(65536);
+        AgentSpacesAutoConfiguration autoConfig = new AgentSpacesAutoConfiguration();
+        ai.badmonkey.agentspaces.identity.PeerIdentity identity = ai.badmonkey.agentspaces.identity.PeerIdentity.generate();
+        ai.badmonkey.agentspaces.peering.node.PeerNode node = autoConfig.buildNode(p, identity, List.of(), List.of(),
+                List.of(), null);
+        try {
+            assertThat(node.wireHints()).containsEntry("wire.ae", "2");
+            ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime = node.joinGroup(
+                    new ai.badmonkey.agentspaces.api.ad.GroupAdvertisement("aspace://zAuditKeys", identity.peerId(),
+                            ai.badmonkey.agentspaces.common.id.GroupId.of("zAuditKeys"), java.time.Instant.EPOCH,
+                            Duration.ofDays(1), "keys",
+                            ai.badmonkey.agentspaces.api.ad.GroupAdvertisement.MembershipPolicy.OPEN,
+                            ai.badmonkey.agentspaces.api.space.ConflictStrategyType.LEASE_RACE,
+                            ai.badmonkey.agentspaces.api.ad.GroupAdvertisement.GossipParameters.defaults()),
+                    ai.badmonkey.agentspaces.peering.membership.GroupMembership.Config.defaults(), List.of());
+            assertThat(runtime.gossip().auditing()).isTrue();
+            assertThat(runtime.gossip().auditSessions()).isEqualTo(2);
+            assertThat(runtime.gossip().auditBudget()).isEqualTo(65536);
+        } finally {
+            node.close();
+        }
+
+        AgentSpacesProperties off = new AgentSpacesProperties();
+        off.getGossip().put("AUDIT", "false");
+        off.refuseUnknownKeys();
+        ai.badmonkey.agentspaces.peering.node.PeerNode quiet = autoConfig.buildNode(off, identity, List.of(),
+                List.of(), List.of(), null);
+        try {
+            assertThat(quiet.wireHints()).doesNotContainKey("wire.ae");
+        } finally {
+            quiet.close();
+        }
+
+        AgentSpacesProperties misspelt = new AgentSpacesProperties();
+        misspelt.getGossip().put("audit-session", "2");
+        assertThatThrownBy(misspelt::refuseUnknownKeys).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.gossip.audit-session ")
+                .hasMessageContaining("audit-sessions");
+        AgentSpacesProperties wrong = new AgentSpacesProperties();
+        wrong.getGossip().put("audit", "maybe");
+        wrong.getGossip().put("audit-sessions", "5");
+        wrong.getGossip().put("audit-budget", "1k");
+        assertThatThrownBy(wrong::audit).hasMessageContaining("agentspaces.gossip.audit");
+        assertThatThrownBy(wrong::auditSessions).hasMessageContaining("agentspaces.gossip.audit-sessions")
+                .hasMessageContaining("from 1 to 4");
+        assertThatThrownBy(wrong::auditBudget).hasMessageContaining("agentspaces.gossip.audit-budget");
+    }
+
+    /**
+     * Probe P45, phase 5 part (srad/replication-by-entry.md appendix D, RE-H-04, RE-Q-MNT-04): the horizon key binds
+     * with its default {@code per-entry}, which advertises {@code wire.horizon=1}; {@code legacy} advertises nothing; a
+     * misspelt key or a value that is neither refuses at start naming the key.
+     */
+    @Test
+    void theHorizonKeyBindsReachesTheNodeAndRefusesMisspellings() throws Exception {
+        AgentSpacesProperties defaults = new AgentSpacesProperties();
+        assertThat(defaults.horizonPerEntry()).isTrue();
+        AgentSpacesAutoConfiguration autoConfig = new AgentSpacesAutoConfiguration();
+        ai.badmonkey.agentspaces.identity.PeerIdentity identity = ai.badmonkey.agentspaces.identity.PeerIdentity.generate();
+        ai.badmonkey.agentspaces.peering.node.PeerNode node = autoConfig.buildNode(defaults, identity, List.of(),
+                List.of(), List.of(), null);
+        try {
+            assertThat(node.wireHints()).containsEntry("wire.horizon", "1");
+            assertThat(node.horizonPerEntry()).isTrue();
+        } finally {
+            node.close();
+        }
+
+        AgentSpacesProperties legacy = new AgentSpacesProperties();
+        legacy.getSpace().put("HORIZON", "Legacy");
+        legacy.refuseUnknownKeys();
+        assertThat(legacy.horizonPerEntry()).isFalse();
+        ai.badmonkey.agentspaces.peering.node.PeerNode old = autoConfig.buildNode(legacy, identity, List.of(),
+                List.of(), List.of(), null);
+        try {
+            assertThat(old.wireHints()).doesNotContainKey("wire.horizon");
+            assertThat(old.horizonPerEntry()).isFalse();
+        } finally {
+            old.close();
+        }
+
+        AgentSpacesProperties misspelt = new AgentSpacesProperties();
+        misspelt.getSpace().put("horizons", "legacy");
+        assertThatThrownBy(misspelt::refuseUnknownKeys).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.space.horizons");
+        AgentSpacesProperties wrong = new AgentSpacesProperties();
+        wrong.getSpace().put("horizon", "per_entry");
+        assertThatThrownBy(wrong::horizonPerEntry).hasMessageContaining("agentspaces.space.horizon")
+                .hasMessageContaining("per-entry or legacy");
+        assertThatThrownBy(() -> autoConfig.buildNode(wrong, identity, List.of(), List.of(), List.of(), null))
+                .as("the starter refuses before it builds the node")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.space.horizon");
     }
 }

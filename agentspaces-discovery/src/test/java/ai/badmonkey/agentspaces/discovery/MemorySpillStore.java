@@ -115,7 +115,7 @@ final class MemorySpillStore implements SpillStore {
     private static AppCard sized(PeerId issuer, GroupId group, String id, Instant issued, List<String> views) {
         return new AppCard("aspace://" + group.value() + "/app/" + issuer.value() + "/" + id, issuer, group, issued, Duration.ofMinutes(15),
                 id, "fed", "a2ui", "example", List.of(group.value() + "/items"), List.of("open"), "", "", "", "1", views,
-                new AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets"), "board", "views", List.of("board-1")))
+                new AppCard.Ui("a2ui", "1.0", List.of("example-widgets"), "board", "views", List.of("board-1")))
                 .withOrigin(AppCard.Origin.of("console", "example-console/" + id, "", null))
                 .withFormats(List.of("application/geo+json"));
     }

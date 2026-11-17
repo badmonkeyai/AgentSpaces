@@ -1594,6 +1594,7 @@ public final class GoldenVectors {
         json.append(contentVectors(codec, hex, wire.encode(ping, identity), self, group, issued));
         json.append(pdtVectors(previous));
         json.append(storeVectors(previous));
+        json.append(carriedForward(previous, SKETCH_VECTORS));
         json.append(field("dtls_pdu_ping", "01030000"));
         json.append(field("dtls_pdu_pong", "01040000"));
         json.append(field("dtls_pdu_close_idle", "01050300"));
@@ -1639,9 +1640,23 @@ public final class GoldenVectors {
                 .put("ASB2".getBytes(StandardCharsets.US_ASCII)).put(beaconTag).put(beaconNonce).put(beaconSealed)
                 .array())));
 
+        // srad/replication-by-entry.md phase 2 (RE-L-05, first half): the renewal clamp, the lapse horizon, and PING
+        // and ACK with hashes and have present and absent. New entries only; they go after every earlier one.
+        json.append(replicationByEntryVectors(codec, hex, wire, identity, group, self, stamp, record));
+        // srad/replication-by-entry.md phase 4 (RE-L-05, second half): the annex I.6 bodies under wire.ae=2. New entries
+        // only; audit-vectors.json, beside this file, holds the trie's own vectors and comes from AuditVectors.java.
+        json.append(auditBodyVectors(codec, hex, wire, identity, group, self, stamp, dto));
+
+        // srad/replication-by-entry.md phase 5 (RE-H-04): the collection horizon under both rules of SPEC §7.3, the
+        // legacy one and the per-entry one of wire.horizon=1. New entries only.
+        json.append(horizonModeVectors(stamp, self, record));
+
         // The envelope version every frame carries and every receiver checks first (SPEC §9).
         json.append(number("wire_version", WireCodec.WIRE_VERSION));
 
+        String ordered = inPreviousOrder(json.toString(), previous);
+        json.setLength(0);
+        json.append(ordered);
         json.setLength(json.length() - 2); // trailing comma
         json.append("\n}\n");
         Files.createDirectories(out.getParent());
@@ -1788,7 +1803,7 @@ public final class GoldenVectors {
         ai.badmonkey.agentspaces.api.ad.AppCard board = new ai.badmonkey.agentspaces.api.ad.AppCard(
                 "aspace://zApps/app/zPeerA/example-board", peer, apps, at, Duration.ofMinutes(15), "example-board", "fed", "a2ui",
                 "example", List.of("zApps/items", "zApps/orders"), List.of(), "", "", "", "1", List.of("board", "items", "orders"),
-                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets"), "board", "views",
+                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "1.0", List.of("example-widgets"), "board", "views",
                         List.of("board-1"), exampleComponents()))
                 .withOrigin(ai.badmonkey.agentspaces.api.ad.AppCard.Origin.of("console", "example-console/example-board", "", null));
         byte[] boardParts = codec.toBytes(board.parts());
@@ -1908,7 +1923,7 @@ public final class GoldenVectors {
         return new ai.badmonkey.agentspaces.api.ad.AppCard("aspace://zApps/app/zPeerA/support-chat", PeerId.of("zPeerA"),
                 GroupId.of("zApps"), hostAt, Duration.ofMinutes(15), "Support chat", "fed", "a2ui", "support",
                 List.of("zApps/conversations"), List.of("ask"), "", "", "", "1", List.of("conversations"),
-                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "v0.9.1", List.of("example-widgets", "agentspaces-viz"), "summariser",
+                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "1.0", List.of("example-widgets", "agentspaces-viz"), "summariser",
                         "views", List.of("chat-1")))
                 .withHost(new ai.badmonkey.agentspaces.api.ad.AppCard.Host("https://chat.example.org", 7801, "zHostPeer", "/", "idp",
                         "summariser", hostAt, "serving"));
@@ -1980,6 +1995,27 @@ public final class GoldenVectors {
     }
 
     // ---- srad/agentspaces-pdt2.md PDT 2 phase 3: the content store vectors ----
+
+    /**
+     * The PDT 2 phase 5 sketch vectors ({@code content_tree_want_sketch_cbor}, {@code content_tree_end_sketch_cbor}),
+     * which {@code agentspaces-content}'s {@code SketchVectorsTest} checks and no generator here computes: carried
+     * forward from the previous file on every run (the A2UI 1.0 regeneration of 2026-11-12 found a run without this
+     * dropped them).
+     */
+    private static final java.util.List<String> SKETCH_VECTORS = java.util.List.of("content_tree_want_sketch_cbor",
+            "content_tree_end_sketch_cbor");
+
+    private static String carriedForward(Map<String, Object> previous, java.util.List<String> names) {
+        StringBuilder out = new StringBuilder();
+        for (String name : names) {
+            if (previous.get(name) instanceof String value) {
+                out.append(field(name, value));
+            } else {
+                throw new IllegalStateException(name + " is not in the previous file: restore it before regenerating");
+            }
+        }
+        return out.toString();
+    }
 
     /** The names {@code StoreVectors.vectors()} emits, carried forward when the class is absent. */
     private static final java.util.List<String> STORE_VECTORS = java.util.List.of("content_challenge_cbor",
@@ -2249,6 +2285,329 @@ public final class GoldenVectors {
         return out.toString();
     }
 
+    /**
+     * The phase 2 vectors of srad/replication-by-entry.md (RE-L-05, first half), all new entries:
+     * <ul>
+     *   <li>{@code renew_clamp_cases}: the expiry a renewal sets, {@code max(current, now + extension)} (SPEC §7.2),
+     *       from {@code SpaceStateCrdt.renewedExpiry};</li>
+     *   <li>{@code lapse_horizon_cases}: the time a tombstone becomes collectable, for a lapsed, a withdrawn and a
+     *       completed state at several maximum leases (SPEC §7.3: a lapse keeps {@code min(2 x maxLease, 5 min)}, a
+     *       completion {@code 2 x maxLease}, a withdrawal {@code max(2 x maxLease, MAX_DRIFT)} since the drift floor of
+     *       owner decision 22), from {@code SpaceStateCrdt.collectionHorizon}, each checked against {@code collectable}
+     *       one millisecond before and at the horizon;</li>
+     *   <li>PING and ACK bodies with {@code hashes} and {@code have} present and absent (SPEC §5.2), one PING with a
+     *       hash for each of twenty streams (more than the sixteen of the old bound, RE-T-07), and one signed frame.</li>
+     * </ul>
+     */
+    private static String replicationByEntryVectors(CborCodec codec, HexFormat hex, WireCodec wire,
+                                                    PeerIdentity identity, GroupId group, PeerId self,
+                                                    HlcTimestamp stamp, EntryRecord record) {
+        StringBuilder out = new StringBuilder();
+        long now = 1_800_000_000_000L;
+        long[][] renewals = {
+                {now + 600_000, now, 120_000},      // shorter: the lease keeps its ten minutes
+                {now + 600_000, now, 1_800_000},    // longer: thirty minutes from now
+                {now + 600_000, now, 600_000},      // equal
+                {now + 600_000, now, 0},            // zero: no shorter
+                {now + 1_000, now, 60_000},         // nearly lapsed: extended
+        };
+        out.append("  \"renew_clamp_cases\": [\n");
+        for (int i = 0; i < renewals.length; i++) {
+            long expiry = ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.renewedExpiry(
+                    renewals[i][0], renewals[i][1], renewals[i][2]);
+            require(expiry == Math.max(renewals[i][0], renewals[i][1] + renewals[i][2]), "the renewal clamp");
+            out.append("    {\"current\": ").append(renewals[i][0]).append(", \"now\": ").append(renewals[i][1])
+                    .append(", \"extension\": ").append(renewals[i][2]).append(", \"expiry\": ").append(expiry)
+                    .append("}").append(i + 1 < renewals.length ? ",\n" : "\n");
+        }
+        out.append("  ],\n");
+
+        long expiry = 1_800_000_000_000L;
+        LeaseInfo leaseInfo = new LeaseInfo(record.issuer(), expiry, LeaseKind.WRITE);
+        ai.badmonkey.agentspaces.space.crdt.LwwRegister<LeaseInfo> lease =
+                new ai.badmonkey.agentspaces.space.crdt.LwwRegister<>(stamp, leaseInfo);
+        Dot dot = new Dot(self.value(), 1);
+        java.util.Map<String, ai.badmonkey.agentspaces.space.crdt.EntryState> states = new java.util.LinkedHashMap<>();
+        states.put("lapsed", new ai.badmonkey.agentspaces.space.crdt.EntryState(record, java.util.Set.of(dot),
+                java.util.Set.of(), lease, false));
+        states.put("withdrawn", new ai.badmonkey.agentspaces.space.crdt.EntryState(record, java.util.Set.of(dot),
+                java.util.Set.of(dot), lease, false));
+        states.put("completed", new ai.badmonkey.agentspaces.space.crdt.EntryState(record, java.util.Set.of(dot),
+                java.util.Set.of(), lease, true));
+        long[] maxLeases = {30_000, 120_000, 600_000, 86_400_000};
+        List<String> horizons = new java.util.ArrayList<>();
+        for (Map.Entry<String, ai.badmonkey.agentspaces.space.crdt.EntryState> state : states.entrySet()) {
+            for (long maxLease : maxLeases) {
+                long horizon = ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.collectionHorizon(
+                        state.getValue(), maxLease);
+                // The rule restated here, apart from the class, so a change to either fails the generator.
+                long keep = switch (state.getKey()) {
+                    case "lapsed" -> Math.min(2 * maxLease, 300_000);
+                    case "withdrawn" -> Math.max(2 * maxLease, 600_000); // the drift floor, MAX_DRIFT
+                    default -> 2 * maxLease;
+                };
+                require(horizon == expiry + keep, "the " + state.getKey() + " horizon at " + maxLease);
+                require(!ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.collectable(state.getValue(),
+                                horizon - 1, maxLease)
+                                && ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.collectable(state.getValue(),
+                                horizon, maxLease),
+                        "collectable from the horizon on, never before");
+                horizons.add("    {\"state\": \"" + state.getKey() + "\", \"expiry\": " + expiry
+                        + ", \"max_lease\": " + maxLease + ", \"horizon\": " + horizon + "}");
+            }
+        }
+        out.append("  \"lapse_horizon_cases\": [\n").append(String.join(",\n", horizons)).append("\n  ],\n");
+
+        java.util.TreeMap<String, byte[]> hashes = new java.util.TreeMap<>();
+        hashes.put("peers", Digests.sha256("peers digest".getBytes(StandardCharsets.UTF_8)));
+        hashes.put("space:jobs", Digests.sha256("jobs digest".getBytes(StandardCharsets.UTF_8)));
+        List<Bodies.HaveItem> have = List.of(new Bodies.HaveItem("space:jobs",
+                Digests.sha256("a forwarded item".getBytes(StandardCharsets.UTF_8))));
+        java.util.TreeMap<String, byte[]> twenty = new java.util.TreeMap<>();
+        for (int i = 0; i < 20; i++) {
+            String stream = String.format("space:s%02d", i);
+            twenty.put(stream, Digests.sha256(("digest of " + stream).getBytes(StandardCharsets.UTF_8)));
+        }
+        Bodies.Ping pingBoth = new Bodies.Ping(42, null, hashes, have);
+        out.append(field("ping_hashes_have_body_cbor", hex.formatHex(codec.toBytes(pingBoth))));
+        out.append(field("ping_hashes_body_cbor", hex.formatHex(codec.toBytes(new Bodies.Ping(42, null, hashes, null)))));
+        out.append(field("ping_have_body_cbor", hex.formatHex(codec.toBytes(new Bodies.Ping(42, null, null, have)))));
+        out.append(field("ping_hashes_twenty_streams_body_cbor",
+                hex.formatHex(codec.toBytes(new Bodies.Ping(42, null, twenty, null)))));
+        out.append(field("ack_body_cbor", hex.formatHex(codec.toBytes(new Bodies.Ack(42, null)))));
+        out.append(field("ack_hashes_have_body_cbor",
+                hex.formatHex(codec.toBytes(new Bodies.Ack(42, null, null, hashes, have)))));
+        out.append(field("ack_hashes_body_cbor",
+                hex.formatHex(codec.toBytes(new Bodies.Ack(42, null, null, hashes, null)))));
+        out.append(field("ack_have_body_cbor",
+                hex.formatHex(codec.toBytes(new Bodies.Ack(42, null, null, null, have)))));
+        Envelope probe = new Envelope(WireCodec.WIRE_VERSION, group, Envelope.Kind.PING, self, self, stamp,
+                codec.toBytes(pingBoth));
+        out.append(field("ping_hashes_have_frame_cbor", hex.formatHex(wire.encode(probe, identity))));
+        return out.toString();
+    }
+
+    /**
+     * The phase 4 vectors of srad/replication-by-entry.md (RE-L-05, second half; SPEC annex I.6), all new entries. The
+     * carriers to accept, each a body a member of {@code wire.ae=2} sends:
+     * <ul>
+     *   <li>{@code digest_tree_request_body_cbor}: two request nodes (a path and the asker's count) under a budget;</li>
+     *   <li>{@code digest_tree_nodes_body_cbor}: a root answered by its 384-byte preimage, the 33 slots {@code e00} to
+     *       {@code e32} of the annex's illustration, from the core's {@code HashTrie};</li>
+     *   <li>{@code digest_tree_lines_body_cbor}: a leaf answered by its lines (the annex's slot {@code a}) and an
+     *       empty node answered by the empty text;</li>
+     *   <li>{@code digest_ids_body_cbor}: a fetch of two ids under a budget, and {@code digest_ids_frame_cbor}, its
+     *       signed frame;</li>
+     *   <li>{@code digest_get_space_budget_body_cbor}: the empty digest of a whole space under a budget;</li>
+     *   <li>{@code pull_resp_body_cbor} and {@code pull_resp_remainder_body_cbor}: one state's delta as every member
+     *       answers it, and the same under a budget with three states left out.</li>
+     * </ul>
+     * The carriers to refuse ({@code adv_digest_*}, {@code adv_pull_resp_*}) each break one form rule of the annex, and
+     * the generator checks that the strict reader refuses each one while the same body with that one value put right
+     * decodes, so every one is refused for its named reason alone.
+     */
+    private static String auditBodyVectors(CborCodec codec, HexFormat hex, WireCodec wire, PeerIdentity identity,
+                                           GroupId group, PeerId self, HlcTimestamp stamp,
+                                           SpaceWire.EntryStateDto dto) {
+        StringBuilder out = new StringBuilder();
+        String stream = "space:tasks";
+        long budget = 1L << 20;
+
+        Bodies.Digest request = new Bodies.Digest(null, null, null, Map.of(stream, List.of(
+                Bodies.TreeNode.request(new byte[]{0x0a}, 12), Bodies.TreeNode.request(new byte[]{0x0a, 0x03}, 40))),
+                null, budget, null);
+        out.append(field("digest_tree_request_body_cbor", hex.formatHex(accepted(codec, request))));
+
+        ai.badmonkey.agentspaces.space.crdt.HashTrie<String> illustration =
+                ai.badmonkey.agentspaces.space.crdt.HashTrie.empty();
+        for (int i = 0; i <= 32; i++) {
+            String id = String.format("e%02d", i);
+            illustration = illustration.put(ai.badmonkey.agentspaces.space.crdt.Slot.<String>empty(EntryId.of(id))
+                    .withDropped("0")); // a remembered line e:<id>=0 needs no state, and the trie reads only the line
+        }
+        require(hex.formatHex(illustration.streamHash())
+                .equals("988d034b3abe2292c17478e2f646d845710c3ce40c30dfd9732598be8c2560cb"), "the annex's 33 slots");
+        byte[] rootNodes = illustration.node(new byte[0]).preimage();
+        Bodies.Digest nodesAnswer = new Bodies.Digest(null, null, null,
+                Map.of(stream, List.of(Bodies.TreeNode.inner(new byte[0], rootNodes))), null, null, null);
+        out.append(field("digest_tree_nodes_body_cbor", hex.formatHex(accepted(codec, nodesAnswer))));
+        Bodies.Digest linesAnswer = new Bodies.Digest(null, null, null, Map.of(stream, List.of(
+                Bodies.TreeNode.lines(new byte[]{0x0c}, "c:a=2\ne:a=1"), Bodies.TreeNode.lines(new byte[]{0x05}, ""))),
+                null, null, null);
+        out.append(field("digest_tree_lines_body_cbor", hex.formatHex(accepted(codec, linesAnswer))));
+
+        Bodies.Digest ids = new Bodies.Digest(null, null, null, null,
+                Map.of(stream, List.of("11111111-2222-3333-4444-555555555555", "entry-150")), 65_536L, null);
+        byte[] idsBody = accepted(codec, ids);
+        out.append(field("digest_ids_body_cbor", hex.formatHex(idsBody)));
+        Envelope idsFrame = new Envelope(WireCodec.WIRE_VERSION, group, Envelope.Kind.DIGEST, self, self, stamp,
+                idsBody);
+        out.append(field("digest_ids_frame_cbor", hex.formatHex(wire.encode(idsFrame, identity))));
+        Bodies.Digest getSpace = new Bodies.Digest(Map.of(stream, new byte[0]), null, null, null, null, budget, null);
+        out.append(field("digest_get_space_budget_body_cbor", hex.formatHex(accepted(codec, getSpace))));
+
+        byte[] delta = codec.toBytes(new SpaceWire.SyncDelta(List.of(dto), Map.of()));
+        out.append(field("pull_resp_body_cbor",
+                hex.formatHex(accepted(codec, new Bodies.PullResp(Map.of(stream, delta))))));
+        out.append(field("pull_resp_remainder_body_cbor",
+                hex.formatHex(accepted(codec, new Bodies.PullResp(Map.of(stream, delta), Map.of(stream, 3L))))));
+
+        // The carriers to refuse, written as raw maps in the record's field order, since the records refuse to hold them.
+        byte[] nodes383 = Arrays.copyOf(rootNodes, 383);
+        byte[] fewNodes = new byte[384];
+        fewNodes[23] = 20; // one child of 20 slots and fifteen empty: 20 is not above 32, so no inner node has it
+        System.arraycopy(rootNodes, 0, fewNodes, 0, 16);
+        out.append(refused(codec, hex, "adv_digest_tree_path_nibble_body",
+                treeBody(stream, treeNode(new byte[]{0x0a, 0x10}, "count", 3L)),
+                treeBody(stream, treeNode(new byte[]{0x0a, 0x0f}, "count", 3L)), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_tree_path_long_body",
+                treeBody(stream, treeNode(new byte[65], "count", 3L)),
+                treeBody(stream, treeNode(new byte[64], "count", 3L)), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_tree_nodes_length_body",
+                treeBody(stream, treeNode(new byte[0], "nodes", nodes383)),
+                treeBody(stream, treeNode(new byte[0], "nodes", rootNodes)), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_tree_nodes_few_body",
+                treeBody(stream, treeNode(new byte[0], "nodes", fewNodes)),
+                treeBody(stream, treeNode(new byte[0], "nodes", rootNodes)), Bodies.Digest.class));
+        java.util.LinkedHashMap<String, Object> twoForms = treeNode(new byte[]{0x01}, "count", 3L);
+        twoForms.put("lines", "e:a=1");
+        out.append(refused(codec, hex, "adv_digest_tree_two_forms_body", treeBody(stream, twoForms),
+                treeBody(stream, treeNode(new byte[]{0x01}, "count", 3L)), Bodies.Digest.class));
+        java.util.LinkedHashMap<String, Object> noForm = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        noForm.put("path", new byte[]{0x01});
+        out.append(refused(codec, hex, "adv_digest_tree_no_form_body", treeBody(stream, noForm),
+                treeBody(stream, treeNode(new byte[]{0x01}, "count", 3L)), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_tree_lines_order_body",
+                treeBody(stream, treeNode(new byte[]{0x01}, "lines", "e:b=1\ne:a=1")),
+                treeBody(stream, treeNode(new byte[]{0x01}, "lines", "e:a=1\ne:b=1")), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_tree_lines_empty_line_body",
+                treeBody(stream, treeNode(new byte[]{0x01}, "lines", "e:a=1\n")),
+                treeBody(stream, treeNode(new byte[]{0x01}, "lines", "e:a=1")), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_ids_twice_body",
+                idsBody(stream, List.of("entry-1", "entry-1"), 65_536L),
+                idsBody(stream, List.of("entry-1", "entry-2"), 65_536L), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_digest_budget_zero_body",
+                idsBody(stream, List.of("entry-1"), 0L), idsBody(stream, List.of("entry-1"), 1L), Bodies.Digest.class));
+        out.append(refused(codec, hex, "adv_pull_resp_remainder_negative_body", pullBody(stream, delta, -1L),
+                pullBody(stream, delta, 0L), Bodies.PullResp.class));
+        return out.toString();
+    }
+
+    /**
+     * The phase 5 vector of srad/replication-by-entry.md (RE-H-04), a new entry: {@code horizon_mode_cases}, the time a
+     * state becomes collectable under each rule of SPEC §7.3, from {@code SpaceStateCrdt.collectionHorizon} and
+     * {@code collectable} with the rule. Each case gives the state, the rule ({@code legacy}, or {@code per-entry}
+     * while every member in view advertises {@code wire.horizon=1}), the expiry the state carries, the maximum lease,
+     * the horizon, and two instants: one millisecond before the horizon, not collectable, and the horizon itself,
+     * collectable. Under {@code per-entry} a withdrawn entry keeps ten minutes whatever the maximum lease, the later of
+     * five minutes and the drift ceiling MAX_DRIFT, and under {@code legacy} the later of {@code 2 x maxLease} and
+     * MAX_DRIFT (owner decision 22); one both withdrawn and completed keeps {@code max(2 x maxLease, MAX_DRIFT)} under
+     * both rules, and a completed one and a lapsed one keep what they keep under {@code legacy}.
+     */
+    private static String horizonModeVectors(HlcTimestamp stamp, PeerId self, EntryRecord record) {
+        long expiry = 1_800_000_000_000L;
+        LeaseInfo leaseInfo = new LeaseInfo(record.issuer(), expiry, LeaseKind.WRITE);
+        ai.badmonkey.agentspaces.space.crdt.LwwRegister<LeaseInfo> lease =
+                new ai.badmonkey.agentspaces.space.crdt.LwwRegister<>(stamp, leaseInfo);
+        Dot dot = new Dot(self.value(), 1);
+        java.util.Map<String, ai.badmonkey.agentspaces.space.crdt.EntryState> states = new java.util.LinkedHashMap<>();
+        states.put("lapsed", new ai.badmonkey.agentspaces.space.crdt.EntryState(record, java.util.Set.of(dot),
+                java.util.Set.of(), lease, false));
+        states.put("withdrawn", new ai.badmonkey.agentspaces.space.crdt.EntryState(record, java.util.Set.of(dot),
+                java.util.Set.of(dot), lease, false));
+        states.put("completed", new ai.badmonkey.agentspaces.space.crdt.EntryState(record, java.util.Set.of(dot),
+                java.util.Set.of(), lease, true));
+        states.put("withdrawn_completed", new ai.badmonkey.agentspaces.space.crdt.EntryState(record,
+                java.util.Set.of(dot), java.util.Set.of(dot), lease, true));
+        long[] maxLeases = {30_000, 120_000, 600_000, 86_400_000};
+        java.util.Map<String, ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.Horizon> modes =
+                new java.util.LinkedHashMap<>();
+        modes.put("legacy", ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.Horizon.LEGACY);
+        modes.put("per-entry", ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.Horizon.PER_ENTRY);
+        List<String> cases = new java.util.ArrayList<>();
+        for (Map.Entry<String, ai.badmonkey.agentspaces.space.crdt.EntryState> state : states.entrySet()) {
+            for (Map.Entry<String, ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.Horizon> mode : modes.entrySet()) {
+                for (long maxLease : maxLeases) {
+                    long horizon = ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.collectionHorizon(
+                            state.getValue(), maxLease, mode.getValue());
+                    // The rule restated here, apart from the class, so a change to either fails the generator.
+                    long keep = switch (state.getKey()) {
+                        case "lapsed" -> Math.min(2 * maxLease, 300_000);
+                        case "withdrawn" -> Math.max(mode.getKey().equals("per-entry") ? 300_000 : 2 * maxLease,
+                                600_000); // the drift floor, MAX_DRIFT
+                        case "withdrawn_completed" -> Math.max(2 * maxLease, 600_000); // completed, and the floor
+                        default -> 2 * maxLease;
+                    };
+                    require(horizon == expiry + keep, "the " + state.getKey() + " horizon under " + mode.getKey()
+                            + " at " + maxLease);
+                    for (long now : new long[]{horizon - 1, horizon}) {
+                        boolean collectable = ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt.collectable(
+                                state.getValue(), now, maxLease, mode.getValue());
+                        require(collectable == (now >= horizon), "collectable from the horizon on, never before");
+                        cases.add("    {\"state\": \"" + state.getKey() + "\", \"mode\": \"" + mode.getKey()
+                                + "\", \"expiry\": " + expiry + ", \"max_lease\": " + maxLease + ", \"horizon\": "
+                                + horizon + ", \"now\": " + now + ", \"collectable\": " + collectable + "}");
+                    }
+                }
+            }
+        }
+        return "  \"horizon_mode_cases\": [\n" + String.join(",\n", cases) + "\n  ],\n";
+    }
+
+    /** Encodes a body and checks that the strict reader takes it back to the same bytes. */
+    private static byte[] accepted(CborCodec codec, Object body) {
+        byte[] bytes = codec.toBytes(body);
+        require(Arrays.equals(codec.toBytes(codec.fromWire(bytes, body.getClass())), bytes),
+                body.getClass().getSimpleName() + " round-trips under the strict reader");
+        return bytes;
+    }
+
+    /** A refused carrier: the strict reader refuses it, and takes the same body with its one bad value put right. */
+    private static String refused(CborCodec codec, HexFormat hex, String name, Map<String, Object> bad,
+                                  Map<String, Object> good, Class<?> type) {
+        byte[] bytes = codec.toBytes(bad);
+        boolean refusedBad;
+        try {
+            codec.fromWire(bytes, type);
+            refusedBad = false;
+        } catch (RuntimeException e) {
+            refusedBad = true;
+        }
+        require(refusedBad, name + " is refused");
+        byte[] fixed = codec.toBytes(good);
+        require(Arrays.equals(codec.toBytes(codec.fromWire(fixed, type)), fixed), name + " put right is read");
+        return field(name, hex.formatHex(bytes));
+    }
+
+    private static java.util.LinkedHashMap<String, Object> treeNode(byte[] path, String form, Object value) {
+        java.util.LinkedHashMap<String, Object> node = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        node.put("path", path);
+        node.put(form, value);
+        return node;
+    }
+
+    private static Map<String, Object> treeBody(String stream, Map<String, Object> node) {
+        java.util.LinkedHashMap<String, Object> body = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        body.put("digests", null);
+        body.put("tree", new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim(Map.of(stream, List.of(node))));
+        return body;
+    }
+
+    private static Map<String, Object> idsBody(String stream, List<String> ids, long budget) {
+        java.util.LinkedHashMap<String, Object> body = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        body.put("digests", null);
+        body.put("ids", new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim(Map.of(stream, ids)));
+        body.put("budget", budget);
+        return body;
+    }
+
+    private static Map<String, Object> pullBody(String stream, byte[] delta, long remainder) {
+        java.util.LinkedHashMap<String, Object> body = new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim();
+        body.put("deltas", new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim(Map.of(stream, delta)));
+        body.put("remainder", new ai.badmonkey.agentspaces.common.codec.CanonicalMaps.Verbatim(Map.of(stream, remainder)));
+        return body;
+    }
+
     private static String filterGrammarCases() {
         Object[][] cases = {
                 {"priority>=3", 3}, {"priority>=3", 2.5}, {"priority=3", 3.0}, {"priority=3", "3"},
@@ -2279,6 +2638,79 @@ public final class GoldenVectors {
             }
         }
         return out.append("],\n").toString();
+    }
+
+    /**
+     * The entries in the previous file's order, each new entry after them in the order this run emits it (the A2UI 1.0
+     * regeneration of 2026-11-12: the clients pin the order of the PDT 2 entries, and this run emits the content store
+     * and sketch vectors after the PDT block, where the committed file has them inside it). Every entry is one line.
+     */
+    private static String inPreviousOrder(String body, Map<String, Object> previous) {
+        if (previous == null || previous.isEmpty()) {
+            return body;
+        }
+        String head = "{\n";
+        if (!body.startsWith(head)) {
+            throw new IllegalStateException("the generated file does not open with {");
+        }
+        // the entries as text: each ends at the first comma, at depth 0 and outside a string, that closes its line
+        java.util.LinkedHashMap<String, String> lines = new java.util.LinkedHashMap<>();
+        String rest = body.substring(head.length());
+        int start = 0;
+        int depth = 0;
+        boolean inString = false;
+        for (int i = 0; i < rest.length(); i++) {
+            char c = rest.charAt(i);
+            if (inString) {
+                if (c == '\\') {
+                    i++;
+                } else if (c == '"') {
+                    inString = false;
+                }
+            } else if (c == '"') {
+                inString = true;
+            } else if (c == '[' || c == '{') {
+                depth++;
+            } else if (c == ']' || c == '}') {
+                depth--;
+            } else if (c == ',' && depth == 0 && i + 1 < rest.length() && rest.charAt(i + 1) == '\n') {
+                String entry = rest.substring(start, i + 1);
+                int open = entry.indexOf('"');
+                int close = entry.indexOf('"', open + 1);
+                if (open < 0 || close < 0) {
+                    throw new IllegalStateException("an entry without a name: " + entry.substring(0, Math.min(60, entry.length())));
+                }
+                lines.put(entry.substring(open + 1, close), entry);
+                start = i + 2;
+            }
+        }
+        if (!rest.substring(start).isBlank()) {
+            throw new IllegalStateException("the generated file ends with text that is not an entry");
+        }
+        // New entries go just before the previous file's last entry (wire_version, which closes the file), so a run
+        // that only adds vectors leaves every earlier line as it was, the old last line's missing comma included, and
+        // the old and new files differ by inserted lines alone (srad/replication-by-entry.md phase 2, 2026-11-15).
+        String closing = null;
+        for (String name : previous.keySet()) {
+            closing = name;
+        }
+        java.util.Set<String> earlier = new java.util.HashSet<>(previous.keySet());
+        StringBuilder out = new StringBuilder(head);
+        for (String name : previous.keySet()) {
+            if (name.equals(closing)) {
+                for (String added : new java.util.ArrayList<>(lines.keySet())) {
+                    if (!earlier.contains(added)) {
+                        out.append(lines.remove(added)).append('\n');
+                    }
+                }
+            }
+            String line = lines.remove(name);
+            if (line != null) {
+                out.append(line).append('\n');
+            }
+        }
+        lines.values().forEach(line -> out.append(line).append('\n'));
+        return out.toString();
     }
 
     private static String field(String name, String value) {

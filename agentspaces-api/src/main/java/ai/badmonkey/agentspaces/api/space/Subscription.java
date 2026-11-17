@@ -25,9 +25,11 @@ import java.time.Duration;
 public interface Subscription extends AutoCloseable {
 
     /**
-     * Extends the subscription lease by the given duration from now.
+     * Extends the subscription lease to at least the given duration from now. It never shortens the lease: the new
+     * expiry is the later of the current one and now plus {@code extension}. {@link #close() Close} the
+     * subscription to stop it sooner.
      *
-     * @param extension how much longer the subscription should live
+     * @param extension how long from now the subscription should live at least
      * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the lease already lapsed
      */
     void renew(Duration extension);

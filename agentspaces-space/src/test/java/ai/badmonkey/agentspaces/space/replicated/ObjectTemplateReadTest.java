@@ -19,8 +19,11 @@ package ai.badmonkey.agentspaces.space.replicated;
 
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
+import ai.badmonkey.agentspaces.api.entry.EntryId;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.api.space.Lease;
+import ai.badmonkey.agentspaces.api.space.Matchers;
+import ai.badmonkey.agentspaces.api.space.Space;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.api.spi.SchemaRegistry;
 import ai.badmonkey.agentspaces.common.id.GroupId;
@@ -38,9 +41,12 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -146,5 +152,75 @@ class ObjectTemplateReadTest {
         local.write(new Claim("c-2", 1), Lease.of(Duration.ofMinutes(1)));
         assertThat(local.readAll(Template.of(Object.class).whereType("Claim"), 10)).hasSize(1);
         assertThat(local.readAll(Template.of(Object.class).whereType("Payment"), 10)).isEmpty();
+    }
+
+    /** The ids of the newest {@code n} entries of a read: sorted by issue stamp, newest first, then cut. */
+    private static Set<EntryId> newest(List<Space.Entry<Claim>> entries, int n) {
+        Set<EntryId> ids = new HashSet<>();
+        entries.stream().sorted(Comparator.comparing((Space.Entry<Claim> e) -> e.issued()).reversed()).limit(n)
+                .forEach(e -> ids.add(e.entryId()));
+        return ids;
+    }
+
+    private static Set<EntryId> idsOf(List<Space.Entry<Claim>> entries) {
+        Set<EntryId> ids = new HashSet<>();
+        entries.forEach(e -> ids.add(e.entryId()));
+        return ids;
+    }
+
+    /**
+     * P15 (reviews/RBE-REGRESSION-MATRIX.md §3, the core part): readAll over more than its cap. A capped read promises
+     * no order. It returns {@code limit} distinct entries that the template selects and that are available (live and
+     * unclaimed), counted after those filters, so other types, other tags and entries in hand never use up the cap; and
+     * they are the head of an uncapped read at the same moment, in the same order. A caller that wants one subset, as a
+     * chat wants its newest 500, reads past the cap and sorts by the issue stamp before it cuts: that gives the same
+     * subset on every replica, whether the entries came by live writes or by one batched {@code PULL_RESP}.
+     */
+    @Test
+    void aCappedReadIsTheHeadOfTheFullReadAndOnlyASortedReadGivesTheNewest() throws Exception {
+        ReplicatedSpace writer = peer("w", null);
+        ReplicatedSpace batched = peer("b", null); // no seeds: learns everything from one PULL_RESP
+        Lease lease = Lease.of(Duration.ofMinutes(30));
+        List<EntryId> room = new ArrayList<>();
+        for (int i = 0; i < 600; i++) {
+            room.add(writer.write(new Claim("m-" + i, i), lease, Map.of("room", "r1")).entryId());
+            if (i % 6 == 0) {
+                writer.write(new Claim("other-" + i, i), lease, Map.of("room", "r2"));
+                writer.write(new Payment("p-" + i), lease, Map.of("room", "r1"));
+            }
+        }
+        assertThat(batched.applySyncDelta(writer.deltaFor(batched.digest()))).isTrue();
+        assertThat(batched.knownEntries()).isEqualTo(writer.knownEntries());
+
+        Template<Claim> chat = Template.of(Claim.class).whereTag("room", Matchers.eq("r1"));
+        Set<EntryId> newest500 = new HashSet<>(room.subList(100, 600));
+        for (ReplicatedSpace replica : List.of(writer, batched)) {
+            List<Space.Entry<Claim>> all = replica.readAllEntries(chat, 10_000);
+            assertThat(all).hasSize(600);
+            List<Space.Entry<Claim>> capped = replica.readAllEntries(chat, 500);
+            assertThat(capped).as("the cap, counted over the selected entries only").hasSize(500);
+            assertThat(capped).extracting(Space.Entry::entryId).as("the head of the full read, in its order")
+                    .containsExactlyElementsOf(all.subList(0, 500).stream().map(Space.Entry::entryId).toList());
+            assertThat(idsOf(capped)).as("distinct, and all of the room").hasSize(500).isSubsetOf(room);
+            assertThat(replica.readAll(chat, 500)).as("readAll returns the same head")
+                    .containsExactlyElementsOf(capped.stream().map(Space.Entry::value).toList());
+            assertThat(newest(all, 500)).as("sort, then cut: the newest 500").isEqualTo(newest500);
+            assertThat(replica.readAll(Template.of(Claim.class).whereTag("room", Matchers.eq("r2")), 500))
+                    .as("another room's entries are not cut by the first room's").hasSize(100);
+        }
+
+        // Entries in hand leave the read before the cap is counted.
+        Set<EntryId> inHand = new HashSet<>();
+        for (int i = 0; i < 150; i++) {
+            inHand.add(writer.take(chat, Lease.of(Duration.ofMinutes(5)), Duration.ZERO).orElseThrow().entryId());
+        }
+        List<Space.Entry<Claim>> rest = writer.readAllEntries(chat, 10_000);
+        assertThat(rest).hasSize(450);
+        List<Space.Entry<Claim>> capped = writer.readAllEntries(chat, 400);
+        assertThat(capped).hasSize(400);
+        assertThat(idsOf(capped)).doesNotContainAnyElementsOf(inHand);
+        assertThat(capped).extracting(Space.Entry::entryId)
+                .containsExactlyElementsOf(rest.subList(0, 400).stream().map(Space.Entry::entryId).toList());
+        assertThat(writer.readAllEntries(chat, 500)).as("fewer available than the cap: all of them").hasSize(450);
     }
 }

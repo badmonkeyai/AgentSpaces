@@ -23,6 +23,7 @@ import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.peering.gossip.GossipBus;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
@@ -107,6 +108,61 @@ class DtlsFleetTest {
         assertThat(memberIds(second)).contains(first.identity().peerId());
     }
 
+    /**
+     * P30 of reviews/RBE-REGRESSION-MATRIX.md (srad/replication-by-entry.md RE-I-04, RE-I-05; SPEC annex I.6): a member
+     * joins late over DTLS a space another member already holds, with every anti-entropy answer cut to 4 KiB. The
+     * joiner's audit descends the holder's trie past the root to the leaves and fetches every entry by id in answers
+     * cut to the budget, continuing each that carries a remainder; each answer is a frame the recovery sublayer
+     * fragments into datagrams. The space converges to equal stream hashes. The test prints what the join took; the
+     * 120 s wait only means "broken" (a few seconds here).
+     */
+    @Test
+    @Timeout(180)
+    void aLateJoinersTrieAuditDescendsAndFetchesInBudgetedAnswersOverDtls() throws Exception {
+        long budget = 4_096;
+        int n = 600;
+        int seedPort = freeUdpPort();
+        Peer holder = startPeer(seedPort, 0, budget, "tasks");
+        for (int i = 0; i < n; i++) {
+            holder.space().write(new Job("job-" + i, "row " + i + " of the late join"), Lease.of(Duration.ofHours(1)));
+        }
+        long started = System.nanoTime();
+        Peer joiner = startPeer(freeUdpPort(), seedPort, budget, "tasks");
+        long deadline = started + Duration.ofSeconds(120).toNanos();
+        while (System.nanoTime() < deadline && jobIds(joiner).size() < n) {
+            Thread.sleep(50);
+        }
+        long millis = Duration.ofNanos(System.nanoTime() - started).toMillis();
+        GossipBus.AuditSignals asker = joiner.runtime().gossip().auditSignals();
+        GossipBus.AuditSignals partner = holder.runtime().gossip().auditSignals();
+        GossipBus.PacingSignals pacing = joiner.runtime().gossip().pacingSignals();
+        System.out.printf("dtls budgeted join (P30): %d entries under a %,d-byte budget in %d ms; the holder answered %d"
+                        + " roots and %d descent requests (%d nodes) and cut %d answers to the budget; the joiner asked"
+                        + " %d ids, continued %d at once, re-queued %d, received %d PULL_RESP of %,d bytes with %d states"
+                        + " left for later; dtls retransmitted %d of %d datagrams%n", n, budget, millis,
+                partner.rootsAnswered(), partner.requestsAnswered(), partner.nodesAnswered(), partner.budgetedAnswers(),
+                asker.idsFetched(), asker.fetchContinued(), asker.fetchRequeued(), pacing.pullRespReceived(),
+                pacing.pullRespBytesReceived(), asker.remainderReceived(), holder.transport().counters().retransmitted(),
+                holder.transport().counters().pdusSent());
+
+        assertThat(jobIds(joiner)).as("the joiner holds every entry").hasSize(n).isEqualTo(jobIds(holder));
+        assertThat(joiner.space().knownEntries()).isEqualTo(holder.space().knownEntries());
+        assertThat(partner.rootsAnswered()).as("the joiner's audit opened on the holder's root").isPositive();
+        assertThat(partner.requestsAnswered()).as("and descended past it").isPositive();
+        assertThat(asker.idsFetched()).as("every entry fetched by id").isGreaterThanOrEqualTo(n);
+        assertThat(partner.budgetedAnswers()).as("a sequence of bounded answers").isGreaterThan(1);
+        assertThat(asker.remainderReceived()).isPositive();
+        assertThat(asker.refusals()).doesNotContainKeys("fingerprint-mismatch", "unsolicited-answer");
+    }
+
+    private static java.util.Set<String> jobIds(Peer peer) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (Job job : peer.space().readAll(Template.of(Job.class), 100_000)) {
+            ids.add(job.jobId());
+        }
+        return ids;
+    }
+
     private static List<ai.badmonkey.agentspaces.common.id.PeerId> memberIds(Peer peer) {
         return peer.runtime().membership().allMembers().stream()
                 .map(GroupMembership.Member::id).toList();
@@ -136,8 +192,16 @@ class DtlsFleetTest {
     }
 
     private Peer startPeer(int port, int seedPort) throws Exception {
+        return startPeer(port, seedPort, 0, "jobs");
+    }
+
+    private Peer startPeer(int port, int seedPort, long auditBudget, String spaceName) throws Exception {
         PeerIdentity identity = PeerIdentity.generate();
-        PeerNode node = PeerNode.builder(identity).build();
+        PeerNode.Builder builder = PeerNode.builder(identity);
+        if (auditBudget > 0) {
+            builder.auditBudget(auditBudget);
+        }
+        PeerNode node = builder.build();
         DtlsTransport transport = new DtlsTransport(identity);
         node.listen(transport, "127.0.0.1:" + port);
         List<PeerAdvertisement.Endpoint> seeds = seedPort == 0 ? List.of()
@@ -145,7 +209,7 @@ class DtlsFleetTest {
         GroupRuntime runtime = node.joinGroup(group(),
                 new GroupMembership.Config(Duration.ofSeconds(30), Duration.ofSeconds(2), 2),
                 seeds);
-        ReplicatedSpace space = ReplicatedSpace.builder(runtime, "jobs", identity, "host")
+        ReplicatedSpace space = ReplicatedSpace.builder(runtime, spaceName, identity, "host")
                 .settleWindow(Duration.ofMillis(150))
                 .build();
         node.startTicking(Duration.ofMillis(250));

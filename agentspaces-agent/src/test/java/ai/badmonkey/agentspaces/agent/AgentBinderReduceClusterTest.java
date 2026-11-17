@@ -75,10 +75,17 @@ class AgentBinderReduceClusterTest {
             GroupAdvertisement.MembershipPolicy.OPEN, ConflictStrategyType.LEASE_RACE,
             GroupAdvertisement.GossipParameters.defaults());
 
+    /**
+     * Held for the class's life: the log manager keeps loggers only weakly, so a logger configured and dropped is
+     * collected and comes back at the default level, and the DEBUG timeline silently disappears.
+     */
+    private static final List<java.util.logging.Logger> DEBUG_LOGGERS = new ArrayList<>();
+
     static {
         // The reduce's and the join's decisions at DEBUG on the console, so a failure reads as a timeline.
         for (String name : List.of("ai.badmonkey.agentspaces.agent.reduce", "ai.badmonkey.agentspaces.agent.join")) {
             java.util.logging.Logger logger = java.util.logging.Logger.getLogger(name);
+            DEBUG_LOGGERS.add(logger);
             logger.setLevel(java.util.logging.Level.FINE);
             java.util.logging.ConsoleHandler console = new java.util.logging.ConsoleHandler();
             console.setLevel(java.util.logging.Level.FINE);
@@ -109,7 +116,15 @@ class AgentBinderReduceClusterTest {
 
     private Member member(String address, long seed, java.time.InstantSource clock, String... seeds)
             throws IOException {
-        PeerIdentity identity = PeerIdentity.generate();
+        return member(address, seed, clock, PeerIdentity.generate(), seeds);
+    }
+
+    private Member member(String address, long seed, PeerIdentity identity, String... seeds) throws IOException {
+        return member(address, seed, clock, identity, seeds);
+    }
+
+    private Member member(String address, long seed, java.time.InstantSource clock, PeerIdentity identity,
+                          String... seeds) throws IOException {
         PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).build();
         node.listen(network.register(address), address);
         List<PeerAdvertisement.Endpoint> endpoints = new ArrayList<>();
@@ -215,6 +230,269 @@ class AgentBinderReduceClusterTest {
             assertThat(m.space().readAll(Template.of(JoinTicket.class), 20))
                     .as("tickets drained at " + m.identity().peerId().display()).isEmpty();
         }
+    }
+
+    /** What a late member saw at the first event of its first batch: per account, the accumulator's count and the payments left. */
+    private record FirstView(int known, java.util.Map<String, Integer> folded, java.util.Map<String, Integer> visible) {
+    }
+
+    /**
+     * RBE regression matrix probe P8 (srad/replication-by-entry.md phase 1, RE-M-08): a reducer on a member that
+     * joins late learns, in one {@code PULL_RESP}, the elements already folded (completed, each with the accumulator it
+     * produced), the accumulators they replaced (cancelled), and the elements not yet folded. The batch's events fire
+     * after all of it is in, so the reducer's first look sees one atomic view: the newest accumulator counting exactly the
+     * folded elements, and only the unfolded ones still readable. It folds those on top, each once, and every member
+     * ends with one accumulator per key holding every element once.
+     */
+    @Test
+    void aLateReducerSeesTheCompletionsAndTheNewAccumulatorAsOneViewAndFoldsEachElementOnce() throws Exception {
+        Member a = member("a", 1);
+        Member b = member("b", 2, "a");
+        // The third voter starts after the folding: never admitted before, it hears no lazy-push announcement of the
+        // older rumors, so anti-entropy is its only source and one PULL_RESP carries the whole ledger.
+        PeerIdentity lateIdentity = PeerIdentity.generate();
+        List<PeerId> memberIds = List.of(a.identity().peerId(), b.identity().peerId(), lateIdentity.peerId());
+        tickAll(4);
+        int seed = 100;
+        for (Member m : List.of(a, b)) {
+            m.group().ordered("ledger", OrderedTakes.over(new CapabilityPipes(m.runtime(), codec), codec,
+                    m.identity(), "teller", memberIds, clock, seed++, m.space()));
+        }
+        for (int i = 0; i < 60 && List.of(a, b).stream().noneMatch(this::leads); i++) {
+            tickAll(1);
+        }
+        assertThat(List.of(a, b).stream().filter(this::leads).count()).as("a leader of two of three").isEqualTo(1);
+
+        Teller early = new Teller();
+        AgentBinder.Bound earlyBinding = a.group().bind(early);
+        long[] expected = new long[2];
+        for (int i = 1; i <= 6; i++) {
+            b.space().write(new Payment("acct-" + (i % 2), i), Lease.of(Duration.ofMinutes(10)));
+            expected[i % 2] += i;
+        }
+        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+        while (System.nanoTime() < deadline && !(foldedAt(a, 3) && ticketsDrained(List.of(a, b)))) {
+            tickAll(1);
+            Thread.sleep(20);
+        }
+        assertThat(foldedAt(a, 3)).as("the early reducer folded the first six").isTrue();
+        // Close returns once the early reducer can fold nothing more, so the rest can be written at once.
+        earlyBinding.close();
+        assertThat(early.steps.get()).isEqualTo(6);
+        for (int i = 7; i <= 10; i++) {
+            b.space().write(new Payment("acct-" + (i % 2), i), Lease.of(Duration.ofMinutes(10)));
+            expected[i % 2] += i;
+        }
+        tickAll(2);
+        assertThat(b.space().readAll(Template.of(Payment.class), 20)).as("four left unfolded").hasSize(4);
+        int ledger = b.space().knownEntries(); // payments, accumulators, and the tickets the early reducer held
+        assertThat(a.space().knownEntries()).as("both replicas hold the same ledger").isEqualTo(ledger);
+
+        Member c = member("c", 3, lateIdentity, "a");
+        OrderedTakes third = OrderedTakes.over(new CapabilityPipes(c.runtime(), codec), codec,
+                c.identity(), "teller", memberIds, clock, seed, c.space());
+        c.group().ordered("ledger", third);
+        java.util.concurrent.atomic.AtomicReference<FirstView> first = new java.util.concurrent.atomic.AtomicReference<>();
+        Lease hour = Lease.of(Duration.ofHours(1));
+        for (Class<?> type : List.of(Payment.class, Balance.class)) {
+            c.space().notify(Template.of(type), e -> first.compareAndSet(null, viewAt(c)), hour);
+        }
+        Teller late = new Teller();
+        closeables.add(c.group().bind(late));
+        assertThat(c.space().knownEntries()).as("bound before anything arrived").isZero();
+
+        List<Member> members = List.of(a, b, c);
+        deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
+        while (System.nanoTime() < deadline && !(settledAt(members, expected, 5) && ticketsDrained(members))) {
+            tickAll(1);
+            Thread.sleep(20);
+        }
+
+        FirstView view = first.get();
+        assertThat(view).as("the late member heard the ledger").isNotNull();
+        assertThat(view.known()).as("one batch: the whole ledger was in at the first event").isEqualTo(ledger);
+        assertThat(view.folded()).as("the newest accumulator counts exactly the folded elements")
+                .containsEntry("acct-0", 3).containsEntry("acct-1", 3);
+        assertThat(view.visible()).as("only the unfolded elements are readable beside it")
+                .containsEntry("acct-0", 2).containsEntry("acct-1", 2);
+        assertThat(settledAt(members, expected, 5))
+                .as("every member holds one accumulator per key with every element once").isTrue();
+        assertThat(early.steps.get()).isEqualTo(6);
+        assertThat(late.steps.get()).as("the late reducer folded only the four left, each once").isEqualTo(4);
+        assertThat(ticketsDrained(members)).isTrue();
+    }
+
+    /** An ORDERED teller whose drain waits long for the next element, so a close finds its take in flight. */
+    @AgentSpec(name = "teller", description = "Keeps a running balance per account, once fleet-wide", goals = {"balance"})
+    public static class PatientOrderedTeller {
+        final AtomicInteger steps = new AtomicInteger();
+
+        @SpaceReduce(space = "ledger", key = "account", mode = SpaceReduce.Mode.ORDERED, name = "teller",
+                lease = "30s", pollTimeout = "20s", accumulatorLease = "1h")
+        public Balance apply(Balance balance, Payment payment) {
+            steps.incrementAndGet();
+            return new Balance(payment.account(), (balance == null ? 0 : balance.cents()) + payment.cents(),
+                    (balance == null ? 0 : balance.payments()) + 1);
+        }
+    }
+
+    /** The LEASED form of {@link PatientOrderedTeller}. */
+    @AgentSpec(name = "teller", description = "Keeps a running balance per account", goals = {"balance"})
+    public static class PatientLeasedTeller {
+        final AtomicInteger steps = new AtomicInteger();
+
+        @SpaceReduce(space = "ledger", key = "account", mode = SpaceReduce.Mode.LEASED, name = "teller",
+                lease = "30s", pollTimeout = "20s", accumulatorLease = "1h")
+        public Balance apply(Balance balance, Payment payment) {
+            steps.incrementAndGet();
+            return new Balance(payment.account(), (balance == null ? 0 : balance.cents()) + payment.cents(),
+                    (balance == null ? 0 : balance.payments()) + 1);
+        }
+    }
+
+    /**
+     * Closing an ORDERED reduce stops the take it has in flight. The reducer folds two payments and then waits in
+     * its next element take (a 20 s poll). Before the fix, close returned at once but the take swallowed the
+     * interrupt, kept scanning, and adopted and folded a payment written after close; the core and PetClinic tests
+     * waited out the poll and the log's attempt window for it. Now close returns once nothing more can fold, and the
+     * payment is left to the next reducer, which folds it once.
+     */
+    @Test
+    void closingAnOrderedReduceStopsItsTakeInFlightAndNothingFoldsAfterClose() throws Exception {
+        Member a = member("a", 1);
+        Member b = member("b", 2, "a");
+        Member c = member("c", 3, "a");
+        List<Member> members = List.of(a, b, c);
+        List<PeerId> memberIds = members.stream().map(m -> m.identity().peerId()).toList();
+        tickAll(4);
+        int seed = 100;
+        for (Member m : members) {
+            m.group().ordered("ledger", OrderedTakes.over(new CapabilityPipes(m.runtime(), codec), codec,
+                    m.identity(), "teller", memberIds, clock, seed++, m.space()));
+        }
+        for (int i = 0; i < 60 && members.stream().noneMatch(this::leads); i++) {
+            tickAll(1);
+        }
+        assertThat(members.stream().filter(this::leads).count()).as("exactly one leader").isEqualTo(1);
+
+        PatientOrderedTeller closing = new PatientOrderedTeller();
+        AgentBinder.Bound binding = a.group().bind(closing);
+        assertClosePrompt(members, a, b, binding, closing.steps, () -> {
+            PatientOrderedTeller next = new PatientOrderedTeller();
+            closeables.add(b.group().bind(next));
+            return next.steps;
+        });
+    }
+
+    /** As {@link #closingAnOrderedReduceStopsItsTakeInFlightAndNothingFoldsAfterClose}, for a LEASED reduce. */
+    @Test
+    void closingALeasedReduceStopsItsTakeInFlightAndNothingFoldsAfterClose() throws Exception {
+        Member a = member("a", 1);
+        Member b = member("b", 2, "a");
+        List<Member> members = List.of(a, b);
+        tickAll(4);
+        PatientLeasedTeller closing = new PatientLeasedTeller();
+        AgentBinder.Bound binding = a.group().bind(closing);
+        assertClosePrompt(members, a, b, binding, closing.steps, () -> {
+            PatientLeasedTeller next = new PatientLeasedTeller();
+            closeables.add(b.group().bind(next));
+            return next.steps;
+        });
+    }
+
+    private void assertClosePrompt(List<Member> members, Member a, Member b, AgentBinder.Bound binding,
+                                   AtomicInteger closingSteps,
+                                   java.util.concurrent.Callable<AtomicInteger> bindNext) throws Exception {
+        for (int i = 1; i <= 2; i++) {
+            b.space().write(new Payment("acct-0", i), Lease.of(Duration.ofMinutes(10)));
+        }
+        java.util.function.BooleanSupplier twoFolded = () -> closingSteps.get() == 2
+                && Reductions.current(a.space(), Balance.class, "teller", "acct-0")
+                        .map(e -> e.value().payments() == 2).orElse(false);
+        assertThat(awaitTicking("two folded", twoFolded, Duration.ofSeconds(60))).as("two folded").isTrue();
+        // The drain now waits in its next element take, which a 20 s poll keeps in flight.
+        Thread.sleep(200);
+
+        long start = System.nanoTime();
+        binding.close();
+        long closeMillis = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("REDUCE-CLOSE-MEASURE close returned in " + closeMillis + " ms");
+        assertThat(closeMillis).as("close stops the take in flight rather than waiting out its 20 s poll")
+                .isLessThan(20_000);
+
+        b.space().write(new Payment("acct-0", 3), Lease.of(Duration.ofMinutes(10)));
+        // As long as the take used to stay in flight after close (the old poll and attempt window), with the log
+        // and gossip running: a take still in flight would claim the payment here.
+        for (int i = 0; i < 20; i++) {
+            tickAll(1);
+            Thread.sleep(200);
+        }
+        assertThat(closingSteps.get()).as("nothing folds after close returns").isEqualTo(2);
+        for (Member m : members) {
+            assertThat(m.space().readAll(Template.of(Payment.class), 20)).as("the payment waits, unfolded")
+                    .containsExactly(new Payment("acct-0", 3));
+        }
+
+        AtomicInteger nextSteps = bindNext.call();
+        java.util.function.BooleanSupplier allFolded = () -> members.stream().allMatch(m ->
+                m.space().readAll(Template.of(Payment.class), 20).isEmpty()
+                        && Reductions.current(m.space(), Balance.class, "teller", "acct-0")
+                                .map(e -> e.value().cents() == 6 && e.value().payments() == 3).orElse(false));
+        assertThat(awaitTicking("next reducer folds the third", allFolded, Duration.ofSeconds(60)))
+                .as("the next reducer folds the payment the closed one left").isTrue();
+        assertThat(nextSteps.get()).as("folded once, by the next reducer").isEqualTo(1);
+        assertThat(closingSteps.get()).isEqualTo(2);
+    }
+
+    /** Ticks until the condition holds or the ceiling passes, and prints how long it took. */
+    private boolean awaitTicking(String what, java.util.function.BooleanSupplier condition, Duration ceiling)
+            throws InterruptedException {
+        long start = System.nanoTime();
+        long deadline = start + ceiling.toNanos();
+        boolean held = condition.getAsBoolean();
+        while (!held && System.nanoTime() < deadline) {
+            tickAll(1);
+            Thread.sleep(20);
+            held = condition.getAsBoolean();
+        }
+        System.out.println("REDUCE-CLOSE-MEASURE " + what + " " + (System.nanoTime() - start) / 1_000_000 + " ms"
+                + (held ? "" : " (ceiling reached)"));
+        return held;
+    }
+
+    private static FirstView viewAt(Member m) {
+        java.util.Map<String, Integer> folded = new java.util.TreeMap<>();
+        java.util.Map<String, Integer> visible = new java.util.TreeMap<>();
+        for (String account : List.of("acct-0", "acct-1")) {
+            folded.put(account, Reductions.current(m.space(), Balance.class, "teller", account)
+                    .map(e -> e.value().payments()).orElse(0));
+            visible.put(account, (int) m.space().readAll(Template.of(Payment.class), 20).stream()
+                    .filter(p -> p.account().equals(account)).count());
+        }
+        return new FirstView(m.space().knownEntries(), folded, visible);
+    }
+
+    private static boolean foldedAt(Member m, int each) {
+        return m.space().readAll(Template.of(Payment.class), 20).isEmpty()
+                && List.of("acct-0", "acct-1").stream().allMatch(account -> Reductions.current(m.space(),
+                        Balance.class, "teller", account).map(e -> e.value().payments() == each).orElse(false));
+    }
+
+    private static boolean settledAt(List<Member> members, long[] expected, int each) {
+        for (Member m : members) {
+            if (!m.space().readAll(Template.of(Payment.class), 20).isEmpty()
+                    || m.space().readAll(Template.of(Balance.class), 20).size() != 2) {
+                return false;
+            }
+            for (int account = 0; account < 2; account++) {
+                var current = Reductions.current(m.space(), Balance.class, "teller", "acct-" + account);
+                if (current.isEmpty() || current.get().value().cents() != expected[account]
+                        || current.get().value().payments() != each) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /** An accumulator the space cannot write: its payload is over the inline limit and the space has no block store. */

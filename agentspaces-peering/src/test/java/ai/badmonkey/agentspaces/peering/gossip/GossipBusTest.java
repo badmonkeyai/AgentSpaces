@@ -358,6 +358,95 @@ class GossipBusTest {
         assertThat(digestsSent.get(0).hashes()).isNull();
     }
 
+    /**
+     * The pacing signals (RE-F-03, srad/replication-by-entry.md): each side of a hashed round, a plain round, a
+     * PULL_RESP sent, applied and refused, and the targeted rounds a probe opens are counted, and counting changes
+     * nothing the bus sends.
+     */
+    @Test
+    void thePacingSignalsCountEachSideOfARound() {
+        List<Bodies.Digest> askerSent = new ArrayList<>();
+        List<Bodies.PullResp> askerResps = new ArrayList<>();
+        GossipBus asker = new GossipBus(sampler, new GossipBus.FrameSender() {
+            @Override public void sendRumor(PeerId to, Bodies.Rumor rumor) { }
+            @Override public void sendDigest(PeerId to, Bodies.Digest digest) { askerSent.add(digest); }
+            @Override public void sendPullResp(PeerId to, Bodies.PullResp deltas) { askerResps.add(deltas); }
+        }, CborCodec.defaultCodec(), 3, 6);
+        asker.hashedDigests(p -> true);
+        asker.reconcile("same", digestState("s"));
+        asker.reconcile("differs", digestState("mine"));
+        List<Bodies.Digest> partnerSent = new ArrayList<>();
+        List<Bodies.PullResp> partnerResps = new ArrayList<>();
+        GossipBus partner = new GossipBus(sampler, new GossipBus.FrameSender() {
+            @Override public void sendRumor(PeerId to, Bodies.Rumor rumor) { }
+            @Override public void sendDigest(PeerId to, Bodies.Digest digest) { partnerSent.add(digest); }
+            @Override public void sendPullResp(PeerId to, Bodies.PullResp deltas) { partnerResps.add(deltas); }
+        }, CborCodec.defaultCodec(), 3, 6);
+        partner.reconcile("same", digestState("s"));
+        partner.reconcile("differs", digestState("theirs"));
+        assertThat(asker.pacingSignals().wantFraction()).as("no opening yet").isZero();
+
+        asker.antiEntropyTick();
+        partner.onDigest(neighbor, askerSent.get(0));
+        asker.onDigest(neighbor, partnerSent.get(0));
+        partner.onDigest(neighbor, askerSent.get(1));
+        asker.onPullResp(neighbor, partnerResps.get(0));
+
+        GossipBus.PacingSignals opener = asker.pacingSignals();
+        assertThat(opener.hashedOpeningsSent()).isEqualTo(1);
+        assertThat(opener.hashedOpeningStreamsSent()).isEqualTo(2);
+        assertThat(opener.wantsReceived()).isEqualTo(1);
+        assertThat(opener.wantedStreamsReceived()).isEqualTo(1);
+        assertThat(opener.wantFraction()).isEqualTo(1.0);
+        assertThat(opener.digestTextBytesSent()).as("the full text of the wanted stream alone")
+                .isEqualTo(bytes("mine").length);
+        assertThat(opener.pullRespReceived()).isEqualTo(1);
+        assertThat(opener.pullRespDeltasReceived()).isEqualTo(1);
+        assertThat(opener.pullRespBytesReceived()).isEqualTo(bytes("delta").length);
+        GossipBus.PacingSignals answerer = partner.pacingSignals();
+        assertThat(answerer.hashedOpeningsReceived()).isEqualTo(1);
+        assertThat(answerer.wantsSent()).isEqualTo(1);
+        assertThat(answerer.digestTextBytesReceived()).isEqualTo(bytes("mine").length);
+        assertThat(answerer.pullRespSent()).isEqualTo(1);
+        assertThat(answerer.pullRespDeltasSent()).isEqualTo(1);
+        assertThat(answerer.pullRespBytesSent()).isEqualTo(bytes("delta").length);
+
+        // A round in sync: the opening is answered with nothing, so the want fraction falls to one in two.
+        askerSent.clear();
+        partnerSent.clear();
+        asker.antiEntropyTick();
+        partner.onDigest(neighbor, new Bodies.Digest(null, Map.of("same",
+                ai.badmonkey.agentspaces.common.crypto.Digests.sha256(bytes("s"))), null));
+        assertThat(partnerSent).isEmpty();
+        assertThat(asker.pacingSignals().hashedOpeningsSent()).isEqualTo(2);
+        assertThat(asker.pacingSignals().wantFraction()).isEqualTo(0.5);
+        assertThat(partner.pacingSignals().wantsSent()).as("an opening in sync takes no want").isEqualTo(1);
+
+        // A PULL_RESP from a member no round was opened with is dropped and counted as such.
+        asker.onPullResp(attacker, new Bodies.PullResp(Map.of("same", bytes("forged"))));
+        assertThat(asker.pacingSignals().pullRespUnsolicited()).isEqualTo(1);
+        assertThat(asker.pacingSignals().pullRespReceived()).isEqualTo(1);
+
+        // Toward a member without the hint the round opens with the full text, counted by its bytes.
+        GossipBus legacy = new GossipBus(sampler, sender, CborCodec.defaultCodec(), 3, 6);
+        legacy.reconcile("same", digestState("s"));
+        legacy.reconcile("other", digestState("abc"));
+        legacy.antiEntropyTick();
+        assertThat(legacy.pacingSignals().hashedOpeningsSent()).isZero();
+        assertThat(legacy.pacingSignals().digestTextBytesSent()).isEqualTo(4);
+
+        // The rounds a probe opens, by what the probe carried; each is an ordinary targeted round.
+        long rounds = legacy.antiEntropyRounds();
+        legacy.antiEntropyFromProbe(neighbor, false);
+        legacy.antiEntropyFromProbe(neighbor, true);
+        legacy.antiEntropyFromProbe(neighbor, true);
+        assertThat(legacy.pacingSignals().probeRoundsHashes()).isEqualTo(1);
+        assertThat(legacy.pacingSignals().probeRoundsRootOnly()).isEqualTo(2);
+        assertThat(legacy.pacingSignals().probeRounds()).isEqualTo(3);
+        assertThat(legacy.antiEntropyRounds() - rounds).isEqualTo(3);
+        assertThat(legacy.pacingSignals().digestTextBytesSent()).isEqualTo(4 * 4);
+    }
+
     private static ReconcilableState digestState(String digest) {
         return new ReconcilableState() {
             @Override public byte[] digest() { return bytes(digest); }
@@ -366,5 +455,81 @@ class GossipBusTest {
             }
             @Override public void applyDelta(byte[] delta) { }
         };
+    }
+
+    /**
+     * Honest backoff (reviews/IDLE-WORK-2026-11-13.md 5a(b)): a first copy of a rumor on a stream this node does not
+     * hold is forwarded exactly as before, but it is no activity here, so it cannot hold this node's anti-entropy at
+     * its base period. A rumor on a stream it holds still is.
+     */
+    @Test
+    void aRumorOnAStreamThisNodeDoesNotHoldIsForwardedButIsNoActivity() {
+        bus.consumeActivity(); // a new bus starts active
+        bus.consumeTraffic();
+        bus.onRumor(attacker, new Bodies.Rumor("space:positions", "p-1", 4, bytes("a position")));
+        assertThat(forwarded).as("forwarded exactly as before").hasSize(1);
+        assertThat(forwarded.get(0).hopsRemaining()).isEqualTo(3);
+        assertThat(bus.consumeActivity()).as("nothing held here changed").isFalse();
+        assertThat(bus.consumeTraffic()).as("but it is gossip traffic, so the membership probe stays at its base")
+                .isTrue();
+
+        bus.onStream("space:tasks", (from, itemId, payload) -> { });
+        bus.onRumor(attacker, new Bodies.Rumor("space:tasks", "t-1", 4, bytes("a task")));
+        assertThat(bus.consumeActivity()).as("a stream this node holds").isTrue();
+    }
+
+    /** Honest backoff (IDLE-WORK item 8): a pulled delta that changed nothing is no activity; one that did is. */
+    @Test
+    void aPulledDeltaCountsAsActivityOnlyWhenItChangedSomething() {
+        java.util.concurrent.atomic.AtomicBoolean changes = new java.util.concurrent.atomic.AtomicBoolean();
+        List<byte[]> applied = new ArrayList<>();
+        bus.reconcile("space:tasks", new ReconcilableState() {
+            @Override public byte[] digest() { return bytes("d"); }
+            @Override public byte[] deltaFor(byte[] remoteDigest) { return new byte[0]; }
+            @Override public void applyDelta(byte[] delta) { applied.add(delta); }
+            @Override public boolean applyDeltaChanged(byte[] delta) {
+                applyDelta(delta);
+                return changes.get();
+            }
+        });
+        bus.antiEntropyTick();
+        bus.consumeActivity();
+        bus.consumeTraffic();
+        bus.onPullResp(neighbor, new Bodies.PullResp(Map.of("space:tasks", bytes("re-offered"))));
+        assertThat(applied).hasSize(1);
+        assertThat(bus.consumeActivity()).as("every state refused or already held").isFalse();
+        assertThat(bus.consumeTraffic()).as("still traffic for the membership probe's quiet rule").isTrue();
+
+        changes.set(true);
+        bus.antiEntropyTick();
+        bus.onPullResp(neighbor, new Bodies.PullResp(Map.of("space:tasks", bytes("news"))));
+        assertThat(bus.consumeActivity()).isTrue();
+    }
+
+    /**
+     * IDLE-WORK item 3: the probe asks each state for the hash of its digest, and the root over unchanged hashes is
+     * the root already taken; a state's default hash is the SHA-256 of its digest, so the bytes are what they were.
+     */
+    @Test
+    void probeHashesComeFromTheStatesAndTheRootIsReusedWhileNoHashMoves() {
+        java.util.concurrent.atomic.AtomicInteger digests = new java.util.concurrent.atomic.AtomicInteger();
+        StringBuilder content = new StringBuilder("one");
+        bus.reconcile("space:tasks", new ReconcilableState() {
+            @Override public byte[] digest() {
+                digests.incrementAndGet();
+                return bytes(content.toString());
+            }
+            @Override public byte[] deltaFor(byte[] remoteDigest) { return new byte[0]; }
+            @Override public void applyDelta(byte[] delta) { }
+        });
+        Map<String, byte[]> hashes = bus.probeHashes();
+        assertThat(hashes.get("space:tasks")).isEqualTo(ai.badmonkey.agentspaces.common.crypto.Digests.sha256(bytes("one")));
+        byte[] root = bus.rootDigest();
+        assertThat(bus.rootDigest()).isSameAs(root);
+        content.append("-two");
+        assertThat(bus.rootDigest()).isNotEqualTo(root);
+        int before = digests.get();
+        assertThat(bus.differs((byte[]) null)).as("a probe without a root says nothing").isFalse();
+        assertThat(digests.get()).as("and costs no digest").isEqualTo(before);
     }
 }

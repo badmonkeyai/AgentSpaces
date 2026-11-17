@@ -115,6 +115,13 @@ public final class ConnectorRuntime implements AutoCloseable {
     private final Map<String, Set<String>> invokeOpsByAsset = new ConcurrentHashMap<>();
     /** Answered invocations by id, kept for {@link #invocationRetention} so a retry never re-runs the target. */
     private final Map<String, Answered> answered = new ConcurrentHashMap<>();
+    /**
+     * Answered invocations whose completion the space refused, so this connector wrote no result for them: a
+     * replica's result for one of these is still mirrored, although the id is answered here (R2, 2026-11-16).
+     */
+    private final Set<String> owedMirror = ConcurrentHashMap.newKeySet();
+    /** Orders a mirror written by the event thread against one written by the invoke loop, so an id gets one. */
+    private final Object mirrorLock = new Object();
     /** Optional (TODO-EFG §4): when set, only assets this connector's own peer is
      * permitted {@code CONNECTOR_SERVE} for are advertised. */
     private volatile Authorizer authorizer;
@@ -595,8 +602,8 @@ public final class ConnectorRuntime implements AutoCloseable {
                     .anyMatch(r -> r.issuer().peer().equals(identity.peerId()));
             if (live) {
                 completeQuietly(space, taken);
-            } else {
-                finish(space, taken, remembered.result());
+            } else if (finish(space, taken, remembered.result())) {
+                owedMirror.remove(id); // this connector's own result now answers the id
             }
             return;
         }
@@ -661,11 +668,25 @@ public final class ConnectorRuntime implements AutoCloseable {
         }
         PeerId from = event.issuer().peer();
         AssetInvocationResult result = event.entry();
-        if (from.equals(identity.peerId()) || !peers.test(from) || !freshnessByAsset.containsKey(result.asset())
-                || answered.containsKey(result.invocationId())) {
+        if (from.equals(identity.peerId()) || !peers.test(from) || !freshnessByAsset.containsKey(result.asset())) {
             return;
         }
-        remember(result.invocationId(), result);
+        String id = result.invocationId();
+        synchronized (mirrorLock) {
+            // An id this connector answered is mirrored only when the space refused its completion, which
+            // wrote no result: then the replica's result is the only answer a requester through this card gets.
+            boolean owed = owedMirror.remove(id);
+            if (!owed && answered.containsKey(id)) {
+                return;
+            }
+            if (!owed) {
+                remember(id, result);
+            }
+            writeMirror(result);
+        }
+    }
+
+    private void writeMirror(AssetInvocationResult result) {
         Duration lease = result.ok()
                 ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : Duration.ofSeconds(30);
         try {
@@ -723,20 +744,44 @@ public final class ConnectorRuntime implements AutoCloseable {
         return AssetInvocationResult.of(invocation, outcome);
     }
 
-    /** Writes the result (leased for the asset's freshness window, or 30 s on an error) and completes the take. */
-    private void finish(Space space, TakenEntry<AssetInvocation> taken, AssetInvocationResult result) {
+    /**
+     * Writes the result (leased for the asset's freshness window, or 30 s on an error) and completes the take;
+     * returns whether the completion, and so the result, landed.
+     *
+     * <p>The space refuses the completion, writing no result, when the take lapsed, or when a replica's better
+     * claim displaced it or the claim the lattice keeps acknowledges a displaced replica's completion (SPEC §7.4,
+     * the settle guarantee). The id stays answered here, so the target never runs again, but this connector then
+     * holds no result under its identity, and a requester that invoked through its card reads only that. So a
+     * replica's result is mirrored: at once when it is already here, otherwise when it lands. Before this, the
+     * mirror skipped every answered id, and such a requester waited out its timeout unless this connector happened
+     * to take its retry (AssetInvocationsClusterTest, R2, 2026-11-16).
+     */
+    private boolean finish(Space space, TakenEntry<AssetInvocation> taken, AssetInvocationResult result) {
         Duration lease = result.ok()
                 ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : Duration.ofSeconds(30);
         try {
             space.complete(taken, result, Lease.of(lease));
-        } catch (RuntimeException lapsed) {
-            LOG.log(System.Logger.Level.WARNING, "completing invocation " + result.invocationId() + " failed", lapsed);
+            return true;
+        } catch (RuntimeException refused) {
+            LOG.log(System.Logger.Level.WARNING, "completing invocation " + result.invocationId() + " failed", refused);
+            if (replicas != null) {
+                synchronized (mirrorLock) {
+                    AssetInvocationResult fromReplica = replicaResult(space, result.invocationId());
+                    if (fromReplica != null) {
+                        writeMirror(fromReplica);
+                    } else {
+                        owedMirror.add(result.invocationId());
+                    }
+                }
+            }
+            return false;
         }
     }
 
     private void remember(String id, AssetInvocationResult result) {
         Instant now = clock.instant();
         answered.values().removeIf(entry -> Duration.between(entry.at(), now).compareTo(invocationRetention) > 0);
+        owedMirror.removeIf(owed -> !answered.containsKey(owed));
         answered.put(id, new Answered(result, now));
     }
 

@@ -923,6 +923,16 @@ public final class Refs implements AutoCloseable {
                 late(state, head, Late.FAILED_FETCH); // the tick fetches it again after its backoff
             }
         }
+        if (!waiting.isEmpty()) {
+            // a loaded version that a loaded head supersedes through live versions still loading is no head either: the
+            // rule of headsAmong reads base links among the versions it is given, so with the middle of a chain late, the
+            // version below it was read as a head and merged in, and a key a later version removed came back for that
+            // read (SC-I4 of srad/spoiler-peers.md: a late joiner's stale ancestors as heads, R2's T-F3)
+            Set<Heads.Head> folded = supersededBy(loadable, live);
+            if (!folded.isEmpty()) {
+                loadable.removeAll(folded);
+            }
+        }
         return new Heads(state.name, headsAmong(loadable));
     }
 
@@ -2126,6 +2136,14 @@ public final class Refs implements AutoCloseable {
                 }
             }
             others.add(takenHead);
+            if (others.size() <= candidates.size()) {
+                // as for a read (heads): a loaded version that a loaded head supersedes through live versions still
+                // loading is no merge head, else the merge this swap writes puts back what the later versions removed,
+                // for every reader and not for one read (SC-I4's write path, SpoilerLinearTakeTest)
+                List<Heads.Head> live = new ArrayList<>(candidates);
+                live.add(takenHead);
+                others.removeAll(supersededBy(others, live));
+            }
             Heads heads = new Heads(state.name, headsAmong(others));
             if (!heads.roots().contains(takenHead.root())) {
                 heads = new Heads(state.name, List.of(takenHead));

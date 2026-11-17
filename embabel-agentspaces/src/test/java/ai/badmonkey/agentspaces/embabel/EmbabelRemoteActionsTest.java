@@ -75,6 +75,10 @@ class EmbabelRemoteActionsTest {
     public record Finding(String topic, String summary) {
     }
 
+    /** A second result type, for a second capability. */
+    public record Summary(String topic, String text) {
+    }
+
     /** The remote worker whose card becomes the planner action. */
     @AgentSpec(name = "researcher", description = "Researches topics",
             goals = {"answer research questions"})
@@ -180,20 +184,21 @@ class EmbabelRemoteActionsTest {
         assertThatThrownBy(() -> action.invoke(agent, new Task("nobody home", 1)))
                 .isInstanceOf(InvocationTargetException.class)
                 .cause()
-                .isInstanceOf(IllegalStateException.class)
+                .isInstanceOf(RemoteActionTimeoutException.class)
                 .hasMessageContaining("produced no Finding")
                 .hasMessageContaining("researcher_Task")
-                .hasMessageContaining("PT0.5S");
+                .hasMessageContaining("PT0.5S")
+                .hasMessageContaining("withdrawn");
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(10));
-        // The request entry stays leased in the space: a work item, not a lost call.
+        // Review §7.5: the unanswered request is withdrawn, not left as an orphan.
         assertThat(lonely.work().readAll(ai.badmonkey.agentspaces.api.space.Template.of(Task.class), 10))
-                .extracting(Task::topic).contains("nobody home");
+                .extracting(Task::topic).doesNotContain("nobody home");
     }
 
-    /** SPEC §10.6: two remote agents with the same name yield distinct, collision-free @Action methods. */
+    /** Review §7.7: two peers offering one capability are one planner action; names stay stable and collision-free. */
     @Test
     @Timeout(60)
-    void generatedMethodNamesDoNotCollide() throws Exception {
+    void onePlannerActionPerCapabilityWithStableNames() throws Exception {
         Peer lonely = startPeer(freePort(), 0);
         publishForeignCard(lonely, PeerIdentity.generate(), "researcher");
         publishForeignCard(lonely, PeerIdentity.generate(), "researcher");
@@ -203,16 +208,25 @@ class EmbabelRemoteActionsTest {
         while (System.nanoTime() < deadline && remote.available().size() < 2) {
             Thread.sleep(100);
         }
-        assertThat(remote.available()).hasSize(2);
+        assertThat(remote.available()).as("the registry sees both peers").hasSize(2);
 
-        Object agent = new EmbabelRemoteActions(remote, Duration.ofSeconds(1), "remoteFleet", "d")
-                .agentInstance().orElseThrow();
+        EmbabelRemoteActions bridge = new EmbabelRemoteActions(remote, Duration.ofSeconds(1), "remoteFleet", "d");
+        assertThat(bridge.available()).as("one capability, however many offer it").hasSize(1);
+        Object agent = bridge.agentInstance().orElseThrow();
         Method first = agent.getClass().getMethod("researcher_Task", Task.class);
-        Method second = agent.getClass().getMethod("researcher_Task_2", Task.class);
         assertThat(first.getAnnotation(Action.class)).isNotNull();
-        assertThat(second.getAnnotation(Action.class)).isNotNull();
         assertThat(first.getReturnType()).isEqualTo(Finding.class);
-        assertThat(second.getReturnType()).isEqualTo(Finding.class);
+        assertThat(agent.getClass().getDeclaredMethods()).filteredOn(m -> m.getName().startsWith("researcher")).hasSize(1);
+
+        // Two different capabilities under one agent name: the output type disambiguates, never a counter.
+        Map<String, ai.badmonkey.agentspaces.agent.remote.RemoteAction> names = EmbabelRemoteActions.methodNames(
+                List.of(bridge.available().get(0)));
+        assertThat(names.keySet()).containsExactly("researcher_Task");
+        assertThat(EmbabelRemoteActions.normaliseCost("2", 0.5)).isEqualTo(2.0 / 3.0);
+        assertThat(EmbabelRemoteActions.normaliseCost("PT1M", 0.5)).isEqualTo(0.5);
+        assertThat(EmbabelRemoteActions.normaliseCost("low", 0.5)).isEqualTo(0.2);
+        assertThat(EmbabelRemoteActions.normaliseCost("", 0.4)).isEqualTo(0.4);
+        assertThat(EmbabelRemoteActions.normaliseCost("0.25", 0.5)).isEqualTo(0.25);
     }
 
     /** SPEC §10.6: the bridge deploys itself onto the platform when remote actions appear, and again when the action set changes. */
@@ -228,7 +242,8 @@ class EmbabelRemoteActionsTest {
         AgentPlatform platform = deployed::add;
 
         try (EmbabelRemoteActionsDeployer deployer =
-                     new EmbabelRemoteActionsDeployer(bridge, Duration.ofMillis(100))) {
+                     new EmbabelRemoteActionsDeployer(bridge, Duration.ofMillis(100))
+                             .minInterval(Duration.ofMillis(200)).absenceGrace(Duration.ZERO)) {
             deployer.deployWhenReady(platform);
             deployer.start();
             assertThat(deployer.isRunning()).isTrue();
@@ -243,16 +258,67 @@ class EmbabelRemoteActionsTest {
             assertThat(deployed.get(0).getClass().getMethod("researcher_Task", Task.class)
                     .getAnnotation(Action.class)).isNotNull();
 
+            // A second peer offering the same capability is no new generation (review §7.7).
+            publishForeignCard(lonely, PeerIdentity.generate(), "researcher");
+            Thread.sleep(600);
+            assertThat(deployer.deployments()).as("same capability, no redeploy").isEqualTo(1);
+
             // A second capability arrives: a new generation carries both actions.
-            publishForeignCard(lonely, PeerIdentity.generate(), "summarizer");
+            publishForeignCard(lonely, PeerIdentity.generate(), "summarizer", Summary.class);
             awaitDeployments(deployer, 2, Duration.ofSeconds(10));
             assertThat(deployed).hasSize(2);
             assertThat(deployed.get(1).getClass().getMethod("summarizer_Task", Task.class))
+                    .isNotNull();
+            assertThat(deployed.get(1).getClass().getMethod("researcher_Task", Task.class))
                     .isNotNull();
 
             // The same two cards, refreshed: no change, so no redeploy.
             Thread.sleep(400);
             assertThat(deployer.deployments()).isEqualTo(2);
+            assertThat(deployer.generationsRetained()).as("a platform without agents() reads back nothing").isZero();
+        }
+    }
+
+    /** Review §7.9: a platform that already holds the bridge's name is a user's agent; the deployer refuses it. */
+    @Test
+    @Timeout(60)
+    void aPlatformHoldingTheBridgesNameIsRefused() throws Exception {
+        Peer lonely = startPeer(freePort(), 0);
+        RemoteActions remote = new RemoteActions(lonely.discovery(),
+                lonely.identity().peerId(), Map.of("work", lonely.work()));
+        EmbabelRemoteActions bridge = new EmbabelRemoteActions(remote, Duration.ofSeconds(1), "remoteFleet", "x");
+        NamedPlatform platform = new NamedPlatform(List.of("remoteFleet"));
+        try (EmbabelRemoteActionsDeployer deployer = new EmbabelRemoteActionsDeployer(bridge, Duration.ofMillis(100))) {
+            assertThatThrownBy(() -> deployer.deployWhenReady(platform))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("remoteFleet");
+        }
+        assertThat(EmbabelRemoteActions.deployedNames(platform)).containsExactly("remoteFleet");
+    }
+
+    /** A platform stand-in with agents(), as Embabel's has: deploy replaces by name, and the deployer reads it back. */
+    public static final class NamedPlatform implements AgentPlatform {
+        private final java.util.LinkedHashMap<String, Object> byName = new java.util.LinkedHashMap<>();
+
+        NamedPlatform(List<String> held) {
+            held.forEach(name -> byName.put(name, new Named(name)));
+        }
+
+        public record Named(String name) {
+            public String getName() {
+                return name;
+            }
+        }
+
+        @Override
+        public void deploy(Object agent) {
+            Agent annotation = agent.getClass().getAnnotation(Agent.class);
+            byName.put(annotation == null ? agent.toString() : annotation.name(), new Named(
+                    annotation == null ? agent.toString() : annotation.name()));
+        }
+
+        public List<Named> agents() {
+            return byName.values().stream().map(Named.class::cast).toList();
         }
     }
 
@@ -296,12 +362,16 @@ class EmbabelRemoteActionsTest {
 
     /** Publishes a Task-to-Finding card signed by a foreign identity into the peer's discovery. */
     private static void publishForeignCard(Peer peer, PeerIdentity foreign, String agentName) {
+        publishForeignCard(peer, foreign, agentName, Finding.class);
+    }
+
+    private static void publishForeignCard(Peer peer, PeerIdentity foreign, String agentName, Class<?> produces) {
         GroupId groupId = peer.runtime().id();
         AgentCard card = new AgentCard(
                 "aspace://" + groupId.value() + "/agent/" + foreign.peerId().value() + "/" + agentName,
                 foreign.peerId(), groupId, Instant.now(), Duration.ofMinutes(15),
                 foreign.agent(agentName), "Researches topics", List.of("answer research questions"),
-                List.of(Task.class.getName() + "#v1"), List.of(Finding.class.getName() + "#v1"),
+                List.of(Task.class.getName() + "#v1"), List.of(produces.getName() + "#v1"),
                 Map.of());
         peer.discovery().publish(new AdvertisementSigner().sign(card, foreign));
     }

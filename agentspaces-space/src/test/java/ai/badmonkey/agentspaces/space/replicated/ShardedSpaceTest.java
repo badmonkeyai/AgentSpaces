@@ -165,4 +165,59 @@ class ShardedSpaceTest {
         assertThat(writer.space().readAll(Template.of(TaskEntry.class), 10))
                 .containsExactly(new TaskEntry("my own out-of-shard note", 4));
     }
+
+    /**
+     * P36 (srad/replication-by-entry.md phase 4): the trie audit of annex I.6 between a full replica and a sharded one.
+     * The sharded replica's dropped entries stand in its slots as the state line it remembered, so after one repair
+     * its audited set equals the full replica's, both stream hashes match, and later rounds open no audit and fetch
+     * nothing. A changed out-of-shard entry makes the sets differ by one line, which the next round fetches by id,
+     * drops again, and settles.
+     */
+    @Test
+    void anAuditBetweenAShardedAndAFullReplicaSettlesWithTheDroppedLinesInTheSlots() throws Exception {
+        Peer full = newPeer("a", 1, null);
+        Peer euOnly = newPeer("b", 2, tags -> "eu".equals(tags.get("region")), "a");
+        tickAll(6);
+        ai.badmonkey.agentspaces.peering.gossip.GossipBus fullBus = gossip(full);
+        ai.badmonkey.agentspaces.peering.gossip.GossipBus shardBus = gossip(euOnly);
+        assertThat(shardBus.audits(full.node().peerId())).as("both on wire.ae=2").isTrue();
+
+        network.partition("a", "b");
+        List<ai.badmonkey.agentspaces.api.space.EntryHandle> us = new ArrayList<>();
+        for (int i = 0; i < 60; i++) {
+            full.space().write(new TaskEntry("eu-" + i, i), MINUTES_30, Map.of("region", "eu"));
+            us.add(full.space().write(new TaskEntry("us-" + i, i), MINUTES_30, Map.of("region", "us")));
+        }
+        network.heal();
+        for (int round = 0; round < 4; round++) {
+            shardBus.antiEntropyWith(full.node().peerId());
+            fullBus.antiEntropyWith(euOnly.node().peerId());
+            clock.advance(Duration.ofSeconds(1));
+        }
+        assertThat(euOnly.space().knownEntries()).as("the shard holds its own").isEqualTo(60);
+        assertThat(euOnly.space().stats().shardDroppedLines()).as("and remembers each dropped line").isEqualTo(60);
+        assertThat(euOnly.space().streamHash()).as("the audited sets are equal")
+                .isEqualTo(full.space().streamHash());
+
+        long audits = shardBus.auditSignals().roundsAudited() + fullBus.auditSignals().roundsAudited();
+        long fetched = shardBus.auditSignals().idsFetched() + fullBus.auditSignals().idsFetched();
+        tickAll(6);
+        assertThat(shardBus.auditSignals().roundsAudited() + fullBus.auditSignals().roundsAudited())
+                .as("equal hashes open no audit").isEqualTo(audits);
+        assertThat(shardBus.auditSignals().idsFetched() + fullBus.auditSignals().idsFetched()).isEqualTo(fetched);
+
+        us.get(7).renew(Duration.ofMinutes(45)); // a new state of an out-of-shard entry: one line differs
+        for (int round = 0; round < 3; round++) {
+            shardBus.antiEntropyWith(full.node().peerId());
+            clock.advance(Duration.ofSeconds(1));
+        }
+        assertThat(euOnly.space().knownEntries()).as("the changed entry was fetched and dropped again")
+                .isEqualTo(60);
+        assertThat(euOnly.space().streamHash()).isEqualTo(full.space().streamHash());
+        assertThat(shardBus.auditSignals().refusals()).doesNotContainKeys("undecodable", "fingerprint-mismatch");
+    }
+
+    private static ai.badmonkey.agentspaces.peering.gossip.GossipBus gossip(Peer peer) {
+        return peer.node().groups().iterator().next().gossip();
+    }
 }

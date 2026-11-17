@@ -16,6 +16,8 @@
 package ai.badmonkey.agentspaces.embabel;
 
 import ai.badmonkey.agentspaces.agent.AgentSpaces;
+import ai.badmonkey.agentspaces.agent.remote.RemoteAction;
+import ai.badmonkey.agentspaces.agent.remote.RemoteActions;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.spring.AgentSpacesProperties;
 import org.springframework.beans.factory.ObjectProvider;
@@ -27,29 +29,34 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 
 import java.time.Duration;
-import java.time.InstantSource;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
 
 /**
- * Activates the Embabel bridge when Embabel is on the application classpath
- * (spec §10): every {@code @Agent} bean's metadata becomes a published
- * AgentCard in every joined group (§10.4), with worker loops still declared
- * through {@code @SpaceTake} on actions and bound by the core starter; the
- * fleet's cards come back as a generated planner agent (§10.6) that deploys
- * onto the application's {@code AgentPlatform} bean automatically. Without
- * Embabel present this configuration never loads, so the dependency stays
- * one-directional.
+ * Activates the Embabel bridge when Embabel is on the application classpath (spec §10). Outbound, every
+ * {@code @Agent} bean gets <em>one</em> card from the core binder, named by {@code @Agent(name)}, through the
+ * {@link EmbabelDeclarationReader} this configuration registers with the settings under
+ * {@code agentspaces.embabel} (review §7.2, §7.3); worker loops are the core starter's, explicit or implied.
+ * Inbound, the fleet's cards come back as a generated planner agent (§10.6) over the configured groups
+ * (review §7.7) that deploys onto the application's {@code AgentPlatform} bean automatically (review §7.9).
+ * Without Embabel present this configuration never loads, so the dependency stays one-directional.
  */
 @AutoConfiguration
 @ConditionalOnClass(name = "com.embabel.agent.api.annotation.Agent")
 public class EmbabelAgentSpacesAutoConfiguration {
 
     /**
-     * The post-processor publishing Embabel-derived cards.
+     * The post-processor that registers the configured declaration reader before any bean binds. The card
+     * publishing it once did is the core binder's now (review §7.2); the bean stays so an application that
+     * named it keeps working.
      *
-     * @param properties the starter configuration, for group order
+     * @param properties the starter configuration
      * @param spaces     the facade
      * @param identity   the peer identity
      * @return the post-processor
@@ -59,46 +66,60 @@ public class EmbabelAgentSpacesAutoConfiguration {
     public static EmbabelBindingPostProcessor embabelBindingPostProcessor(
             ObjectProvider<AgentSpacesProperties> properties, ObjectProvider<AgentSpaces> spaces,
             ObjectProvider<PeerIdentity> identity) {
-        return new EmbabelBindingPostProcessor(() -> binder(properties.getObject(), spaces.getObject(),
-                identity.getObject()));
+        return new EmbabelBindingPostProcessor(() -> readerSettings(properties.getObject()), true)
+                .invoker(() -> takeInvoker(properties.getObject()));
+    }
+
+    /** The take invoker {@code agentspaces.embabel.take-mode} asks for (review §7.8), or empty under {@code direct}. */
+    public static Optional<EmbabelTakeInvoker> takeInvoker(AgentSpacesProperties properties) {
+        AgentSpacesProperties.Embabel embabel = properties.getEmbabel();
+        String mode = lower(embabel.getTakeMode());
+        if ("direct".equals(mode)) {
+            return Optional.empty();
+        }
+        Duration maxRun = Duration.parse(embabel.getServedMaxRun());
+        return Optional.of(new EmbabelTakeInvoker("platform".equals(mode)
+                ? EmbabelTakeInvoker.Mode.PLATFORM : EmbabelTakeInvoker.Mode.AUTO, maxRun));
     }
 
     /**
      * The post-processor over already built beans, for programmatic use.
      *
-     * @param properties the starter configuration, for group order
+     * @param properties the starter configuration
      * @param spaces     the facade
      * @param identity   the peer identity
      * @return the post-processor
      */
     public static EmbabelBindingPostProcessor embabelBindingPostProcessor(
             AgentSpacesProperties properties, AgentSpaces spaces, PeerIdentity identity) {
-        EmbabelBinder binder = binder(properties, spaces, identity);
-        return new EmbabelBindingPostProcessor(() -> binder);
+        EmbabelDeclarationReader.Settings settings = readerSettings(properties);
+        return new EmbabelBindingPostProcessor(() -> settings, true).invoker(() -> takeInvoker(properties));
     }
 
-    private static EmbabelBinder binder(AgentSpacesProperties properties, AgentSpaces spaces,
-                                        PeerIdentity identity) {
-        List<String> order = new ArrayList<>();
-        properties.getGroups().forEach(group -> order.add(group.getName()));
-        // ISSUE-WorkflowShape §9.1: the facade's registry (the SchemaRegistry bean,
-        // when the application declares one) names the Embabel cards too.
-        return new EmbabelBinder(spaces, identity, InstantSource.system(), order,
-                spaces.schemaRegistry().orElse(null));
+    /** The reader's settings from {@code agentspaces.embabel} (review §7.2, §7.3, §7.8). */
+    public static EmbabelDeclarationReader.Settings readerSettings(AgentSpacesProperties properties) {
+        AgentSpacesProperties.Embabel embabel = properties.getEmbabel();
+        EmbabelDeclarationReader.Unserved unserved = switch (lower(embabel.getAdvertiseUnserved())) {
+            case "invocable" -> EmbabelDeclarationReader.Unserved.INVOCABLE;
+            case "omit" -> EmbabelDeclarationReader.Unserved.OMIT;
+            default -> EmbabelDeclarationReader.Unserved.LOCAL;
+        };
+        boolean platformInvoker = !"direct".equals(lower(embabel.getTakeMode()));
+        return new EmbabelDeclarationReader.Settings(!"class".equals(lower(embabel.getCardName())),
+                embabel.isServeActions(), embabel.getActionSpace(), embabel.getActionLease(), unserved,
+                platformInvoker);
+    }
+
+    private static String lower(String value) {
+        return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
     }
 
     /**
-     * The remote-action bridge: the fleet's discovered AgentCards as a
-     * generated {@code @Agent} the GOAP planner plans over (spec §10.6). The
-     * bean builds over the first configured group with the default routing (a
-     * one-space group needs none); define your own {@code EmbabelRemoteActions}
-     * bean to route several spaces or tune correlation. Absent entirely under
-     * {@code agentspaces.embabel.remote-actions-enabled=false}, so an
-     * {@code @Autowired} consumer sees a clean missing bean rather than a
-     * null. Deployment onto the platform bean is automatic through
-     * {@link #embabelRemoteActionsDeployer}; to drive it by hand instead, set
-     * {@code agentspaces.embabel.auto-deploy=false} and call
-     * {@code bridge.deployTo(agentPlatform)} on your own cadence.
+     * The remote-action bridge: the fleet's discovered AgentCards as a generated {@code @Agent} the GOAP
+     * planner plans over (spec §10.6). The bean spans the groups {@code agentspaces.embabel.groups} names
+     * (the first configured group by default, {@code *} for every group; review §7.7), with the default
+     * routing; define your own {@code EmbabelRemoteActions} bean to tune routes or correlation. Absent
+     * entirely under {@code agentspaces.embabel.remote-actions-enabled=false}.
      *
      * @param properties the starter configuration
      * @param spaces     the facade
@@ -115,26 +136,62 @@ public class EmbabelAgentSpacesAutoConfiguration {
         if (properties.getGroups().isEmpty()) {
             return null;
         }
-        ai.badmonkey.agentspaces.agent.remote.RemoteActions remote =
-                ai.badmonkey.agentspaces.agent.remote.RemoteActions.over(
-                        spaces.group(properties.getGroups().get(0).getName()),
-                        identity.peerId());
-        return new EmbabelRemoteActions(remote,
-                java.time.Duration.ofMillis(embabel.getRemoteActionTimeoutMillis()),
-                embabel.getRemoteAgentName(), embabel.getRemoteAgentDescription());
+        List<RemoteActions> registries = new ArrayList<>();
+        for (String group : bridgedGroups(properties)) {
+            registries.add(RemoteActions.over(spaces.group(group), identity.peerId()));
+        }
+        return new EmbabelRemoteActions(registries, Duration.ofMillis(embabel.getRemoteActionTimeoutMillis()),
+                embabel.getRemoteAgentName(), embabel.getRemoteAgentDescription(), attributes(embabel));
+    }
+
+    /** The groups the default bridge spans (review §7.7): the listed ones, every one under {@code *}, else the first. */
+    static List<String> bridgedGroups(AgentSpacesProperties properties) {
+        List<String> configured = new ArrayList<>();
+        properties.getGroups().forEach(group -> configured.add(group.getName()));
+        List<String> wanted = properties.getEmbabel().getGroups();
+        if (wanted == null || wanted.isEmpty()) {
+            if (configured.size() > 1) {
+                System.getLogger(EmbabelAgentSpacesAutoConfiguration.class.getName()).log(System.Logger.Level.INFO,
+                        "the Embabel bridge spans the first group '" + configured.get(0) + "' of " + configured
+                                + "; set agentspaces.embabel.groups to span more");
+            }
+            return List.of(configured.get(0));
+        }
+        if (wanted.size() == 1 && "*".equals(wanted.get(0).trim())) {
+            return configured;
+        }
+        for (String name : wanted) {
+            if (!configured.contains(name)) {
+                throw new IllegalArgumentException("agentspaces.embabel.groups names '" + name
+                        + "', which is not a configured group; groups: " + configured);
+            }
+        }
+        return List.copyOf(wanted);
+    }
+
+    /** The generated actions' behaviour from {@code agentspaces.embabel} (review §7.5, §7.6). */
+    static EmbabelRemoteActions.Attributes attributes(AgentSpacesProperties.Embabel embabel) {
+        boolean fireOnce = !"default".equals(lower(embabel.getRemoteActionRetry()));
+        RemoteAction.OnTimeout onTimeout = "leave".equals(lower(embabel.getOnTimeout()))
+                ? RemoteAction.OnTimeout.LEAVE : RemoteAction.OnTimeout.WITHDRAW;
+        EmbabelRemoteActions.CarryConditions conditions = switch (lower(embabel.getCarryConditions())) {
+            case "none" -> EmbabelRemoteActions.CarryConditions.NONE;
+            case "pre-post", "pre_post", "prepost" -> EmbabelRemoteActions.CarryConditions.PRE_POST;
+            default -> EmbabelRemoteActions.CarryConditions.PRE;
+        };
+        return new EmbabelRemoteActions.Attributes(fireOnce, onTimeout, embabel.getRemoteActionDefaultCost(),
+                conditions);
     }
 
     /**
-     * The auto-deployer (spec §10.6): a {@code SmartLifecycle} that catches the
-     * application's Embabel {@code AgentPlatform} bean as it initializes and,
-     * from context start, deploys the generated remote-fleet agent onto it —
-     * redeploying as the fleet's advertised actions change, on the
-     * {@code deploy-poll-millis} cadence. Off under
-     * {@code agentspaces.embabel.auto-deploy=false}; inert when the bridge
-     * bean itself is disabled.
+     * The auto-deployer (spec §10.6): a {@code SmartLifecycle} that catches the application's Embabel
+     * {@code AgentPlatform} bean as it initializes and, from context start, deploys every bridge bean's
+     * generated agent onto it, redeploying as the fleet's capabilities change (review §7.9). Off under
+     * {@code agentspaces.embabel.auto-deploy=false}; inert when no bridge bean exists. Two bridges sharing an
+     * agent name refuse to start, because the platform keeps one agent per name (review §7.7).
      *
      * @param properties the starter configuration
-     * @param bridge     the remote-action bridge, when enabled
+     * @param bridges    the remote-action bridges, when enabled
      * @return the lifecycle
      */
     @Bean
@@ -142,9 +199,9 @@ public class EmbabelAgentSpacesAutoConfiguration {
     @ConditionalOnProperty(prefix = "agentspaces.embabel", name = "auto-deploy",
             havingValue = "true", matchIfMissing = true)
     public static EmbabelRemoteActionsDeployerLifecycle embabelRemoteActionsDeployer(
-            ObjectProvider<AgentSpacesProperties> properties, ObjectProvider<EmbabelRemoteActions> bridge) {
-        return new EmbabelRemoteActionsDeployerLifecycle(() -> deployer(properties.getObject(),
-                Optional.ofNullable(bridge.getIfAvailable())));
+            ObjectProvider<AgentSpacesProperties> properties, ObjectProvider<EmbabelRemoteActions> bridges) {
+        return new EmbabelRemoteActionsDeployerLifecycle(() -> deployers(properties.getObject(),
+                bridges.orderedStream().filter(Objects::nonNull).toList()));
     }
 
     /**
@@ -156,58 +213,106 @@ public class EmbabelAgentSpacesAutoConfiguration {
      */
     public static EmbabelRemoteActionsDeployerLifecycle embabelRemoteActionsDeployer(
             AgentSpacesProperties properties, Optional<EmbabelRemoteActions> bridge) {
-        return new EmbabelRemoteActionsDeployerLifecycle(deployer(properties, bridge));
+        List<EmbabelRemoteActions> bridges = bridge.map(List::of).orElse(List.of());
+        return new EmbabelRemoteActionsDeployerLifecycle(() -> deployers(properties, bridges));
     }
 
-    private static Optional<EmbabelRemoteActionsDeployer> deployer(AgentSpacesProperties properties,
-                                                                  Optional<EmbabelRemoteActions> bridge) {
-        Duration poll = Duration.ofMillis(properties.getEmbabel().getDeployPollMillis());
-        return bridge.map(remote -> new EmbabelRemoteActionsDeployer(remote, poll));
+    static List<EmbabelRemoteActionsDeployer> deployers(AgentSpacesProperties properties,
+                                                        List<EmbabelRemoteActions> bridges) {
+        AgentSpacesProperties.Embabel embabel = properties.getEmbabel();
+        Set<String> names = new HashSet<>();
+        List<EmbabelRemoteActionsDeployer> deployers = new ArrayList<>();
+        for (EmbabelRemoteActions bridge : bridges) {
+            if (!names.add(bridge.agentName())) {
+                throw new IllegalStateException("two Embabel bridges share the agent name '" + bridge.agentName()
+                        + "'; the platform keeps one agent per name, so give each bridge its own");
+            }
+            deployers.add(new EmbabelRemoteActionsDeployer(bridge, Duration.ofMillis(embabel.getDeployPollMillis()))
+                    .absenceGrace(Duration.ofMillis(embabel.getAbsenceGraceMillis()))
+                    .debounce(Duration.ofMillis(embabel.getDeployDebounceMillis()))
+                    .minInterval(Duration.ofMillis(embabel.getDeployMinIntervalMillis())));
+        }
+        return deployers;
     }
 
-    /** Publishes an Embabel-derived card for every {@code @Agent} bean, into every group (§10.4). */
+    /**
+     * Registers the configured {@link EmbabelDeclarationReader} before the first bean initializes, so the
+     * core binder's card for every {@code @Agent} bean carries the Embabel declaration (review §7.2). The
+     * card publishing this post-processor once did itself is gone: the core post-processor binds the bean.
+     */
     public static class EmbabelBindingPostProcessor implements BeanPostProcessor {
 
-        private final java.util.function.Supplier<EmbabelBinder> binder;
-        private volatile EmbabelBinder resolved;
+        private final Supplier<EmbabelDeclarationReader.Settings> settings;
+        private volatile Supplier<Optional<EmbabelTakeInvoker>> invoker = Optional::empty;
+        private volatile boolean registered;
 
-        /**
-         * Creates the post-processor.
-         *
-         * @param binder the Embabel binder
-         */
-        public EmbabelBindingPostProcessor(EmbabelBinder binder) {
-            java.util.Objects.requireNonNull(binder, "binder");
-            this.binder = () -> binder;
+        /** The take invoker to register beside the reader (review §7.8). */
+        EmbabelBindingPostProcessor invoker(Supplier<Optional<EmbabelTakeInvoker>> invoker) {
+            this.invoker = Objects.requireNonNull(invoker, "invoker");
+            return this;
         }
 
         /**
-         * Creates the post-processor over a binder resolved on the first
-         * {@code @Agent} bean, so creating the post-processor does not build
-         * the fabric before the context's other post-processors register.
+         * Creates the post-processor over a binder; kept for applications that built one by hand. The binder
+         * is deprecated and publishes nothing; the reader is registered with the default settings.
+         *
+         * @param binder the Embabel binder
+         */
+        @Deprecated(since = "0.7.0", forRemoval = true)
+        public EmbabelBindingPostProcessor(EmbabelBinder binder) {
+            Objects.requireNonNull(binder, "binder");
+            this.settings = EmbabelDeclarationReader.Settings::defaults;
+        }
+
+        /**
+         * Creates the post-processor over a lazily resolved binder; kept for applications that built one by hand.
          *
          * @param binder supplies the Embabel binder
          */
-        public EmbabelBindingPostProcessor(java.util.function.Supplier<EmbabelBinder> binder) {
-            this.binder = java.util.Objects.requireNonNull(binder, "binder");
+        @Deprecated(since = "0.7.0", forRemoval = true)
+        public EmbabelBindingPostProcessor(Supplier<EmbabelBinder> binder) {
+            Objects.requireNonNull(binder, "binder");
+            this.settings = EmbabelDeclarationReader.Settings::defaults;
+        }
+
+        /**
+         * Creates the post-processor that registers the reader with the given settings on the first bean.
+         *
+         * @param settings supplies the reader settings
+         */
+        public EmbabelBindingPostProcessor(Supplier<EmbabelDeclarationReader.Settings> settings, boolean marker) {
+            this.settings = Objects.requireNonNull(settings, "settings");
+        }
+
+        /** Registers the configured reader now; the post-processor does so itself before the first bean initializes. */
+        public void register() {
+            if (!registered) {
+                synchronized (this) {
+                    if (!registered) {
+                        new EmbabelDeclarationReader(settings.get()).register();
+                        invoker.get().ifPresent(ai.badmonkey.agentspaces.agent.AgentBinder::registerTakeInvoker);
+                        registered = true;
+                    }
+                }
+            }
+        }
+
+        @Override
+        public Object postProcessBeforeInitialization(Object bean, String beanName) {
+            // Only when an @Agent bean is about to initialize: the settings come from the properties bean, which
+            // must not be asked for while Spring is still creating it (a circular reference otherwise).
+            if (!registered && EmbabelIntrospector.introspect(bean.getClass()).isPresent()) {
+                register();
+            }
+            return bean;
         }
 
         @Override
         public Object postProcessAfterInitialization(Object bean, String beanName) {
-            if (EmbabelIntrospector.introspect(bean.getClass()).isEmpty()) {
-                return bean; // not an Embabel @Agent: nothing to publish, no fabric needed
+            if (EmbabelRemoteActionsDeployerLifecycle.isAgentPlatform(bean)) {
+                EmbabelTakeInvoker.attach(bean); // served tasks run on this platform (review §7.8)
             }
-            EmbabelBinder current = resolved;
-            if (current == null) {
-                synchronized (this) {
-                    if (resolved == null) {
-                        resolved = binder.get();
-                    }
-                    current = resolved;
-                }
-            }
-            current.bindAll(bean);
-            return bean;
+            return bean; // the core post-processor binds the bean; one card, from the core binder
         }
     }
 }

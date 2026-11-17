@@ -29,7 +29,7 @@ import java.util.Set;
  * from a group's declarations.
  *
  * @param protocol   {@code a2ui}
- * @param version    the A2UI version, {@code v0.9.1}
+ * @param version    the A2UI version, {@code 1.0} (A2UI 1.0 since 2026-11-12; v0.9.1 before)
  * @param components the components, each unique by id within the card
  * @param entries    the entry type IRIs the agent reads and writes through its components
  * @param catalogIds the distinct catalog ids of the components, derived when empty
@@ -37,7 +37,7 @@ import java.util.Set;
 public record UiDeclaration(String protocol, String version, List<Component> components, Entries entries, List<String> catalogIds) {
 
     public static final String PROTOCOL = "a2ui";
-    public static final String VERSION = "v0.9.1";
+    public static final String VERSION = "1.0";
     public static final int MAX_COMPONENTS = 32;
     public static final int MAX_CONTROLS = 16;
     public static final int MAX_ENTRIES = 64;

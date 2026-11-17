@@ -346,12 +346,18 @@ public final class OrderedTakes {
      * through the log, wait for commitment, and adopt the entry when this agent's
      * claim was the first committed for the entry's current generation.
      *
+     * <p>An interrupt is how a closing binding stops a take in flight. The take submits no new claim after it and
+     * returns empty with the thread's interrupt status kept, except for a claim it already has out: that one is
+     * waited on for the rest of its attempt window, as a timeout waits on it, and handed to the caller when the log
+     * grants it, so the caller can finish or release it. Abandoning it instead would make the stop a little faster
+     * and leave a claim the log may still commit, holding the entry for its whole lease with nobody to adopt it.
+     *
      * @param template  the template to match
      * @param takeLease the TAKE lease
      * @param timeout   how long to keep trying (spans leader elections); a claim already submitted is waited on
      *                  for its attempt window even past it
      * @param <T>       the entry type
-     * @return the taken entry, or empty when out-arbitrated or timed out
+     * @return the taken entry, or empty when out-arbitrated, timed out, or interrupted
      */
     public <T> Optional<TakenEntry<T>> take(Template<T> template, Lease takeLease,
                                             Duration timeout) {
@@ -359,6 +365,9 @@ public final class OrderedTakes {
         Objects.requireNonNull(takeLease, "takeLease");
         long deadline = System.nanoTime() + timeout.toNanos();
         while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                return Optional.empty(); // the caller is stopping: submit nothing new
+            }
             long now = clock.instant().toEpochMilli();
             List<T> candidates = space.readAll(template, 16);
             for (T candidate : candidates) {
@@ -383,29 +392,37 @@ public final class OrderedTakes {
                 // window holds even past the caller's timeout: a claim the log
                 // commits after the caller gave up would hold the entry for its whole
                 // lease with nobody to adopt it (the 0.6.0 regression, 2026-11-10).
+                // An interrupt does not cut the window short (see the method's comment): the wait sleeps through
+                // it and sets the status again on the way out.
                 long attemptDeadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
-                while (System.nanoTime() < attemptDeadline) {
-                    Optional<TakeClaim> decided = space.currentClaim(entryId.get());
-                    if (decided.isPresent() && decided.get().epoch() >= epoch) {
-                        if (decided.get().holder().equals(issuer)
-                                && decided.get().epoch() == epoch) {
-                            Optional<TakenEntry<T>> adopted = holderIdentity == null
-                                    ? space.adoptClaim(template, entryId.get())
-                                    : space.adoptClaim(template, entryId.get(), holderIdentity);
-                            if (adopted.isPresent()) {
-                                return adopted;
+                boolean interrupted = false;
+                try {
+                    while (System.nanoTime() < attemptDeadline) {
+                        Optional<TakeClaim> decided = space.currentClaim(entryId.get());
+                        if (decided.isPresent() && decided.get().epoch() >= epoch) {
+                            if (decided.get().holder().equals(issuer)
+                                    && decided.get().epoch() == epoch) {
+                                Optional<TakenEntry<T>> adopted = holderIdentity == null
+                                        ? space.adoptClaim(template, entryId.get())
+                                        : space.adoptClaim(template, entryId.get(), holderIdentity);
+                                if (adopted.isPresent()) {
+                                    return adopted;
+                                }
                             }
+                            break; // someone else won this generation; try another entry
                         }
-                        break; // someone else won this generation; try another entry
+                        interrupted |= sleepThrough(Duration.ofMillis(20));
                     }
-                    sleep(Duration.ofMillis(20));
+                } finally {
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
-                break; // re-scan candidates (and resubmit when still undecided)
+                break; // re-scan candidates (and resubmit when still undecided), unless interrupted
             }
-            if (System.nanoTime() >= deadline) {
+            if (System.nanoTime() >= deadline || !pause(Duration.ofMillis(20))) {
                 return Optional.empty();
             }
-            sleep(Duration.ofMillis(20));
         }
     }
 
@@ -425,14 +442,37 @@ public final class OrderedTakes {
                 holderIdentity.sign(claimBytes), certificate);
     }
 
-    private static void sleep(Duration duration) {
-        if (duration.isZero()) {
-            return;
+    /**
+     * Sleeps the whole duration whatever interrupts arrive, and answers whether one did; the status is left clear
+     * for the caller to set again. Waiting on a claim already out uses it, so the wait neither stops early nor
+     * spins on a kept status (every sleep would throw at once).
+     */
+    private static boolean sleepThrough(Duration duration) {
+        long deadline = System.nanoTime() + duration.toNanos();
+        boolean interrupted = false;
+        for (long left = duration.toNanos(); left > 0; left = deadline - System.nanoTime()) {
+            try {
+                java.util.concurrent.TimeUnit.NANOSECONDS.sleep(left);
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
         }
+        return interrupted;
+    }
+
+    /**
+     * Sleeps, and answers false when interrupted, with the interrupt status set again for the caller. The old sleep
+     * kept the status but not the stop: every later sleep of the take then threw at once, so an interrupted take
+     * spun through its timeout, submitting claims on whatever it found, and could adopt and return an entry written
+     * after its binding closed.
+     */
+    private static boolean pause(Duration duration) {
         try {
             Thread.sleep(duration.toMillis());
+            return true;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            return false;
         }
     }
 }

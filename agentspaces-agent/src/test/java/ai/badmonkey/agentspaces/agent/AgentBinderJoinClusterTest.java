@@ -203,4 +203,119 @@ class AgentBinderJoinClusterTest {
                 .as("tickets drained at the bystander, which never held a claim").isEmpty();
         assertThat(desk.space().readAll(Template.of(Result.class), 10)).hasSize(6);
     }
+
+    @AgentSpec(name = "joiner", description = "Joins left and right on this member", goals = {"join"})
+    public static class LocalJoiner {
+        final List<String> fired = new CopyOnWriteArrayList<>();
+
+        @SpaceJoin(space = "intake", key = "caseId", mode = SpaceJoin.Mode.LOCAL,
+                parts = {@Part(Left.class), @Part(Right.class)})
+        public Result join(Joined j) {
+            fired.add(j.key());
+            return new Result(j.key(), j.get(Left.class).value(), j.get(Right.class).note(), "local");
+        }
+    }
+
+    /** Records how many entries the space knew at each part's WRITTEN: all of a batch's parts are in before its first event. */
+    private static List<Integer> partArrivals(Member m) {
+        List<Integer> known = new CopyOnWriteArrayList<>();
+        Lease hour = Lease.of(Duration.ofHours(1));
+        m.space().notify(Template.of(Left.class), e -> known.add(m.space().knownEntries()), hour);
+        m.space().notify(Template.of(Right.class), e -> known.add(m.space().knownEntries()), hour);
+        return known;
+    }
+
+    /**
+     * RBE regression matrix probe P7 (srad/replication-by-entry.md phase 1, RE-M-08), the {@code LOCAL} mode: a member
+     * that joins after every part of three keys was written learns them in one {@code PULL_RESP}, so each part's WRITTEN
+     * fires after the whole batch is in and every one of them sees its key complete. The in-memory fired set still lets
+     * each key fire exactly once.
+     */
+    @Test
+    void everyPartOfAKeyInOneBatchFiresALocalJoinOnce() throws Exception {
+        Member writer = member("w", 1);
+        for (int i = 1; i <= 3; i++) {
+            writer.space().write(new Left("b" + i, i), Lease.of(Duration.ofMinutes(10)));
+            writer.space().write(new Right("b" + i, "n" + i), Lease.of(Duration.ofMinutes(10)));
+        }
+        // Joins after the writes: no lazy-push announcement covers them, so anti-entropy is its only source.
+        Member late = member("j", 2, "w");
+        List<Integer> arrivals = partArrivals(late);
+        LocalJoiner joiner = new LocalJoiner();
+        closeables.add(late.group().bind(joiner));
+        assertThat(late.space().knownEntries()).as("bound before anything arrived").isZero();
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (System.nanoTime() < deadline && late.space().readAll(Template.of(Result.class), 10).size() < 3) {
+            tickAll(1);
+            Thread.sleep(20);
+        }
+        tickAll(10);
+        Thread.sleep(200); // a second firing would run on its own virtual thread
+
+        assertThat(arrivals).as("six parts arrived").hasSize(6);
+        assertThat(arrivals).as("in one batch: every part's event fired after all six were in")
+                .allSatisfy(known -> assertThat(known).isGreaterThanOrEqualTo(6));
+        assertThat(joiner.fired).as("each key fired exactly once").containsExactlyInAnyOrder("b1", "b2", "b3");
+        assertThat(late.space().readAll(Template.of(Result.class), 10)).extracting(Result::caseId)
+                .containsExactlyInAnyOrder("b1", "b2", "b3");
+    }
+
+    /**
+     * RBE regression matrix probe P7, the {@code ORDERED} mode: three log members join after every part of three keys
+     * was written by a bystander, so each learns all the parts in one {@code PULL_RESP} and every part's event at every
+     * member sees its key complete: up to six tickets requested per member, for three keys. Each key still fires exactly
+     * once fleet-wide, and every ticket drains everywhere.
+     */
+    @Test
+    void everyPartOfAKeyInOneBatchFiresAnOrderedJoinOnceFleetWide() throws Exception {
+        Member desk = member("d", 4);              // writes every part, then stays a bystander
+        for (int i = 1; i <= 3; i++) {
+            desk.space().write(new Left("o" + i, i), Lease.of(Duration.ofMinutes(10)));
+            desk.space().write(new Right("o" + i, "n" + i), Lease.of(Duration.ofMinutes(10)));
+        }
+        Member a = member("a", 1, "d");
+        Member b = member("b", 2, "d");
+        Member c = member("c", 3, "d");
+        List<Member> members = List.of(a, b, c);
+        List<PeerId> memberIds = members.stream().map(m -> m.identity().peerId()).toList();
+        List<List<Integer>> arrivals = new ArrayList<>();
+        List<Joiner> joiners = new ArrayList<>();
+        int seed = 100;
+        for (Member m : members) {
+            arrivals.add(partArrivals(m));
+            OrderedTakes ordered = OrderedTakes.over(new CapabilityPipes(m.runtime(), codec), codec,
+                    m.identity(), "joiner", memberIds, clock, seed++, m.space());
+            m.group().ordered("intake", ordered);
+            Joiner joiner = new Joiner(m.identity().peerId().display());
+            closeables.add(m.group().bind(joiner));
+            joiners.add(joiner);
+            assertThat(m.space().knownEntries()).as("bound before anything arrived").isZero();
+        }
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+        while (System.nanoTime() < deadline
+                && (a.space().readAll(Template.of(Result.class), 10).size() < 3
+                    || !members.stream().allMatch(m -> m.space().readAll(Template.of(JoinTicket.class), 20).isEmpty())
+                    || !desk.space().readAll(Template.of(JoinTicket.class), 20).isEmpty())) {
+            tickAll(1);
+            Thread.sleep(20);
+        }
+
+        for (int i = 0; i < members.size(); i++) {
+            assertThat(arrivals.get(i)).as("six parts at member " + i).hasSize(6);
+            assertThat(arrivals.get(i)).as("in one batch at member " + i + ": every part's event after all six were in")
+                    .allSatisfy(known -> assertThat(known).isGreaterThanOrEqualTo(6));
+        }
+        assertThat(members.stream().filter(this::leads).count()).as("exactly one leader").isEqualTo(1);
+        assertThat(a.space().readAll(Template.of(Result.class), 10)).extracting(Result::caseId)
+                .containsExactlyInAnyOrder("o1", "o2", "o3");
+        assertThat(joiners.stream().flatMap(j -> j.fired.stream()).toList())
+                .as("every key fired exactly once across the fleet").containsExactlyInAnyOrder("o1", "o2", "o3");
+        for (Member m : members) {
+            assertThat(m.space().readAll(Template.of(JoinTicket.class), 20))
+                    .as("tickets drained at " + m.identity().peerId().display()).isEmpty();
+        }
+        assertThat(desk.space().readAll(Template.of(JoinTicket.class), 20)).isEmpty();
+    }
 }

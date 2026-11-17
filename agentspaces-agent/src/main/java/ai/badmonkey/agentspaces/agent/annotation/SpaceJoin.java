@@ -59,7 +59,12 @@ public @interface SpaceJoin {
     enum Mode {
         /** Once per key per bound agent, remembered in memory. */
         LOCAL,
-        /** A ticket entry taken under a lease: once per lease race per ticket. */
+        /**
+         * A ticket entry taken under a lease: once per lease race per ticket. The race picks one winner only
+         * while every claim reaches every rival within the settle window (SPEC §7.4, the settle guarantee), so
+         * a claim later than that can fire a key twice; a join whose result must exist once keys its result
+         * (an idempotent completion, such as a proposal id) or uses {@link #ORDERED}.
+         */
         LEASED,
         /** A ticket entry taken through the ordered log: once fleet-wide per key. */
         ORDERED

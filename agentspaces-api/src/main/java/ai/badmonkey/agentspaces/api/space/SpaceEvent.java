@@ -71,13 +71,30 @@ public record SpaceEvent<T>(Kind kind, EntryId entryId, T entry, AgentId issuer,
         return details == null ? Map.of() : details.tags();
     }
 
-    /** The kinds of entry event a space emits. */
+    /**
+     * The kinds of entry event a space emits.
+     *
+     * <p>A replica raises {@code WRITTEN} only for an entry a reader there could have seen: present and unexpired
+     * when it arrives, and, for a content-addressed or bulk entry whose payload is fetched first, still present and
+     * unexpired when the payload lands. An entry a replica first learns already completed (a late joiner's pull, an
+     * anti-entropy repair) never raises {@code WRITTEN} (SPEC §7.2, decision 21 of srad/replication-by-entry.md);
+     * nor does one that completed while its payload was on the way, which raises {@code COMPLETED} alone when the
+     * payload lands. Every event carries the entry's value, so {@code COMPLETED} is raised only where the value can
+     * be decoded: an entry first learned completed whose content-addressed or bulk payload is not held here may
+     * raise no event at all, since the replica does not fetch a payload only to report its end. A listener that
+     * pairs the two, such as a counter or a precedence check, must accept a {@code COMPLETED} with no
+     * {@code WRITTEN} before it.
+     */
     public enum Kind {
-        /** A matching entry was written. */
+        /** A matching entry was written, and arrived here present and unexpired. */
         WRITTEN,
         /** A matching entry was taken exclusively. */
         TAKEN,
-        /** A matching entry was completed (consumed permanently). */
+        /**
+         * A matching entry was completed (consumed permanently). It may be the first event a replica raises for the
+         * entry, with no {@code WRITTEN} before it, when the entry reached the replica already completed or completed
+         * before its payload landed there.
+         */
         COMPLETED,
         /**
          * A matching entry vanished: its write lease lapsed, or its writer cancelled it (SPEC §7.2, core cancel

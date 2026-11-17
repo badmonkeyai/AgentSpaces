@@ -21,7 +21,7 @@
   <parent>
     <groupId>ai.badmonkey.agentspaces</groupId>
     <artifactId>agentspaces-examples</artifactId>
-    <version>0.6.0</version>
+    <version>0.7.0-SNAPSHOT</version>
   </parent>
   <artifactId>example-34-store-and-graph</artifactId>
   <name>AgentSpaces Example 34 :: Store and Graph</name>
@@ -81,6 +81,12 @@
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-transport-dtls</artifactId>
       <version>${project.version}</version>
+    </dependency>
+    <!-- Measured waits (srad/feature-measurements.md §3.5): test scope only. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-measure</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
   <build>

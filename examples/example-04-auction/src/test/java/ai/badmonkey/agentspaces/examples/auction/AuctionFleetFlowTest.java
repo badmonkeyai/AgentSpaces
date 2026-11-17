@@ -89,15 +89,36 @@ class AuctionFleetFlowTest {
 
             List<ModelResult> results = List.of();
             long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-            while (results.size() < tasks && System.nanoTime() < deadline) {
+            while (results.stream().map(ModelResult::prompt).distinct().count() < tasks
+                    && System.nanoTime() < deadline) {
                 results = coordinator.tasks().readAll(Template.of(ModelResult.class), 20);
                 Thread.sleep(250);
             }
 
-            assertThat(results).hasSize(tasks);
-            assertThat(results).extracting(ModelResult::prompt)
+            // One result per task while every bid arrives within the settle window. Beyond it SPEC §7.4
+            // allows a second completion, which the space detects: every result past one per task must be a
+            // duplicate the replica holding the winning bid counted.
+            assertThat(results.stream().map(ModelResult::prompt).distinct())
                     .containsExactlyInAnyOrder("task-1", "task-2", "task-3",
                             "task-4", "task-5", "task-6");
+            // A duplicate and its count travel in milliseconds; 30 s is a ceiling, and the time is reported.
+            long countFrom = System.nanoTime();
+            long countBy = countFrom + Duration.ofSeconds(30).toNanos();
+            long counted;
+            int found;
+            do {
+                counted = List.of(coordinator, mini, premium).stream()
+                        .mapToLong(peer -> peer.tasks().duplicateCompletions()).sum();
+                found = coordinator.tasks().readAll(Template.of(ModelResult.class), 20).size();
+                if (found == tasks + counted) {
+                    break;
+                }
+                Thread.sleep(100);
+            } while (System.nanoTime() < countBy);
+            System.out.printf("results %d, counted duplicates %d, agreed after %d ms%n", found, counted,
+                    Duration.ofNanos(System.nanoTime() - countFrom).toMillis());
+            assertThat(found).as("every result past one per task is a counted duplicate")
+                    .isEqualTo(tasks + (int) counted);
             assertThat(coordinator.tasks().read(Template.of(ModelTask.class))).isEmpty();
         } finally {
             premium.close();

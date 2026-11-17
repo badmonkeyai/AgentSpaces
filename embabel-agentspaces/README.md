@@ -11,9 +11,9 @@ with no Embabel artifact and activates only when Embabel is on the application c
 
 | File | What it is |
 | --- | --- |
-| `EmbabelBinder`, `EmbabelIntrospector` | Publishes `@Agent` metadata as AgentCards through `AgentBinder.adopt(card)` (so they are refreshed too) and skips beans the space binder already handles. |
-| `EmbabelRemoteActions`, `RemoteActionInterceptor` | Generates (Byte Buddy) a typed `@Agent` whose one-argument actions map to the fleet's `RemoteActions`, one per foreign card and consumed/produced type pair. |
-| `EmbabelRemoteActionsDeployer`, `EmbabelRemoteActionsDeployerLifecycle`, `EmbabelAgentSpacesAutoConfiguration` | Auto-deploy onto the platform (`agentspaces.embabel.auto-deploy`, on by default): redeploy when the set of actions changes, not on a refresh that changes only the issue time. |
+| `EmbabelDeclarationReader`, `EmbabelIntrospector` | The `AgentDeclarationReader` the core binder consults (registered through `ServiceLoader` and, configured, by the autoconfiguration): one card per `@Agent` bean, named by `@Agent(name)`, with implied takes for every map-of-1 `@Action` (`aspace.action=<agent>.<method>`) and `local` for what cannot be served. `EmbabelBinder` is deprecated and binds through the facade. |
+| `EmbabelRemoteActions`, `RemoteActionInterceptor`, `RemoteActionTimeoutException` | Generates (Byte Buddy) a typed `@Agent` over the bridged groups, one action per capability (not per peer) with stable names, carrying the card's description, a normalised cost and the foreign `pre`; fires once, re-awaits within one process, withdraws a timed-out input. |
+| `EmbabelRemoteActionsDeployer`, `EmbabelRemoteActionsDeployerLifecycle`, `EmbabelAgentSpacesAutoConfiguration` | Auto-deploy onto the platform (`agentspaces.embabel.auto-deploy`, on by default): redeploy when the capability set changes (debounced, rate-limited, with an absence grace), a vacant generation when every action lapses, a refusal when the platform already holds the bridge's name, a read-back after each deploy. |
 
 ## Key dependencies
 
@@ -24,8 +24,14 @@ with no Embabel artifact and activates only when Embabel is on the application c
 
 - The Party Bus (`agentspaces-partybus/` at the workspace root) is the largest consumer: its
   planner finds the fleet's scouts as planner actions through this bridge.
-- Embabel's platform exposes no undeploy in the interface this module reaches; a vanished action
-  stays in the previous generation until the platform restarts.
+- Embabel's default platform replaces an agent deployed under the same name, so each generation
+  replaces the last; when every fleet action lapses the deployer deploys a vacant generation, and it
+  reads the platform back after each deploy (`generationsRetained()` counts a platform that kept more
+  than one). `AgentPlatform` itself has no undeploy.
+- The second generation of the bridge (2026-11-12) is designed in
+  `reviews/embabel-agentspaces-review-2026-11-12.md` §7, one subsection per change, with the properties
+  under `agentspaces.embabel` that keep the earlier behaviour (`card-name`, `serve-actions`,
+  `advertise-unserved`, `remote-action-retry`, `on-timeout`, `groups`, `take-mode`).
 - Large planner inputs and outputs (SPEC v0.1.23 §7.1): with
   `agentspaces.content.enabled=true` on the host, a `@SpaceTake` input or a result a remote action
   writes above `agentspaces.content.escalate-above` (4 MiB) travels as an artifact of the content

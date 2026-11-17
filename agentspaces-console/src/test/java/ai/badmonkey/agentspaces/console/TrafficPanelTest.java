@@ -151,6 +151,44 @@ class TrafficPanelTest {
     }
 
     /**
+     * srad/replication-by-entry.md RE-Q-MNT-02, RE-F-03: each group shows its replication status: the members by the
+     * form a round toward each takes (both members here are on wire.ae=2), each space's live and tombstone counts and
+     * trie depth with its audit rounds, bytes and fetch re-queues, every pace with its floor and ceiling, and the
+     * signals an adjuster reads.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void showsEachGroupsReplicationStatusPerSpaceWithItsPacesAndSignals() throws Exception {
+        PeerIdentity writer = PeerIdentity.generate();
+        try (ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace space =
+                     ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace.builder(atA, "jobs", writer, "worker")
+                             .clock(clock).settleWindow(Duration.ZERO).build()) {
+            for (int i = 0; i < 40; i++) {
+                space.write(new ai.badmonkey.agentspaces.test.Fixtures.TaskEntry("job-" + i, i),
+                        ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofHours(1)));
+            }
+            space.write(new ai.badmonkey.agentspaces.test.Fixtures.TaskEntry("gone", 0),
+                    ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofHours(1))).cancel();
+            Map<String, Object> group = ((List<Map<String, Object>>) read(TrafficPanel.of(a, clock)).get("groups"))
+                    .get(0);
+            Map<String, Object> replication = (Map<String, Object>) group.get("replication");
+            assertThat((Map<String, Integer>) replication.get("partnersByForm"))
+                    .containsExactly(Map.entry("ae", 1), Map.entry("hashes", 0), Map.entry("text", 0));
+            Map<String, Object> jobs = ((List<Map<String, Object>>) replication.get("streams")).stream()
+                    .filter(row -> "space:jobs".equals(row.get("stream"))).findFirst().orElseThrow();
+            assertThat(jobs).containsEntry("live", 40L).containsEntry("tombstones", 1L)
+                    .containsEntry("trieDepth", 1).containsKeys("tombstonesPastExpiry", "auditRounds", "auditBytes",
+                            "fetchRequeued");
+            assertThat(((List<Map<String, Object>>) replication.get("paces")).stream().map(p -> p.get("name")))
+                    .contains("anti-entropy-period", "anti-entropy-stretch", "audit-budget", "audit-sessions",
+                            "probe-interval", "probe-stretch");
+            assertThat((Map<String, Object>) replication.get("signals")).containsKeys("rounds", "costPerRound",
+                    "wantFraction", "fetchRequeued", "refusals");
+            assertThat(json.writeValueAsString(replication)).as("plain values, as /healthz renders them").isNotBlank();
+        }
+    }
+
+    /**
      * HLC logical counter, 2026-11-08 (Rust team report): a member's frame whose stamp carries a
      * logical counter above LOGICAL_LIMIT is refused and counted, and the panel shows the count
      * beside the other refusal counters.

@@ -66,7 +66,7 @@ class EmbabelBinderTest {
     private PeerNode node;
     private AgentSpaces spaces;
     private DiscoveryService discovery;
-    private EmbabelBinder binder;
+    private EmbabelDeclarationReader reader;
     private GroupRuntime runtime;
 
     @BeforeEach
@@ -86,11 +86,18 @@ class EmbabelBinderTest {
                 codec, identity.peerId());
         spaces = new AgentSpaces(identity, clock);
         spaces.register("fleet", groupId, runtime, discovery);
-        binder = new EmbabelBinder(spaces, identity, clock, List.of("fleet"));
+        reader = new EmbabelDeclarationReader().register();
+    }
+
+    /** The core binder's card for one bean, bound through the facade (review §7.2). */
+    private java.util.Optional<AgentCard> bindOne(Object bean) {
+        List<ai.badmonkey.agentspaces.agent.AgentBinder.Bound> bound = spaces.bind(bean);
+        return bound.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(bound.get(0).card());
     }
 
     @AfterEach
     void tearDown() {
+        ai.badmonkey.agentspaces.agent.AgentBinder.unregisterDeclarationReader(EmbabelDeclarationReader.class);
         spaces.close();
         node.close();
     }
@@ -141,55 +148,59 @@ class EmbabelBinderTest {
     public static class Stereotyped {
     }
 
+    /** Review §7.2: an Embabel @Agent bean gets one card from the core binder, named by @Agent(name), with the framework hint. */
     @Test
     void embabelMetadataBecomesAPublishedAgentCard() {
-        assertThat(binder.bind(new EmbabelResearcher())).hasValueSatisfying(card -> {
+        assertThat(bindOne(new EmbabelResearcher())).hasValueSatisfying(card -> {
             assertThat(card.agent().localName()).isEqualTo("researcher");
-            assertThat(card.description())
-                    .isEqualTo("Researches topics from the shared task space");
+            assertThat(card.description()).isEqualTo("Researches topics from the shared task space");
             assertThat(card.goals()).containsExactly("produce findings");
-            assertThat(card.consumes())
-                    .containsExactly(TaskEntry.class.getName() + "#v1");
-            assertThat(card.produces())
-                    .containsExactly(FindingEntry.class.getName() + "#v1");
+            assertThat(card.consumes()).containsExactly(TaskEntry.class.getName() + "#v1");
+            assertThat(card.produces()).containsExactly(FindingEntry.class.getName() + "#v1");
             assertThat(card.costHints()).containsEntry("framework", "embabel");
         });
-
-        List<AgentCard> found = discovery.find(AgentCard.class,
-                card -> "researcher".equals(card.agent().localName()));
-        assertThat(found).hasSize(1);
+        List<AgentCard> found = discovery.find(AgentCard.class, card -> "researcher".equals(card.agent().localName()));
+        assertThat(found).as("one card, not two").hasSize(1);
+        assertThat(discovery.find(AgentCard.class, card -> true)).hasSize(1);
     }
 
     @Test
     void agentsWithoutANameUseTheDecapitalizedClassName() {
-        assertThat(binder.bind(new UnnamedAgent())).hasValueSatisfying(card ->
+        assertThat(bindOne(new UnnamedAgent())).hasValueSatisfying(card ->
                 assertThat(card.agent().localName()).isEqualTo("unnamedAgent"));
     }
 
+    /** Review §7.2 (X19): an @AgentSpec or stereotype name wins over @Agent; a plain bean is no agent. */
     @Test
-    void explicitAgentSpecBeansAndPlainBeansAreSkipped() {
-        assertThat(binder.bind(new ExplicitlyCarded())).isEmpty();
-        assertThat(binder.bind(new NotAnAgent())).isEmpty();
-        assertThat(discovery.find(AgentCard.class, card -> true)).isEmpty();
+    void explicitAgentSpecBeansKeepTheirNameAndPlainBeansAreSkipped() {
+        assertThat(bindOne(new ExplicitlyCarded())).hasValueSatisfying(card ->
+                assertThat(card.agent().localName()).isEqualTo("explicit"));
+        assertThat(bindOne(new Stereotyped())).hasValueSatisfying(card ->
+                assertThat(card.agent().localName()).isEqualTo("stereotyped"));
+        assertThat(bindOne(new NotAnAgent())).isEmpty();
+        assertThat(discovery.find(AgentCard.class, card -> true)).hasSize(2);
     }
 
     @Test
     void presenceDetectionFollowsTheClassLoader() throws IOException {
-        assertThat(EmbabelIntrospector.embabelPresent(getClass().getClassLoader()))
-                .isTrue();
+        assertThat(EmbabelIntrospector.embabelPresent(getClass().getClassLoader())).isTrue();
         try (URLClassLoader empty = new URLClassLoader(new URL[0], null)) {
             assertThat(EmbabelIntrospector.embabelPresent(empty)).isFalse();
         }
     }
 
-    /** SPEC §10.3/§10.4: a @SpaceAgent stereotype bean already has the core card; the Embabel binder must not double-card it. */
+    /** Review §7.2: the deprecated binder binds through the facade and returns the core card; it makes no second card. */
     @Test
-    void aSpaceAgentStereotypeBeanIsSkippedByTheEmbabelBinder() {
-        assertThat(binder.bind(new Stereotyped())).isEmpty();
-        assertThat(discovery.find(AgentCard.class, card -> true)).isEmpty();
+    @SuppressWarnings("removal")
+    void theDeprecatedBinderReturnsTheCoreCard() {
+        EmbabelBinder binder = new EmbabelBinder(spaces, identity, clock, List.of("fleet"));
+        assertThat(binder.bind(new EmbabelResearcher())).hasValueSatisfying(card ->
+                assertThat(card.agent().localName()).isEqualTo("researcher"));
+        assertThat(binder.bind(new NotAnAgent())).isEmpty();
+        assertThat(discovery.find(AgentCard.class, card -> true)).hasSize(1);
     }
 
-    /** An Embabel action that is also a space worker: the card learns which space it takes from. */
+    /** An Embabel action that is also a space worker: the one card learns which space it takes from. */
     @Agent(name = "spaceWorker", description = "Takes tasks from the work space")
     public static class SpaceBoundEmbabelWorker {
 
@@ -203,57 +214,49 @@ class EmbabelBinderTest {
     /** SPEC §10.4: an Embabel agent's card is published into every joined group, not only the first. */
     @Test
     void embabelCardsReachEveryJoinedGroup() throws IOException {
-        // A second group on the same node, with its own discovery and ad-cache.
         GroupId secondId = GroupId.of("zEmbabelTwo");
         GroupAdvertisement secondAd = new GroupAdvertisement("aspace://zEmbabelTwo",
                 PeerIdentity.generate().peerId(), secondId, java.time.Instant.EPOCH,
                 Duration.ofDays(1), "fleet2", GroupAdvertisement.MembershipPolicy.OPEN,
                 ConflictStrategyType.LEASE_RACE, GroupAdvertisement.GossipParameters.defaults());
         GroupRuntime second = node.joinGroup(secondAd, GroupMembership.Config.defaults(), List.of());
-        DiscoveryService secondDiscovery = new DiscoveryService(second,
-                new AdCache(codec, clock), codec, identity.peerId());
+        DiscoveryService secondDiscovery = new DiscoveryService(second, new AdCache(codec, clock), codec, identity.peerId());
         spaces.register("fleet2", secondId, second, secondDiscovery);
-        EmbabelBinder both = new EmbabelBinder(spaces, identity, clock, List.of("fleet", "fleet2"));
 
-        List<AgentCard> cards = both.bindAll(new EmbabelResearcher());
-        assertThat(cards).hasSize(2);
-        assertThat(cards).extracting(AgentCard::group).containsExactly(runtime.id(), secondId);
-        assertThat(both.bind(new UnnamedAgent())).hasValueSatisfying(card ->
-                assertThat(card.group()).as("bind() returns the first group's card")
-                        .isEqualTo(runtime.id()));
-
+        List<ai.badmonkey.agentspaces.agent.AgentBinder.Bound> bound = spaces.bind(new EmbabelResearcher());
+        assertThat(bound).hasSize(2);
+        assertThat(bound).extracting(b -> b.card().group()).containsExactlyInAnyOrder(runtime.id(), secondId);
         for (DiscoveryService each : List.of(discovery, secondDiscovery)) {
-            List<AgentCard> found = each.find(AgentCard.class,
-                    card -> "researcher".equals(card.agent().localName()));
+            List<AgentCard> found = each.find(AgentCard.class, card -> "researcher".equals(card.agent().localName()));
             assertThat(found).hasSize(1);
             assertThat(found.get(0).consumes()).containsExactly(TaskEntry.class.getName() + "#v1");
         }
-        assertThat(discovery.find(AgentCard.class, card -> true))
-                .extracting(AgentCard::group).containsOnly(runtime.id());
-        assertThat(secondDiscovery.find(AgentCard.class, card -> true))
-                .extracting(AgentCard::group).containsOnly(secondId);
 
         // Both groups' cards stay fresh through the one facade refresh.
         clock.advance(Duration.ofMinutes(16));
         assertThat(discovery.find(AgentCard.class, card -> true)).isEmpty();
         assertThat(secondDiscovery.find(AgentCard.class, card -> true)).isEmpty();
         spaces.refreshCards();
-        assertThat(discovery.find(AgentCard.class, card -> true)).hasSize(2);
-        assertThat(secondDiscovery.find(AgentCard.class, card -> true)).hasSize(2);
+        assertThat(discovery.find(AgentCard.class, card -> true)).hasSize(1);
+        assertThat(secondDiscovery.find(AgentCard.class, card -> true)).hasSize(1);
     }
 
-    /** SPEC §6.1/§10.4: an Embabel card binds each consumed type to the space its @SpaceTake action takes it from, when known. */
+    /** SPEC §6.1/§10.4: the card binds each consumed type to the space its @SpaceTake action takes it from. */
     @Test
     void embabelCardsDeclareSpaceBindingsFromSpaceTakeActions() {
         LocalSpace work = LocalSpace.builder("work", identity.agent("host")).build();
         LocalSpace other = LocalSpace.builder("other", identity.agent("host")).build();
         try {
             spaces.group("fleet").space("work", work).space("other", other);
-            AgentCard card = binder.bind(new SpaceBoundEmbabelWorker()).orElseThrow();
+            AgentCard card = bindOne(new SpaceBoundEmbabelWorker()).orElseThrow();
             assertThat(card.spaceFor(TaskEntry.class.getName() + "#v1")).contains("work");
-            // A plain @Action without a space annotation declares no binding.
-            AgentCard plain = binder.bind(new EmbabelResearcher()).orElseThrow();
+            assertThat(card.actions()).hasSize(1);
+            assertThat(card.actions().get(0).kind()).isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.TAKE);
+            // Review §7.3 (X46): a plain @Action in a two-space group with no action space is local, not served.
+            AgentCard plain = bindOne(new EmbabelResearcher()).orElseThrow();
             assertThat(plain.spaceBindings()).isEmpty();
+            assertThat(plain.actions()).hasSize(1);
+            assertThat(plain.actions().get(0).kind()).isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.LOCAL);
         } finally {
             work.close();
             other.close();
@@ -263,11 +266,9 @@ class EmbabelBinderTest {
     /** SPEC §10.4: Embabel-derived cards are leased and auto-refreshed like every bound card. */
     @Test
     void embabelCardsStayAliveAcrossRefresh() {
-        AgentCard published = binder.bind(new EmbabelResearcher()).orElseThrow();
-
-        clock.advance(Duration.ofMinutes(16)); // past the 15-minute TTL
+        AgentCard published = bindOne(new EmbabelResearcher()).orElseThrow();
+        clock.advance(Duration.ofMinutes(16));
         assertThat(discovery.find(AgentCard.class, card -> true)).isEmpty();
-
         spaces.refreshCards();
         List<AgentCard> alive = discovery.find(AgentCard.class, card -> true);
         assertThat(alive).hasSize(1);
@@ -277,48 +278,142 @@ class EmbabelBinderTest {
         assertThat(alive.get(0).consumes()).isEqualTo(published.consumes());
     }
 
-    /** SPEC §6.1 v0.1.13 (TODO item 6): each Embabel {@code @Action} is a declared card action, with its own description and its own consumed and produced types. */
+    /**
+     * Review §7.3: in a one-space group every map-of-1 @Action is an implied take, advertised as an embabel-action
+     * with its space and served by writing the entry tagged aspace.action=&lt;agent&gt;.&lt;method&gt;; an @Action with a
+     * precondition is local; the contract rides along.
+     */
     @Test
-    void eachEmbabelActionIsADeclaredCardAction() {
-        AgentCard card = binder.bind(new TwoActionDesk()).orElseThrow();
-        assertThat(card.actions()).extracting(ai.badmonkey.agentspaces.api.ad.CardAction::name)
-                .containsExactly("followUp", "research");
-        ai.badmonkey.agentspaces.api.ad.CardAction research = card.actions().get(1);
-        // ISSUE-CardContract FR-7: an Embabel @Action's pre, post, and cost read as the action's contract
-        assertThat(research.contract()).isNotNull();
-        assertThat(research.contract().pre()).containsExactly("topic-chosen");
-        assertThat(research.contract().post()).containsExactly("findings-ready");
-        assertThat(research.contract().cost()).isEqualTo("2.0");
-        assertThat(card.actions().get(0).contract()).as("no contract declared").isNull();
-        assertThat(research.description()).isEqualTo("Researches one topic");
-        assertThat(research.kind()).isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.EMBABEL_ACTION);
-        assertThat(research.consumes()).containsExactly(TaskEntry.class.getName() + "#v1");
-        assertThat(research.produces()).containsExactly(FindingEntry.class.getName() + "#v1");
-        assertThat(card.actions().get(0).consumes()).containsExactly(FindingEntry.class.getName() + "#v1");
+    void mapOfOneActionsAreImpliedTakesAndPreconditionedOnesAreLocal() {
+        LocalSpace work = LocalSpace.builder("work", identity.agent("host")).build();
+        try {
+            spaces.group("fleet").space("work", work);
+            AgentCard card = bindOne(new TwoActionDesk()).orElseThrow();
+            assertThat(card.actions()).extracting(ai.badmonkey.agentspaces.api.ad.CardAction::name)
+                    .containsExactly("followUp", "research");
+            ai.badmonkey.agentspaces.api.ad.CardAction followUp = card.actions().get(0);
+            assertThat(followUp.kind()).isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.EMBABEL_ACTION);
+            assertThat(followUp.space()).isEqualTo("work");
+            assertThat(followUp.consumes()).containsExactly(FindingEntry.class.getName() + "#v1");
+            assertThat(followUp.produces()).containsExactly(TaskEntry.class.getName() + "#v1");
+            ai.badmonkey.agentspaces.api.ad.CardAction research = card.actions().get(1);
+            assertThat(research.kind()).as("pre on local state: not served by a direct take")
+                    .isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.LOCAL);
+            assertThat(research.space()).isNull();
+            assertThat(research.contract()).isNotNull();
+            assertThat(research.contract().pre()).containsExactly("topic-chosen");
+            assertThat(research.contract().post()).containsExactly("findings-ready");
+            assertThat(research.contract().cost()).isEqualTo("2.0");
+            assertThat(research.description()).isEqualTo("Researches one topic");
+
+            // The implied take serves only an entry addressed to it (X41): an untagged Finding stays.
+            work.write(new FindingEntry("untagged", "x"), ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofMinutes(1)));
+            work.write(new FindingEntry("addressed", "y"), ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofMinutes(1)),
+                    Map.of("aspace.action", "desk.followUp"));
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            while (work.readAll(ai.badmonkey.agentspaces.api.space.Template.of(TaskEntry.class), 10).isEmpty()
+                    && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertThat(work.readAll(ai.badmonkey.agentspaces.api.space.Template.of(TaskEntry.class), 10))
+                    .extracting(TaskEntry::topic).containsExactly("addressed");
+            assertThat(work.readAll(ai.badmonkey.agentspaces.api.space.Template.of(FindingEntry.class), 10))
+                    .extracting(FindingEntry::topic).containsExactly("untagged");
+        } finally {
+            work.close();
+        }
     }
 
-    /** ISSUE-WorkflowShape §7.1 item 1: the Embabel binder names cards from the group's registry, or from one it is given. */
+    /** Review §7.4: a worker that completes into another space binds its produced schema to that space on the card. */
+    @Agent(name = "reporter", description = "Takes from tasks, writes to reports")
+    public static class ResultElsewhere {
+
+        @Action
+        @ai.badmonkey.agentspaces.agent.annotation.SpaceTake(space = "work", resultSpace = "reports")
+        public FindingEntry report(TaskEntry task) {
+            return new FindingEntry(task.topic(), "reported");
+        }
+    }
+
     @Test
-    void embabelCardsNameThroughTheGroupsRegistryOrAnExplicitOne() {
+    void theResultSpaceRidesTheCardAsAProducedBinding() {
+        LocalSpace work = LocalSpace.builder("work", identity.agent("host")).build();
+        LocalSpace reports = LocalSpace.builder("reports", identity.agent("host")).build();
+        try {
+            spaces.group("fleet").space("work", work).space("reports", reports);
+            AgentCard card = bindOne(new ResultElsewhere()).orElseThrow();
+            assertThat(card.spaceFor(TaskEntry.class.getName() + "#v1")).contains("work");
+            assertThat(card.spaceFor(FindingEntry.class.getName() + "#v1")).contains("reports");
+            AgentCard same = bindOne(new SpaceBoundEmbabelWorker()).orElseThrow();
+            assertThat(same.spaceFor(FindingEntry.class.getName() + "#v1")).as("same space: no produced binding").isEmpty();
+        } finally {
+            work.close();
+            reports.close();
+        }
+    }
+
+    /** A different class under the researcher's name. */
+    @Agent(name = "researcher", description = "Another researcher")
+    public static class ImpostorResearcher {
+        @Action
+        public FindingEntry research(TaskEntry task) {
+            return new FindingEntry(task.topic(), "impostor");
+        }
+    }
+
+    /**
+     * Review §7.2 (X20): two different classes under one name on one peer would flap one card id between two
+     * cards; the second refuses to bind. A second instance of the same class publishes the same card and may.
+     */
+    @Test
+    void aDifferentClassUnderTheSameNameRefusesToBind() {
+        bindOne(new EmbabelResearcher()).orElseThrow();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> spaces.bind(new ImpostorResearcher()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("researcher")
+                .hasMessageContaining("ImpostorResearcher");
+        assertThat(spaces.bind(new EmbabelResearcher())).as("the same class again is allowed").hasSize(1);
+    }
+
+    /** Review §7.2: a configured reader names the card by the class instead; card-name: class. */
+    @Test
+    void cardNameClassKeepsTheClassDerivedName() {
+        new EmbabelDeclarationReader(new EmbabelDeclarationReader.Settings(false, true, "", "1m",
+                EmbabelDeclarationReader.Unserved.LOCAL, false)).register();
+        assertThat(bindOne(new EmbabelResearcher())).hasValueSatisfying(card ->
+                assertThat(card.agent().localName()).isEqualTo("embabelResearcher"));
+    }
+
+    /** Review §7.3: serve-actions false and advertise-unserved omit / invocable. */
+    @Test
+    void unservedActionsFollowTheSettings() {
+        LocalSpace work = LocalSpace.builder("work", identity.agent("host")).build();
+        try {
+            spaces.group("fleet").space("work", work);
+            new EmbabelDeclarationReader(new EmbabelDeclarationReader.Settings(true, false, "", "1m",
+                    EmbabelDeclarationReader.Unserved.INVOCABLE, false)).register();
+            AgentCard invocable = bindOne(new EmbabelResearcher()).orElseThrow();
+            assertThat(invocable.actions()).hasSize(1);
+            assertThat(invocable.actions().get(0).kind()).isEqualTo(ai.badmonkey.agentspaces.api.ad.CardAction.EMBABEL_ACTION);
+            assertThat(invocable.actions().get(0).space()).as("advertised as before: no space, a caller times out").isNull();
+
+            new EmbabelDeclarationReader(new EmbabelDeclarationReader.Settings(true, false, "", "1m",
+                    EmbabelDeclarationReader.Unserved.OMIT, false)).register();
+            AgentCard omitted = bindOne(new UnnamedAgent()).orElseThrow();
+            assertThat(omitted.actions()).isNull();
+        } finally {
+            work.close();
+        }
+    }
+
+    /** ISSUE-WorkflowShape §7.1 item 1: the card is named from the group's registry. */
+    @Test
+    void embabelCardsNameThroughTheGroupsRegistry() {
         String ns = "https://example.org/test#";
-        SchemaRegistry shared =
-                NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
+        SchemaRegistry shared = NamespaceSchemaRegistry.of(Map.of("ai.badmonkey.agentspaces.test", ns));
         spaces.group("fleet").schemaRegistry(shared);
-
-        AgentCard card = binder.bind(new TwoActionDesk()).orElseThrow();
-        assertThat(card.consumes())
-                .containsExactlyInAnyOrder(ns + "TaskEntry", ns + "FindingEntry");
-        assertThat(card.produces())
-                .containsExactlyInAnyOrder(ns + "FindingEntry", ns + "TaskEntry");
-        assertThat(card.actions()).allSatisfy(action -> {
-            assertThat(action.consumes()).allMatch(name -> name.startsWith(ns));
-            assertThat(action.produces()).allMatch(name -> name.startsWith(ns));
-        });
-
-        SchemaRegistry own = NamespaceSchemaRegistry.of(
-                Map.of("ai.badmonkey.agentspaces.test", "https://example.org/own#"));
-        EmbabelBinder explicit = new EmbabelBinder(spaces, identity, clock, List.of("fleet"), own);
-        assertThat(explicit.bind(new EmbabelResearcher()).orElseThrow().consumes())
-                .containsExactly("https://example.org/own#TaskEntry");
+        AgentCard card = bindOne(new EmbabelResearcher()).orElseThrow();
+        assertThat(card.consumes()).containsExactly(ns + "TaskEntry");
+        assertThat(card.produces()).containsExactly(ns + "FindingEntry");
     }
 }

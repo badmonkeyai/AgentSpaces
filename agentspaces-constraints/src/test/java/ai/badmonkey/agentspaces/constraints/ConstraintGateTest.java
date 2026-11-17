@@ -37,10 +37,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** FR-7 to FR-11, SR-1: the gate over local spaces. */
 class ConstraintGateTest {
 
-    record HumanApproval(String claimId, String by) {
+    // public: the replicated lanes of the batch probe encode them
+    public record HumanApproval(String claimId, String by) {
     }
 
-    record PaymentOrder(String claimId, long amount) {
+    public record PaymentOrder(String claimId, long amount) {
     }
 
     record Quote(String claimId, String vendor) {
@@ -326,6 +327,106 @@ class ConstraintGateTest {
             assertThat(gate.events("c-5")).hasSize(2);
             gate.interest("Quote", "field:claimId");   // the same interest again reads nothing twice
             assertThat(gate.events("c-5")).hasSize(2);
+        }
+    }
+
+    /** One node of a SimNetwork group with a replicated {@code payments} lane open, its two types registered. */
+    private static ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace lane(
+            ai.badmonkey.agentspaces.test.SimNetwork network, ai.badmonkey.agentspaces.test.TestClock clock,
+            ai.badmonkey.agentspaces.api.ad.GroupAdvertisement groupAd, String address, List<String> seeds,
+            List<ai.badmonkey.agentspaces.peering.node.PeerNode> nodes) throws Exception {
+        PeerIdentity identity = PeerIdentity.generate();
+        ai.badmonkey.agentspaces.peering.node.PeerNode node = ai.badmonkey.agentspaces.peering.node.PeerNode
+                .builder(identity).clock(clock).randomSeed(nodes.size() + 1).build();
+        nodes.add(node);
+        node.listen(network.register(address), address);
+        ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime = node.joinGroup(groupAd,
+                ai.badmonkey.agentspaces.peering.membership.GroupMembership.Config.defaults(),
+                seeds.stream().map(seed -> new ai.badmonkey.agentspaces.api.ad.PeerAdvertisement.Endpoint("mem", seed, 0))
+                        .toList());
+        // The member knows the lane's types, as an agent that works the lane does: a replica decodes only the types
+        // it has registered, and fires no event for an entry it cannot decode.
+        return ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace.builder(runtime, "payments", identity, address)
+                .clock(clock).settleWindow(Duration.ZERO).schemaHints(HumanApproval.class, PaymentOrder.class).build();
+    }
+
+    /**
+     * RBE regression matrix probe P9 (srad/replication-by-entry.md phase 1, RE-M-08): a gate on a member that joins
+     * late learns a lane in one {@code PULL_RESP}, so every event of the lane fires together after the batch and a
+     * precedence's A and B reach it at once, B often first. The gate orders the events by the entries' issue stamps, not
+     * by when they arrived, so no B is refused and no {@link ConstraintViolated} is written. The keys cover: A and B
+     * both open (c-1); A written and taken, so its WRITTEN and its claim arrive in the one batch (c-2); A taken and
+     * completed before the late member joined (c-3); and B written and taken (c-4).
+     */
+    @Test
+    void aPrecedencesAAndBInOneBatchAtALateGateWriteNoFalseViolation() throws Exception {
+        ai.badmonkey.agentspaces.test.TestClock clock = ai.badmonkey.agentspaces.test.TestClock.create();
+        ai.badmonkey.agentspaces.test.SimNetwork network = new ai.badmonkey.agentspaces.test.SimNetwork();
+        ai.badmonkey.agentspaces.api.ad.GroupAdvertisement groupAd = new ai.badmonkey.agentspaces.api.ad.GroupAdvertisement(
+                "aspace://zGate", PeerIdentity.generate().peerId(), ai.badmonkey.agentspaces.common.id.GroupId.of("zGate"),
+                java.time.Instant.EPOCH, Duration.ofDays(1), "gate-batch",
+                ai.badmonkey.agentspaces.api.ad.GroupAdvertisement.MembershipPolicy.OPEN,
+                ai.badmonkey.agentspaces.api.space.ConflictStrategyType.LEASE_RACE,
+                ai.badmonkey.agentspaces.api.ad.GroupAdvertisement.GossipParameters.defaults());
+        List<ai.badmonkey.agentspaces.peering.node.PeerNode> nodes = new java.util.ArrayList<>();
+        try {
+            ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace writer =
+                    lane(network, clock, groupAd, "w", List.of(), nodes);
+            Lease minutes = Lease.of(Duration.ofMinutes(30));
+            Lease takeLease = Lease.of(Duration.ofMinutes(10));
+            for (String key : List.of("c-1", "c-2", "c-3", "c-4")) {
+                writer.write(new HumanApproval(key, "alice"), minutes);
+                clock.advance(Duration.ofMillis(5));
+            }
+            writer.take(Template.of(HumanApproval.class).where("claimId", ai.badmonkey.agentspaces.api.space.Matchers.eq("c-2")),
+                    takeLease, Duration.ZERO).orElseThrow();
+            writer.complete(writer.take(Template.of(HumanApproval.class)
+                    .where("claimId", ai.badmonkey.agentspaces.api.space.Matchers.eq("c-3")), takeLease, Duration.ZERO)
+                    .orElseThrow());
+            // every B is issued after its A, as a worker would write it
+            for (String key : List.of("c-1", "c-2", "c-3", "c-4")) {
+                writer.write(new PaymentOrder(key, 60000), minutes);
+                clock.advance(Duration.ofMillis(5));
+            }
+            writer.take(Template.of(PaymentOrder.class).where("claimId", ai.badmonkey.agentspaces.api.space.Matchers.eq("c-4")),
+                    takeLease, Duration.ZERO).orElseThrow();
+            int total = writer.knownEntries();
+
+            // The gate's member joins after all of it: no lazy-push announcement covers those writes, so one
+            // anti-entropy PULL_RESP brings the whole lane.
+            ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace late =
+                    lane(network, clock, groupAd, "g", List.of("w"), nodes);
+            List<Integer> knownAtEvent = new java.util.concurrent.CopyOnWriteArrayList<>();
+            late.notify(Template.of(Object.class), ev -> knownAtEvent.add(late.knownEntries()), Lease.of(Duration.ofHours(1)));
+            Space constraints = space("constraints");
+            publish(constraints, precedence());
+            try (ConstraintGate gate = ConstraintGate.attach(constraints, null, "constraints", clock, "late-gate")) {
+                gate.watch("payments", late);
+                assertThat(late.knownEntries()).as("watching before anything arrived").isZero();
+                for (int i = 0; i < 40 && late.knownEntries() < total; i++) {
+                    nodes.forEach(ai.badmonkey.agentspaces.peering.node.PeerNode::tick);
+                    clock.advance(Duration.ofSeconds(1));
+                }
+                assertThat(late.knownEntries()).isEqualTo(total);
+                assertThat(knownAtEvent).as("the lane's events reached the late member").isNotEmpty();
+                assertThat(knownAtEvent).as("one batch: every event fired after the whole lane was in")
+                        .allSatisfy(known -> assertThat(known).isEqualTo(total));
+
+                for (String key : List.of("c-1", "c-2", "c-3", "c-4")) {
+                    assertThat(gate.marking("rb-claims", key).violations())
+                            .as("no violation in the marking of " + key + ": events=" + gate.events(key)).isEmpty();
+                }
+                for (Space.Entry<PaymentOrder> order : late.readAllEntries(Template.of(PaymentOrder.class), 10)) {
+                    String key = order.value().claimId();
+                    assertThat(gate.beforeClaim(order).admitted())
+                            .as("the open order " + key + " follows its approval: events=" + gate.events(key)).isTrue();
+                }
+                assertThat(late.readAllEntries(Template.of(PaymentOrder.class), 10)).extracting(e -> e.value().claimId())
+                        .containsExactlyInAnyOrder("c-1", "c-2", "c-3");
+                assertThat(constraints.readAll(Template.of(ConstraintViolated.class), 10)).as("no false violation").isEmpty();
+            }
+        } finally {
+            nodes.forEach(ai.badmonkey.agentspaces.peering.node.PeerNode::close);
         }
     }
 }

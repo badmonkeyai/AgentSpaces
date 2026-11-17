@@ -15,6 +15,11 @@
  */
 package ai.badmonkey.agentspaces.examples.storegraph;
 
+import ai.badmonkey.agentspaces.measure.Direction;
+import ai.badmonkey.agentspaces.measure.Measure;
+import ai.badmonkey.agentspaces.measure.Params;
+import ai.badmonkey.agentspaces.measure.Rec;
+import ai.badmonkey.agentspaces.measure.Unit;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -89,7 +94,23 @@ class StoreAndGraphTest {
     void twoStoresOneBlindHoldTheBlobAfterItsWriterLeavesAndReconcileAfterARestart(@TempDir Path dir) throws Exception {
         StoreHalf.Report report = StoreHalf.run(dir, "tcp", FREE_TCP, StoreHalf.Sizes.quick(), System.out);
         System.out.print(report.summary());
+        recordStoreHalf(report, "quick");
         assertStoreHalf(report, StoreHalf.Sizes.quick());
+    }
+
+    /**
+     * The store half's times, recorded rather than asserted (srad/feature-measurements.md §7.3): StoreHalf stays in
+     * src/main and keeps its own ceilings and its report (FM-L-13); the test records the figures from the report, so a
+     * slower fetch, join or repair shows as a number. Recorded before the assertions, so a failing run is measured too.
+     */
+    static void recordStoreHalf(StoreHalf.Report report, String sizes) {
+        Params params = Params.of("transport", report.binding(), "sizes", sizes);
+        Measure.record("storegraph.fetch.pinned", Unit.MS, Direction.LOWER, report.cold().millis(),
+                Rec.with().params(params));
+        Measure.record("storegraph.join.reader", Unit.MS, Direction.LOWER, report.join().millis(),
+                Rec.with().params(params));
+        Measure.record("storegraph.restart.repair", Unit.MS, Direction.LOWER, report.restart().repairMillis(),
+                Rec.with().params(params));
     }
 
     /** The store half's rows, on any binding (PdtBindingsTest repeats them on dtls). */

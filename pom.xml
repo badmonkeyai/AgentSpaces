@@ -22,7 +22,7 @@
 
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces</artifactId>
-  <version>0.6.0</version>
+  <version>0.7.0-SNAPSHOT</version>
   <packaging>pom</packaging>
 
   <name>AgentSpaces</name>
@@ -110,6 +110,8 @@
     <module>agentspaces-spring-boot-autoconfigure</module>
     <module>agentspaces-spring-boot-starter</module>
     <module>embabel-agentspaces</module>
+    <!-- Spoiler peers (srad/spoiler-peers.md SP-G-01): test-only, never deployed, downstream of every core module. -->
+    <module>agentspaces-spoilers</module>
     <module>examples</module>
   </modules>
 
@@ -159,6 +161,15 @@
 
     <!-- Coverage gate, overridable per module. Examples set this to 0. -->
     <jacoco.line.minimum>0.80</jacoco.line.minimum>
+
+    <!-- Peering, space and pdt attach a test-jar so agentspaces-spoilers can reuse their fleets and
+         ForgeSupport (srad/spoiler-peers.md SP-G-01). The release profile turns this on, so no test-jar
+         ever reaches Central. -->
+    <agentspaces.testjars.skip>false</agentspaces.testjars.skip>
+
+    <!-- Measured waits for tests (srad/feature-measurements.md FM-L-01): a standalone open project, JDK only,
+         used at test scope only and installed before the core reactor. -->
+    <agentspaces-test-measure.version>0.7.0-SNAPSHOT</agentspaces-test-measure.version>
   </properties>
 
   <dependencyManagement>
@@ -254,6 +265,11 @@
         <groupId>ai.badmonkey.agentspaces</groupId>
         <artifactId>agentspaces-space</artifactId>
         <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.badmonkey.agentspaces</groupId>
+        <artifactId>agentspaces-test-measure</artifactId>
+        <version>${agentspaces-test-measure.version}</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
@@ -441,6 +457,11 @@
          MAVEN_GPG_PASSPHRASE environment variable. -->
     <profile>
       <id>central-publish</id>
+      <properties>
+        <!-- SP-G-01: test-jars stay off Central; agentspaces-spoilers has its own central-publish
+             profile that drops the test-jar dependencies and skips its tests. -->
+        <agentspaces.testjars.skip>true</agentspaces.testjars.skip>
+      </properties>
       <build>
         <plugins>
           <plugin>

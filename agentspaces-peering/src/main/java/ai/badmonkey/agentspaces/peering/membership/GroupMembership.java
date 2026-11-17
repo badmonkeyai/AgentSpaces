@@ -79,11 +79,14 @@ public final class GroupMembership implements PeerSampler {
         private volatile java.util.Set<PeerAdvertisement.PeerRole> roles = java.util.Set.of();
         private volatile long lastHeardMillis;
         private volatile boolean suspect;
+        /** When this member entered the view, on the node's clock; a member that leaves and returns starts afresh. */
+        private final long joinedMillis;
 
         private Member(PeerId id, List<PeerAdvertisement.Endpoint> endpoints, long lastHeardMillis) {
             this.id = id;
             this.endpoints = endpoints;
             this.lastHeardMillis = lastHeardMillis;
+            this.joinedMillis = lastHeardMillis;
         }
 
         /** Returns the topology roles the member advertises (spec §5.4). */
@@ -170,6 +173,62 @@ public final class GroupMembership implements PeerSampler {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.random = Objects.requireNonNull(random, "random");
         this.config = Objects.requireNonNull(config, "config");
+        // RE-F-03: the probe's paces start where the configuration puts them and move by runtime setters; each holds
+        // a raise for one probe interval before a lowering takes effect (RE-Q-REL-09).
+        this.probeIntervalPace = new ai.badmonkey.agentspaces.peering.gossip.Pace("probe-interval",
+                PROBE_INTERVAL_FLOOR_MILLIS, PROBE_INTERVAL_CEILING_MILLIS, config.probeInterval().toMillis(),
+                this::nowMillis, this::probeHoldMillis);
+        this.probeStretchPace = new ai.badmonkey.agentspaces.peering.gossip.Pace("probe-stretch", 0,
+                MAX_QUIET_STRETCH, MAX_QUIET_STRETCH, this::nowMillis, this::probeHoldMillis);
+    }
+
+    /** The least probe interval a setter may ask for. */
+    public static final long PROBE_INTERVAL_FLOOR_MILLIS = 100;
+    /** The greatest probe interval a setter may ask for. */
+    public static final long PROBE_INTERVAL_CEILING_MILLIS = 60_000;
+    private final ai.badmonkey.agentspaces.peering.gossip.Pace probeIntervalPace;
+    private final ai.badmonkey.agentspaces.peering.gossip.Pace probeStretchPace;
+
+    private long probeHoldMillis() {
+        ai.badmonkey.agentspaces.peering.gossip.Pace interval = probeIntervalPace;
+        return interval == null ? config.probeInterval().toMillis() : interval.get();
+    }
+
+    /**
+     * Sets the probe interval, the base of SWIM's protocol period (RE-F-03); a runtime setter. A raise takes effect at
+     * once; a lowering waits until the raised interval has served one interval (RE-Q-REL-09).
+     *
+     * @param interval from {@value #PROBE_INTERVAL_FLOOR_MILLIS} ms to {@value #PROBE_INTERVAL_CEILING_MILLIS} ms
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void probeInterval(Duration interval) {
+        probeIntervalPace.set(interval.toMillis());
+    }
+
+    /** The probe interval in effect, in milliseconds. */
+    public long probeIntervalMillis() {
+        return probeIntervalPace.get();
+    }
+
+    /**
+     * Sets how many doublings a quiet group's probe interval may stretch by (RE-F-03); a runtime setter. Zero never
+     * stretches; the ceiling is {@link #MAX_QUIET_STRETCH}, so a member's keepalive reasoning holds at every setting.
+     *
+     * @param doublings from 0 to {@link #MAX_QUIET_STRETCH}
+     * @throws IllegalArgumentException outside those bounds
+     */
+    public void probeStretch(int doublings) {
+        probeStretchPace.set(doublings);
+    }
+
+    /** How many doublings a quiet group's probe interval may stretch by now. */
+    public int probeStretch() {
+        return (int) probeStretchPace.get();
+    }
+
+    /** The probe's paces, as a status page or an adjuster reads them. */
+    public java.util.List<ai.badmonkey.agentspaces.peering.gossip.Pace.Snapshot> paces() {
+        return java.util.List.of(probeIntervalPace.snapshot(), probeStretchPace.snapshot());
     }
 
     /**
@@ -363,13 +422,14 @@ public final class GroupMembership implements PeerSampler {
         // Probe one random member once per protocol period (SWIM): probing on every 250 ms tick
         // was four fifths of an idle peer's frames, and detection speed comes from the suspicion
         // timeout, not the probe rate. Timeouts above are still judged on every tick.
-        long interval = config.probeInterval().toMillis() * (1L << quietCycles);
+        int stretch = (int) probeStretchPace.get();
+        long interval = probeIntervalPace.get() * (1L << Math.min(quietCycles, stretch));
         if (lastProbeMillis != Long.MIN_VALUE && now - lastProbeMillis < interval) {
             return;
         }
         lastProbeMillis = now;
         if (!activeSinceProbe) {
-            quietCycles = Math.min(quietCycles + 1, MAX_QUIET_STRETCH);
+            quietCycles = Math.min(quietCycles + 1, stretch);
         }
         activeSinceProbe = false;
         // Round-robin over a shuffled order (SWIM's protocol period), so every member is probed
@@ -391,6 +451,30 @@ public final class GroupMembership implements PeerSampler {
      */
     public Optional<Member> member(PeerId peer) {
         return Optional.ofNullable(members.get(peer));
+    }
+
+    /**
+     * How long a peer has been in this view without a break, on the node's clock (RE-H-04): a writer the per-entry
+     * horizon trusts must have been in sight for as long as any copy it renewed out of sight could stay live.
+     *
+     * @param peer the member id
+     * @return the time since it entered the view, or -1 when it is not in the view
+     */
+    public long inViewForMillis(PeerId peer) {
+        Member member = members.get(peer);
+        return member == null ? -1 : Math.max(0, nowMillis() - member.joinedMillis);
+    }
+
+    /**
+     * When a peer entered this view for its current stay, on the node's clock (RE-H-04). A member that leaves and
+     * returns gets a new time, so a reader can tell one stay from the next.
+     *
+     * @param peer the member id
+     * @return the node-clock time it entered the view, or -1 when it is not in the view
+     */
+    public long joinedAtMillis(PeerId peer) {
+        Member member = members.get(peer);
+        return member == null ? -1 : member.joinedMillis;
     }
 
     /** Returns a snapshot of all current members. */

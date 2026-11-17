@@ -1213,4 +1213,39 @@ class ContentSwarmTest {
         assertThat(rows).singleElement().satisfies(row -> assertThat(row).containsEntry("roots", 1));
         inMission.close();
     }
+
+    /** The lease expiry of the manifest entry of a root, as the publisher's replica holds it. */
+    private static long manifestExpiry(Peer peer, String root) {
+        return peer.space().readAllEntries(ai.badmonkey.agentspaces.api.space.Template.of(Manifest.class)
+                        .whereTag(Manifest.ROOT_TAG, ai.badmonkey.agentspaces.api.space.Matchers.eq(root)), 8)
+                .get(0).lease().expiresAtMillis();
+    }
+
+    /**
+     * Probe P21 and RE-H-07's core caller (srad/replication-by-entry.md §3.6): the holder's manifest keepalive renews
+     * each complete root's manifest to seven days. Before phase 2 that shortened a longer publish to seven days on the
+     * first tick; under the renew clamp a 90-day publish keeps its 90 days, and a 2-day one is extended to seven.
+     */
+    @Test
+    void theManifestKeepaliveKeepsALongerPublishAndExtendsAShorterOne() throws Exception {
+        Peer a = newPeer("a", 1, null);
+        long published = clock.instant().toEpochMilli();
+        Manifest quarter = a.content().publish(randomBytes(3000, 91), options().withName("ninety-days.bin")
+                .withLease(ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofDays(90))));
+        Manifest brief = a.content().publish(randomBytes(3000, 92), options().withName("two-days.bin")
+                .withLease(ai.badmonkey.agentspaces.api.space.Lease.of(Duration.ofDays(2))));
+        assertThat(manifestExpiry(a, quarter.root())).isEqualTo(published + Duration.ofDays(90).toMillis());
+        assertThat(manifestExpiry(a, brief.root())).isEqualTo(published + Duration.ofDays(2).toMillis());
+
+        clock.advance(Duration.ofMillis(Content.MANIFEST_KEEPALIVE_INTERVAL_MILLIS + 1_000));
+        a.node().tick(); // the content tick runs the keepalive, due after its interval
+        long ticked = clock.instant().toEpochMilli();
+
+        assertThat(manifestExpiry(a, quarter.root())).as("the 90-day publish keeps its lease")
+                .isEqualTo(published + Duration.ofDays(90).toMillis());
+        assertThat(manifestExpiry(a, brief.root())).as("the 2-day publish is extended to seven days")
+                .isEqualTo(ticked + Duration.ofDays(7).toMillis());
+        assertThat(a.space().renewShortenings()).as("the keepalive asked the 90-day manifest for less, once")
+                .isEqualTo(1);
+    }
 }

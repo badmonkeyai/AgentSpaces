@@ -69,6 +69,10 @@ public final class RemoteActions {
     private volatile Lease writeLease = Lease.of(Duration.ofMinutes(10));
     /** Carries asset operations to their connector; null until a host wires one (JS-C-11). */
     private volatile AssetOperation.AssetInvoker assetInvoker;
+    /** Schema names resolved to classes (review §7.9): successes for the registry's life, failures for 30 s. */
+    private final Map<String, Optional<Class<?>>> resolved = new ConcurrentHashMap<>();
+    private final Map<String, Long> resolveFailedAt = new ConcurrentHashMap<>();
+    private static final long RESOLVE_FAILURE_TTL_MILLIS = 30_000;
 
     /**
      * Creates a registry over explicit pieces.
@@ -203,12 +207,15 @@ public final class RemoteActions {
                     continue; // an older refresh of the same capability
                 }
                 taskSpaceFor(input.get(), card, pair.action(), consumed).ifPresent(taskSpace -> {
-                    // No result route: await in the take space, as @SpaceTake
-                    // itself completes there by default (spec §10.6).
+                    // An explicit result route, else the card's binding for the produced schema (review §7.4:
+                    // a produced schema bound to the space the worker writes it to), else the take space, as
+                    // @SpaceTake itself completes there by default (spec §10.6).
                     Space resultSpace = routedSpace(output.get(), resultRoutes)
+                            .or(() -> card.spaceFor(produced).map(spaces::get))
                             .orElse(taskSpace);
                     actions.add(new RemoteAction(card, input.get(), output.get(),
-                            taskSpace, resultSpace, correlation, writeLease, pair.action()));
+                            taskSpace, resultSpace, correlation, writeLease, pair.action(),
+                            addressTags(card, pair.action())));
                 });
             }
         }
@@ -333,7 +340,58 @@ public final class RemoteActions {
      * A name containing {@code :} or {@code /} is an IRI, which never resolves
      * as a class.
      */
+    /**
+     * The tags an invocation writes (SPEC §10.6, review §7.3): an {@code embabel-action} that names its space is
+     * an implied take addressed by {@code aspace.action=<agent>.<action>}; every other action is untagged.
+     */
+    private static Map<String, String> addressTags(AgentCard card, ai.badmonkey.agentspaces.api.ad.CardAction action) {
+        if (action == null || !ai.badmonkey.agentspaces.api.ad.CardAction.EMBABEL_ACTION.equals(action.kind())
+                || action.space() == null) {
+            return Map.of();
+        }
+        String name = action.name();
+        int overload = name.indexOf('(');
+        if (overload > 0) {
+            name = name.substring(0, overload);
+        }
+        return Map.of("aspace.action", card.agent().localName() + "." + name);
+    }
+
+    /**
+     * The ad-cache's change counter (review §7.9), so a host polling this registry can tell without recomputing
+     * anything whether the fleet's cards changed since it last looked.
+     *
+     * @return the discovery cache's generation
+     */
+    public long generation() {
+        return discovery.cache().generation();
+    }
+
+    /** When the ad-cache will next change by itself (a card expiring), if it holds anything. */
+    public Optional<java.time.Instant> nextExpiry() {
+        return discovery.cache().nextExpiry();
+    }
+
     private Optional<Class<?>> resolve(String schemaName) {
+        Optional<Class<?>> known = resolved.get(schemaName);
+        if (known != null) {
+            return known;
+        }
+        Long failedAt = resolveFailedAt.get(schemaName);
+        if (failedAt != null && System.currentTimeMillis() - failedAt < RESOLVE_FAILURE_TTL_MILLIS) {
+            return Optional.empty();
+        }
+        Optional<Class<?>> answer = resolveUncached(schemaName);
+        if (answer.isPresent()) {
+            resolved.put(schemaName, answer);
+            resolveFailedAt.remove(schemaName);
+        } else {
+            resolveFailedAt.put(schemaName, System.currentTimeMillis());
+        }
+        return answer;
+    }
+
+    private Optional<Class<?>> resolveUncached(String schemaName) {
         if (schemas != null) {
             Optional<Class<?>> known = schemas.classFor(schemaName);
             if (known.isPresent()) {

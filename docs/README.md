@@ -16,6 +16,7 @@ The README is short by design: what this is, the quick start, and how to add it 
 | [Version 0.4.0 Capabilities](capabilities-by-version.md) | Java developers who build with AgentSpaces | Every specification layer (0 through 4) has a working implementation, and every clause the specification does not mark as planned has a pinning test. |
 | [Build](build.md) | contributors who build and test the core | JDK 21+ and Maven are the only prerequisites. |
 | [Modules](modules.md) | contributors and anyone choosing modules | Each module in two or three sentences. |
+| [Proofs and models](proofs/README.md) | contributors and reviewers who change replication rules | The argument behind a replication rule, with its TLA+ model and the Java check: so far, why the per-entry tombstone horizon is safe. |
 | [Extending AgentSpaces](extending.md) | developers who extend the core with a capability, a transport, or a host | The core stays small. |
 | [Build environments](BUILD-ENVIRONMENTS.md) | contributors and release engineers | Which build runs where: the CI gate, the coverage and Spring profiles, and the local runs. |
 | [The fleet console](CONSOLE.md) | operators of a fleet | The read-only console peer: what it shows, how to start it, and its settings. |

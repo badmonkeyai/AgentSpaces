@@ -22,6 +22,7 @@ import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.common.id.SpaceId;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -135,5 +136,64 @@ class TakeClaimMergeTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> claim(1, at(5, 0), ALICE, Double.POSITIVE_INFINITY, 1_000))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static SpaceWire.SignedClaim signed(TakeClaim claim, int mark) {
+        return new SpaceWire.SignedClaim(claim, new byte[] {(byte) mark}, new byte[] {(byte) mark});
+    }
+
+    private static void permutations(List<SpaceWire.SignedClaim> rest, List<SpaceWire.SignedClaim> prefix,
+                                     List<List<SpaceWire.SignedClaim>> out) {
+        if (rest.isEmpty()) {
+            out.add(prefix);
+            return;
+        }
+        for (int i = 0; i < rest.size(); i++) {
+            List<SpaceWire.SignedClaim> next = new ArrayList<>(rest);
+            List<SpaceWire.SignedClaim> grown = new ArrayList<>(prefix);
+            grown.add(next.remove(i));
+            permutations(next, grown, out);
+        }
+    }
+
+    /**
+     * P3 (reviews/RBE-REGRESSION-MATRIX.md §3): a batch of contending claims for one entry, merged one after another in
+     * any order, as a replica merges a PULL_RESP's claim into the one it holds and then the next batch's, ends on the
+     * claim the pairwise merges of live gossip pick, under AUCTION bids and under LEASE_RACE stamps (a stamp tie
+     * included), and the signed claim kept is the winner's own proof.
+     */
+    @Test
+    void aBatchOfContendingClaimsFoldsToTheSameWinnerInEveryOrder() {
+        List<SpaceWire.SignedClaim> auction = List.of(
+                signed(claim(1, at(3, 0), ALICE, 9.0, 1_000), 1),
+                signed(claim(1, at(8, 0), BOB, 2.0, 1_000), 2),
+                signed(claim(1, at(6, 0), ALICE, 2.0, 1_000), 3),
+                signed(claim(1, at(1, 0), BOB, 4.0, 1_000), 4));
+        List<SpaceWire.SignedClaim> leaseRace = List.of(
+                signed(claim(1, at(7, 0), ALICE, 0.0, 1_000), 5),
+                signed(claim(1, at(5, 2), BOB, 0.0, 1_000), 6),
+                signed(claim(1, at(5, 2), ALICE, 0.0, 1_000), 7),
+                signed(claim(1, at(9, 0), BOB, 0.0, 1_000), 8));
+        for (List<SpaceWire.SignedClaim> batch : List.of(auction, leaseRace)) {
+            TakeClaim live = null;
+            for (SpaceWire.SignedClaim signed : batch) {
+                live = TakeClaim.merge(live, signed.claim());
+            }
+            List<List<SpaceWire.SignedClaim>> orders = new ArrayList<>();
+            permutations(batch, List.of(), orders);
+            assertThat(orders).hasSize(24);
+            for (List<SpaceWire.SignedClaim> order : orders) {
+                SpaceWire.SignedClaim held = null;
+                for (SpaceWire.SignedClaim offered : order) {
+                    held = held == null ? offered : SpaceWire.SignedClaim.merge(held, offered);
+                }
+                assertThat(held.claim()).as("order %s", order).isSameAs(live);
+                SpaceWire.SignedClaim winner = held;
+                assertThat(batch).as("the proof travels with its claim")
+                        .anySatisfy(input -> assertThat(input).isSameAs(winner));
+            }
+        }
+        assertThat(TakeClaim.merge(auction.get(1).claim(), auction.get(2).claim()))
+                .as("AUCTION: the lower stamp breaks a tie of bids").isSameAs(auction.get(2).claim());
     }
 }

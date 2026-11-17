@@ -25,6 +25,7 @@ import ai.badmonkey.agentspaces.api.space.SpaceEvent;
 import ai.badmonkey.agentspaces.api.space.Subscription;
 import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
+import ai.badmonkey.agentspaces.common.id.AgentId;
 import ai.badmonkey.agentspaces.test.Fixtures;
 import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
@@ -149,6 +150,197 @@ class LocalSpaceTest {
         clock.advance(Duration.ofMinutes(2));
         space.complete(taken);
         assertThat(space.read(Template.of(TaskEntry.class))).isEmpty();
+    }
+
+    /**
+     * RE-H-01 and RE-H-02 (srad/replication-by-entry.md): a renewal for less than the lease has left is counted, write
+     * and take alike, and logged once for the space, and it keeps the longer lease, since a renewal never shortens.
+     */
+    @Test
+    void aShorteningRenewalIsCountedLoggedOnceAndKeepsTheLongerLease() {
+        List<java.util.logging.LogRecord> logged = new CopyOnWriteArrayList<>();
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(LocalSpace.class.getName());
+        java.util.logging.Handler capture = new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) { logged.add(record); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(capture);
+        try {
+            EntryHandle handle = space.write(new TaskEntry("gossip", 3), MINUTES_10);
+            handle.renew(Duration.ofMinutes(20));
+            assertThat(space.renewShortenings()).isZero();
+            handle.renew(Duration.ofMinutes(1));
+            handle.renew(Duration.ofSeconds(30));
+            assertThat(space.renewShortenings()).isEqualTo(2);
+            assertThat(logged).hasSize(1);
+            assertThat(logged.get(0).getMessage()).contains("space tasks", handle.entryId().value(), "write lease",
+                    "kept the longer lease");
+
+            TakenEntry<TaskEntry> taken = space.take(Template.of(TaskEntry.class), MINUTES_10, Duration.ZERO)
+                    .orElseThrow();
+            taken.renew(Duration.ofMinutes(1));
+            assertThat(space.renewShortenings()).isEqualTo(3);
+            assertThat(logged).as("still once for the space").hasSize(1);
+            clock.advance(Duration.ofMinutes(2));
+            assertThat(space.read(Template.of(TaskEntry.class))).as("the take kept its ten minutes, so the entry is "
+                    + "still held").isEmpty();
+            space.complete(taken);
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    /**
+     * RE-H-02's clamp on a local space, the same rule as a replicated one: a shorter extension keeps the longer lease,
+     * a longer one extends it, for the write lease, the take lease and a subscription.
+     */
+    @Test
+    void aRenewalSetsTheLaterOfTheCurrentExpiryAndNowPlusTheExtension() {
+        EntryHandle handle = space.write(new TaskEntry("clamp", 1), MINUTES_10);
+        clock.advance(Duration.ofMinutes(1));
+        handle.renew(Duration.ofMinutes(2)); // nine minutes were left; two would shorten it
+        clock.advance(Duration.ofMinutes(8));
+        assertThat(space.read(Template.of(TaskEntry.class))).as("still the ten-minute lease, at minute nine")
+                .isPresent();
+        handle.renew(Duration.ofMinutes(5)); // one minute left: five extends it
+        clock.advance(Duration.ofMinutes(4));
+        assertThat(space.read(Template.of(TaskEntry.class))).as("extended to minute fourteen").isPresent();
+        clock.advance(Duration.ofMinutes(2));
+        assertThat(space.read(Template.of(TaskEntry.class))).as("lapsed at minute fourteen").isEmpty();
+
+        space.write(new TaskEntry("held", 2), Lease.of(Duration.ofHours(1)));
+        TakenEntry<TaskEntry> taken = space.take(Template.of(TaskEntry.class), MINUTES_10, Duration.ZERO)
+                .orElseThrow();
+        taken.renew(Duration.ofSeconds(30));
+        clock.advance(Duration.ofMinutes(9));
+        assertThat(space.take(Template.of(TaskEntry.class), MINUTES_10, Duration.ZERO))
+                .as("the take kept its ten minutes").isEmpty();
+        taken.renew(Duration.ofMinutes(10));
+        clock.advance(Duration.ofMinutes(5));
+        space.complete(taken); // still held at minute fourteen: the longer renewal extended it
+
+        List<SpaceEvent<TaskEntry>> received = new CopyOnWriteArrayList<>();
+        Subscription subscription = space.notify(Template.of(TaskEntry.class), received::add, MINUTES_10);
+        subscription.renew(Duration.ofSeconds(1));
+        clock.advance(Duration.ofMinutes(9));
+        space.write(new TaskEntry("heard", 3), MINUTES_10);
+        assertThat(received).as("the subscription kept its ten minutes").hasSize(1);
+        subscription.close();
+    }
+
+    /**
+     * RE-H-02's preconditions on a local space: renewal needs the entry present (a cancelled or completed one is gone),
+     * unexpired, and renewed by its issuer; each refusal is the exception the API documents.
+     */
+    @Test
+    void aRenewalNeedsTheEntryPresentUnexpiredAndItsIssuer() {
+        EntryHandle cancelled = space.write(new TaskEntry("cancelled", 1), MINUTES_10);
+        cancelled.cancel();
+        assertThatThrownBy(() -> cancelled.renew(Duration.ofMinutes(5))).isInstanceOf(LeaseExpiredException.class);
+
+        EntryHandle completed = space.write(new TaskEntry("completed", 2), MINUTES_10);
+        space.complete(space.take(Template.of(TaskEntry.class).where("topic", eq("completed")), MINUTES_10,
+                Duration.ZERO).orElseThrow());
+        assertThatThrownBy(() -> completed.renew(Duration.ofMinutes(5))).isInstanceOf(LeaseExpiredException.class);
+
+        EntryHandle lapsed = space.write(new TaskEntry("lapsed", 3), Lease.of(Duration.ofMinutes(1)));
+        clock.advance(Duration.ofMinutes(2));
+        assertThatThrownBy(() -> lapsed.renew(Duration.ofMinutes(5))).isInstanceOf(LeaseExpiredException.class);
+
+        EntryHandle owned = space.write(new TaskEntry("owned", 4), MINUTES_10);
+        EntryHandle other = space.handleAs(owned.entryId(), Fixtures.agent("someone-else"));
+        assertThatThrownBy(() -> other.renew(Duration.ofMinutes(20))).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cannot act on");
+        owned.renew(Duration.ofMinutes(20)); // the issuer's own handle still renews
+    }
+
+    /**
+     * The lease a reader sees moves with a renewal (RESUME-RBE core item a): readAllEntries reported the lease the
+     * entry was written with after renew, because renew moved the expiry the sweep uses but not the record the views
+     * are built from. A shortening renewal leaves the reported lease where it was, as it leaves the lease.
+     */
+    @Test
+    void readAllEntriesReportsTheRenewedWriteLease() {
+        long writtenAt = clock.millis();
+        EntryHandle handle = space.write(new TaskEntry("renewed", 1), MINUTES_10);
+        assertThat(onlyEntry().lease().expiresAtMillis()).isEqualTo(writtenAt + MINUTES_10.duration().toMillis());
+
+        clock.advance(Duration.ofMinutes(1));
+        handle.renew(Duration.ofMinutes(30));
+        Space.Entry<TaskEntry> renewed = onlyEntry();
+        assertThat(renewed.lease().expiresAtMillis()).as("now plus the extension, not the written ten minutes")
+                .isEqualTo(clock.millis() + Duration.ofMinutes(30).toMillis());
+        assertThat(renewed.lease().kind()).isEqualTo(LeaseKind.WRITE);
+        assertThat(renewed.lease().holder()).isEqualTo(Fixtures.agent("coordinator"));
+
+        long expected = renewed.lease().expiresAtMillis();
+        handle.renew(Duration.ofMinutes(1));
+        assertThat(onlyEntry().lease().expiresAtMillis()).as("a shorter renewal changes nothing").isEqualTo(expected);
+
+        // Renewed while taken, the write lease shows once the take lapses and the entry reappears.
+        TakenEntry<TaskEntry> taken = space.take(Template.of(TaskEntry.class), Lease.of(Duration.ofMinutes(1)),
+                Duration.ZERO).orElseThrow();
+        assertThat(space.readAllEntries(Template.of(TaskEntry.class), 10)).isEmpty();
+        handle.renew(Duration.ofHours(2));
+        long renewedWhileTaken = clock.millis() + Duration.ofHours(2).toMillis();
+        clock.advance(Duration.ofMinutes(2));
+        assertThat(onlyEntry().lease().expiresAtMillis()).isEqualTo(renewedWhileTaken);
+        assertThat(onlyEntry().lease().kind()).isEqualTo(LeaseKind.WRITE);
+        assertThat(taken.entry().topic()).isEqualTo("renewed");
+    }
+
+    /**
+     * A take that lapses gives the write lease back to the entry's writer: the record names the writer as the
+     * holder, so an entry an agent view wrote keeps that agent as the holder, not the space's own identity.
+     */
+    @Test
+    void aLapsedTakeRestoresTheWritersLease() {
+        AgentId worker = new AgentId(Fixtures.agent("coordinator").peer(), "worker");
+        Space asWorker = space.as(new ai.badmonkey.agentspaces.api.spi.AgentIdentity() {
+            @Override public AgentId id() { return worker; }
+            @Override public byte[] publicKey() { return new byte[32]; }
+            @Override public byte[] sign(byte[] bytes) { throw new UnsupportedOperationException("unsigned space"); }
+            @Override public Optional<ai.badmonkey.agentspaces.api.security.AgentCertificate> certificate() {
+                return Optional.empty();
+            }
+        });
+        asWorker.write(new TaskEntry("worker's", 1), MINUTES_10);
+        assertThat(onlyEntry().lease().holder()).isEqualTo(worker);
+
+        space.take(Template.of(TaskEntry.class), Lease.of(Duration.ofMinutes(1)), Duration.ZERO).orElseThrow();
+        clock.advance(Duration.ofMinutes(2));
+        Space.Entry<TaskEntry> back = onlyEntry();
+        assertThat(back.lease().holder()).isEqualTo(worker);
+        assertThat(back.lease().kind()).isEqualTo(LeaseKind.WRITE);
+        assertThat(back.issuer()).isEqualTo(worker);
+    }
+
+    private Space.Entry<TaskEntry> onlyEntry() {
+        List<Space.Entry<TaskEntry>> entries = space.readAllEntries(Template.of(TaskEntry.class), 10);
+        assertThat(entries).hasSize(1);
+        return entries.get(0);
+    }
+
+    /** {@code agentspaces.space.renew-shortening-log=false}: the count runs and nothing is logged. */
+    @Test
+    void theShorteningLogCanBeTurnedOffAndTheCountStillRuns() {
+        List<java.util.logging.LogRecord> logged = new CopyOnWriteArrayList<>();
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(LocalSpace.class.getName());
+        java.util.logging.Handler capture = new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) { logged.add(record); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(capture);
+        try (LocalSpace quiet = LocalSpace.builder("quiet", Fixtures.agent("coordinator")).clock(clock)
+                .renewShorteningLog(false).build()) {
+            quiet.write(new TaskEntry("x", 1), MINUTES_10).renew(Duration.ofMinutes(1));
+            assertThat(quiet.renewShortenings()).isEqualTo(1);
+            assertThat(logged).isEmpty();
+        } finally {
+            logger.removeHandler(capture);
+        }
     }
 
     @Test

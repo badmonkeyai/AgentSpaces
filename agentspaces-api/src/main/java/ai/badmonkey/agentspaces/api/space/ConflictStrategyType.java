@@ -24,15 +24,23 @@ public enum ConflictStrategyType {
 
     /**
      * Default. Takers race claims and a gossip settle-window arbitrates
-     * deterministically by lowest {@code (hlc, peerId)}. At most one take completes
-     * per entry; transient duplicate work is possible during partitions. Suits
-     * idempotent tasks.
+     * deterministically by lowest {@code (hlc, peerId)}. One take wins an entry
+     * only while every claim reaches every rival claimant within the settle
+     * window (spec §7.4, the settle guarantee). A claim later than that can leave
+     * two holders that each did the work; a holder that hears of the better claim
+     * or of the completion before it completes yields, and the shared state always
+     * keeps one completion, but a duplicate completion and its result remain
+     * possible. Suits idempotent tasks; a one-winner outcome needs {@link #ORDERED}.
      */
     LEASE_RACE,
 
     /**
      * Cost-aware allocation: takes carry bids, a CBAA/CBBA-style auction converges
-     * to a conflict-free least-cost assignment in O(diameter) gossip rounds.
+     * to a conflict-free least-cost assignment in O(diameter) gossip rounds. The
+     * settle guarantee of {@link #LEASE_RACE} applies, with half the settle window
+     * as the bound for a better bid's counter-claim: the allocation is
+     * probabilistic, and a one-winner outcome needs {@link #ORDERED} or an
+     * idempotent completion.
      */
     AUCTION,
 

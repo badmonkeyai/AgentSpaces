@@ -66,6 +66,12 @@ public final class StoreHalf {
     /** The blob ref the table lives on. */
     public static final String REF = "table";
 
+    /*
+     * Each wait's ceiling means "broken", not a deadline; the report gives what each step took. On the loopback the
+     * fleet forms and the late reader joins in about 0.1 s on tcp and on dtls, and the 16 MiB fetch takes about 0.2 s
+     * on either (2026-11-15). The join used to take 50 to 100 s on dtls, when every send to the data agent that had
+     * left waited out a 10 s dial; a dial to a closed port now fails at once, as on tcp (DialSocket).
+     */
     private static final Duration CONVERGE = Duration.ofSeconds(90);
     private static final Duration FETCH = Duration.ofSeconds(240);
 
@@ -101,6 +107,17 @@ public final class StoreHalf {
 
     /** A store's receipt as the data agent read it. */
     public record Receipt(String store, boolean blind, long bytes) {
+    }
+
+    /**
+     * The late reader's join after the writer left: how long until every peer saw the others at feature level 2, and
+     * how its replicas filled. Every wait in the run has a ceiling that means "broken"; this is what the join took.
+     *
+     * @param millis    from the reader's start to the fleet's convergence
+     * @param pullResps the anti-entropy answers the reader received by the end of its fetch
+     * @param remainder the states those answers left out for a later answer, past the audit budget (RE-I-04)
+     */
+    public record Join(long millis, long pullResps, long remainder) {
     }
 
     /**
@@ -154,12 +171,13 @@ public final class StoreHalf {
      * @param treeNodes  the nodes of the table's tree, its outboard left out
      * @param treeBytes  their sealed bytes
      * @param receipts   the stores' receipts
+     * @param join       the late reader's join
      * @param cold       the late reader's fetch
      * @param challenges the late reader's challenges, store-a then store-b
      * @param restart    the restart and reconcile
      */
     public record Report(String binding, long blobBytes, String root, String identity, int treeNodes, long treeBytes,
-                         List<Receipt> receipts, Cold cold, List<Challenge> challenges, Restart restart) {
+                         List<Receipt> receipts, Join join, Cold cold, List<Challenge> challenges, Restart restart) {
 
         public String summary() {
             StringBuilder out = new StringBuilder();
@@ -168,6 +186,8 @@ public final class StoreHalf {
             for (Receipt r : receipts) {
                 out.append(String.format("  receipt from %s: %d bytes%s%n", r.store(), r.bytes(), r.blind() ? ", blind" : ""));
             }
+            out.append(String.format("  the late reader joined in %d ms, %d anti-entropy answers, %d states left for a later"
+                    + " answer%n", join.millis(), join.pullResps(), join.remainder()));
             out.append(String.format("  late reader after the writer left: %s in %d ms, %d round trips, by source %s, identity %s%n",
                     cold.complete() ? "complete" : "INCOMPLETE", cold.millis(), cold.roundTrips(), cold.bytesBySource(),
                     cold.identity().equals(identity) ? "equal" : "DIFFERS"));
@@ -206,20 +226,32 @@ public final class StoreHalf {
      * @throws Exception when a step fails
      */
     public static Report run(Path dir, String binding, IntSupplier ports, Sizes sizes, PrintStream out) throws Exception {
+        return run(dir, binding, ports, sizes, 0, out);
+    }
+
+    /**
+     * Runs the store half with every peer's anti-entropy answers cut to a budget (P28 of
+     * reviews/RBE-REGRESSION-MATRIX.md): the late reader's spaces then arrive in many answers.
+     *
+     * @param auditBudget the bytes one answer carries, 4,096 to 4,194,304, or 0 for the node's default
+     * @see #run(Path, String, IntSupplier, Sizes, PrintStream)
+     */
+    public static Report run(Path dir, String binding, IntSupplier ports, Sizes sizes, long auditBudget, PrintStream out)
+            throws Exception {
         GroupKey key = GroupKey.generate();
         int storeAPort = ports.getAsInt();
         String seed = binding.equals("tcp") ? "127.0.0.1:" + storeAPort : binding + "://127.0.0.1:" + storeAPort;
         PeerIdentity storeAIdentity = PeerIdentity.generate();
-        StoreGraphFleet.Spec storeASpec = spec(binding, storeAPort, List.of(), dir.resolve("store-a"), sizes)
+        StoreGraphFleet.Spec storeASpec = spec(binding, storeAPort, List.of(), dir.resolve("store-a"), sizes, auditBudget)
                 .identity(storeAIdentity).sealedNodes(key).store("store-a", policy(false));
         List<Peer> running = new ArrayList<>();
         try {
             Peer storeA = started(running, StoreGraphFleet.start("store-a", storeASpec));
             int storeBPort = ports.getAsInt();
             Peer storeB = started(running, StoreGraphFleet.start("store-b", spec(binding, storeBPort, List.of(seed),
-                    dir.resolve("store-b"), sizes).sealedNodes(null).store("store-b", policy(true))));
+                    dir.resolve("store-b"), sizes, auditBudget).sealedNodes(null).store("store-b", policy(true))));
             Peer agent = started(running, StoreGraphFleet.start("data-agent", spec(binding, ports.getAsInt(), List.of(seed),
-                    dir.resolve("data-agent"), sizes).sealedNodes(key)));
+                    dir.resolve("data-agent"), sizes, auditBudget).sealedNodes(key)));
             require(StoreGraphFleet.awaitFleet(List.of(storeA, storeB, agent), CONVERGE), "the vault group forms");
             require(StoreGraphFleet.await(CONVERGE, () -> storeCards(agent).size() == 2), "the data agent sees both store cards");
 
@@ -247,9 +279,12 @@ public final class StoreHalf {
             // the data agent leaves; a late reader with the key fetches from the stores alone
             agent.close();
             running.remove(agent);
+            long joining = System.nanoTime();
             Peer reader = started(running, StoreGraphFleet.start("reader", spec(binding, ports.getAsInt(), List.of(seed),
-                    dir.resolve("reader"), sizes).sealedNodes(key)));
+                    dir.resolve("reader"), sizes, auditBudget).sealedNodes(key)));
             require(StoreGraphFleet.awaitFleet(List.of(storeA, storeB, reader), CONVERGE), "the reader joins the stores");
+            long joinMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - joining);
+            out.printf("  the reader joined in %d ms%n", joinMillis);
             long started = System.nanoTime();
             TreeFetch fetch = reader.content().fetchTree(root, List.of(),
                     FetchOptions.defaults().withTimeout(FETCH).prefer(storeA.id(), storeB.id()));
@@ -263,6 +298,8 @@ public final class StoreHalf {
             });
             String readIdentity = complete ? PBlob.load(reader.store(), root).identity() : "";
             Cold cold = new Cold(complete, millis, fetch.progress().roundTrips(), bySource, readIdentity);
+            Join join = new Join(joinMillis, reader.runtime().gossip().pacingSignals().pullRespReceived(),
+                    reader.runtime().gossip().auditSignals().remainderReceived());
             out.printf("  the reader fetched the table in %d ms from %s%n", millis, bySource);
 
             // a challenge of each store, from a member that holds the table (P2-S-07)
@@ -294,7 +331,8 @@ public final class StoreHalf {
             Challenge after = Challenge.of("store-a", await(reader.pdt().challenge(root, storeA2.id())));
             Restart restart = new Restart(packs.size(), cut, lost, completeAfterRestart, reconciled.have(), reconciled.need(),
                     reconciled.repairing(), reconciled.rounds(), reconciled.bytes(), repaired, repairMillis, equal, after);
-            return new Report(binding, sizes.blobBytes(), root, identity, treeNodes, treeBytes, receipts, cold, challenges, restart);
+            return new Report(binding, sizes.blobBytes(), root, identity, treeNodes, treeBytes, receipts, join, cold, challenges,
+                    restart);
         } finally {
             for (Peer p : running) {
                 p.close();
@@ -302,9 +340,10 @@ public final class StoreHalf {
         }
     }
 
-    private static StoreGraphFleet.Spec spec(String binding, int port, List<String> seeds, Path dir, Sizes sizes) {
+    private static StoreGraphFleet.Spec spec(String binding, int port, List<String> seeds, Path dir, Sizes sizes,
+                                             long auditBudget) {
         return StoreGraphFleet.Spec.member(FOUNDING, port, seeds, dir).listeners(Map.of(binding, port))
-                .maxPackBytes(sizes.maxPackBytes());
+                .maxPackBytes(sizes.maxPackBytes()).auditBudget(auditBudget);
     }
 
     private static Peer started(List<Peer> running, Peer peer) {

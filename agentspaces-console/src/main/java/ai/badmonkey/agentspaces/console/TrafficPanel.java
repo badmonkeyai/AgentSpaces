@@ -229,6 +229,9 @@ public final class TrafficPanel implements ConsolePanel {
         }
         doc.put("treeFramesSent", tree);
         doc.put("rumorsSentByStream", new TreeMap<>(gossip.rumorsSentByStream()));
+        // srad/replication-by-entry.md RE-Q-MNT-02, RE-F-03: per space live and tombstone counts, trie depth, audit
+        // rounds and bytes, fetch re-queues; the members by form; the paces and the signals an adjuster reads.
+        doc.put("replication", runtime.replicationStatus().toMap());
         return doc;
     }
 

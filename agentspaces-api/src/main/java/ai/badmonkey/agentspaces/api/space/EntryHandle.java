@@ -29,10 +29,19 @@ public interface EntryHandle {
     EntryId entryId();
 
     /**
-     * Extends the write lease by the given duration from now.
+     * Extends the write lease to at least the given duration from now. It never shortens the lease: the new
+     * expiry is the later of the current one and now plus {@code extension} (SPEC §7.2), so renewing for less than
+     * the lease has left changes nothing. To end an entry sooner, {@link #cancel() cancel} it, and write it again
+     * for a shorter lease if it should stay.
      *
-     * @param extension how much longer the entry should live
-     * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the lease already lapsed
+     * <p>Only the entry's issuer renews it, and only while it is present and unexpired. Renewing for less than the
+     * lease has left is counted and logged once per space, so a caller that still relies on shortening shows up.
+     *
+     * @param extension how long from now the entry should live at least
+     * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the entry is gone (withdrawn, completed,
+     *         or never held here) or its lease already lapsed
+     * @throws IllegalStateException if the caller is not the entry's issuer, such as another agent of the same peer
+     *         acting on an agent-attested entry
      */
     void renew(Duration extension);
 

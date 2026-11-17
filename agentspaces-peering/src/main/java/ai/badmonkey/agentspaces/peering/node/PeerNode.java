@@ -186,6 +186,35 @@ public final class PeerNode implements AutoCloseable {
     /** Members whose advertisement carries {@link #RECORDLESS_HINT}. */
     private final Set<PeerId> recordlessPeers = ConcurrentHashMap.newKeySet();
     /**
+     * The hint a node advertises when it audits spaces by their fingerprinted tries and fetches by entry id (SPEC annex
+     * I.6, v0.1.35; srad/replication-by-entry.md RE-T-02): {@code wire.ae=2}, a value in the hints map, never a new
+     * card field. Toward a member whose current card carries it, a round opens with each space's trie hash and the
+     * DIGEST carries the audit's fields; toward any other the forms of v0.1.17 and before go out unchanged.
+     */
+    public static final String AE_HINT = "wire.ae";
+    /** The value of {@link #AE_HINT} this build implements; a later form would be a new value. */
+    public static final String AE_LEVEL = "2";
+    /** Members whose advertisement carries {@link #AE_HINT} at {@link #AE_LEVEL}. */
+    private final Set<PeerId> aePeers = ConcurrentHashMap.newKeySet();
+    /**
+     * The hint a node advertises when it collects a withdrawn entry by the entry's own lease (SPEC §7.3, v0.1.35;
+     * srad/replication-by-entry.md RE-H-04): {@code wire.horizon=1}, a value in the hints map, never a new card field.
+     * A space applies the per-entry horizon only while this node and every member of its view carry it, and only to a
+     * withdrawal whose writing node is this one or a hinted member that has been in the view longer than the space's
+     * longest lease plus five minutes; a writer out of sight keeps the legacy horizon there.
+     *
+     * <p>The hint is a promise about every writer behind the node: it renews by the rule of SPEC §7.2 (issuer only,
+     * present and unexpired, never shorter), and no identity it renews for renews the same entry from a second node at
+     * the same time. Two nodes renewing one identity can each hold a longer lease than the expiry the withdrawal
+     * carries, and that lease would come back past the shorter horizon (docs/proofs/per-entry-horizon.md, probe P40).
+     * A deployment that runs one identity on two nodes at once sets {@code agentspaces.space.horizon=legacy} on them.
+     */
+    public static final String HORIZON_HINT = "wire.horizon";
+    /** The value of {@link #HORIZON_HINT} this build implements. */
+    public static final String HORIZON_LEVEL = "1";
+    /** Members whose advertisement carries {@link #HORIZON_HINT} at {@link #HORIZON_LEVEL}. */
+    private final Set<PeerId> horizonPeers = ConcurrentHashMap.newKeySet();
+    /**
      * The hint a node advertises once every decoder it runs reads the v0.1.32 schemas of the AppCard and the
      * AgentCard ({@code wire.appcard=2}; SPEC §6.1a.2 and §9; AppCard origin and formats, 2026-11-09): canonical
      * decimal text, read as level N or above. An issuer writes a card's origin, formats, an {@code idp} host, and a
@@ -298,6 +327,24 @@ public final class PeerNode implements AutoCloseable {
     /** Members whose advertisement carries {@link #TREE_HINT}: the gossip bus pushes to them lazily. */
     private final Set<PeerId> treePeers = ConcurrentHashMap.newKeySet();
     private final boolean lazyPush;
+    /** How many streams a probe carries per-stream hashes for, in every group ({@code agentspaces.gossip.probe-hash-streams}). */
+    private final int probeHashStreams;
+    /** Whether this node advertises {@link #AE_HINT} and audits toward members that do. */
+    private final boolean audit;
+    /** Audit sessions this node keeps open per asker. */
+    private final int auditSessions;
+    /** The budget this node puts on its audit requests, in bytes. */
+    private final long auditBudget;
+    /** Whether a space on this node logs its first shortening renewal ({@code agentspaces.space.renew-shortening-log}). */
+    private final boolean renewShorteningLog;
+    /** Whether this node advertises {@link #HORIZON_HINT} ({@code agentspaces.space.horizon=per-entry}). */
+    private final boolean horizonPerEntry;
+    /**
+     * Whether every probe and acknowledgement carries the hashes, whatever this node's own pace. SPEC §5.2 makes them
+     * a MAY, and an older node or another implementation attaches them always; tests stand such a member in with
+     * this, so a mixed group can be checked (RE-P-03).
+     */
+    private volatile boolean probeHashesAlways;
     private static final int BATCH_MAX_FRAMES = 64;
     private static final int BATCH_MAX_BYTES = 48 * 1024;
 
@@ -333,6 +380,16 @@ public final class PeerNode implements AutoCloseable {
     /** Connections whose remote end presented a chain, for re-judging; weak, so closed ones drop away. */
     private final Set<TransportConnection> chained = java.util.Collections.synchronizedSet(
             java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>()));
+    /**
+     * Connections cut because of the chain they presented (a revoked leaf, or a leaf the CA
+     * revoked). A transport hands frames it read before the cut to the node after the cut, so
+     * onFrame drops whatever such a connection still delivers. Weak, so a cut connection drops
+     * away once its last queued frame is gone.
+     */
+    private final Set<TransportConnection> chainCut = java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>()));
+    /** Whether any link was ever cut for its chain: spares every other frame the set's lock. */
+    private volatile boolean anyChainCut;
     /**
      * Per group, the join credential hash and delegation hash each member was admitted under, kept
      * past a lapse and across restarts so a member admitted inside an invite window stays admissible
@@ -972,6 +1029,12 @@ public final class PeerNode implements AutoCloseable {
                 ? builder.peerAdTtl.dividedBy(2) : builder.peerAdInterval;
         this.coalesceWindow = builder.coalesceWindow;
         this.lazyPush = builder.lazyPush;
+        this.probeHashStreams = builder.probeHashStreams;
+        this.audit = builder.audit;
+        this.auditSessions = builder.auditSessions;
+        this.auditBudget = builder.auditBudget;
+        this.renewShorteningLog = builder.renewShorteningLog;
+        this.horizonPerEntry = builder.horizonPerEntry;
         if (lazyPush) {
             nodeHints.put(TREE_HINT, "1");
         }
@@ -981,6 +1044,12 @@ public final class PeerNode implements AutoCloseable {
         nodeHints.put(HASHES_HINT, "1");
         if (builder.recordless) {
             nodeHints.put(RECORDLESS_HINT, "1");
+        }
+        if (builder.audit) {
+            nodeHints.put(AE_HINT, AE_LEVEL);
+        }
+        if (builder.horizonPerEntry) {
+            nodeHints.put(HORIZON_HINT, HORIZON_LEVEL);
         }
         this.appCardLevel = builder.appCardLevel;
         if (appCardLevel > 1) {
@@ -1050,6 +1119,12 @@ public final class PeerNode implements AutoCloseable {
         private Duration peerAdTtl = Duration.ofMinutes(10);
         private Duration peerAdInterval = Duration.ofSeconds(30);
         private boolean lazyPush = true;
+        private int probeHashStreams = GossipBus.PROBE_DIGEST_STREAMS;
+        private boolean audit = true;
+        private int auditSessions = 4;
+        private long auditBudget = 1L << 20;
+        private boolean renewShorteningLog = true;
+        private boolean horizonPerEntry = true;
         private boolean recordless = true;
         private int appCardLevel = APPCARD_LEVEL;
         private Duration coalesceWindow;
@@ -1264,6 +1339,102 @@ public final class PeerNode implements AutoCloseable {
          */
         public Builder lazyPush(boolean enabled) {
             this.lazyPush = enabled;
+            return this;
+        }
+
+        /**
+         * How many streams a probe carries per-stream hashes for (RE-T-07 of srad/replication-by-entry.md,
+         * {@code agentspaces.gossip.probe-hash-streams}); a node holding more streams sends the root alone. The
+         * default, {@link GossipBus#PROBE_DIGEST_STREAMS}, sits above the twenty streams a hub member holding many spaces carries. Nothing new goes on the
+         * wire: the hashes map is the one every probe could carry since v0.1.17.
+         *
+         * @param streams the bound, from {@link GossipBus#PROBE_DIGEST_STREAMS_FLOOR} to
+         *                {@link GossipBus#PROBE_DIGEST_STREAMS_CEILING}
+         * @return this builder
+         * @throws IllegalArgumentException outside those bounds
+         */
+        public Builder probeHashStreams(int streams) {
+            if (streams < GossipBus.PROBE_DIGEST_STREAMS_FLOOR || streams > GossipBus.PROBE_DIGEST_STREAMS_CEILING) {
+                throw new IllegalArgumentException("probe-hash-streams must be from "
+                        + GossipBus.PROBE_DIGEST_STREAMS_FLOOR + " to " + GossipBus.PROBE_DIGEST_STREAMS_CEILING
+                        + ", not " + streams);
+            }
+            this.probeHashStreams = streams;
+            return this;
+        }
+
+        /**
+         * Whether this node audits spaces by their fingerprinted tries and fetches by entry id (SPEC annex I.6,
+         * {@code agentspaces.gossip.audit}): on by default, which advertises {@link #AE_HINT}. Off, the node advertises
+         * no such hint and reconciles every stream by the forms of v0.1.17 and before, as a 0.6.0 member does.
+         *
+         * @param enabled whether to audit
+         * @return this builder
+         */
+        public Builder audit(boolean enabled) {
+            this.audit = enabled;
+            return this;
+        }
+
+        /**
+         * How many audit sessions this node keeps open per asker (annex I.6, {@code agentspaces.gossip.audit-sessions}):
+         * 4 by default, the most annex I.6 allows. A stream whose root finds the asker's sessions at the bound waits a
+         * round.
+         *
+         * @param sessions from 1 to 4
+         * @return this builder
+         * @throws IllegalArgumentException outside those bounds
+         */
+        public Builder auditSessions(int sessions) {
+            if (sessions < 1 || sessions > 4) {
+                throw new IllegalArgumentException("audit-sessions must be from 1 to 4, not " + sessions);
+            }
+            this.auditSessions = sessions;
+            return this;
+        }
+
+        /**
+         * The budget this node puts on its audit requests ({@code agentspaces.gossip.audit-budget}): 1 MiB by default,
+         * annex I.6's default.
+         *
+         * @param bytes from 4 KiB to 4 MiB
+         * @return this builder
+         * @throws IllegalArgumentException outside those bounds
+         */
+        public Builder auditBudget(long bytes) {
+            if (bytes < (4L << 10) || bytes > (4L << 20)) {
+                throw new IllegalArgumentException("audit-budget must be from 4096 to 4194304 bytes, not " + bytes);
+            }
+            this.auditBudget = bytes;
+            return this;
+        }
+
+        /**
+         * Whether each space on this node logs, once, the first renewal that asks for less than its lease has left
+         * (RE-H-01, {@code agentspaces.space.renew-shortening-log}); on by default. Spaces count such renewals
+         * either way.
+         *
+         * @param log whether to log it
+         * @return this builder
+         */
+        public Builder renewShorteningLog(boolean log) {
+            this.renewShorteningLog = log;
+            return this;
+        }
+
+        /**
+         * Whether this node advertises {@link #HORIZON_HINT} and lets its spaces collect a withdrawn entry by the
+         * entry's own lease while every member of their view does too (SPEC §7.3, RE-H-04,
+         * {@code agentspaces.space.horizon}): on by default ({@code per-entry}). Off ({@code legacy}), the node
+         * advertises no such hint, so every group it is in keeps {@code 2 x maxLease} for withdrawals, as a 0.6.0
+         * member does. Set it off on a node that renews for an identity another node also renews for at the same
+         * time, since the hint promises one renewing node per identity ({@link #HORIZON_HINT}).
+         *
+         * @param perEntry whether to advertise the hint
+         * @return this builder
+         */
+        public Builder horizon(boolean perEntry) {
+            this.horizonPerEntry = perEntry;
             return this;
         }
 
@@ -1846,7 +2017,8 @@ public final class PeerNode implements AutoCloseable {
 
     /**
      * The wire hints this node advertises ({@code wire.batch}, {@code wire.tree},
-     * {@code wire.session}, {@code wire.hashes}, {@code wire.recordless}, {@code wire.appcard}), a copy.
+     * {@code wire.session}, {@code wire.hashes}, {@code wire.recordless}, {@code wire.appcard}, {@code wire.ae}, {@code wire.horizon}), a
+     * copy.
      *
      * @return the hints
      */
@@ -2530,6 +2702,9 @@ public final class PeerNode implements AutoCloseable {
         if ("1".equals(hint.parameters().get(RECORDLESS_HINT))) {
             recordlessPeers.add(peer);
         }
+        if (AE_LEVEL.equals(hint.parameters().get(AE_HINT))) {
+            aePeers.add(peer);
+        }
     }
 
     /**
@@ -2727,6 +2902,7 @@ public final class PeerNode implements AutoCloseable {
         // the bus times its asks for announced items by this node's clock (swarm retries, ROBUSTNESS.md §10.2)
         GossipBus gossip = new GossipBus(membership, sender, codec,
                 groupAd.gossip().fanout(), GossipBus.DEFAULT_HOPS, clock::millis, random);
+        gossip.probeDigestStreams(probeHashStreams);
         if (lazyPush) {
             gossip.lazyPush(treePeers::contains);
             gossip.directDelivery(PEER_AD_STREAM); // introduced directly and flooded: never a tree duplicate
@@ -2735,6 +2911,12 @@ public final class PeerNode implements AutoCloseable {
             gossip.alwaysEager(CREDENTIAL_REVOCATION_STREAM);
         }
         gossip.hashedDigests(hashPeers::contains);
+        if (audit) {
+            // The form toward each member is read from its current card at every round (RE-T-03, RE-Q-REL-09).
+            gossip.audit(aePeers::contains);
+            gossip.auditSessions(auditSessions);
+            gossip.auditBudget(auditBudget);
+        }
         RevocationRegistry revocations = new RevocationRegistry(groupAd,
                 revocationValidator, codec, clock,
                 ad -> onPeerRevoked(membership, ad));
@@ -2999,6 +3181,8 @@ public final class PeerNode implements AutoCloseable {
             sessionPeers.remove(peer);
             hashPeers.remove(peer);
             recordlessPeers.remove(peer);
+            aePeers.remove(peer);
+            horizonPeers.remove(peer);
             appCardLevels.remove(peer); // FR-6: a member counts at level 2 only on an advertisement held now
         }
         LOG.log(System.Logger.Level.INFO, "left group " + groupId.value() + ": " + held.size()
@@ -3021,13 +3205,27 @@ public final class PeerNode implements AutoCloseable {
             GossipBus gossip = runtime.gossip();
             publishSelfAd(runtime, gossip, nowMillis);
             boolean active = gossip.consumeActivity();
+            // The membership probe's quiet rule (SPEC §5.2) counts all gossip, held here or not, as it did before the
+            // honest backoff: a member forwarding a busy stream it does not hold keeps the failure detector at the
+            // base period, and only the anti-entropy period (below) reads the honest activity.
+            boolean traffic = gossip.consumeTraffic();
+            // The digest hashes a probe carries (v0.1.17) are taken here, before the membership monitor is held, and
+            // only when they will be read (IDLE-WORK item 7): a receiver reads them only while its own anti-entropy
+            // has backed off, which in a quiet group is when this node's has too. Busy, both run anti-entropy at the
+            // base period, the hashes would differ on every probe anyway, and taking them cost every stream's
+            // digest twice a second.
+            boolean probing = probeHashesAlways || !active && runtime.antiEntropyStretched();
+            // Two kinds of hashes, taken only when they will be read: a member on wire.ae=2 gets each space's trie
+            // hash and any other member the text digests' hashes, so each compares like with like (annex I.6).
+            ProbeDigests probeText = probing ? probeDigests(gossip, false) : ProbeDigests.NONE;
+            ProbeDigests probeTrie = probing && gossip.auditing() ? probeDigests(gossip, true) : ProbeDigests.NONE;
             runtime.membership().tick(new GroupMembership.Prober() {
                 @Override
                 public void ping(PeerId target, long nonce) {
-                    // The probe carries the anti-entropy digests and the recent items (v0.1.17).
-                    Map<String, byte[]> hashes = gossip.probeHashes();
+                    // The probe carries the anti-entropy digests, when taken above, and the recent items (v0.1.17).
+                    ProbeDigests probe = gossip.audits(target) ? probeTrie : probeText;
                     send(runtime.id(), target, Envelope.Kind.PING, new Bodies.Ping(nonce,
-                            hashes == null ? gossip.rootDigest() : null, hashes, gossip.piggyback(target)));
+                            probe.root(), probe.hashes(), gossip.piggyback(target)));
                 }
 
                 @Override
@@ -3035,7 +3233,7 @@ public final class PeerNode implements AutoCloseable {
                     send(runtime.id(), relay, Envelope.Kind.PING_REQ,
                             new Bodies.PingReq(target, nonce));
                 }
-            }, !active);
+            }, !traffic);
             // A member that left the view since the last tick (the failure detector dropped it, or
             // an eviction did) is outside the data plane: only its own introduction re-admits it,
             // and it sends one on the channel it dials next (see connectionTo), so the stale
@@ -3120,7 +3318,9 @@ public final class PeerNode implements AutoCloseable {
      */
     long refreshIntervalMillis(GroupRuntime runtime, int members) {
         GroupMembership.Config config = runtime.membership().config();
-        long probeCycle = (long) (members + 1) * config.probeInterval().toMillis() * (1L << GroupMembership.MAX_QUIET_STRETCH);
+        // the probe interval in effect (RE-F-03 moves it at run time), stretched as far as a quiet group may
+        long probeCycle = (long) (members + 1) * runtime.membership().probeIntervalMillis()
+                * (1L << GroupMembership.MAX_QUIET_STRETCH);
         long ttl = config.memberTtl().toMillis();
         if (probeCycle < ttl) {
             return peerAdInterval.toMillis();
@@ -3702,13 +3902,30 @@ public final class PeerNode implements AutoCloseable {
         if (pins != null) {
             pins.remove(signal.target());
             if (signal.failedHop() != null) {
-                pins.entrySet().removeIf(e -> e.getValue().path().contains(signal.failedHop()));
+                // What failed is the step from the signalling relay to the failed hop, not the
+                // hop itself: a relay that cannot reach a listening relay says nothing about a
+                // path that reaches that relay from elsewhere. Forgetting every pin through the
+                // hop dropped working paths whenever a one-hop frame to that relay was refused.
+                PeerId signaller = envelope.from();
+                pins.entrySet().removeIf(e -> crossesStep(e.getValue().path(), e.getKey(),
+                        signaller, signal.failedHop()));
             }
         }
         LOG.log(System.Logger.Level.DEBUG, "relay " + envelope.from().display() + " could not reach "
                 + signal.target().display() + " via " + (signal.failedHop() == null ? "?" : signal.failedHop().display())
                 + " in group " + runtime.id().value() + "; path forgotten");
         return true;
+    }
+
+    /** Whether a pinned path to a target steps straight from one node to another (the target being its last step). */
+    static boolean crossesStep(List<PeerId> path, PeerId target, PeerId from, PeerId to) {
+        for (int i = 0; i < path.size(); i++) {
+            if (path.get(i).equals(from)) {
+                PeerId next = i + 1 < path.size() ? path.get(i + 1) : target;
+                return next.equals(to);
+            }
+        }
+        return false;
     }
 
     /** Tells the origin of a dropped path frame which hop failed, at most once per 10 s per pair (LB-R-07). */
@@ -3805,22 +4022,40 @@ public final class PeerNode implements AutoCloseable {
 
     // ---------------------------------------------------------------- internals
 
-    private void attach(TransportConnection connection) {
-        connection.onReceive(frame -> onFrame(connection, frame));
+    /**
+     * Wires a new connection to this node. A presented chain is judged before the reader starts:
+     * the far end writes its first frames the moment its handshake ends, so a reader started
+     * first can take a frame off a link presenting a revoked leaf in the instant before the
+     * cut. Such a link is closed without ever being read.
+     *
+     * @return false when the link was cut for its chain
+     */
+    private boolean attach(TransportConnection connection) {
         connection.onClose(() -> onConnectionClosed(connection));
         java.security.cert.X509Certificate[] chain = connection.remoteChain();
-        if (chain.length == 0) {
-            return;
+        if (chain.length > 0) {
+            chained.add(connection); // before the checks, so a revocation landing meanwhile still finds it
+            if (leafRevokedInAnyGroup(chain[0])) {
+                cutForChain(connection);
+                return false;
+            }
+            if (channelTrust != null) {
+                judgeChannel(connection, channelTrust.get());
+                if (chainCut.contains(connection)) {
+                    return false;
+                }
+            }
         }
-        chained.add(connection);
-        if (leafRevokedInAnyGroup(chain[0])) {
-            chained.remove(connection);
-            connection.close();
-            return;
-        }
-        if (channelTrust != null) {
-            judgeChannel(connection, channelTrust.get());
-        }
+        connection.onReceive(frame -> onFrame(connection, frame));
+        return true;
+    }
+
+    /** Cuts a link for the chain it presented; anything it read before the cut is dropped in onFrame. */
+    private void cutForChain(TransportConnection connection) {
+        anyChainCut = true;
+        chainCut.add(connection);
+        chained.remove(connection);
+        connection.close();
     }
 
     /** Whether a founder's {@code X509_LEAF} revocation names this leaf in any joined group (v0.1.13). */
@@ -3848,8 +4083,7 @@ public final class PeerNode implements AutoCloseable {
         for (TransportConnection connection : live) {
             java.security.cert.X509Certificate[] chain = connection.remoteChain();
             if (chain.length > 0 && leafRevokedInAnyGroup(chain[0])) {
-                chained.remove(connection);
-                connection.close();
+                cutForChain(connection);
             }
         }
     }
@@ -3868,8 +4102,7 @@ public final class PeerNode implements AutoCloseable {
                 || !revoked.authorizesPeerRevocation()) {
             return;
         }
-        chained.remove(connection);
-        connection.close();
+        cutForChain(connection);
         if (!caRevoked.add(revoked.peer())) {
             return; // already rooted here: one per peer per node
         }
@@ -3919,6 +4152,11 @@ public final class PeerNode implements AutoCloseable {
 
     private void onFrame(TransportConnection connection, byte[] frame) {
         bytesReceived.addAndGet(frame.length);
+        if (anyChainCut && chainCut.contains(connection)) {
+            // Read before the link was cut for its chain, delivered after: the revocation wins.
+            framesDropped.incrementAndGet();
+            return;
+        }
         Session session = sessions.get(connection);
         Optional<WireCodec.Decoded> decoded = wire.decodeDetailed(frame, connection.attestedPeer(),
                 session == null ? null : session.established());
@@ -4036,9 +4274,18 @@ public final class PeerNode implements AutoCloseable {
                 Bodies.Ping ping = codec.fromWire(envelope.body(), Bodies.Ping.class);
                 onProbePiggyback(runtime, envelope.from(), ping.root(), ping.hashes(), ping.have());
                 GossipBus gossip = runtime.gossip();
-                Map<String, byte[]> hashes = gossip.probeHashes();
+                // As on the PING: the hashes only while they will be read (IDLE-WORK item 7). That is while this
+                // node's anti-entropy has backed off, and also whenever the PING itself carried hashes: a pinger sends
+                // them only while its own anti-entropy has backed off, so it will read the ACK's. Without the second
+                // case a busy member never answers a quiet one with hashes (the quiet member stretched because the
+                // busy stream is not one it holds), and the quiet member's repair of a shared stream it missed waits
+                // for its own stretched round instead of the next probe. An older node sends hashes on every PING,
+                // so toward it the ACK carries them as before.
+                boolean asked = ping.root() != null || ping.hashes() != null;
+                ProbeDigests probe = asked || probeHashesAlways || runtime.antiEntropyStretched()
+                        ? probeDigests(gossip, gossip.audits(envelope.from())) : ProbeDigests.NONE;
                 send(runtime.id(), envelope.from(), Envelope.Kind.ACK, new Bodies.Ack(ping.nonce(), null,
-                        hashes == null ? gossip.rootDigest() : null, hashes, gossip.piggyback(envelope.from())));
+                        probe.root(), probe.hashes(), gossip.piggyback(envelope.from())));
             }
             case PING_REQ -> {
                 Bodies.PingReq req = codec.fromWire(envelope.body(), Bodies.PingReq.class);
@@ -4067,10 +4314,18 @@ public final class PeerNode implements AutoCloseable {
             }
             case RUMOR -> runtime.gossip().onRumor(envelope.from(),
                     codec.fromWire(envelope.body(), Bodies.Rumor.class));
-            case DIGEST -> runtime.gossip().onDigest(envelope.from(),
-                    codec.fromWire(envelope.body(), Bodies.Digest.class));
-            case PULL_RESP -> runtime.gossip().onPullResp(envelope.from(),
-                    codec.fromWire(envelope.body(), Bodies.PullResp.class));
+            case DIGEST -> {
+                Bodies.Digest digest = decodeAntiEntropy(runtime, envelope, Bodies.Digest.class);
+                if (digest != null) {
+                    runtime.gossip().onDigest(envelope.from(), digest);
+                }
+            }
+            case PULL_RESP -> {
+                Bodies.PullResp resp = decodeAntiEntropy(runtime, envelope, Bodies.PullResp.class);
+                if (resp != null) {
+                    runtime.gossip().onPullResp(envelope.from(), resp);
+                }
+            }
             case HAVE -> runtime.gossip().onHave(envelope.from(),
                     codec.fromWire(envelope.body(), Bodies.Have.class));
             case GRAFT -> runtime.gossip().onGraft(envelope.from(),
@@ -4757,6 +5012,67 @@ public final class PeerNode implements AutoCloseable {
                 shared, new byte[0], info.toByteArray(), WireCodec.SESSION_MAC_LENGTH);
     }
 
+    /** Whether a space on this node logs its first shortening renewal ({@link Builder#renewShorteningLog}). */
+    boolean renewShorteningLog() {
+        return renewShorteningLog;
+    }
+
+    /** Whether this node advertises {@link #HORIZON_HINT} ({@link Builder#horizon}). */
+    public boolean horizonPerEntry() {
+        return horizonPerEntry;
+    }
+
+    /**
+     * Whether a member's current advertisement carries {@link #HORIZON_HINT} at {@link #HORIZON_LEVEL}. A member
+     * whose advertisement this node has not received does not, so a newcomer counts as unhinted until its card
+     * arrives.
+     *
+     * @param peer the member
+     * @return true when the member advertises the per-entry horizon
+     */
+    public boolean advertisesHorizon(PeerId peer) {
+        return peer != null && horizonPeers.contains(peer);
+    }
+
+    /** Makes every probe of this node carry the hashes, as an always-attaching member does (tests of RE-P-03). */
+    void probeHashesAlways(boolean always) { // package-private for tests
+        this.probeHashesAlways = always;
+    }
+
+    /**
+     * The digest hashes a probe or its acknowledgement carries (SPEC §5.2, v0.1.17): one per stream, or the root
+     * over them above the bus's {@link GossipBus#probeDigestStreams()} streams; both null when the probe carries
+     * none, which every receiver reads as no information.
+     */
+    private record ProbeDigests(byte[] root, Map<String, byte[]> hashes) {
+        static final ProbeDigests NONE = new ProbeDigests(null, null);
+    }
+
+    /**
+     * The probe's hashes of one kind (annex I.6): toward a member on {@code wire.ae=2} each space's trie hash and the
+     * root over those, toward any other the text digests' hashes and their root.
+     */
+    private static ProbeDigests probeDigests(GossipBus gossip, boolean trie) {
+        Map<String, byte[]> hashes = gossip.probeHashes(trie);
+        return new ProbeDigests(hashes == null ? gossip.rootDigest(trie) : null, hashes);
+    }
+
+    /**
+     * Decodes an anti-entropy body (RE-T-08, RE-Q-REL-07): one that does not decode is dropped, counted under the
+     * bus's {@code undecodable} key and logged once per member, with no strike. The usual cause is a stale card, a
+     * sender that read a hint this node no longer carries, which is nobody's misbehaviour; the sender reads the card
+     * again before its next round and falls back to the form the card names. Not in {@link #framesDropped()}, which
+     * counts the frames that name no verified sender.
+     */
+    private <T> T decodeAntiEntropy(GroupRuntime runtime, Envelope envelope, Class<T> type) {
+        try {
+            return codec.fromWire(envelope.body(), type);
+        } catch (RuntimeException e) {
+            runtime.gossip().undecodable(envelope.from(), envelope.kind().name());
+            return null;
+        }
+    }
+
     /**
      * Handles what a member's probe carried (v0.1.17): its recently forwarded items go to the
      * lazy-push machinery as an announcement, and a digest that differs from this node's on a
@@ -4773,7 +5089,8 @@ public final class PeerNode implements AutoCloseable {
         if (!runtime.antiEntropyStretched()) {
             return; // the periodic round is on its base period and reconciles what moves
         }
-        boolean mismatch = hashes != null ? gossip.differs(hashes) : gossip.differs(root);
+        boolean trie = gossip.audits(from); // the kind the member used toward this node
+        boolean mismatch = hashes != null ? gossip.differs(hashes, trie) : gossip.differs(root, trie);
         if (!mismatch) {
             return;
         }
@@ -4784,7 +5101,7 @@ public final class PeerNode implements AutoCloseable {
             return;
         }
         probePulls.put(from, now);
-        gossip.antiEntropyWith(from);
+        gossip.antiEntropyFromProbe(from, hashes == null);
     }
 
     private void onRelayFrame(GroupRuntime runtime, Envelope envelope) {
@@ -4980,7 +5297,10 @@ public final class PeerNode implements AutoCloseable {
                                              PeerAdvertisement.Endpoint endpoint) throws IOException {
         TransportConnection dialed = transport.dial(endpoint.address(), to);
         connectionSchemes.put(dialed, transport.scheme());
-        attach(dialed);
+        if (!attach(dialed)) {
+            // The far end presented a revoked chain: never cache the cut link as this peer's channel.
+            throw new IOException("the channel certificate " + to.display() + " presented is revoked");
+        }
         TransportConnection raced = connections.putIfAbsent(to, dialed);
         if (raced != null) {
             dialed.close();
@@ -5183,6 +5503,20 @@ public final class PeerNode implements AutoCloseable {
             recordlessPeers.add(ad.issuer());
         } else {
             recordlessPeers.remove(ad.issuer());
+        }
+        // RE-T-03: the form toward a member follows its current card alone, so a card that drops the hint moves the
+        // member back to the hashed or text form at the next round, and nothing else moves it (RE-Q-REL-09).
+        if (AE_LEVEL.equals(ad.resourceHints().get(AE_HINT))) {
+            aePeers.add(ad.issuer());
+        } else {
+            aePeers.remove(ad.issuer());
+        }
+        // RE-H-04: the per-entry horizon follows the current card alone, so a card that drops the hint disengages
+        // every space whose view holds its member at the next read, and a beacon hint never engages it.
+        if (HORIZON_LEVEL.equals(ad.resourceHints().get(HORIZON_HINT))) {
+            horizonPeers.add(ad.issuer());
+        } else {
+            horizonPeers.remove(ad.issuer());
         }
         int level = appCardLevelOf(ad.resourceHints().get(APPCARD_HINT));
         if (level > 1) {

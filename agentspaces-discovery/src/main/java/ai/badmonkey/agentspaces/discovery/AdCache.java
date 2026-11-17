@@ -109,6 +109,8 @@ public final class AdCache {
     private static final java.time.Duration MAX_TTL = java.time.Duration.ofDays(30);
 
     private final Map<String, CacheEntry> byId = new ConcurrentHashMap<>();
+    /** Bumped on every admission, replacement and removal, so a reader can tell cheaply whether the cache changed. */
+    private final java.util.concurrent.atomic.AtomicLong generation = new java.util.concurrent.atomic.AtomicLong();
     private static final ai.badmonkey.agentspaces.identity.AgentCertificates CERTIFICATES =
             new ai.badmonkey.agentspaces.identity.AgentCertificates();
     private volatile Predicate<PeerId> refusedIssuers = issuer -> false;
@@ -318,9 +320,11 @@ public final class AdCache {
         if (existing == null) {
             byId.put(id, candidate);
             bytes += length;
+            generation.incrementAndGet();
         } else if (candidate.advertisement().issued().isAfter(existing.advertisement().issued())) {
             byId.put(id, candidate);
             bytes += length - existing.stored().adBytes().length;
+            generation.incrementAndGet();
         }
         return true;
     }
@@ -448,7 +452,37 @@ public final class AdCache {
                 removed++;
             }
         }
+        if (removed > 0) {
+            generation.incrementAndGet();
+        }
         return removed;
+    }
+
+    /**
+     * A counter that moves on every admission, replacement and removal (including expiry sweeps): a reader that
+     * remembers the last value it saw can skip recomputing anything when the cache has not changed.
+     *
+     * @return the generation
+     */
+    public long generation() {
+        return generation.get();
+    }
+
+    /**
+     * The earliest moment a cached advertisement expires, so a reader knows when the cache will next change by
+     * itself; empty when the cache is empty.
+     *
+     * @return the next expiry
+     */
+    public java.util.Optional<java.time.Instant> nextExpiry() {
+        java.time.Instant next = null;
+        for (CacheEntry entry : byId.values()) {
+            java.time.Instant expiry = entry.advertisement().issued().plus(entry.advertisement().ttl());
+            if (next == null || expiry.isBefore(next)) {
+                next = expiry;
+            }
+        }
+        return java.util.Optional.ofNullable(next);
     }
 
     private static String typeTag(Advertisement ad) {

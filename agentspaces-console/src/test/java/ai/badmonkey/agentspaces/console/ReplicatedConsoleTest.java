@@ -140,4 +140,73 @@ class ReplicatedConsoleTest {
                     .hasSize(1);
         }
     }
+
+    /**
+     * RBE regression matrix probe P14 (srad/replication-by-entry.md phase 1, RE-M-08): a console that joins after the
+     * fleet worked learns the space in one {@code PULL_RESP} and counts from that batch's events. Work completed before
+     * it joined arrives completed, so the console hears COMPLETED for it and never WRITTEN; it must still count that
+     * work as written, or {@code written - completed - queued} comes out short and the work in progress reads zero.
+     * After the batch, live events count on as before.
+     */
+    @Test
+    void aLateConsoleCountsTheWorkABatchBrings() throws Exception {
+        Peer coordinator = newPeer("coordinator", 1);
+        Peer worker = newPeer("worker", 2, "coordinator");
+        tickAll(4);
+        for (int i = 1; i <= 5; i++) {
+            coordinator.space().write(new TaskEntry("job-" + i, i), MINUTES_30);
+        }
+        tickAll(4);
+        Lease takeLease = Lease.of(Duration.ofMinutes(5));
+        for (int i = 0; i < 2; i++) {
+            TakenEntry<TaskEntry> taken = worker.space().take(Template.of(TaskEntry.class), takeLease, Duration.ZERO)
+                    .orElseThrow();
+            worker.space().complete(taken, new FindingEntry(taken.entry().topic(), "by worker"), MINUTES_30);
+        }
+        TakenEntry<TaskEntry> held = worker.space().take(Template.of(TaskEntry.class), takeLease, Duration.ZERO)
+                .orElseThrow();
+        tickAll(4);
+        int total = coordinator.space().knownEntries();
+        assertThat(worker.space().knownEntries()).isEqualTo(total);
+
+        // Joins after the work: no lazy-push announcement covers it, so one anti-entropy PULL_RESP brings it all.
+        Peer console = newPeer("console", 3, "coordinator");
+        List<Integer> knownAtEvent = new java.util.concurrent.CopyOnWriteArrayList<>();
+        console.space().notify(Template.of(TaskEntry.class),
+                event -> knownAtEvent.add(console.space().knownEntries()), MINUTES_30);
+        try (ConsoleView view = ConsoleView.builder()
+                .space("tasks", console.space(), TaskEntry.class)
+                .results("tasks", FindingEntry.class, entry -> {
+                    FindingEntry finding = (FindingEntry) entry;
+                    return finding.summary().startsWith("by ") ? finding.summary().substring(3) : "";
+                })
+                .clock(clock)
+                .build()) {
+            assertThat(console.space().knownEntries()).as("watching before anything arrived").isZero();
+            for (int i = 0; i < 20 && console.space().knownEntries() < total; i++) {
+                tickAll(1);
+            }
+            assertThat(console.space().knownEntries()).isEqualTo(total);
+            assertThat(knownAtEvent).as("one batch: every event fired after the whole space was in")
+                    .isNotEmpty().allSatisfy(known -> assertThat(known).isEqualTo(total));
+
+            ConsoleView.SpaceStats stats = view.spaces().get(0);
+            assertThat(stats.written()).as("every task the fleet wrote, the completed ones included").isEqualTo(5);
+            assertThat(stats.completed()).isEqualTo(2);
+            assertThat(stats.queued()).isEqualTo(2);
+            assertThat(stats.inProgress()).as("the one task a take lease holds").isEqualTo(1);
+            assertThat(view.perWorker()).containsEntry("worker", 2);
+
+            // After the batch the live events count on.
+            worker.space().complete(held, new FindingEntry(held.entry().topic(), "by worker"), MINUTES_30);
+            coordinator.space().write(new TaskEntry("job-6", 6), MINUTES_30);
+            tickAll(6);
+            stats = view.spaces().get(0);
+            assertThat(stats.written()).isEqualTo(6);
+            assertThat(stats.completed()).isEqualTo(3);
+            assertThat(stats.queued()).isEqualTo(3);
+            assertThat(stats.inProgress()).isZero();
+            assertThat(view.perWorker()).containsEntry("worker", 3);
+        }
+    }
 }

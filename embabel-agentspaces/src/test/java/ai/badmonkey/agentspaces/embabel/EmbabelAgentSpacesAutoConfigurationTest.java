@@ -113,6 +113,7 @@ class EmbabelAgentSpacesAutoConfigurationTest {
 
     @AfterEach
     void tearDown() {
+        ai.badmonkey.agentspaces.agent.AgentBinder.unregisterDeclarationReader(EmbabelDeclarationReader.class);
         spaces.close();
         work.close();
         node.close();
@@ -132,14 +133,19 @@ class EmbabelAgentSpacesAutoConfigurationTest {
         EmbabelAgentSpacesAutoConfiguration.EmbabelBindingPostProcessor processor =
                 autoConfig.embabelBindingPostProcessor(fleetProperties(), spaces, identity);
         PlainBean plain = new PlainBean();
+        assertThat(processor.postProcessBeforeInitialization(plain, "plain")).isSameAs(plain);
         assertThat(processor.postProcessAfterInitialization(plain, "plain")).isSameAs(plain);
         EmbabelPlanner planner = new EmbabelPlanner();
         assertThat(processor.postProcessAfterInitialization(planner, "planner")).isSameAs(planner);
+        // Review §7.2: the post-processor registers the reader; the core binder makes the one card.
+        assertThat(discovery.find(AgentCard.class, card -> true)).isEmpty();
+        spaces.bind(planner);
 
         List<AgentCard> cards = discovery.find(AgentCard.class, card -> true);
         assertThat(cards).hasSize(1);
         assertThat(cards.get(0).agent().localName()).isEqualTo("planner");
         assertThat(cards.get(0).produces()).containsExactly(Task.class.getName() + "#v1");
+        assertThat(cards.get(0).costHints()).containsEntry("framework", "embabel");
     }
 
     /** SPEC §10.6: the bridge is enabled by default and switched off by agentspaces.embabel.remote-actions-enabled. */
@@ -277,9 +283,18 @@ class EmbabelAgentSpacesAutoConfigurationTest {
         assertThatThrownBy(() -> action.invoke(agent, new Task("unserved", 1)))
                 .isInstanceOf(InvocationTargetException.class)
                 .cause()
-                .isInstanceOf(IllegalStateException.class)
+                .isInstanceOf(RemoteActionTimeoutException.class)
                 .hasMessageContaining("PT0.3S");
+        // Review §7.5: the unanswered input is withdrawn by default, leaving nothing in the space.
         assertThat(work.readAll(Template.of(Task.class), 10)).extracting(Task::topic)
-                .contains("unserved");
+                .doesNotContain("unserved");
+
+        properties.getEmbabel().setOnTimeout("leave");
+        EmbabelRemoteActions leaving = autoConfig.embabelRemoteActions(properties, spaces, identity);
+        Object leaver = leaving.agentInstance().orElseThrow();
+        Method leaveAction = leaver.getClass().getMethod("researcher_Task", Task.class);
+        assertThatThrownBy(() -> leaveAction.invoke(leaver, new Task("left", 1)))
+                .isInstanceOf(InvocationTargetException.class);
+        assertThat(work.readAll(Template.of(Task.class), 10)).extracting(Task::topic).contains("left");
     }
 }

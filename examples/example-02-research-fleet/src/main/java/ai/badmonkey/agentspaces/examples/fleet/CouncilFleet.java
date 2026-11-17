@@ -192,6 +192,17 @@ public final class CouncilFleet {
         await(timeout, () -> council.runtime().membership().allMembers().stream()
                 .filter(m -> !m.id().equals(council.node().peerId())).count() >= workers);
         System.out.println("coordinator: " + workers + " workers in view");
+        // Every worker's agent card before the proposal. A ballot binding hears the proposals
+        // written after it binds (SPEC §6, it subscribes to Proposal writes), and a worker binds
+        // only after it has joined, so a proposal written as soon as the worker is in view can
+        // fold there before its ballot watch exists, and is never voted on. Each binder (Java,
+        // Python, TypeScript, Ruby) registers its watches before it publishes the card, so the
+        // card here means the ballot is listening. The Python and Ruby workers used to be
+        // rescued by their pulls, which offered an empty digest every half second and so
+        // folded every state again; their budgeted pulls (annex I.6) send only what the
+        // replica lacks (R2, 2026-11-16).
+        await(timeout, () -> workerCards(council) >= workers);
+        System.out.println("coordinator: " + workerCards(council) + " worker cards");
         for (int i = 1; i <= taskCount; i++) {
             council.tasks().write(new ResearchTask("council-topic-" + i, i), Lease.of(Duration.ofMinutes(30)));
         }
@@ -202,9 +213,16 @@ public final class CouncilFleet {
         System.out.println("coordinator: " + taskCount + " tasks, proposal " + PROPOSAL
                 + " (quorum " + (workers + 1) + "), epoch " + EPOCH + " = " + localValue);
 
-        await(timeout, () -> findings(council).size() >= taskCount);
+        // Every topic found, counted by topic: under LEASE_RACE two workers can both take and
+        // complete one task when their claims reach each other only after the settle window
+        // (SPEC §7.4, the settle guarantee), so a count of findings can reach the task count
+        // with some topics twice and others still in flight. Research is idempotent, so a
+        // second finding for a topic is accepted and reported, never counted as another task.
+        await(timeout, () -> topics(findings(council)).size() >= taskCount);
         List<Finding> findings = findings(council);
         findings.forEach(f -> System.out.println("finding: " + f.topic() + " by " + f.worker()));
+        System.out.println("coordinator: " + findings.size() + " findings for " + topics(findings).size()
+                + " topics; duplicate completions counted here: " + council.tasks().duplicateCompletions());
 
         await(timeout, () -> council.vote().decision(PROPOSAL).isPresent());
         Optional<VoteCapability.Decision> decision = council.vote().decision(PROPOSAL);
@@ -249,6 +267,19 @@ public final class CouncilFleet {
 
     private static List<Finding> findings(Council council) {
         return council.tasks().readAll(Template.of(Finding.class), 100);
+    }
+
+    /** The distinct topics among the findings: one task may be found twice under LEASE_RACE. */
+    public static java.util.Set<String> topics(List<Finding> findings) {
+        java.util.Set<String> topics = new java.util.TreeSet<>();
+        findings.forEach(f -> topics.add(f.topic()));
+        return topics;
+    }
+
+    /** How many other peers have published an agent card here: one per bound worker. */
+    private static long workerCards(Council council) {
+        return council.discovery().find(AgentCard.class, card -> !card.issuer().equals(council.identity().peerId()))
+                .stream().map(AgentCard::issuer).distinct().count();
     }
 
     private static void await(Duration timeout, BooleanSupplier condition) throws InterruptedException {

@@ -94,7 +94,8 @@ class EmbabelFleetPlanningTest {
     }
 
     /** The echo that worker produces, carrying the Embabel process id it ran under. */
-    public record Echoed(String text, String processId, boolean takeContextSeen) {
+    public record Echoed(String text, String processId, boolean takeContextSeen, String processClass,
+                         String thread) {
     }
 
     /**
@@ -109,7 +110,8 @@ class EmbabelFleetPlanningTest {
         @SpaceTake(space = "work", pollTimeout = "PT0.2S", lease = "PT20S")
         public Echoed echo(Ping ping, com.embabel.agent.api.common.OperationContext context) {
             return new Echoed(ping.text(), context.getAgentProcess().getId(),
-                    ai.badmonkey.agentspaces.agent.TakeContext.current().isPresent());
+                    ai.badmonkey.agentspaces.agent.TakeContext.current().isPresent(),
+                    context.getAgentProcess().getClass().getSimpleName(), Thread.currentThread().getName());
         }
     }
 
@@ -235,6 +237,8 @@ class EmbabelFleetPlanningTest {
             assertThat(echoed).as("the platform-served worker answered").hasSize(1);
             assertThat(echoed.get(0).text()).isEqualTo("hello");
             assertThat(echoed.get(0).processId()).isNotBlank();
+            // Under Embabel's default SIMPLE process type the action runs on the invoker's thread (review §10.5).
+            assertThat(echoed.get(0).processClass()).isEqualTo("SimpleAgentProcess");
             // The take context rides the thread Embabel runs the action on, so renewal and the agent identity of
             // nested writes are available inside a served action (review §10.2, S6).
             assertThat(echoed.get(0).takeContextSeen()).isTrue();

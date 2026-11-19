@@ -186,8 +186,10 @@ public final class RemoteAction {
 
     /**
      * Invokes the action, saying what to do with the input when no result arrives in time (review §7.5):
-     * {@link OnTimeout#WITHDRAW} cancels the written entry, which the space refuses while a worker holds it
-     * under a live take claim, so a withdrawal never robs a worker mid-task.
+     * {@link OnTimeout#WITHDRAW} cancels the written entry only while this replica still offers it: an entry a
+     * worker holds under a take claim this replica knows is left to the worker. The space itself does not refuse
+     * the cancel (an issuer's cancel wins over a take), so a claim still in flight to this replica is robbed:
+     * the worker's complete fails and the work is not done twice ({@code RemoteActionWithdrawTest}).
      *
      * @param input     the input entry
      * @param timeout   how long to wait

@@ -114,6 +114,19 @@ public final class NodeCollector {
     private int cycleTicks;
     private int cycleRemoved;
     private long cycleBytesFreed;
+    /** Every root this cycle's mark started from. */
+    private Set<String> cycleRoots = new HashSet<>();
+    /** The roots the last completed cycle marked from, or null before one completed. */
+    private Set<String> lastCycleRoots;
+    /** How many nodes the store held when the last cycle completed. */
+    private int heldAfterLastCycle = -1;
+    /** Checks that found no cycle due since the last cycle began. */
+    private int skippedSinceCycle;
+    /** Cycles {@link #due()} found nothing for. */
+    private long cyclesSkipped;
+
+    /** After this many skipped checks a cycle runs anyway: a backstop for a change the cheap check cannot see. */
+    public static final int FORCE_CYCLE_AFTER_SKIPS = 30;
 
     /**
      * A collector with the default budget.
@@ -168,6 +181,31 @@ public final class NodeCollector {
     }
 
     /**
+     * Whether a new cycle could remove anything (idle-loop O3, reviews/IDLE-LOOP-2026-11-18.md). A node becomes garbage
+     * only when a root the last cycle marked from stops being a root, or a node is stored after that cycle's candidates
+     * were taken; the last cycle removed everything else it could. So a cycle is due when the store holds a different
+     * count of nodes than that cycle left, when one of its mark roots is no longer a root, or after
+     * {@link #FORCE_CYCLE_AFTER_SKIPS} checks found nothing. Skipping is always safe: it removes nothing, so a missed
+     * change only keeps garbage until the next cycle. A collector in a cycle is always due, to finish it.
+     *
+     * @return whether to start (or continue) a cycle now
+     */
+    public synchronized boolean due() {
+        if (phase != Phase.IDLE || lastCycleRoots == null || skippedSinceCycle >= FORCE_CYCLE_AFTER_SKIPS
+                || store.backend().size() != heldAfterLastCycle || !roots().containsAll(lastCycleRoots)) {
+            return true;
+        }
+        skippedSinceCycle++;
+        cyclesSkipped++;
+        return false;
+    }
+
+    /** Cycles {@link #due()} found nothing for since this collector was made. */
+    public synchronized long cyclesSkipped() {
+        return cyclesSkipped;
+    }
+
+    /**
      * Runs one tick of at most {@link #visitsPerTick()} visits.
      *
      * @return what the tick did
@@ -205,6 +243,8 @@ public final class NodeCollector {
                 if (!candidates.hasNext()) {
                     candidates = null;
                     phase = Phase.IDLE;
+                    lastCycleRoots = cycleRoots;
+                    heldAfterLastCycle = store.backend().size();
                     frontier.clear();
                     depths.clear();
                     return new Tick(phase, visited, removed, freed, undecodable, true);
@@ -249,6 +289,8 @@ public final class NodeCollector {
         frontier.clear();
         depths.clear();
         candidates = new ArrayList<>(store.backend().cids()).iterator();
+        cycleRoots = new HashSet<>();
+        skippedSinceCycle = 0;
         cycleTicks = 0;
         cycleRemoved = 0;
         cycleBytesFreed = 0;
@@ -260,6 +302,7 @@ public final class NodeCollector {
         rootsGeneration = store.pinGeneration();
         boolean any = false;
         for (String root : roots()) {
+            cycleRoots.add(root);
             if (marked.add(root)) {
                 frontier.add(root);
                 depths.add(1);

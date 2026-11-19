@@ -195,6 +195,45 @@ class IdleWorkSpaceTest {
     }
 
     /**
+     * On the system clock, with nothing that could become readable without a signal, a waiting take sleeps on changes
+     * alone (idle-loop O9): a three-second wait tries at its start and at its deadline, not once a second. And a
+     * caller that looked and found nothing waits for the next change with {@code awaitChange}.
+     */
+    @Test
+    void anIdleWaitOnTheSystemClockSleepsOnChangesAlone() throws Exception {
+        Peer a = peer("a", 1);
+        ReplicatedSpace space = ReplicatedSpace.builder(a.runtime(), "idle", a.identity(), "worker")
+                .settleWindow(Duration.ZERO).build(); // the system clock
+
+        long polls = space.waitingPolls();
+        Optional<TakenEntry<TaskEntry>> none = space.take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(3));
+        assertThat(none).isEmpty();
+        assertThat(space.waitingPolls() - polls).as("the first try and the deadline, no one-second slices")
+                .isLessThanOrEqualTo(2);
+
+        long seen = space.changeSignals();
+        long started = System.nanoTime();
+        space.awaitChange(seen, Duration.ofMillis(300));
+        assertThat((System.nanoTime() - started) / 1_000_000).as("no change: the whole wait").isGreaterThanOrEqualTo(280);
+
+        long before = space.changeSignals();
+        CompletableFuture<Long> waited = CompletableFuture.supplyAsync(() -> {
+            long t0 = System.nanoTime();
+            try {
+                space.awaitChange(before, Duration.ofSeconds(20));
+            } catch (InterruptedException e) {
+                throw new IllegalStateException(e);
+            }
+            return (System.nanoTime() - t0) / 1_000_000;
+        });
+        Thread.sleep(200);
+        space.write(new TaskEntry("job", 1), MINUTES_10);
+        assertThat(waited.get(5, TimeUnit.SECONDS)).as("a write ends the wait at once").isLessThan(2_000);
+        assertThat(space.changeSignals()).isNotEqualTo(before);
+    }
+
+    /**
      * A delta whose every state the replica already holds changes nothing (IDLE-WORK items 6 and 8): it reports no
      * change, so the bus counts no activity, and the digest cache survives it.
      */

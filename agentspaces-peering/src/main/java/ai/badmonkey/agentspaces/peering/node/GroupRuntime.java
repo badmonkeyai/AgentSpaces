@@ -266,12 +266,48 @@ public final class GroupRuntime implements AutoCloseable {
         if (node == null || !node.horizonPerEntry()) {
             return false;
         }
+        // idle-loop O5: every space judges this on every tick; the walk runs only when the view or a hint moved.
+        // The versions are read before the walk, so a change during it leaves a stale key and the next call walks.
+        long view = membership.viewVersion();
+        long hints = node.horizonHintsVersion();
+        HorizonJudgement cached = horizonJudgement;
+        if (cached != null && cached.view == view && cached.hints == hints) {
+            return cached.result;
+        }
+        boolean result = true;
         for (GroupMembership.Member member : membership.allMembers()) {
             if (!node.advertisesHorizon(member.id())) {
-                return false;
+                result = false;
+                break;
             }
         }
-        return true;
+        horizonJudgement = new HorizonJudgement(view, hints, result);
+        return result;
+    }
+
+    /** The last judgement of {@link #viewAdvertisesHorizon()}, by the view's and the hints' versions it read. */
+    private record HorizonJudgement(long view, long hints, boolean result) { }
+
+    private volatile HorizonJudgement horizonJudgement;
+
+    /**
+     * Brings this group's tick back to the full rate at once (idle-loop O8): a component that starts work the tick
+     * drives calls this, so the work's first step does not wait out an idle group's slower tick.
+     */
+    public void wake() {
+        if (node != null) {
+            node.wake(id());
+        }
+    }
+
+    /**
+     * A counter that moves whenever this group's view or any member's horizon hint moves (idle-loop O5, O8): a sum of
+     * two counters that only grow, so it moves whenever either does. Only its equality between reads means anything.
+     *
+     * @return the view's epoch
+     */
+    public long viewEpoch() {
+        return membership.viewVersion() + (node == null ? 0 : node.horizonHintsVersion());
     }
 
     /**

@@ -104,6 +104,8 @@ public final class ConsoleView implements AutoCloseable {
     /** Peer to the scheme of its connection ({@code PeerNode.connectionSchemes}); empty for a peer not connected here. */
     private final Supplier<java.util.Map<ai.badmonkey.agentspaces.common.id.PeerId, String>> connectionSchemes;
     private final InstantSource clock;
+    /** The console node's standing in its group, or empty when not wired (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md). */
+    private final Supplier<java.util.Optional<ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipStatus>> membership;
     private final int eventCapacity;
     private final Deque<ConsoleEvent> events = new ArrayDeque<>();
     private final AtomicLong sequence = new AtomicLong();
@@ -116,7 +118,11 @@ public final class ConsoleView implements AutoCloseable {
         this.connectionSchemes = builder.connectionSchemes;
         this.ads = builder.ads;
         this.clock = builder.clock;
+        this.membership = builder.membership;
         this.eventCapacity = builder.eventCapacity;
+        if (builder.membershipEvents != null) {
+            builder.membershipEvents.accept(this::onMembershipStatus);
+        }
         Lease lease = Lease.of(Duration.ofDays(365));
         watched.forEach((name, w) -> {
             for (Class<?> type : w.taskTypes) {
@@ -178,6 +184,42 @@ public final class ConsoleView implements AutoCloseable {
             w.perWorker.computeIfAbsent(worker, key -> new AtomicInteger()).incrementAndGet();
         }
         record(name, "completed", event.entry().getClass().getSimpleName(), worker);
+    }
+
+    /**
+     * A change of the console node's membership state, in the activity stream: kind {@code GROUP_ISOLATED} when it
+     * becomes isolated, {@code GROUP_REJOINED} when members are back after it was isolated, reconnecting or on its last
+     * resort, {@code GROUP_STATUS} for any other change. The space column carries the group, the entry type the new
+     * state and the worker column the previous one.
+     */
+    private volatile ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipState lastMembershipState;
+
+    private void onMembershipStatus(ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipStatus status) {
+        var previous = lastMembershipState;
+        var state = status.state();
+        lastMembershipState = state;
+        if (state == previous) {
+            return;
+        }
+        boolean back = (state == ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipState.CONNECTED
+                || state == ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipState.DEGRADED)
+                && previous != null && switch (previous) {
+                    case ISOLATED, LAST_RESORT, RECONNECTING -> true;
+                    default -> false;
+                };
+        String kind = state == ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipState.ISOLATED
+                ? "GROUP_ISOLATED" : back ? "GROUP_REJOINED" : "GROUP_STATUS";
+        record(status.group().value(), kind, state.name(), previous == null ? "" : previous.name());
+    }
+
+    /**
+     * The console node's standing in its group now: its state and since when, the members in view, the lost members
+     * being retried and the retired ones.
+     *
+     * @return the status, or empty when the view was built without one
+     */
+    public java.util.Optional<ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipStatus> membership() {
+        return membership.get();
     }
 
     private void record(String space, String kind, String entryType, String worker) {
@@ -371,6 +413,10 @@ public final class ConsoleView implements AutoCloseable {
         private Supplier<List<? extends Advertisement>> ads = List::of;
         private InstantSource clock = InstantSource.system();
         private int eventCapacity = 512;
+        private Supplier<java.util.Optional<ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipStatus>> membership =
+                java.util.Optional::empty;
+        private java.util.function.Consumer<java.util.function.Consumer<
+                ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipStatus>> membershipEvents;
 
         private Builder() {
         }
@@ -479,6 +525,27 @@ public final class ConsoleView implements AutoCloseable {
          */
         public Builder ads(Supplier<List<? extends Advertisement>> ads) {
             this.ads = Objects.requireNonNull(ads, "ads");
+            return this;
+        }
+
+        /**
+         * Shows a node's standing in a group (state, lost and retired members) and streams its changes: reads the
+         * status from the node on demand and subscribes to its transitions.
+         *
+         * @param node  the console's node
+         * @param group the group to show
+         * @return this builder
+         */
+        public Builder membership(ai.badmonkey.agentspaces.peering.node.PeerNode node,
+                                  ai.badmonkey.agentspaces.common.id.GroupId group) {
+            Objects.requireNonNull(node, "node");
+            Objects.requireNonNull(group, "group");
+            this.membership = () -> node.membershipStatus(group);
+            this.membershipEvents = listener -> node.onMembershipStatus(status -> {
+                if (status.group().equals(group)) {
+                    listener.accept(status);
+                }
+            });
             return this;
         }
 

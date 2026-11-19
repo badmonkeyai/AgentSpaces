@@ -60,6 +60,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 /**
@@ -214,6 +215,8 @@ public final class PeerNode implements AutoCloseable {
     public static final String HORIZON_LEVEL = "1";
     /** Members whose advertisement carries {@link #HORIZON_HINT} at {@link #HORIZON_LEVEL}. */
     private final Set<PeerId> horizonPeers = ConcurrentHashMap.newKeySet();
+    /** Moves whenever a peer enters or leaves {@link #horizonPeers} (idle-loop O5). */
+    private final AtomicLong horizonHintsVersion = new AtomicLong();
     /**
      * The hint a node advertises once every decoder it runs reads the v0.1.32 schemas of the AppCard and the
      * AgentCard ({@code wire.appcard=2}; SPEC §6.1a.2 and §9; AppCard origin and formats, 2026-11-09): canonical
@@ -278,8 +281,43 @@ public final class PeerNode implements AutoCloseable {
     private record HeldAd(long issuedMillis, byte[] payload) {
     }
     private final Map<GroupId, Long> lastLostRetryMillis = new ConcurrentHashMap<>();
-    /** How long after a member's loss this node keeps introducing itself to its last endpoints. */
+    /**
+     * How long after a member's loss this node keeps introducing itself to its last endpoints when retirement is off;
+     * it then forgets the member, as before retirement existed.
+     */
     static final long LOST_RETRY_WINDOW_MILLIS = 10 * 60_000L;
+    /**
+     * The longest delay between two introductions to one lost member: {@link #LOST_RETRY_EARLY_CAP_MILLIS} for its
+     * first {@link #LOST_RETRY_EARLY_PHASE_MILLIS} lost, so a fleet rejoins within about a minute of a partition, a
+     * sleep or a blip healing; this after, for a member that may be gone for good (2026-11-19: a five-minute cap from
+     * the start made a twelve-minute partition take minutes to heal).
+     */
+    static final long LOST_RETRY_CAP_MILLIS = 5 * 60_000L;
+    static final long LOST_RETRY_EARLY_CAP_MILLIS = 60_000L;
+    static final long LOST_RETRY_EARLY_PHASE_MILLIS = 60 * 60_000L;
+    /** At most this many lost members are re-dialed per round, the oldest-due first: no dial storm after a split. */
+    static final int LOST_RETRY_BUDGET = 8;
+    /** With retirement on, a lost member that never answered retires this long after its loss (the default). */
+    static final long RETIRE_AFTER_MILLIS = 24L * 60 * 60_000L;
+    /** An empty view this long, the seeds and the locator having found nobody, before the last resort is used. */
+    static final long LAST_RESORT_AFTER_MILLIS = 2 * 60_000L;
+    /** Retired members tried per last-resort round. */
+    static final int LAST_RESORT_BUDGET = 4;
+    static final long LAST_RESORT_BASE_MILLIS = 2 * 60_000L;
+    static final long LAST_RESORT_MAX_MILLIS = 10 * 60_000L;
+    /** Each lost member's retry schedule, per group. */
+    private final Map<GroupId, Map<PeerId, Backoff>> lostSchedule = new ConcurrentHashMap<>();
+    /** When each group's view became empty, while it is. */
+    private final Map<GroupId, Long> emptySince = new ConcurrentHashMap<>();
+    private final Map<GroupId, Backoff> lastResortSchedule = new ConcurrentHashMap<>();
+    private final Map<GroupId, Integer> lastResortCursor = new ConcurrentHashMap<>();
+    private final AtomicLong lostIntroductions = new AtomicLong();
+    private final AtomicLong lastResortIntroductions = new AtomicLong();
+    private final AtomicLong retirements = new AtomicLong();
+    private final boolean retirement;
+    private final boolean postRetirement;
+    private final long retireAfterMillis;
+    private final RetirementList retirementList;
     /** How soon after a loss the lost members and (on an empty view) the seeds are first tried. */
     static final long LOST_RETRY_INTERVAL_MILLIS = 5_000L;
     /**
@@ -364,6 +402,10 @@ public final class PeerNode implements AutoCloseable {
     private final Map<GroupId, Integer> lastSelfAdFingerprint = new ConcurrentHashMap<>();
     /** The membership view at the end of the last tick, per group, to notice drops between ticks. */
     private final Map<GroupId, Set<PeerId>> lastView = new ConcurrentHashMap<>();
+    /** The view version {@link #lastView} was taken at, per group (idle-loop O8). */
+    private final Map<GroupId, Long> lastViewVersion = new ConcurrentHashMap<>();
+    /** When each member's last PING carrying digest hashes arrived, per group (idle-loop O6); members in view only. */
+    private final Map<GroupId, Map<PeerId, Long>> hashedPingFrom = new ConcurrentHashMap<>();
     private final ChannelAuth channelAuth;
     /** The revocation authority check (remediation plan §9): founder-rooted by
      * default; enterprise deployments swap in an IdP- or CA-backed validator. */
@@ -1092,6 +1134,10 @@ public final class PeerNode implements AutoCloseable {
                 : new MulticastBeacon(carrier, this::beaconAnnouncements, this::onBeaconDatagram);
         this.credentialHintListeners.addAll(builder.credentialHintListeners);
         this.admissionMemory = new AdmissionMemory(builder.stateDirectory, builder.admissionMemoryBound, clock);
+        this.retirement = builder.retirement;
+        this.postRetirement = builder.postRetirement;
+        this.retireAfterMillis = builder.retireAfter.toMillis();
+        this.retirementList = new RetirementList(builder.stateDirectory, RetirementList.DEFAULT_BOUND);
         this.relayPolicy = builder.relayPolicy;
         this.relayOffload = builder.relayOffload;
         this.maxPathHops = builder.maxPathHops;
@@ -1147,6 +1193,9 @@ public final class PeerNode implements AutoCloseable {
                 new ArrayList<>();
         private java.nio.file.Path stateDirectory;
         private int admissionMemoryBound = AdmissionMemory.DEFAULT_BOUND;
+        private boolean retirement = true;
+        private boolean postRetirement;
+        private Duration retireAfter = Duration.ofMillis(RETIRE_AFTER_MILLIS);
         private RelayPolicy relayPolicy = RelayPolicy.ALLOW;
         private RelayOffload relayOffload = RelayOffload.defaults();
         private int maxPathHops = 4;
@@ -1169,6 +1218,47 @@ public final class PeerNode implements AutoCloseable {
          */
         public Builder stateDirectory(java.nio.file.Path directory) {
             this.stateDirectory = Objects.requireNonNull(directory, "directory");
+            return this;
+        }
+
+        /**
+         * Retirement (default on): a lost member is retried on a back-off of its own (5 s doubling to 5 min) and,
+         * unanswered after {@link #retireAfter} (24 h), retires to the retirement list, persisted beside the
+         * admission memory. Off: a lost member is retried for ten minutes and forgotten, as before.
+         *
+         * @param on whether lost members retire
+         * @return this builder
+         */
+        public Builder retirement(boolean on) {
+            this.retirement = on;
+            return this;
+        }
+
+        /**
+         * How long a lost member is retried before it retires (default 24 h), with retirement on.
+         *
+         * @param after the time after the loss
+         * @return this builder
+         */
+        public Builder retireAfter(Duration after) {
+            if (after == null || after.isNegative() || after.isZero()) {
+                throw new IllegalArgumentException("retireAfter must be positive: " + after);
+            }
+            this.retireAfter = after;
+            return this;
+        }
+
+        /**
+         * Post-retirement (default off): when a group's view has been empty for a while and its lost members, its
+         * seeds and its locator brought nobody back, introduce this node to retired members' last endpoints as a last
+         * resort before it is out of service in the group. Off by default because a retired member's address may
+         * by now belong to another host, which learns of this node from the card it is sent.
+         *
+         * @param on whether the retirement list is consulted as a last resort
+         * @return this builder
+         */
+        public Builder postRetirement(boolean on) {
+            this.postRetirement = on;
             return this;
         }
 
@@ -1915,7 +2005,11 @@ public final class PeerNode implements AutoCloseable {
      * peer it served, so the next tick re-dials and re-introduces this node to that peer
      * rather than a later send discovering the loss. Idempotent, and safe from any thread.
      */
+    /** Every link attached to this node and not yet closed, so closing the node closes them all. */
+    private final Set<TransportConnection> attached = ConcurrentHashMap.newKeySet();
+
     private void onConnectionClosed(TransportConnection connection) {
+        attached.remove(connection);
         for (Map.Entry<PeerId, TransportConnection> entry : List.copyOf(connections.entrySet())) {
             if (entry.getValue() == connection) {
                 dropConnection(entry.getKey(), connection);
@@ -2952,6 +3046,7 @@ public final class PeerNode implements AutoCloseable {
         gossip.forwardFilter(PEER_AD_STREAM, payload -> forwardsPeerAd(revocations, payload));
         // The members admitted under a delegation before a restart, back before the first contact.
         admissionMemory.load(groupId);
+        retirementList.load(groupId, clock.millis());
         if (groupAd.membershipPolicy() == GroupAdvertisement.MembershipPolicy.INVITE
                 && !admissionMemory.persistent()) {
             LOG.log(System.Logger.Level.INFO, "the admission memory of group " + groupId.value()
@@ -3000,40 +3095,333 @@ public final class PeerNode implements AutoCloseable {
      * introduction and both re-admit. A revoked peer is never retried.
      */
     private void retryLost(GroupRuntime runtime, long nowMillis) {
+        retryLostRound(runtime, nowMillis);
+        updateMembershipStatus(runtime, nowMillis);
+    }
+
+    private void retryLostRound(GroupRuntime runtime, long nowMillis) {
         GroupId groupId = runtime.id();
-        Long last = lastLostRetryMillis.get(groupId);
-        long interval = lostRetryIntervalMillis.getOrDefault(groupId, LOST_RETRY_INTERVAL_MILLIS);
-        if (last != null && nowMillis - last < interval) {
-            return;
-        }
         Map<PeerId, Long> lost = lostMembers.get(groupId);
-        boolean tried = false;
-        if (lost != null) {
+        if (lost != null && !lost.isEmpty()) {
+            Map<PeerId, Backoff> schedule = lostSchedule.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>());
+            List<Map.Entry<PeerId, Backoff>> due = new ArrayList<>();
             for (Map.Entry<PeerId, Long> entry : List.copyOf(lost.entrySet())) {
                 PeerId peer = entry.getKey();
-                if (nowMillis - entry.getValue() > LOST_RETRY_WINDOW_MILLIS || runtime.revocations().revoked(peer)
-                        || runtime.membership().member(peer).isPresent()) {
+                long lostAt = entry.getValue();
+                if (runtime.revocations().revoked(peer) || runtime.membership().member(peer).isPresent()) {
                     lost.remove(peer);
+                    schedule.remove(peer);
                     continue;
                 }
-                List<PeerAdvertisement.Endpoint> endpoints = lastEndpoints.get(peer);
-                if (endpoints != null && !endpoints.isEmpty()) {
-                    tried = true;
-                    introduceTo(groupId, endpoints);
+                if (nowMillis - lostAt > (retirement ? retireAfterMillis : LOST_RETRY_WINDOW_MILLIS)) {
+                    lost.remove(peer);
+                    schedule.remove(peer);
+                    if (retirement) {
+                        retire(groupId, peer, lostAt, nowMillis);
+                    }
+                    continue;
+                }
+                Backoff backoff = schedule.computeIfAbsent(peer, p -> new Backoff(lostAt));
+                if (nowMillis >= backoff.nextDueMillis) {
+                    due.add(Map.entry(peer, backoff));
                 }
             }
+            // The oldest-due first, at most a budget per round: a large split re-dials its lost members over a few
+            // rounds rather than all at once (no dial storm; reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md).
+            due.sort(java.util.Comparator.comparingLong(e -> e.getValue().nextDueMillis));
+            int budget = LOST_RETRY_BUDGET;
+            for (Map.Entry<PeerId, Backoff> entry : due) {
+                if (budget-- <= 0) {
+                    break;
+                }
+                List<PeerAdvertisement.Endpoint> endpoints = lastEndpoints.get(entry.getKey());
+                if (endpoints != null && !endpoints.isEmpty()) {
+                    introduceTo(groupId, endpoints);
+                    lostIntroductions.incrementAndGet();
+                }
+                entry.getValue().scheduleNext(nowMillis, random);
+            }
         }
-        if (runtime.membership().allMembers().isEmpty()) {
+        if (!runtime.membership().allMembers().isEmpty()) {
+            emptySince.remove(groupId);
+            return;
+        }
+        long empty = emptySince.computeIfAbsent(groupId, g -> nowMillis);
+        // An empty view: the seeds and the locator, on the group's own back-off (5 s doubling to 30 s).
+        Long last = lastLostRetryMillis.get(groupId);
+        long interval = lostRetryIntervalMillis.getOrDefault(groupId, LOST_RETRY_INTERVAL_MILLIS);
+        if (last == null || nowMillis - last >= interval) {
             List<PeerAdvertisement.Endpoint> seeds = groupSeeds.get(groupId);
             if (seeds != null && !seeds.isEmpty()) {
-                tried = true;
                 introduceTo(groupId, seeds);
             }
             relocateIfStale(groupId, nowMillis);
-        }
-        if (tried) {
             lastLostRetryMillis.put(groupId, nowMillis);
             lostRetryIntervalMillis.put(groupId, Math.min(interval * 2, LOST_RETRY_MAX_INTERVAL_MILLIS));
+        }
+        if (nowMillis - empty < LAST_RESORT_AFTER_MILLIS) {
+            return;
+        }
+        // Nobody for a while after the lost members, the seeds and the locator: the last resort, when opted in.
+        if (postRetirement) {
+            lastResort(groupId, nowMillis);
+        }
+    }
+
+    // ---- the membership status (the console's view of reachability, 2026-11-19)
+
+    /** Where a node stands in one group, from its own view (it is the one place an isolated node can be seen). */
+    public enum MembershipState {
+        /** No member yet since joining, the seeds and the locator still being tried. */
+        JOINING,
+        /** Members in view, none lost. */
+        CONNECTED,
+        /** Members in view, and some lost ones being retried. */
+        DEGRADED,
+        /** Every member lost, for less than the wait before the last resort; lost members, seeds and locator retried. */
+        RECONNECTING,
+        /** Nobody for longer than the wait; post-retirement is trying the retired members. */
+        LAST_RESORT,
+        /** Nobody for longer than the wait, with something to reach and nothing left to try: out of service here. */
+        ISOLATED,
+        /** No member, and nothing to reach: no member ever, no seed, no locator. A sole founder or a one-node setup. */
+        ALONE
+    }
+
+    /** A lost member being retried: when it was lost, how many introductions it had, when the next is due. */
+    public record LostMember(PeerId peer, long lostAtMillis, int attempts, long nextDueMillis,
+                             List<PeerAdvertisement.Endpoint> endpoints) {
+    }
+
+    /** A retired member: when it was last seen, when it retired, where it was. */
+    public record RetiredMember(PeerId peer, long lastSeenMillis, long retiredAtMillis,
+                                List<PeerAdvertisement.Endpoint> endpoints) {
+    }
+
+    /**
+     * A node's standing in a group (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md).
+     *
+     * @param group          the group
+     * @param state          the state
+     * @param sinceMillis    when the state began, on the node's clock
+     * @param members        the members in view
+     * @param lost           the lost members being retried
+     * @param retired        the retired members
+     * @param retirement     whether lost members retire
+     * @param postRetirement whether retired members are the last resort
+     */
+    public record MembershipStatus(GroupId group, MembershipState state, long sinceMillis, int members,
+                                   List<LostMember> lost, List<RetiredMember> retired, boolean retirement,
+                                   boolean postRetirement) {
+    }
+
+    private record StateSince(MembershipState state, long sinceMillis) {
+    }
+
+    private final Map<GroupId, StateSince> membershipStates = new ConcurrentHashMap<>();
+    /** Groups in which this node has had a member: losing them all is a loss, not a start. */
+    private final Set<GroupId> everConnected = ConcurrentHashMap.newKeySet();
+    private final List<Consumer<MembershipStatus>> membershipListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /**
+     * Tells a listener of every change of a group's membership state, from the tick that sees it (a console's event
+     * stream, a health indicator). The listener runs on the tick thread and must be quick.
+     *
+     * @param listener the listener
+     */
+    public void onMembershipStatus(Consumer<MembershipStatus> listener) {
+        membershipListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    /**
+     * A group's membership status now.
+     *
+     * @param groupId the group
+     * @return the status, or empty when this node has not joined the group
+     */
+    public Optional<MembershipStatus> membershipStatus(GroupId groupId) {
+        GroupRuntime runtime = groups.get(groupId);
+        if (runtime == null) {
+            return Optional.empty();
+        }
+        long now = clock.millis();
+        MembershipState state = membershipState(runtime, now);
+        StateSince known = membershipStates.get(groupId);
+        long since = known != null && known.state() == state ? known.sinceMillis() : now;
+        return Optional.of(status(runtime, state, since, now));
+    }
+
+    private MembershipStatus status(GroupRuntime runtime, MembershipState state, long since, long now) {
+        GroupId groupId = runtime.id();
+        List<LostMember> lostRows = new ArrayList<>();
+        Map<PeerId, Backoff> schedule = lostSchedule.getOrDefault(groupId, Map.of());
+        lostMembers.getOrDefault(groupId, Map.of()).forEach((peer, lostAt) -> {
+            Backoff backoff = schedule.get(peer);
+            lostRows.add(new LostMember(peer, lostAt, backoff == null ? 0 : backoff.attempts,
+                    backoff == null ? lostAt + LOST_RETRY_INTERVAL_MILLIS : backoff.nextDueMillis,
+                    lastEndpoints.getOrDefault(peer, List.of())));
+        });
+        lostRows.sort(java.util.Comparator.comparingLong(LostMember::lostAtMillis));
+        List<RetiredMember> retiredRows = retirementList.list(groupId, now).stream()
+                .map(r -> new RetiredMember(r.peer(), r.lastSeenMillis(), r.retiredAtMillis(), r.endpoints()))
+                .toList();
+        return new MembershipStatus(groupId, state, since, runtime.membership().allMembers().size(),
+                List.copyOf(lostRows), retiredRows, retirement, postRetirement);
+    }
+
+    private MembershipState membershipState(GroupRuntime runtime, long now) {
+        GroupId groupId = runtime.id();
+        boolean lost = !lostMembers.getOrDefault(groupId, Map.of()).isEmpty();
+        if (!runtime.membership().allMembers().isEmpty()) {
+            return lost ? MembershipState.DEGRADED : MembershipState.CONNECTED;
+        }
+        boolean retiredAny = !retirementList.list(groupId, now).isEmpty();
+        List<PeerAdvertisement.Endpoint> seeds = groupSeeds.get(groupId);
+        BeaconLocator locator = groupLocators.get(groupId);
+        boolean locates = locator != null && !(locator instanceof SeedsLocator) && locator.canLocate();
+        boolean reachable = everConnected.contains(groupId) || (seeds != null && !seeds.isEmpty()) || locates
+                || lost || retiredAny;
+        if (!reachable) {
+            return MembershipState.ALONE;
+        }
+        Long empty = emptySince.get(groupId);
+        if (empty == null || now - empty < LAST_RESORT_AFTER_MILLIS) {
+            return everConnected.contains(groupId) ? MembershipState.RECONNECTING : MembershipState.JOINING;
+        }
+        return postRetirement && retiredAny ? MembershipState.LAST_RESORT : MembershipState.ISOLATED;
+    }
+
+    private void updateMembershipStatus(GroupRuntime runtime, long nowMillis) {
+        GroupId groupId = runtime.id();
+        if (!runtime.membership().allMembers().isEmpty()) {
+            everConnected.add(groupId);
+        }
+        MembershipState state = membershipState(runtime, nowMillis);
+        StateSince previous = membershipStates.get(groupId);
+        if (previous != null && previous.state() == state) {
+            return;
+        }
+        membershipStates.put(groupId, new StateSince(state, nowMillis));
+        if (state == MembershipState.ISOLATED) {
+            Long empty = emptySince.get(groupId);
+            LOG.log(System.Logger.Level.WARNING, "group " + groupId.value() + ": no member for "
+                    + (empty == null ? 0 : (nowMillis - empty) / 1000) + " s; no lost member, seed or locator brought"
+                    + " one back" + (postRetirement ? ", nor the retirement list" : " (the retirement list is not"
+                    + " consulted: post-retirement is off)") + "; this node is isolated in the group");
+        } else if (previous != null && (previous.state() == MembershipState.ISOLATED
+                || previous.state() == MembershipState.LAST_RESORT)) {
+            LOG.log(System.Logger.Level.INFO, "group " + groupId.value() + ": " + state + " again after "
+                    + (nowMillis - previous.sinceMillis()) / 1000 + " s " + previous.state());
+        }
+        if (!membershipListeners.isEmpty()) {
+            MembershipStatus status = status(runtime, state, nowMillis, nowMillis);
+            for (Consumer<MembershipStatus> listener : membershipListeners) {
+                try {
+                    listener.accept(status);
+                } catch (RuntimeException e) {
+                    LOG.log(System.Logger.Level.WARNING, "a membership status listener failed", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Introduces this node to a few retired members' last endpoints, the most recently seen first, on a slow back-off
+     * of its own (two minutes doubling to ten). Opt-in: a retired member's address may by now belong to another host,
+     * which learns of this node from the card it is sent; admission still verifies whoever answers.
+     *
+     * @return whether the list held anyone to try (the node is not out of options yet)
+     */
+    private boolean lastResort(GroupId groupId, long nowMillis) {
+        List<RetirementList.Retired> retired = new ArrayList<>();
+        for (RetirementList.Retired r : retirementList.list(groupId, nowMillis)) {
+            GroupRuntime runtime = groups.get(groupId);
+            if (runtime != null && runtime.revocations().revoked(r.peer())) {
+                retirementList.remove(groupId, r.peer());
+            } else {
+                retired.add(r);
+            }
+        }
+        if (retired.isEmpty()) {
+            return false;
+        }
+        // the first round at once, the next ones on the slow back-off
+        Backoff backoff = lastResortSchedule.computeIfAbsent(groupId,
+                g -> new Backoff(nowMillis - LAST_RESORT_BASE_MILLIS, LAST_RESORT_BASE_MILLIS, LAST_RESORT_MAX_MILLIS));
+        if (nowMillis < backoff.nextDueMillis) {
+            return true;
+        }
+        int cursor = lastResortCursor.getOrDefault(groupId, 0);
+        for (int i = 0; i < Math.min(LAST_RESORT_BUDGET, retired.size()); i++) {
+            RetirementList.Retired r = retired.get((cursor + i) % retired.size());
+            introduceTo(groupId, r.endpoints());
+            lastResortIntroductions.incrementAndGet();
+        }
+        lastResortCursor.put(groupId, (cursor + LAST_RESORT_BUDGET) % retired.size());
+        backoff.scheduleNext(nowMillis, random);
+        return true;
+    }
+
+    /** For tests: records a member as lost at a time, with endpoints to retry, as a departure would. */
+    void noteLostForTest(GroupId groupId, PeerId peer, List<PeerAdvertisement.Endpoint> endpoints, long lostAtMillis) {
+        lastEndpoints.put(peer, List.copyOf(endpoints));
+        lostMembers.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>()).put(peer, lostAtMillis);
+    }
+
+    /** Moves a lost member that never answered to the retirement list, with its last endpoints and card time. */
+    private void retire(GroupId groupId, PeerId peer, long lostAtMillis, long nowMillis) {
+        List<PeerAdvertisement.Endpoint> endpoints = lastEndpoints.get(peer);
+        if (endpoints == null || endpoints.isEmpty()) {
+            return; // nothing to dial later
+        }
+        Long issued = lostAdIssued.getOrDefault(groupId, Map.of()).get(peer);
+        retirementList.retire(groupId, new RetirementList.Retired(peer, List.copyOf(endpoints),
+                issued == null ? 0 : issued, lostAtMillis, nowMillis));
+        Map<PeerId, Long> lostIssued = lostAdIssued.get(groupId);
+        if (lostIssued != null) {
+            lostIssued.remove(peer);
+        }
+        retirements.incrementAndGet();
+        LOG.log(System.Logger.Level.INFO, "group " + groupId.value() + ": retired " + peer.display()
+                + ", unanswered since " + (nowMillis - lostAtMillis) / 60_000 + " min"
+                + (postRetirement ? "; kept as a last resort" : ""));
+    }
+
+    /**
+     * A per-target retry schedule: the first try at the base after the loss, then doubling to the cap (a lower cap
+     * in the first hour for lost members), each delay spread by a quarter either way so a fleet that lost the same
+     * members does not re-dial them in step.
+     */
+    static final class Backoff {
+        final long sinceMillis;
+        final long baseMillis;
+        final long earlyCapMillis;
+        final long capMillis;
+        int attempts;
+        long nextDueMillis;
+
+        Backoff(long sinceMillis) {
+            this(sinceMillis, LOST_RETRY_INTERVAL_MILLIS, LOST_RETRY_EARLY_CAP_MILLIS, LOST_RETRY_CAP_MILLIS);
+        }
+
+        Backoff(long sinceMillis, long baseMillis, long capMillis) {
+            this(sinceMillis, baseMillis, capMillis, capMillis);
+        }
+
+        Backoff(long sinceMillis, long baseMillis, long earlyCapMillis, long capMillis) {
+            this.sinceMillis = sinceMillis;
+            this.baseMillis = baseMillis;
+            this.earlyCapMillis = earlyCapMillis;
+            this.capMillis = capMillis;
+            this.nextDueMillis = sinceMillis + baseMillis;
+        }
+
+        void scheduleNext(long nowMillis, Random random) {
+            attempts++;
+            long cap = nowMillis - sinceMillis < LOST_RETRY_EARLY_PHASE_MILLIS ? earlyCapMillis : capMillis;
+            long delay = Math.min(cap, baseMillis << Math.min(attempts, 20));
+            long spread = delay / 4;
+            nextDueMillis = nowMillis + delay - spread + (spread == 0 ? 0 : (long) (random.nextDouble() * 2 * spread));
         }
     }
 
@@ -3118,6 +3506,8 @@ public final class PeerNode implements AutoCloseable {
         for (GroupMembership.Member member : runtime.membership().allMembers()) {
             held.add(member.id());
         }
+        lastViewVersion.remove(groupId);
+        idleGroups.remove(groupId);
         Set<PeerId> previous = lastView.remove(groupId);
         if (previous != null) {
             held.addAll(previous);
@@ -3133,6 +3523,15 @@ public final class PeerNode implements AutoCloseable {
         locating.remove(groupId); // a locate in flight checks the group is still joined before it acts
         pendingFounding.remove(groupId); // never present for a joined group; cleared for completeness
         lostMembers.remove(groupId);
+        lostSchedule.remove(groupId);
+        lostAdIssued.remove(groupId);
+        emptySince.remove(groupId);
+        membershipStates.remove(groupId);
+        everConnected.remove(groupId);
+        lastResortSchedule.remove(groupId);
+        lastResortCursor.remove(groupId);
+        retirementList.flushAll(clock.millis());
+        retirementList.forget(groupId);
         lastLostRetryMillis.remove(groupId);
         lostRetryIntervalMillis.remove(groupId);
         heldAds.remove(groupId);
@@ -3182,7 +3581,9 @@ public final class PeerNode implements AutoCloseable {
             hashPeers.remove(peer);
             recordlessPeers.remove(peer);
             aePeers.remove(peer);
-            horizonPeers.remove(peer);
+            if (horizonPeers.remove(peer)) {
+                horizonHintsVersion.incrementAndGet();
+            }
             appCardLevels.remove(peer); // FR-6: a member counts at level 2 only on an advertisement held now
         }
         LOG.log(System.Logger.Level.INFO, "left group " + groupId.value() + ": " + held.size()
@@ -3199,9 +3600,16 @@ public final class PeerNode implements AutoCloseable {
      * is configured, once per beacon interval.
      */
     public void tick() {
+        tick(false, false);
+    }
+
+    private void tick(boolean scheduled, boolean afterIdleSleep) {
         long nowMillis = clock.millis();
         rejudgeIfTrustChanged();
         for (GroupRuntime runtime : groups.values()) {
+            if (scheduled && restsThisTick(runtime, afterIdleSleep)) {
+                continue;
+            }
             GossipBus gossip = runtime.gossip();
             publishSelfAd(runtime, gossip, nowMillis);
             boolean active = gossip.consumeActivity();
@@ -3214,11 +3622,36 @@ public final class PeerNode implements AutoCloseable {
             // has backed off, which in a quiet group is when this node's has too. Busy, both run anti-entropy at the
             // base period, the hashes would differ on every probe anyway, and taking them cost every stream's
             // digest twice a second.
-            boolean probing = probeHashesAlways || !active && runtime.antiEntropyStretched();
+            boolean probing = (probeHashesAlways || !active && runtime.antiEntropyStretched())
+                    && runtime.membership().probeDue(nowMillis); // idle-loop O8: only on the tick a probe goes
             // Two kinds of hashes, taken only when they will be read: a member on wire.ae=2 gets each space's trie
             // hash and any other member the text digests' hashes, so each compares like with like (annex I.6).
-            ProbeDigests probeText = probing ? probeDigests(gossip, false) : ProbeDigests.NONE;
-            ProbeDigests probeTrie = probing && gossip.auditing() ? probeDigests(gossip, true) : ProbeDigests.NONE;
+            // Each kind is taken only when some member in view would receive it: the text form, which rebuilds a
+            // space's sorted digest whenever its generation moved (a lease sweep moves it in a space nobody writes),
+            // only when the view holds a member without wire.ae=2, and the trie form only when it holds one with it.
+            // Taking the text form for an all-hinted view cost the busy spaces' digests every probing tick and was
+            // never sent (a demo console's deployments, 2026-11-18). Both are decided here, outside the membership
+            // monitor the probe callbacks run under, since taking a digest takes its space's lock.
+            boolean textPartner = false;
+            boolean triePartner = false;
+            if (probing) {
+                for (GroupMembership.Member member : runtime.membership().allMembers()) {
+                    if (member.id().equals(peerId())) {
+                        continue;
+                    }
+                    if (gossip.audits(member.id())) {
+                        triePartner = true;
+                    } else {
+                        textPartner = true;
+                    }
+                    if (textPartner && triePartner) {
+                        break;
+                    }
+                }
+            }
+            ProbeDigests probeText = probing && textPartner ? probeDigests(gossip, false) : ProbeDigests.NONE;
+            ProbeDigests probeTrie = probing && triePartner && gossip.auditing() ? probeDigests(gossip, true)
+                    : ProbeDigests.NONE;
             runtime.membership().tick(new GroupMembership.Prober() {
                 @Override
                 public void ping(PeerId target, long nonce) {
@@ -3233,33 +3666,45 @@ public final class PeerNode implements AutoCloseable {
                     send(runtime.id(), relay, Envelope.Kind.PING_REQ,
                             new Bodies.PingReq(target, nonce));
                 }
+
+                @Override
+                public boolean carriesNews(PeerId target, long sinceMillis) {
+                    if (gossip.piggyback(target) != null) {
+                        return true;
+                    }
+                    ProbeDigests probe = gossip.audits(target) ? probeTrie : probeText;
+                    if (probe.root() == null && probe.hashes() == null) {
+                        return false;
+                    }
+                    // The target's own PING with hashes in this period was answered with this node's: both compared.
+                    Long hashedAt = hashedPingFrom.getOrDefault(runtime.id(), Map.of()).get(target);
+                    return hashedAt == null || hashedAt < sinceMillis;
+                }
             }, !traffic);
             // A member that left the view since the last tick (the failure detector dropped it, or
             // an eviction did) is outside the data plane: only its own introduction re-admits it,
             // and it sends one on the channel it dials next (see connectionTo), so the stale
             // channel is closed here to make that happen.
-            Set<PeerId> view = new java.util.HashSet<>();
-            for (GroupMembership.Member member : runtime.membership().allMembers()) {
-                view.add(member.id());
-            }
-            Set<PeerId> previous = lastView.put(runtime.id(), view);
-            if (previous != null) {
-                for (PeerId dropped : previous) {
-                    if (!view.contains(dropped)) {
-                        gossip.memberLeft(dropped);
-                        probePulls.remove(dropped);
-                        boolean ejected = runtime.membership().consumeEjected(dropped);
-                        if (!ejected && !runtime.revocations().revoked(dropped)) {
-                            lostMembers.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, nowMillis);
-                        }
-                        heldAds.getOrDefault(runtime.id(), Map.of()).remove(dropped);
-                        TransportConnection stale = connections.get(dropped);
-                        if (stale != null) {
-                            dropConnection(dropped, stale);
-                            stale.close();
-                        }
-                    }
+            // The view as of this tick, kept for leaving the group (the members held then); taken only when the view's
+            // version moved (idle-loop O8), since every entry and exit moves it.
+            long viewVersion = runtime.membership().viewVersion();
+            Long taken = lastViewVersion.put(runtime.id(), viewVersion);
+            if (taken == null || taken != viewVersion) {
+                Set<PeerId> view = new java.util.HashSet<>();
+                for (GroupMembership.Member member : runtime.membership().allMembers()) {
+                    view.add(member.id());
                 }
+                lastView.put(runtime.id(), view);
+            }
+            // Every departure is handled, each once, from the membership's own record of it: a member that left and came
+            // back between two ticks (re-admitted from a copy of its card, then dropped again by a probe) left all the
+            // same, and a loss not recorded is a loss never retried. Comparing views from tick to tick missed it, and a
+            // fleet whose other members had stopped retrying stayed split for good (HorizonLaggingCopyTest, 2026-11-18).
+            for (PeerId dropped : runtime.membership().drainDeparted()) {
+                if (runtime.membership().member(dropped).isPresent()) {
+                    continue; // back already: nothing to retry, and its link and state stay
+                }
+                memberLeft(runtime, gossip, dropped, nowMillis);
             }
             retryLost(runtime, nowMillis);
             publishReachHints(runtime);
@@ -3291,6 +3736,7 @@ public final class PeerNode implements AutoCloseable {
                     "tick work failed in group " + runtime.id().value(), e));
             admissionMemory.flushIfDue(runtime.id(), nowMillis,
                     runtime.advertisement().gossip().period().toMillis());
+            retirementList.flushIfDue(runtime.id(), nowMillis, runtime.advertisement().gossip().period().toMillis());
         }
         if (beacon != null) {
             Long last = lastBeaconMillis;
@@ -3310,23 +3756,28 @@ public final class PeerNode implements AutoCloseable {
      */
     /**
      * How often this node's advertisement is refreshed to each member of a group. The configured
-     * interval, unless the group's probe cycle (one member per period, stretched up to
-     * {@link GroupMembership#MAX_QUIET_STRETCH} times when quiet) has outgrown the member TTL: a
+     * interval, unless the group's probe cycle (one member per period, stretched four times when
+     * quiet, or further while the TTL bound allows: {@link GroupMembership#maxQuietIntervalMillis}) has outgrown the member TTL: a
      * member is kept by hearing from it, and past that size the probes cannot reach every member
      * inside the TTL, so the refresh takes over as the keepalive at half the TTL (ROBUSTNESS.md
      * §6b, scale). Small groups keep their cadence unchanged.
      */
     long refreshIntervalMillis(GroupRuntime runtime, int members) {
-        GroupMembership.Config config = runtime.membership().config();
+        GroupMembership membership = runtime.membership();
+        long ttl = membership.config().memberTtl().toMillis();
+        long legacy = membership.probeIntervalMillis() * (1L << GroupMembership.LEGACY_QUIET_STRETCH);
+        if (membership.maxQuietIntervalMillis(members) > legacy) {
+            // stretched past four times by the TTL bound, which keeps every member heard twice inside the TTL
+            return peerAdInterval.toMillis();
+        }
         // the probe interval in effect (RE-F-03 moves it at run time), stretched as far as a quiet group may
-        long probeCycle = (long) (members + 1) * runtime.membership().probeIntervalMillis()
-                * (1L << GroupMembership.MAX_QUIET_STRETCH);
-        long ttl = config.memberTtl().toMillis();
+        long probeCycle = (long) (members + 1) * legacy;
         if (probeCycle < ttl) {
             return peerAdInterval.toMillis();
         }
         return Math.min(peerAdInterval.toMillis(), ttl / 2);
     }
+
 
     private void publishSelfAd(GroupRuntime runtime, GossipBus gossip, long nowMillis) {
         GroupId groupId = runtime.id();
@@ -3408,9 +3859,224 @@ public final class PeerNode implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
-        long millis = period.toMillis();
-        ticker.scheduleAtFixedRate(this::tick, millis, millis,
-                java.util.concurrent.TimeUnit.MILLISECONDS);
+        scheduleNextTick();
+    }
+
+    // ---- the sleeping ticker (idle-loop item 1, reviews/IDLE-LOOP-2026-11-18.md §6)
+
+    private final Object tickSchedule = new Object();
+    /** The next scheduled tick. Under {@link #tickSchedule}. */
+    private java.util.concurrent.ScheduledFuture<?> nextTick;
+    /** Whether the next scheduled tick is a long one, every group idle. Under {@link #tickSchedule}. */
+    private boolean sleepingIdle;
+    private final AtomicLong idleSleeps = new AtomicLong();
+
+    /** Introductions this node sent to lost members' last endpoints (the per-member back-off). */
+    public long lostIntroductions() {
+        return lostIntroductions.get();
+    }
+
+    /** Introductions this node sent to retired members as a last resort (post-retirement). */
+    public long lastResortIntroductions() {
+        return lastResortIntroductions.get();
+    }
+
+    /** Lost members this node retired. */
+    public long retirements() {
+        return retirements.get();
+    }
+
+    /**
+     * The members retired in a group, the most recently seen first (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md).
+     *
+     * @param groupId the group
+     * @return their peer ids
+     */
+    public List<PeerId> retired(GroupId groupId) {
+        return retirementList.list(groupId, clock.millis()).stream().map(RetirementList.Retired::peer).toList();
+    }
+
+    /** Whether lost members retire (the retirement setting). */
+    public boolean retirement() {
+        return retirement;
+    }
+
+    /** Whether retired members are tried as a last resort (the post-retirement setting). */
+    public boolean postRetirement() {
+        return postRetirement;
+    }
+
+    /**
+     * Whether this node is isolated in a group: its view has been empty for longer than the last resort waits, and
+     * neither its lost members, its seeds, its locator, nor (with post-retirement on) its retired members brought
+     * anyone back. A status for health checks and the console; the node keeps trying as before.
+     *
+     * @param groupId the group
+     * @return true while isolated
+     */
+    public boolean isolated(GroupId groupId) {
+        StateSince known = membershipStates.get(groupId);
+        return known != null && known.state() == MembershipState.ISOLATED;
+    }
+
+    /** Times the ticker slept a whole idle span because every group was idle (idle-loop item 1). */
+    public long idleSleeps() {
+        return idleSleeps.get();
+    }
+
+    /**
+     * Schedules the next tick: one period away, or, while every group is idle, {@link #IDLE_TICK_DIVIDER} periods away,
+     * so an idle node's ticker thread sleeps instead of waking to look. A {@link #wake} cuts a long sleep short.
+     */
+    private void scheduleNextTick() {
+        java.util.concurrent.ScheduledExecutorService executor = ticker;
+        Duration period = tickPeriod;
+        if (executor == null || executor.isShutdown() || period == null) {
+            return;
+        }
+        synchronized (tickSchedule) {
+            boolean idle = everyGroupIdle();
+            sleepingIdle = idle;
+            if (idle) {
+                idleSleeps.incrementAndGet();
+            }
+            try {
+                nextTick = executor.schedule(this::scheduledTick,
+                        idle ? period.toMillis() * IDLE_TICK_DIVIDER : period.toMillis(),
+                        java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException closing) {
+                // the node is closing
+            }
+        }
+    }
+
+    private void scheduledTick() {
+        boolean slept;
+        synchronized (tickSchedule) {
+            slept = sleepingIdle;
+            sleepingIdle = false;
+        }
+        try {
+            tick(true, slept);
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING, "scheduled tick failed", e);
+        } finally {
+            scheduleNextTick();
+        }
+    }
+
+    /** Cuts a long idle sleep short: the next tick runs now. */
+    private void rouseTicker() {
+        synchronized (tickSchedule) {
+            java.util.concurrent.ScheduledExecutorService executor = ticker;
+            if (!sleepingIdle || executor == null || nextTick == null || !nextTick.cancel(false)) {
+                return;
+            }
+            sleepingIdle = false;
+            try {
+                nextTick = executor.schedule(this::scheduledTick, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException closing) {
+                // the node is closing
+            }
+        }
+    }
+
+    /** Whether every group has been idle long enough, with nothing pending, for the ticker to sleep a whole span. */
+    private boolean everyGroupIdle() {
+        if (groups.isEmpty()) {
+            return false;
+        }
+        for (GroupRuntime runtime : groups.values()) {
+            Idleness idleness = idleGroups.get(runtime.id());
+            GossipBus gossip = runtime.gossip();
+            if (idleness == null || idleness.woken || idleness.quietTicks < IDLE_AFTER_TICKS
+                    || gossip.activityPending() || gossip.trafficPending() || runtime.membership().probesPending()
+                    || runtime.membership().viewVersion() != idleness.view) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ---- the idle tick (idle-loop O8, reviews/IDLE-LOOP-2026-11-18.md)
+
+    /** A group idle this long, in scheduled ticks, runs one scheduled tick in {@link #IDLE_TICK_DIVIDER}. */
+    static final int IDLE_AFTER_TICKS = 40;
+    /** An idle group's full tick runs on one scheduled tick in this many; the others only look for work. */
+    static final int IDLE_TICK_DIVIDER = 4;
+
+    /** One group's idleness, as the scheduled ticks judge it. */
+    private static final class Idleness {
+        volatile boolean woken = true;
+        int quietTicks;
+        int skipped;
+        long view = -1;
+    }
+
+    private final Map<GroupId, Idleness> idleGroups = new ConcurrentHashMap<>();
+    private final AtomicLong idleTicksSkipped = new AtomicLong();
+
+    /** Group ticks the scheduled ticker skipped because the group was idle (idle-loop O8). */
+    public long idleTicksSkipped() {
+        return idleTicksSkipped.get();
+    }
+
+    /**
+     * Brings a group back to the full tick rate at once: work this node started that the tick drives (a fetch, a
+     * protocol step) calls this, as a frame of such work does on arrival or departure (idle-loop O8).
+     *
+     * @param groupId the group
+     */
+    public void wake(GroupId groupId) {
+        Idleness idleness = idleGroups.get(groupId);
+        if (idleness != null) {
+            idleness.woken = true;
+            rouseTicker();
+        }
+    }
+
+    /** Frames that are liveness or time-paced reconciliation; any other kind is work the tick may be driving. */
+    private static boolean wakes(Envelope.Kind kind) {
+        return switch (kind) {
+            case PING, PING_REQ, ACK, RUMOR, DIGEST, PULL_RESP -> false;
+            default -> true;
+        };
+    }
+
+    /**
+     * Whether a scheduled tick may skip a group's full tick: the group showed no work (gossip activity or traffic, a
+     * probe awaiting its answer, a change of view, a working frame either way, a {@link #wake}) for
+     * {@link #IDLE_AFTER_TICKS} scheduled ticks, and this is not its one tick in {@link #IDLE_TICK_DIVIDER}. Every
+     * judgement below the tick is by the clock, so a skipped tick delays it by at most the divider's span; the flags
+     * read here are only peeked, and the full tick consumes them as before. A direct {@link #tick()} never skips.
+     */
+    private boolean restsThisTick(GroupRuntime runtime, boolean afterIdleSleep) {
+        Idleness idleness = idleGroups.computeIfAbsent(runtime.id(), g -> new Idleness());
+        GossipBus gossip = runtime.gossip();
+        long view = runtime.membership().viewVersion();
+        boolean busy = idleness.woken || gossip.activityPending() || gossip.trafficPending()
+                || runtime.membership().probesPending() || view != idleness.view;
+        if (busy) {
+            idleness.woken = false;
+            idleness.quietTicks = 0;
+            idleness.skipped = 0;
+            idleness.view = view;
+            return false;
+        }
+        if (idleness.quietTicks < IDLE_AFTER_TICKS) {
+            idleness.quietTicks++;
+            return false;
+        }
+        if (afterIdleSleep) {
+            idleness.skipped = 0; // the ticker slept the span: this is the group's one tick in the divider
+            return false;
+        }
+        if (++idleness.skipped < IDLE_TICK_DIVIDER) {
+            idleTicksSkipped.incrementAndGet();
+            return true;
+        }
+        idleness.skipped = 0;
+        return false;
     }
 
     /**
@@ -3427,6 +4093,9 @@ public final class PeerNode implements AutoCloseable {
     boolean send(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
         if (!groups.containsKey(groupId)) {
             return false; // a group this node left sends nothing more, even over a link it still holds (R2-2.2)
+        }
+        if (wakes(kind)) {
+            wake(groupId);
         }
         if (quarantined(to)) {
             return false; // cautious: a sentenced peer is sent nothing, and no link is opened to it
@@ -4002,8 +4671,17 @@ public final class PeerNode implements AutoCloseable {
             }
         }
         admissionMemory.flushAll(); // an admission inside the last gossip period survives the restart
+        retirementList.flushAll(clock.millis());
         connections.values().forEach(TransportConnection::close);
         connections.clear();
+        // Every link this node attached, accepted or dialed, not only the one it sends to each peer on: a peer that
+        // dialed this node holds its end open until this end closes, and one left open after this node closed took
+        // frames into a reader nobody served. That peer, hearing this identity again from a restart (a new port, a
+        // new link), kept sending replies into the dead one (example 34's store restart, 2026-11-19).
+        for (TransportConnection link : List.copyOf(attached)) {
+            link.close();
+        }
+        attached.clear();
         for (AutoCloseable resource : ownedResources) {
             try {
                 resource.close();
@@ -4031,6 +4709,7 @@ public final class PeerNode implements AutoCloseable {
      * @return false when the link was cut for its chain
      */
     private boolean attach(TransportConnection connection) {
+        attached.add(connection);
         connection.onClose(() -> onConnectionClosed(connection));
         java.security.cert.X509Certificate[] chain = connection.remoteChain();
         if (chain.length > 0) {
@@ -4049,6 +4728,35 @@ public final class PeerNode implements AutoCloseable {
         connection.onReceive(frame -> onFrame(connection, frame));
         return true;
     }
+
+    /** A member left a group's view: its per-member state goes, its loss is recorded for retries, its link closes. */
+    private void memberLeft(GroupRuntime runtime, GossipBus gossip, PeerId dropped, long nowMillis) {
+        Map<PeerId, Long> hashed = hashedPingFrom.get(runtime.id());
+        if (hashed != null) {
+            hashed.remove(dropped);
+        }
+        gossip.memberLeft(dropped);
+        probePulls.remove(dropped);
+        boolean ejected = runtime.membership().consumeEjected(dropped);
+        if (!ejected && !runtime.revocations().revoked(dropped)) {
+            lostMembers.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, nowMillis);
+            Long issued = lastAdIssued.get(dropped);
+            if (issued != null) {
+                lostAdIssued.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, issued);
+            }
+        }
+        heldAds.getOrDefault(runtime.id(), Map.of()).remove(dropped);
+        TransportConnection stale = connections.get(dropped);
+        if (stale != null) {
+            dropConnection(dropped, stale);
+            stale.close();
+        }
+    }
+
+    /** The issue time of each peer's newest admitted advertisement, on the issuer's own clock. */
+    private final Map<PeerId, Long> lastAdIssued = new ConcurrentHashMap<>();
+    /** Per group, the issue time of a lost member's newest advertisement when it was dropped, on its own clock. */
+    private final Map<GroupId, Map<PeerId, Long>> lostAdIssued = new ConcurrentHashMap<>();
 
     /** Cuts a link for the chain it presented; anything it read before the cut is dropped in onFrame. */
     private void cutForChain(TransportConnection connection) {
@@ -4257,7 +4965,14 @@ public final class PeerNode implements AutoCloseable {
                 }
             }
         }
-        runtime.membership().recordHeard(envelope.from());
+        if (envelope.kind() == Envelope.Kind.ACK) {
+            runtime.membership().recordAnswered(envelope.from()); // an answer to this node's probe is no contact (O6)
+        } else {
+            runtime.membership().recordHeard(envelope.from());
+        }
+        if (wakes(envelope.kind())) {
+            wake(runtime.id());
+        }
         try {
             dispatchKind(runtime, envelope, connection);
         } catch (RuntimeException e) {
@@ -4282,6 +4997,10 @@ public final class PeerNode implements AutoCloseable {
                 // for its own stretched round instead of the next probe. An older node sends hashes on every PING,
                 // so toward it the ACK carries them as before.
                 boolean asked = ping.root() != null || ping.hashes() != null;
+                if (asked) {
+                    hashedPingFrom.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>())
+                            .put(envelope.from(), clock.millis());
+                }
                 ProbeDigests probe = asked || probeHashesAlways || runtime.antiEntropyStretched()
                         ? probeDigests(gossip, gossip.audits(envelope.from())) : ProbeDigests.NONE;
                 send(runtime.id(), envelope.from(), Envelope.Kind.ACK, new Bodies.Ack(ping.nonce(), null,
@@ -5034,6 +5753,16 @@ public final class PeerNode implements AutoCloseable {
         return peer != null && horizonPeers.contains(peer);
     }
 
+    /**
+     * A counter that moves whenever a peer's {@link #HORIZON_HINT} is learned or lost, so a judgement over the view's
+     * hints is recomputed only when it moved (idle-loop O5).
+     *
+     * @return the hints' version
+     */
+    public long horizonHintsVersion() {
+        return horizonHintsVersion.get();
+    }
+
     /** Makes every probe of this node carry the hashes, as an always-attaching member does (tests of RE-P-03). */
     void probeHashesAlways(boolean always) { // package-private for tests
         this.probeHashesAlways = always;
@@ -5440,10 +6169,21 @@ public final class PeerNode implements AutoCloseable {
                     continue; // a copy admits nobody under attestation
                 }
                 Long droppedAt = lostMembers.getOrDefault(runtime.id(), Map.of()).get(ad.issuer());
-                if (!member && droppedAt != null && ad.issued().toEpochMilli() <= droppedAt) {
-                    continue; // issued before this node dropped it: no evidence it lives
+                Long issuedAtDrop = lostAdIssued.getOrDefault(runtime.id(), Map.of()).get(ad.issuer());
+                Optional<RetirementList.Retired> retiredCard = member ? Optional.empty()
+                        : retirementList.get(runtime.id(), ad.issuer());
+                if (retiredCard.isPresent() && ad.issued().toEpochMilli() <= retiredCard.get().cardIssuedMillis()) {
+                    continue; // a retired member's old card is no evidence it is back
                 }
-                if (!member && droppedAt == null && lastView.getOrDefault(runtime.id(), Set.of()).contains(ad.issuer())) {
+                // Issued no later than the newest card this node held when it dropped the member, both on the
+                // issuer's own clock: no evidence it lives. Comparing the issue time with this node's drop time mixed
+                // two clocks, so a node whose clock trails the issuer's re-admitted the member from an old copy, again
+                // and again (HorizonLaggingCopyTest, 2026-11-18). Without the card's time, the drop time stands in.
+                if (!member && droppedAt != null && ad.issued().toEpochMilli()
+                        <= (issuedAtDrop != null ? issuedAtDrop : droppedAt)) {
+                    continue;
+                }
+                if (!member && droppedAt == null && runtime.membership().departurePending(ad.issuer())) {
                     // Dropped inside this very tick (a failed probe), its loss not yet recorded:
                     // the probe's own ACK carried the view hash that started this pull.
                     continue;
@@ -5469,10 +6209,24 @@ public final class PeerNode implements AutoCloseable {
         boolean admission = runtime.membership().member(ad.issuer()).isEmpty();
         runtime.membership().onPeerAdvertisement(ad);
         lastEndpoints.put(ad.issuer(), List.copyOf(ad.endpoints()));
+        lastAdIssued.merge(ad.issuer(), ad.issued().toEpochMilli(), Math::max);
         Map<PeerId, Long> lost = lostMembers.get(runtime.id());
         if (lost != null) {
             lost.remove(ad.issuer());
         }
+        Map<PeerId, Long> lostIssued = lostAdIssued.get(runtime.id());
+        if (lostIssued != null) {
+            lostIssued.remove(ad.issuer());
+        }
+        Map<PeerId, Backoff> schedule = lostSchedule.get(runtime.id());
+        if (schedule != null) {
+            schedule.remove(ad.issuer());
+        }
+        if (retirementList.remove(runtime.id(), ad.issuer())) {
+            LOG.log(System.Logger.Level.INFO, "group " + runtime.id().value() + ": " + ad.issuer().display()
+                    + " is back from retirement");
+        }
+        lastResortSchedule.remove(runtime.id()); // somebody is here: the last resort starts afresh next time
         if (admission && runtime.membership().member(ad.issuer()).isPresent()) {
             lostRetryIntervalMillis.remove(runtime.id()); // somebody answered: retries start fresh
             newlyAdmitted.computeIfAbsent(runtime.id(), g -> ConcurrentHashMap.newKeySet()).add(ad.issuer());
@@ -5514,9 +6268,13 @@ public final class PeerNode implements AutoCloseable {
         // RE-H-04: the per-entry horizon follows the current card alone, so a card that drops the hint disengages
         // every space whose view holds its member at the next read, and a beacon hint never engages it.
         if (HORIZON_LEVEL.equals(ad.resourceHints().get(HORIZON_HINT))) {
-            horizonPeers.add(ad.issuer());
+            if (horizonPeers.add(ad.issuer())) {
+                horizonHintsVersion.incrementAndGet();
+            }
         } else {
-            horizonPeers.remove(ad.issuer());
+            if (horizonPeers.remove(ad.issuer())) {
+                horizonHintsVersion.incrementAndGet();
+            }
         }
         int level = appCardLevelOf(ad.resourceHints().get(APPCARD_HINT));
         if (level > 1) {
@@ -5646,7 +6404,7 @@ public final class PeerNode implements AutoCloseable {
             return Optional.empty();
         }
         if (!PeerId.fromPublicKey(signed.publicKey()).equals(ad.issuer())
-                || !Ed25519.verify(Ed25519.publicKeyFromRaw(signed.publicKey()),
+                || !Ed25519.verifyRaw(signed.publicKey(),
                         signed.adBytes(), signed.signature())) {
             return Optional.empty();
         }

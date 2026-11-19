@@ -722,7 +722,11 @@ class PeerClusterTest {
         stateB.applied.clear();
         long roundsBefore = atB.gossip().antiEntropyRounds();
         stateA.add("v2");
-        tickAll(6); // at most one stretched probe interval each way
+        // at most one stretched probe interval each way: the pair's TTL-bounded stretch (idle-loop item 3)
+        int cycle = (int) (atB.membership().maxQuietIntervalMillis(1) / 1000) + 2;
+        for (int i = 0; i < cycle && !stateB.members.contains("v2"); i++) {
+            tickAll(1);
+        }
         assertThat(stateB.members).as("B pulled A's change on a probe").contains("v2");
         assertThat(atB.gossip().antiEntropyRounds() - roundsBefore).as("one targeted round, not one per probe")
                 .isBetween(1L, 2L);
@@ -765,8 +769,16 @@ class PeerClusterTest {
         }
         assertThat(rumors - rumorsBefore).as("one refresh interval: each member sent its advertisement to each other once")
                 .isEqualTo(4L * 3);
-        assertThat(pings - pingsBefore).as("probes stretched to four seconds: about eight per member, not thirty")
-                .isBetween(4L * 6, 4L * 12);
+        // Probes stretch to five seconds here (four members under a 30 s TTL: idle-loop item 3), six per member, not
+        // thirty; and a probe of a member whose own hash-carrying probe reached this node since this node's last
+        // turn rests, both sides having compared through it (idle-loop O6): about three per member, never none.
+        assertThat(pings - pingsBefore).as("probes stretched to five seconds, some resting")
+                .isBetween(4L * 2, 4L * 8);
+        long rested = 0;
+        for (PeerNode node : List.of(a, b, c, d)) {
+            rested += node.group(group.advertisement().group()).orElseThrow().membership().probesRested();
+        }
+        assertThat(rested).as("probes rested on a member just heard with hashes").isPositive();
     }
 
     /**

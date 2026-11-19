@@ -100,6 +100,31 @@ class AgentSpacesAutoConfigurationTest {
     }
 
     /** ISSUE-Constraints FR-10: the gate is installed in each binder only when the property is on, with the hint. */
+    /** reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md: retirement on by default, post-retirement an opt-in. */
+    @Test
+    void retirementIsOnAndPostRetirementOffUnlessConfigured() throws Exception {
+        AgentSpacesProperties properties = fleetProperties(freePort(), 0);
+        PeerIdentity identity = autoConfig.agentSpacesIdentity(properties);
+        PeerNode node = autoConfig.agentSpacesNode(properties, identity);
+        closeables.add(node::close);
+        assertThat(node.retirement()).isTrue();
+        assertThat(node.postRetirement()).isFalse();
+
+        AgentSpacesProperties opted = fleetProperties(freePort(), 0);
+        opted.getRetirement().setEnabled(false);
+        opted.getPostRetirement().setEnabled(true);
+        PeerNode optedNode = autoConfig.agentSpacesNode(opted, autoConfig.agentSpacesIdentity(opted));
+        closeables.add(optedNode::close);
+        assertThat(optedNode.retirement()).isFalse();
+        assertThat(optedNode.postRetirement()).isTrue();
+
+        AgentSpacesProperties bad = fleetProperties(freePort(), 0);
+        bad.getRetirement().setAfter(java.time.Duration.ZERO);
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () -> autoConfig.agentSpacesNode(bad, autoConfig.agentSpacesIdentity(bad)))
+                .hasMessageContaining("agentspaces.retirement.after");
+    }
+
     @Test
     void theConstraintGateInstallsWithTheRulesProperty() throws Exception {
         AgentSpacesProperties properties = fleetProperties(freePort(), 0);

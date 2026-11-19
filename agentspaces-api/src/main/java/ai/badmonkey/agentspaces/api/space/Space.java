@@ -222,6 +222,32 @@ public interface Space {
     }
 
     /**
+     * A counter that moves with every change a reader of this space could act on, so a caller that looked and found
+     * nothing waits for the next change instead of looking again on a timer. Only its equality between two reads
+     * means anything.
+     *
+     * <p>The default keeps no counter and answers {@code -1}; {@link #awaitChange} then simply waits.
+     *
+     * @return the change count, or {@code -1} when this space keeps none
+     */
+    default long changeSignals() {
+        return -1;
+    }
+
+    /**
+     * Waits until {@link #changeSignals()} moves past {@code seen}, or {@code max} passes, whichever is first. A
+     * change between the caller's read of {@code seen} and this call returns at once. The default, for a space that
+     * keeps no counter, waits {@code max}.
+     *
+     * @param seen the count the caller read before it looked
+     * @param max  the longest wait
+     * @throws InterruptedException when interrupted while waiting
+     */
+    default void awaitChange(long seen, java.time.Duration max) throws InterruptedException {
+        Thread.sleep(max);
+    }
+
+    /**
      * The entries {@link #readAllEntries} matches by type and tags but cannot decode (HLC round
      * six, 2026-11-08, ruling R3): live, unclaimed, held here in the clear, and holding no value
      * of the template's type. The reads skip them; a reader that counts the records it refuses,

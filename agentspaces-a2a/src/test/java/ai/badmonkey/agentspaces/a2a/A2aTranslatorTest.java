@@ -48,9 +48,11 @@ class A2aTranslatorTest {
         A2aAgentCard a2a = A2aTranslator.translate(
                 card(List.of("research", "summarize")), "http://gw:8080", "Acme");
 
-        assertThat(a2a.protocolVersion()).isEqualTo(A2aAgentCard.PROTOCOL_VERSION);
+        assertThat(a2a.select()).hasValueSatisfying(i -> {
+            assertThat(i.protocolVersion()).isEqualTo(A2aAgentCard.PROTOCOL_VERSION);
+            assertThat(i.url()).isEqualTo("http://gw:8080/agents/researcher");
+        });
         assertThat(a2a.name()).isEqualTo("researcher");
-        assertThat(a2a.url()).isEqualTo("http://gw:8080/agents/researcher");
         assertThat(a2a.provider().organization()).isEqualTo("Acme");
         assertThat(a2a.skills()).extracting(A2aAgentCard.Skill::name)
                 .containsExactly("research", "summarize");
@@ -60,7 +62,7 @@ class A2aTranslatorTest {
     }
 
     @Test
-    void theAgentSpacesIdentitySurvivesInMetadata() {
+    void theAgentSpacesIdentitySurvivesInItsExtension() {
         A2aAgentCard a2a = A2aTranslator.translate(
                 card(List.of("research")), "http://gw:8080", "Acme");
 
@@ -89,14 +91,23 @@ class A2aTranslatorTest {
         AgentCard source = card(List.of("research"));
         A2aAgentCard a2a = A2aTranslator.translate(source, "http://gw:8080", "Acme");
 
-        assertThat(a2a.protocolVersion()).isEqualTo("1.0");
-        assertThat(a2a.name()).isEqualTo("researcher");
-        assertThat(a2a.description()).isEqualTo("Researches topics and writes findings");
+        // A2A 1.0: both interfaces at the agent's one URL, 1.0 preferred; 0.3's
+        // top-level fields describe the 0.3 interface for 0.3 clients
+        assertThat(a2a.supportedInterfaces()).containsExactly(
+                new A2aAgentCard.Interface("http://gw:8080/agents/researcher", "JSONRPC", "1.0"),
+                new A2aAgentCard.Interface("http://gw:8080/agents/researcher", "JSONRPC", "0.3"));
+        assertThat(a2a.protocolVersion()).isEqualTo("0.3");
         assertThat(a2a.url()).isEqualTo("http://gw:8080/agents/researcher");
         assertThat(a2a.preferredTransport()).isEqualTo("JSONRPC");
+        assertThat(a2a.name()).isEqualTo("researcher");
+        assertThat(a2a.description()).isEqualTo("Researches topics and writes findings");
         assertThat(a2a.version()).isEqualTo("0.1");
         assertThat(a2a.provider()).isEqualTo(new A2aAgentCard.Provider("Acme", "http://gw:8080"));
-        assertThat(a2a.capabilities()).isEqualTo(A2aAgentCard.Capabilities.none());
+        assertThat(a2a.capabilities().streaming()).isFalse();
+        assertThat(a2a.capabilities().pushNotifications()).isFalse();
+        assertThat(a2a.capabilities().extendedAgentCard()).isFalse();
+        assertThat(a2a.capabilities().extensions()).extracting(A2aAgentCard.Extension::uri)
+                .containsExactly(A2aAgentCard.IDENTITY_EXTENSION);
         assertThat(a2a.defaultInputModes()).containsExactly("application/json");
         assertThat(a2a.defaultOutputModes()).containsExactly("application/json");
         assertThat(a2a.skills()).hasSize(1);
@@ -115,9 +126,11 @@ class A2aTranslatorTest {
                 .containsEntry("agentspaces.group", source.group().value());
 
         // Explicit endpoint capabilities pass straight through.
-        A2aAgentCard.Capabilities streaming = new A2aAgentCard.Capabilities(true, true, false);
-        assertThat(A2aTranslator.translate(source, "http://gw:8080", "Acme", streaming)
-                .capabilities()).isEqualTo(streaming);
+        A2aAgentCard.Capabilities streaming = new A2aAgentCard.Capabilities(true, true);
+        A2aAgentCard.Capabilities served = A2aTranslator.translate(source, "http://gw:8080", "Acme", streaming)
+                .capabilities();
+        assertThat(served.streaming()).isTrue();
+        assertThat(served.pushNotifications()).isTrue();
     }
 
     /** TECH-SPEC §9.4: every skill of one agent carries the same schema tags. */

@@ -295,9 +295,19 @@ public final class ConstraintGate implements AutoCloseable {
                         .filter(c -> c.book().equals(book) && c.version() == v.version()).toList();
                 loaded.put(book, new Version(v, cs));
             });
+            boolean changed = !versions.equals(loaded);
             versions.clear();
             versions.putAll(loaded);
             catchUp();
+            if (changed) {
+                for (Runnable listener : reloadListeners) {
+                    try {
+                        listener.run();
+                    } catch (RuntimeException e) {
+                        warn("a reload listener failed: " + e);
+                    }
+                }
+            }
         } catch (RuntimeException e) {
             warn("cannot read constraints: " + e);
         }
@@ -312,6 +322,19 @@ public final class ConstraintGate implements AutoCloseable {
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    private final java.util.List<Runnable> reloadListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /**
+     * Runs a listener whenever a reload changes the loaded versions (idle-loop item 2): a binder whose takes wait long
+     * while no rule is loaded looks again at once when rules arrive. The listener runs on the reloading thread and must
+     * be quick.
+     *
+     * @param listener the listener
+     */
+    public void onReload(Runnable listener) {
+        reloadListeners.add(java.util.Objects.requireNonNull(listener, "listener"));
     }
 
     public Collection<Version> loaded() {

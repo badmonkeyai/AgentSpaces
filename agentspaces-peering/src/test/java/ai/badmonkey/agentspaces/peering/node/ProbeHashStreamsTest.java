@@ -210,10 +210,14 @@ class ProbeHashStreamsTest {
         network.twoWay("y", "x");
         assertThat(network.oneWayDropped("y", "x")).isPositive();
         assertThat(atX.held).as("the rumor was lost").doesNotContain("from-y");
+        long roundsAtY = ry.gossip().antiEntropyRounds();
         int toX = secondsUntilHeld(atX, "from-y", bound);
-        assertThat(toX).as("repaired at X within the probe cycle (seconds: %s)", toX).isBetween(0, 8);
-        assertThat(rx.gossip().pacingSignals().probeRoundsHashes()).as("X opened the repair from Y's hashes")
-                .isPositive();
+        int cycle = (int) (rx.membership().maxQuietIntervalMillis(1) / 1000) + 4;
+        assertThat(toX).as("repaired at X within the probe cycle (seconds: %s)", toX).isBetween(0, cycle);
+        // X's probes stretch as far as the pair's TTL bound (idle-loop item 3), so busy Y's base-period round may
+        // carry the hashes first; either way a round opened by hashes repaired X, inside the 32x bound
+        assertThat(rx.gossip().pacingSignals().probeRoundsHashes() + (ry.gossip().antiEntropyRounds() - roundsAtY))
+                .as("a round opened by hashes repaired X").isPositive();
 
         // X's rumor to Y is lost: Y, busy, runs its anti-entropy at the base period and repairs it there.
         long droppedBefore = network.oneWayDropped("x", "y");

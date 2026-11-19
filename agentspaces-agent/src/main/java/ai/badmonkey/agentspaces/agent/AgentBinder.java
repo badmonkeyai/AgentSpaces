@@ -346,7 +346,78 @@ public final class AgentBinder implements AutoCloseable {
      */
     public AgentBinder constraintGate(ai.badmonkey.agentspaces.constraints.ConstraintGate gate) {
         this.constraintGate = gate;
+        if (gate != null) {
+            gate.onReload(this::rouseUngatedTakes);
+        }
+        rouseUngatedTakes(); // a take waiting long without a gate looks at the new one now
         return this;
+    }
+
+    // ---- ungated takes wait on changes (idle-loop item 2, reviews/IDLE-LOOP-2026-11-18.md §6)
+
+    /**
+     * How long an ungated take waits for a matching entry before its loop looks again. It wakes at once on a change to
+     * the space, and a gate installed or reloaded interrupts it, so the length only bounds what neither covers. A gated
+     * take keeps its {@code pollTimeout}.
+     */
+    static final Duration UNGATED_TAKE_WAIT = Duration.ofSeconds(30);
+
+    /** One take loop's wait, so a gate change interrupts it only while it waits, never in its action. */
+    private static final class TakeWait {
+        final Thread thread;
+        /** In the ungated take, interruptible by a gate change. Under this object's monitor. */
+        boolean waiting;
+        /** Inside the ungated take call at all, interrupted or not. Under this object's monitor. */
+        boolean inTake;
+
+        TakeWait(Thread thread) {
+            this.thread = thread;
+        }
+    }
+
+    /** The longest a gate change waits for an interrupted take to leave its wait. */
+    private static final long ROUSE_WAIT_MILLIS = 2_000;
+
+    private final Set<TakeWait> ungatedWaits = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Interrupts every ungated take while it waits, and returns once each has left its take, so its loop looks at the
+     * gate before any entry written after this returns can be claimed. An interrupted take can still claim what was
+     * there before, as a take that started before the gate always could; it cannot wake for a later write and claim
+     * it past the gate, which a bare interrupt raced with. Bounded: a take that does not leave in
+     * {@link #ROUSE_WAIT_MILLIS} is left to finish.
+     */
+    private void rouseUngatedTakes() {
+        for (TakeWait wait : ungatedWaits) {
+            synchronized (wait) {
+                if (!wait.waiting) {
+                    continue;
+                }
+                wait.waiting = false;
+                wait.thread.interrupt();
+                long deadline = System.nanoTime() + ROUSE_WAIT_MILLIS * 1_000_000L;
+                boolean interrupted = false;
+                while (wait.inTake) {
+                    long left = (deadline - System.nanoTime()) / 1_000_000L;
+                    if (left <= 0) {
+                        break;
+                    }
+                    try {
+                        wait.wait(left);
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    private boolean ungated() {
+        ai.badmonkey.agentspaces.constraints.ConstraintGate gate = constraintGate;
+        return gate == null || gate.loaded().isEmpty();
     }
 
     public ai.badmonkey.agentspaces.constraints.ConstraintGate constraintGate() {
@@ -360,11 +431,15 @@ public final class AgentBinder implements AutoCloseable {
      * narrows the take to its key, and when every candidate is refused the loop waits one poll. Returns the
      * template to take with, or empty when nothing may be taken now.
      */
+    /** The longest a gated take waits for a change before it looks again (idle-loop O9). */
+    static final long GATED_LOOK_MAX_MILLIS = 1_000;
+
     private Optional<Template<?>> gated(Space space, Template<?> template, Duration pollTimeout) {
         ai.badmonkey.agentspaces.constraints.ConstraintGate gate = constraintGate;
         if (gate == null || gate.loaded().isEmpty()) {
             return Optional.of(template);
         }
+        long seen = space.changeSignals();
         List<? extends Space.Entry<?>> candidates;
         try {
             candidates = space.readAllEntries(template, 16);
@@ -376,10 +451,17 @@ public final class AgentBinder implements AutoCloseable {
                 return Optional.of(gate.narrow(template, candidate));
             }
         }
-        // nothing admitted now (nothing there, or every candidate refused): wait one poll and look again,
-        // rather than a blocking take that would claim an entry the gate never saw
+        // nothing admitted now (nothing there, or every candidate refused): wait and look again, rather than a
+        // blocking take that would claim an entry the gate never saw. The wait ends at the space's next change, so a
+        // new entry is looked at at once, and after at most the poll timeout (a second at most), for what changes
+        // outside the space: the gate's rules, or a judgement that moves with time (idle-loop O9; was a 250 ms sleep).
         try {
-            Thread.sleep(Math.max(20, Math.min(pollTimeout.toMillis(), 250)));
+            long cap = Math.max(20, Math.min(pollTimeout.toMillis(), GATED_LOOK_MAX_MILLIS));
+            if (seen < 0) {
+                Thread.sleep(Math.max(20, Math.min(pollTimeout.toMillis(), 250)));
+            } else {
+                space.awaitChange(seen, Duration.ofMillis(cap));
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -1252,39 +1334,77 @@ public final class AgentBinder implements AutoCloseable {
 
         return Thread.ofVirtual().name("space-take-" + label).start(() -> {
             TakeFailures failures = new TakeFailures(label, false);
-            while (handle.running) {
-                Optional<? extends TakenEntry<?>> taken;
-                try {
-                    Optional<Template<?>> admitted = gated(space, template, pollTimeout);
-                    if (admitted.isEmpty()) {
+            TakeWait wait = new TakeWait(Thread.currentThread());
+            ungatedWaits.add(wait);
+            try {
+                while (handle.running) {
+                    Optional<? extends TakenEntry<?>> taken;
+                    try {
+                        Optional<Template<?>> admitted = gated(space, template, pollTimeout);
+                        if (admitted.isEmpty()) {
+                            continue;
+                        }
+                        if (ungated()) {
+                            // idle-loop item 2: wait on the space's changes, not a one-second poll; a gate change interrupts
+                            synchronized (wait) {
+                                wait.waiting = true;
+                                wait.inTake = true;
+                            }
+                            if (!ungated()) { // a gate loaded between the look and the wait: look again
+                                synchronized (wait) {
+                                    wait.waiting = false;
+                                    wait.inTake = false;
+                                    wait.notifyAll();
+                                }
+                                if (handle.running) {
+                                    Thread.interrupted();
+                                }
+                                continue;
+                            }
+                            try {
+                                taken = space.take(admitted.get(), takeLease,
+                                        pollTimeout.compareTo(UNGATED_TAKE_WAIT) > 0 ? pollTimeout : UNGATED_TAKE_WAIT);
+                            } finally {
+                                synchronized (wait) {
+                                    wait.waiting = false;
+                                    wait.inTake = false;
+                                    wait.notifyAll(); // a gate change waiting for this take to leave
+                                    if (handle.running) {
+                                        Thread.interrupted(); // a gate change's interrupt, now spent; a close keeps its own
+                                    }
+                                }
+                            }
+                        } else {
+                            taken = space.take(admitted.get(), takeLease, gatedPoll(pollTimeout));
+                        }
+                    } catch (RuntimeException e) {
+                        if (!handle.running || !failures.failed(e)) {
+                            return;
+                        }
                         continue;
                     }
-                    taken = space.take(admitted.get(), takeLease, gatedPoll(pollTimeout));
-                } catch (RuntimeException e) {
-                    if (!handle.running || !failures.failed(e)) {
-                        return;
+                    failures.succeeded();
+                    if (taken.isEmpty()) {
+                        continue;
                     }
-                    continue;
+                    try {
+                        TakeContext context = new TakeContext(taken.get(), takeLease.duration(), handle.agentId, space.name());
+                        Optional<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invoker = invokerFor(agent, method);
+                        Object result = invoker.isPresent()
+                                ? invokeThrough(invoker.get(), context, agent, method, taken.get().entry())
+                                : invokeWithin(context, agent, method, taken.get().entry());
+                        dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
+                    } catch (RuntimeException | Error e) {
+                        // The crash idiom: no complete, the TAKE lease lapses, and the
+                        // entry reappears for another worker (spec §7.2). Errors are
+                        // caught too, so an AssertionError or StackOverflowError in
+                        // the action cannot silently kill the worker loop.
+                        LOG.log(System.Logger.Level.WARNING,
+                                label + ": action failed; lease will lapse", e);
+                    }
                 }
-                failures.succeeded();
-                if (taken.isEmpty()) {
-                    continue;
-                }
-                try {
-                    TakeContext context = new TakeContext(taken.get(), takeLease.duration(), handle.agentId, space.name());
-                    Optional<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invoker = invokerFor(agent, method);
-                    Object result = invoker.isPresent()
-                            ? invokeThrough(invoker.get(), context, agent, method, taken.get().entry())
-                            : invokeWithin(context, agent, method, taken.get().entry());
-                    dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
-                } catch (RuntimeException | Error e) {
-                    // The crash idiom: no complete, the TAKE lease lapses, and the
-                    // entry reappears for another worker (spec §7.2). Errors are
-                    // caught too, so an AssertionError or StackOverflowError in
-                    // the action cannot silently kill the worker loop.
-                    LOG.log(System.Logger.Level.WARNING,
-                            label + ": action failed; lease will lapse", e);
-                }
+            } finally {
+                ungatedWaits.remove(wait);
             }
         });
     }

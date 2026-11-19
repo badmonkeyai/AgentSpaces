@@ -21,6 +21,8 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -263,9 +265,49 @@ public final class PackNodeStore implements BlockStore, MetaStore, AutoCloseable
         Objects.requireNonNull(dir, "dir");
         Objects.requireNonNull(options, "options");
         Files.createDirectories(dir);
+        // One directory serves one store. Two stores on one directory, in two processes or in one, each append at the
+        // offsets only they track and rewrite the shared index, so a read past a pack the other rewrote is short and
+        // bytes the other wrote come back under a CID they do not hash to (the PDT second-swap ticket, 2026-11-17:
+        // every peer of a group on one host defaulted to the same directory). The lock refuses the second store.
+        FileChannel lockChannel = FileChannel.open(dir.resolve(LOCK_FILE), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        FileLock dirLock;
+        try {
+            dirLock = lockChannel.tryLock();
+        } catch (OverlappingFileLockException sameJvm) {
+            dirLock = null;
+        }
+        if (dirLock == null) {
+            lockChannel.close();
+            throw new IOException("another node store holds " + dir + ": one directory serves one store, so give each"
+                    + " peer its own store path");
+        }
         PackNodeStore store = new PackNodeStore(dir, options);
-        store.start();
+        store.dirLock = dirLock;
+        try {
+            store.start();
+        } catch (IOException | RuntimeException e) {
+            store.releaseDirLock();
+            throw e;
+        }
         return store;
+    }
+
+    /** The lock file that keeps a second store off this directory. */
+    static final String LOCK_FILE = ".store.lock";
+
+    private FileLock dirLock;
+
+    private void releaseDirLock() {
+        FileLock held = dirLock;
+        dirLock = null;
+        if (held != null) {
+            try {
+                held.release();
+                held.channel().close();
+            } catch (IOException ignored) {
+                // the lock dies with the channel and the process; nothing else holds it
+            }
+        }
     }
 
     /** The directory. */
@@ -794,6 +836,8 @@ public final class PackNodeStore implements BlockStore, MetaStore, AutoCloseable
                 // closing is best effort; the data is on disk or in the torn tail
             }
         }
+        // a closed store, or a crashed one (abandon), leaves the directory free, as a process exit does
+        releaseDirLock();
     }
 
     // ---- appends, dead marks, packs ----

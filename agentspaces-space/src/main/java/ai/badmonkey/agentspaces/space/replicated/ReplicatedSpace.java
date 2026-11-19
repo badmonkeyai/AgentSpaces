@@ -274,8 +274,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private SweepActions lastSweep = SweepActions.NONE;
 
     // ---- the change signal a waiting take or read sleeps on (IDLE-WORK 5a(a))
-    /** Bumped with every change a waiting take or read could act on. Under {@link #lock}. */
-    private long signals;
+    /** Bumped with every change a waiting take or read could act on. Written under {@link #lock}; read anywhere. */
+    private volatile long signals;
     /** Threads waiting on {@link #lock} for a change; a change notifies only when there are any. Under {@link #lock}. */
     private int waiters;
     /**
@@ -285,6 +285,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * moved by hand). The poll it replaces ran every 20 ms.
      */
     static final long WAIT_SLICE_MILLIS = 1_000;
+    /**
+     * The slice when nothing this space holds can become readable without a signal (idle-loop O9): no payload or block
+     * awaited, no retry pending, no recordless state, no sealing (a key arriving does not signal), and the system
+     * clock (a test clock moved by hand does not signal either). A waiting take then sleeps on changes alone.
+     */
+    static final long IDLE_WAIT_SLICE_MILLIS = 30_000;
+
+    /** The longest a waiter sleeps between looks right now; see {@link #IDLE_WAIT_SLICE_MILLIS}. Under {@link #lock}. */
+    private long waitSliceLocked() {
+        boolean nothingUnsignalled = keyRing == null && InstantSource.system().equals(clock) && awaitingPayload.isEmpty()
+                && blockRetries.isEmpty() && bulkRetries.isEmpty() && pendingStates.isEmpty();
+        return nothingUnsignalled ? IDLE_WAIT_SLICE_MILLIS : WAIT_SLICE_MILLIS;
+    }
     /** How many times a blocking read or take has tried, for the test that a waiting take does not poll. */
     private final AtomicLong waitingPolls = new AtomicLong();
     /**
@@ -1212,6 +1225,16 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
 
         ReplicatedSpace owner() {
             return ReplicatedSpace.this;
+        }
+
+        @Override
+        public long changeSignals() {
+            return ReplicatedSpace.this.changeSignals();
+        }
+
+        @Override
+        public void awaitChange(long seen, Duration max) throws InterruptedException {
+            ReplicatedSpace.this.awaitChange(seen, max);
         }
 
         @Override
@@ -6165,6 +6188,39 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
     }
 
+    /**
+     * A counter that moves with every change a reader of this space could act on: a write, a merge, a renewal, a
+     * cancel, a claim, a sweep that lapses a claim, a block or artifact landing. A component that derives state from
+     * the space recomputes only when it moved (idle-loop O4, reviews/IDLE-LOOP-2026-11-18.md); time alone moves it
+     * only through the sweep, so a reader with leases of its own also keeps their due times.
+     *
+     * @return the change count; only its equality between two reads means anything
+     */
+    @Override
+    public long changeSignals() {
+        return signals;
+    }
+
+    @Override
+    public void awaitChange(long seen, Duration max) throws InterruptedException {
+        Objects.requireNonNull(max, "max");
+        long deadline = System.nanoTime() + max.toNanos();
+        synchronized (lock) {
+            while (signals == seen) {
+                long leftMillis = (deadline - System.nanoTime() + 999_999) / 1_000_000;
+                if (leftMillis <= 0) {
+                    return;
+                }
+                waiters++;
+                try {
+                    lock.wait(leftMillis);
+                } finally {
+                    waiters--;
+                }
+            }
+        }
+    }
+
     /** {@link #signal()} from outside the lock: a block or an artifact landed, so a waiting read may decode now. */
     private void signalArrival() {
         synchronized (lock) {
@@ -6724,7 +6780,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 if (leftMillis <= 0) {
                     return;
                 }
-                long wait = Math.min(leftMillis, WAIT_SLICE_MILLIS);
+                long wait = Math.min(leftMillis, waitSliceLocked());
                 long untilDue = nextDueLocked() - nowMillis();
                 if (untilDue > 0 && untilDue < wait) {
                     wait = untilDue; // a claim lapsing by the clock makes its entry takeable without a signal

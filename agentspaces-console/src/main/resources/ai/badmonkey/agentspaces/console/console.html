@@ -99,6 +99,15 @@ tr:last-child td { border-bottom: none; }
 #feed .k-completed { color: var(--as-ok); }
 #feed .k-taken { color: var(--as-warn); }
 #feed .k-command { color: var(--as-c2); font-weight: 600; }
+#feed .k-GROUP_ISOLATED { color: var(--as-warn); font-weight: 600; }
+#feed .k-GROUP_REJOINED { color: var(--as-ok); font-weight: 600; }
+#feed .k-GROUP_STATUS { color: var(--as-muted); }
+.state-ok { color: var(--as-ok); }
+.state-warn { color: var(--as-warn); }
+.state-bad { color: var(--as-warn); font-weight: 700; }
+#isolated { display: none; margin: 0 0 14px; padding: 10px 14px; border: 1px solid var(--as-warn);
+  border-radius: 8px; color: var(--as-warn); }
+.tile .s { color: var(--as-muted); font-size: 11.5px; margin-top: 2px; }
 #feed time { color: var(--as-muted); font-family: var(--as-mono); font-size: 11.5px;
   margin-right: 6px; }
 .badge { display: inline-block; padding: 0 7px; border-radius: 999px;
@@ -137,7 +146,10 @@ footer a { color: var(--as-accent); text-decoration: none; }
   <span id="live">● live</span>
 </header>
 <main>
+  <div id="isolated"></div>
   <div class="tiles">
+    <div class="tile"><div class="n" id="t-state" style="font-size: 18px">–</div><div class="l">membership</div>
+      <div class="s" id="t-state-since"></div></div>
     <div class="tile"><div class="n" id="t-members">–</div><div class="l">members</div></div>
     <div class="tile"><div class="n" id="t-agents">–</div><div class="l">agents</div></div>
     <div class="tile"><div class="n" id="t-queued">–</div><div class="l">queued</div></div>
@@ -187,17 +199,45 @@ async function refresh() {
     $("workers").innerHTML = workers.length
       ? table(["worker", "completed"], workers.map(([w, n]) => [esc(w), n]))
       : '<div class="empty">no completions yet</div>';
+    const m = o.membership;
+    if (m) {
+      const cls = {CONNECTED: "state-ok", ALONE: "state-ok", ISOLATED: "state-bad"}[m.state] || "state-warn";
+      $("t-state").innerHTML = '<span class="' + cls + '">' + esc(m.state.toLowerCase().replace("_", " ")) + "</span>";
+      const secs = Math.max(0, Math.round((Date.now() - Date.parse(m.since)) / 1000));
+      $("t-state-since").textContent = "for " + (secs < 120 ? secs + " s" : Math.round(secs / 60) + " min")
+        + (m.lost ? " · " + m.lost + " lost" : "") + (m.retired ? " · " + m.retired + " retired" : "");
+      const banner = $("isolated");
+      if (m.state === "ISOLATED" || m.state === "LAST_RESORT") {
+        banner.style.display = "block";
+        banner.textContent = m.state === "ISOLATED"
+          ? "This node is isolated in " + m.group + ": no member, and its lost members, seeds and locator brought"
+            + " nobody back" + (m.postRetirement ? ", nor its retired members." : " (post-retirement is off).")
+          : "No member in " + m.group + ": trying " + m.retired + " retired member(s) as the last resort.";
+      } else {
+        banner.style.display = "none";
+      }
+    }
     const peers = await (await fetch("/api/v1/peers")).json();
+    const when = (iso) => esc(iso.replace(/^.*T/, "").replace(/\..*$/, ""));
+    const lostRows = (peers.lost || []).map((l) => ['<span class="mono">' + esc(l.peer.slice(0, 10)) + '…</span>',
+      when(l.lostAt), l.attempts, when(l.nextAttempt)]);
+    const retiredRows = (peers.retired || []).map((r) => ['<span class="mono">' + esc(r.peer.slice(0, 10)) + '…</span>',
+      when(r.lastSeen), when(r.retiredAt)]);
+    const extra = (lostRows.length ? '<h2 style="margin-top: 14px">Lost, being retried</h2>'
+        + table(["peer", "lost", "tries", "next"], lostRows) : "")
+      + (retiredRows.length ? '<h2 style="margin-top: 14px">Retired</h2>'
+        + table(["peer", "last seen", "retired"], retiredRows) : "");
     $("peers").innerHTML = table(["peer", "roles", "state", "channel"],
       peers.peers.map((p) => ['<span class="mono">' + esc(p.peer.slice(0, 16)) + '…</span>',
         p.roles.map((r) => '<span class="badge">' + esc(r.toLowerCase()) + "</span>").join(" "),
         p.suspect ? '<span class="k-taken">suspect</span>' : "alive",
         p.channel === "attested"
-          ? '<span class="badge">attested</span>' : esc(p.channel || "signed")]));
+          ? '<span class="badge">attested</span>' : esc(p.channel || "signed")])) + extra;
     const ads = await (await fetch("/api/v1/ads")).json();
     $("ads").innerHTML = table(["kind", "who / what", "detail"],
       ads.ads.map((a) => ['<span class="badge">' + esc(a.kind) + "</span>",
         esc(a.title), esc(a.detail)]));
+    for (const id of ["spaces", "peers", "ads"]) $(id).classList.remove("empty"); // "loading…" is over
     $("live").textContent = "● live";
     $("live").className = "";
   } catch (e) {
@@ -212,9 +252,12 @@ function follow() {
     const a = JSON.parse(e.data);
     const li = document.createElement("li");
     const at = a.at.replace(/^.*T/, "").replace(/\..*$/, "");
-    li.innerHTML = "<time>" + esc(at) + '</time><span class="k-' + esc(a.kind) + '">'
-      + esc(a.kind) + "</span> " + esc(a.entryType) + " in " + esc(a.space)
-      + (a.worker ? " · " + esc(a.worker) : "");
+    li.innerHTML = a.kind.startsWith("GROUP_")
+      ? "<time>" + esc(at) + '</time><span class="k-' + esc(a.kind) + '">' + esc(a.kind) + "</span> "
+        + esc(a.space) + " " + esc(a.entryType) + (a.worker ? " (was " + esc(a.worker) + ")" : "")
+      : "<time>" + esc(at) + '</time><span class="k-' + esc(a.kind) + '">'
+        + esc(a.kind) + "</span> " + esc(a.entryType) + " in " + esc(a.space)
+        + (a.worker ? " · " + esc(a.worker) : "");
     const feed = $("feed");
     feed.prepend(li);
     while (feed.children.length > 30) feed.removeChild(feed.lastChild);

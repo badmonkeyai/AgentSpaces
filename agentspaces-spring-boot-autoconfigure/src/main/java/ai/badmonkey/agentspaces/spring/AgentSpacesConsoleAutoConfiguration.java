@@ -70,6 +70,7 @@ public class AgentSpacesConsoleAutoConfiguration {
             AgentSpaces.GroupContext group = spaces.group(groupName);
             if (first) {
                 builder.members(() -> group.runtime().membership().allMembers());
+                builder.membership(node, group.runtime().id()); // state, lost and retired members, their changes
                 builder.discovery(group.discovery());
                 first = false;
             }

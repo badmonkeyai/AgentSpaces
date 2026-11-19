@@ -348,7 +348,17 @@ public class AgentSpacesAutoConfiguration {
                 .auditSessions(properties.auditSessions())
                 .auditBudget(properties.auditBudget())
                 .renewShorteningLog(properties.renewShorteningLog()) // RE-H-01
-                .horizon(properties.horizonPerEntry()); // RE-H-04, wire.horizon=1
+                .horizon(properties.horizonPerEntry()) // RE-H-04, wire.horizon=1
+                // reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md: retirement on, post-retirement opt-in
+                .retirement(properties.getRetirement().isEnabled())
+                .postRetirement(properties.getPostRetirement().isEnabled());
+        if (properties.getRetirement().getAfter() != null) {
+            try {
+                builder.retireAfter(properties.getRetirement().getAfter());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("agentspaces.retirement.after: " + e.getMessage(), e);
+            }
+        }
         // ISSUE-PeerRobustness-2: the keystore directory is the node's state directory, so a
         // member admitted under an invite delegation is still admitted after a restart (R2-1.5),
         // and the application's RelayPolicy bean, when it declares one, judges each relayed frame.

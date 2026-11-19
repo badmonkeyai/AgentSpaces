@@ -55,10 +55,19 @@ import java.util.function.Supplier;
  *
  * <p>With a {@link #taskBinding(A2aTaskBinding) task binding} attached, the
  * gateway also serves the A2A task surface as JSON-RPC 2.0 POSTed to an
- * agent's URL: {@code message/send} writes a task entry into the fleet's
- * space, {@code tasks/get} reports the task's state straight from space
- * semantics, and {@code tasks/cancel} withdraws the entry. Without a binding
- * the gateway is a read-only discovery surface.
+ * agent's URL: sending a message writes a task entry into the fleet's space,
+ * getting a task reports its state straight from space semantics, and
+ * canceling withdraws the entry. Without a binding the gateway is a read-only
+ * discovery surface.
+ *
+ * <p>Two A2A versions share each URL, chosen per request by the
+ * {@code A2A-Version} header or query parameter (A2A 1.0 §3.6): {@code 1.0}
+ * gets 1.0's methods ({@code SendMessage}, {@code GetTask},
+ * {@code CancelTask}, {@code SendStreamingMessage}, {@code SubscribeToTask},
+ * the push-config methods) and shapes; none, or {@code 0.3}, gets 0.3's
+ * ({@code message/send}, {@code tasks/get} and the rest) exactly as before;
+ * any other is {@code VersionNotSupportedError}. Every card lists both
+ * interfaces, 1.0 first.
  */
 public final class A2aGateway implements AutoCloseable {
 
@@ -86,14 +95,15 @@ public final class A2aGateway implements AutoCloseable {
     private final String provider;
     private final Supplier<List<AgentCard>> cards;
     private final ObjectMapper json = new ObjectMapper();
+    private final A2aWire wire = new A2aWire(json);
     /** Live push registrations, bounded: oldest evict so a registration flood
      * cannot grow memory without bound (ASF-007). */
-    private final java.util.Map<String, PushConfig> pushConfigs =
+    private final java.util.Map<String, Registration> pushConfigs =
             java.util.Collections.synchronizedMap(
                     new java.util.LinkedHashMap<>(64, 0.75f, false) {
                         @Override
                         protected boolean removeEldestEntry(
-                                java.util.Map.Entry<String, PushConfig> eldest) {
+                                java.util.Map.Entry<String, Registration> eldest) {
                             return size() > MAX_PUSH_CONFIGS;
                         }
                     });
@@ -120,6 +130,15 @@ public final class A2aGateway implements AutoCloseable {
      *              receiver can authenticate the callback
      */
     public record PushConfig(String url, String token) {
+    }
+
+    /**
+     * A task's live push registration: the config, the A2A version it was
+     * registered under (the webhook payload follows it), its 1.0 config id,
+     * and the 1.0 {@code authentication} the gateway presents to the webhook.
+     */
+    private record Registration(PushConfig config, A2aVersion version, String id,
+                                String authScheme, String authCredentials) {
     }
 
     /**
@@ -323,7 +342,7 @@ public final class A2aGateway implements AutoCloseable {
         // With a task binding attached, SSE streaming and webhook push both
         // work; discovery-only gateways advertise nothing.
         return binding == null ? A2aAgentCard.Capabilities.none()
-                : new A2aAgentCard.Capabilities(true, true, false);
+                : new A2aAgentCard.Capabilities(true, true);
     }
 
     private List<A2aAgentCard> translated() {
@@ -339,19 +358,17 @@ public final class A2aGateway implements AutoCloseable {
         List<A2aAgentCard.Skill> allSkills = new ArrayList<>();
         translated().forEach(card -> allSkills.addAll(card.skills()));
         A2aAgentCard gatewayCard = new A2aAgentCard(
-                A2aAgentCard.PROTOCOL_VERSION,
                 fleetName,
                 "AgentSpaces fleet gateway: one A2A surface for every agent "
                         + "currently advertising in the group.",
-                baseUrl() + "/agents",
-                "JSONRPC",
-                "0.1",
+                A2aAgentCard.jsonRpc(baseUrl() + "/agents"),
                 new A2aAgentCard.Provider(provider, baseUrl()),
-                endpointCapabilities(),
+                "0.1",
+                endpointCapabilities().with(A2aAgentCard.Extension.identity(
+                        java.util.Map.of("agentspaces.gateway", "true"))),
                 List.of("application/json"),
                 List.of("application/json"),
-                allSkills,
-                java.util.Map.of("agentspaces.gateway", "true"));
+                allSkills);
         respond(exchange, 200, json.writeValueAsBytes(gatewayCard));
     }
 
@@ -414,6 +431,19 @@ public final class A2aGateway implements AutoCloseable {
         }
         JsonNode id = request.path("id");
         String method = request.path("method").asText("");
+        // A2A 1.0 §3.6: the request names its version; none means 0.3
+        String requested = requestedVersion(exchange);
+        Optional<A2aVersion> version = A2aVersion.negotiate(requested);
+        if (version.isEmpty()) {
+            respond(exchange, 200, rpcError(id, -32009, "A2A version " + requested
+                    + " is not supported; this gateway speaks "
+                    + A2aAgentCard.PROTOCOL_VERSION + " and " + A2aAgentCard.LEGACY_PROTOCOL_VERSION,
+                    wire.errorInfo("VERSION_NOT_SUPPORTED", java.util.Map.of(
+                            "requestedVersion", requested,
+                            "supportedVersions", A2aAgentCard.PROTOCOL_VERSION + ","
+                                    + A2aAgentCard.LEGACY_PROTOCOL_VERSION))));
+            return;
+        }
         A2aTaskBinding taskBinding = binding;
         if (taskBinding == null) {
             respond(exchange, 200, rpcError(id, -32601,
@@ -421,100 +451,307 @@ public final class A2aGateway implements AutoCloseable {
             return;
         }
         try {
-            switch (method) {
-                case "message/send" -> {
-                    Optional<String> text = firstTextPart(request.path("params"));
-                    if (text.isEmpty()) {
-                        respond(exchange, 200, rpcError(id, -32602,
-                                "params.message.parts must contain a text part"));
-                        return;
-                    }
-                    if (translated().stream().noneMatch(c -> c.name().equals(agentName))) {
-                        respond(exchange, 200, rpcError(id, -32602,
-                                "no agent named '" + agentName + "'"));
-                        return;
-                    }
-                    respond(exchange, 200,
-                            rpcResult(id, taskBinding.send(agentName, text.get())));
-                }
-                case "tasks/get" -> respondTask(exchange, id,
-                        taskBinding.get(request.path("params").path("id").asText("")));
-                case "tasks/cancel" -> respondTask(exchange, id,
-                        taskBinding.cancel(request.path("params").path("id").asText("")));
-                case "message/stream" -> {
-                    Optional<String> text = firstTextPart(request.path("params"));
-                    if (text.isEmpty()) {
-                        respond(exchange, 200, rpcError(id, -32602,
-                                "params.message.parts must contain a text part"));
-                        return;
-                    }
-                    if (translated().stream().noneMatch(c -> c.name().equals(agentName))) {
-                        respond(exchange, 200, rpcError(id, -32602,
-                                "no agent named '" + agentName + "'"));
-                        return;
-                    }
-                    streamTask(exchange, id, taskBinding,
-                            taskBinding.send(agentName, text.get()).id());
-                }
-                case "tasks/resubscribe" -> {
-                    String taskId = request.path("params").path("id").asText("");
-                    if (taskBinding.get(taskId).isEmpty()) {
-                        respond(exchange, 200, rpcError(id, -32001, "task not found"));
-                        return;
-                    }
-                    streamTask(exchange, id, taskBinding, taskId);
-                }
-                case "tasks/pushNotificationConfig/set" -> {
-                    String taskId = request.path("params").path("taskId").asText("");
-                    String url = request.path("params").path("pushNotificationConfig")
-                            .path("url").asText("");
-                    String token = request.path("params").path("pushNotificationConfig")
-                            .path("token").asText(null);
-                    if (taskBinding.get(taskId).isEmpty()) {
-                        respond(exchange, 200, rpcError(id, -32001, "task not found"));
-                        return;
-                    }
-                    if (url.isBlank()) {
-                        respond(exchange, 200, rpcError(id, -32602,
-                                "pushNotificationConfig.url is required"));
-                        return;
-                    }
-                    if (!webhookPermitted(url)) {
-                        // ASF-007: deny the blind-SSRF targets by default.
-                        respond(exchange, 200, rpcError(id, -32602,
-                                "pushNotificationConfig.url is not a permitted webhook target"));
-                        return;
-                    }
-                    PushConfig config = new PushConfig(url, token);
-                    pushConfigs.put(taskId, config);
-                    watchAndPush(taskBinding, taskId, config);
-                    respond(exchange, 200, rpcResult(id, java.util.Map.of(
-                            "taskId", taskId, "pushNotificationConfig", config)));
-                }
-                case "tasks/pushNotificationConfig/get" -> {
-                    String taskId = request.path("params").path("id").asText(
-                            request.path("params").path("taskId").asText(""));
-                    PushConfig config = pushConfigs.get(taskId);
-                    if (config == null) {
-                        respond(exchange, 200, rpcError(id, -32001,
-                                "no push configuration for task '" + taskId + "'"));
-                        return;
-                    }
-                    // The callback token authenticates the gateway to the
-                    // receiver; reading it back needs only the taskId, so it
-                    // is redacted here (ASF-037).
-                    respond(exchange, 200, rpcResult(id, java.util.Map.of(
-                            "taskId", taskId, "pushNotificationConfig",
-                            new PushConfig(config.url(), null))));
-                }
-                default -> respond(exchange, 200, rpcError(id, -32601,
-                        "unknown method '" + method + "'"));
+            if (version.get() == A2aVersion.V1_0) {
+                rpc10(exchange, id, method, request.path("params"), agentName, taskBinding);
+            } else {
+                rpc03(exchange, id, method, request, agentName, taskBinding);
             }
         } catch (RuntimeException e) {
             // Internal detail stays server-side (ASF-036).
             LOG.log(System.Logger.Level.WARNING, "rpc '" + method + "' failed", e);
             respond(exchange, 200, rpcError(id, -32603, "internal error"));
         }
+    }
+
+    /** A missing {@code historyLength}: the default, all of the history. */
+    private static final JsonNode MISSING =
+            com.fasterxml.jackson.databind.node.MissingNode.getInstance();
+
+    /**
+     * The {@code A2A-Version} service parameter: the header, else the query
+     * parameter of the same name (A2A 1.0 §3.6.1); null when neither is set.
+     */
+    private static String requestedVersion(HttpExchange exchange) {
+        String header = exchange.getRequestHeaders().getFirst(A2aVersion.HEADER);
+        if (header != null && !header.isBlank()) {
+            return header.strip();
+        }
+        String query = exchange.getRequestURI().getRawQuery();
+        if (query != null) {
+            for (String pair : query.split("&")) {
+                int eq = pair.indexOf('=');
+                String key = java.net.URLDecoder.decode(eq < 0 ? pair : pair.substring(0, eq),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                if (A2aVersion.HEADER.equalsIgnoreCase(key) && eq >= 0) {
+                    return java.net.URLDecoder.decode(pair.substring(eq + 1),
+                            java.nio.charset.StandardCharsets.UTF_8).strip();
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The A2A 0.3 methods, as the gateway has always served them. */
+    private void rpc03(HttpExchange exchange, JsonNode id, String method, JsonNode request,
+                       String agentName, A2aTaskBinding taskBinding) throws IOException {
+        switch (method) {
+            case "message/send" -> {
+                Optional<String> text = firstTextPart(request.path("params"), A2aVersion.V0_3);
+                if (text.isEmpty()) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "params.message.parts must contain a text part"));
+                    return;
+                }
+                if (translated().stream().noneMatch(c -> c.name().equals(agentName))) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "no agent named '" + agentName + "'"));
+                    return;
+                }
+                respond(exchange, 200,
+                        rpcResult(id, taskBinding.send(agentName, text.get())));
+            }
+            case "tasks/get" -> respondTask(exchange, id,
+                    taskBinding.get(request.path("params").path("id").asText("")));
+            case "tasks/cancel" -> respondTask(exchange, id,
+                    taskBinding.cancel(request.path("params").path("id").asText("")));
+            case "message/stream" -> {
+                Optional<String> text = firstTextPart(request.path("params"), A2aVersion.V0_3);
+                if (text.isEmpty()) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "params.message.parts must contain a text part"));
+                    return;
+                }
+                if (translated().stream().noneMatch(c -> c.name().equals(agentName))) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "no agent named '" + agentName + "'"));
+                    return;
+                }
+                streamTask(exchange, id, taskBinding,
+                        taskBinding.send(agentName, text.get()).id(), A2aVersion.V0_3, MISSING);
+            }
+            case "tasks/resubscribe" -> {
+                String taskId = request.path("params").path("id").asText("");
+                if (taskBinding.get(taskId).isEmpty()) {
+                    respond(exchange, 200, rpcError(id, -32001, "task not found"));
+                    return;
+                }
+                streamTask(exchange, id, taskBinding, taskId, A2aVersion.V0_3, MISSING);
+            }
+            case "tasks/pushNotificationConfig/set" -> {
+                String taskId = request.path("params").path("taskId").asText("");
+                String url = request.path("params").path("pushNotificationConfig")
+                        .path("url").asText("");
+                String token = request.path("params").path("pushNotificationConfig")
+                        .path("token").asText(null);
+                if (taskBinding.get(taskId).isEmpty()) {
+                    respond(exchange, 200, rpcError(id, -32001, "task not found"));
+                    return;
+                }
+                if (url.isBlank()) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "pushNotificationConfig.url is required"));
+                    return;
+                }
+                if (!webhookPermitted(url)) {
+                    // ASF-007: deny the blind-SSRF targets by default.
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "pushNotificationConfig.url is not a permitted webhook target"));
+                    return;
+                }
+                PushConfig config = new PushConfig(url, token);
+                register(taskBinding, taskId, new Registration(config, A2aVersion.V0_3,
+                        taskId, null, null));
+                respond(exchange, 200, rpcResult(id, java.util.Map.of(
+                        "taskId", taskId, "pushNotificationConfig", config)));
+            }
+            case "tasks/pushNotificationConfig/get" -> {
+                String taskId = request.path("params").path("id").asText(
+                        request.path("params").path("taskId").asText(""));
+                Registration registration = pushConfigs.get(taskId);
+                PushConfig config = registration == null ? null : registration.config();
+                if (config == null) {
+                    respond(exchange, 200, rpcError(id, -32001,
+                            "no push configuration for task '" + taskId + "'"));
+                    return;
+                }
+                // The callback token authenticates the gateway to the
+                // receiver; reading it back needs only the taskId, so it
+                // is redacted here (ASF-037).
+                respond(exchange, 200, rpcResult(id, java.util.Map.of(
+                        "taskId", taskId, "pushNotificationConfig",
+                        new PushConfig(config.url(), null))));
+            }
+            default -> respond(exchange, 200, rpcError(id, -32601,
+                    "unknown method '" + method + "'"));
+        }
+    }
+
+    /**
+     * The A2A 1.0 methods (§9.4): the same task binding under 1.0's names and
+     * shapes. {@code ListTasks} is refused as unsupported, since the binding
+     * does not scope tasks to a caller and 1.0 lists only a caller's own
+     * (§3.1.4); {@code GetExtendedAgentCard} is refused since the gateway has
+     * no extended card.
+     */
+    private void rpc10(HttpExchange exchange, JsonNode id, String method, JsonNode params,
+                       String agentName, A2aTaskBinding taskBinding) throws IOException {
+        switch (method) {
+            case "SendMessage", "SendStreamingMessage" -> {
+                Optional<String> text = firstTextPart(params, A2aVersion.V1_0);
+                if (text.isEmpty()) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "params.message.parts must contain a text part"));
+                    return;
+                }
+                if (translated().stream().noneMatch(c -> c.name().equals(agentName))) {
+                    respond(exchange, 200, rpcError(id, -32602,
+                            "no agent named '" + agentName + "'"));
+                    return;
+                }
+                JsonNode historyLength = params.path("configuration").path("historyLength");
+                A2aMessages.Task task = taskBinding.send(agentName, text.get());
+                if ("SendMessage".equals(method)) {
+                    respond(exchange, 200, rpcResult(id, wire.taskResponse(task, historyLength)));
+                } else {
+                    streamTask(exchange, id, taskBinding, task.id(), A2aVersion.V1_0, historyLength);
+                }
+            }
+            case "GetTask" -> {
+                Optional<A2aMessages.Task> task = taskBinding.get(params.path("id").asText(""));
+                if (task.isEmpty()) {
+                    respond(exchange, 200, taskNotFound(id, params.path("id").asText("")));
+                    return;
+                }
+                respond(exchange, 200, rpcResult(id, wire.task(task.get(), params.path("historyLength"))));
+            }
+            case "CancelTask" -> {
+                String taskId = params.path("id").asText("");
+                Optional<A2aMessages.Task> task = taskBinding.get(taskId);
+                if (task.isEmpty()) {
+                    respond(exchange, 200, taskNotFound(id, taskId));
+                    return;
+                }
+                if (terminal(task.get().status().state())) {
+                    // §3.3.2: a task in a terminal state is not cancelable
+                    respond(exchange, 200, rpcError(id, -32002, "task is "
+                            + A2aWire.state(task.get().status().state()) + " and cannot be canceled",
+                            wire.errorInfo("TASK_NOT_CANCELABLE", java.util.Map.of("taskId", taskId))));
+                    return;
+                }
+                respond(exchange, 200, rpcResult(id, wire.task(taskBinding.cancel(taskId).orElseThrow(), MISSING)));
+            }
+            case "SubscribeToTask" -> {
+                String taskId = params.path("id").asText("");
+                Optional<A2aMessages.Task> task = taskBinding.get(taskId);
+                if (task.isEmpty()) {
+                    respond(exchange, 200, taskNotFound(id, taskId));
+                    return;
+                }
+                if (terminal(task.get().status().state())) {
+                    // §9.4.6: no subscription to a task in a terminal state
+                    respond(exchange, 200, rpcError(id, -32004, "task is "
+                            + A2aWire.state(task.get().status().state()) + "; there is nothing to subscribe to",
+                            wire.errorInfo("UNSUPPORTED_OPERATION", java.util.Map.of("taskId", taskId))));
+                    return;
+                }
+                streamTask(exchange, id, taskBinding, taskId, A2aVersion.V1_0, MISSING);
+            }
+            case "CreateTaskPushNotificationConfig" -> {
+                // the params are a TaskPushNotificationConfig (a2a.proto 1.0)
+                String taskId = params.path("taskId").asText("");
+                String url = params.path("url").asText("");
+                if (taskBinding.get(taskId).isEmpty()) {
+                    respond(exchange, 200, taskNotFound(id, taskId));
+                    return;
+                }
+                if (url.isBlank()) {
+                    respond(exchange, 200, rpcError(id, -32602, "url is required"));
+                    return;
+                }
+                if (!webhookPermitted(url)) {
+                    // ASF-007: deny the blind-SSRF targets by default.
+                    respond(exchange, 200, rpcError(id, -32602, "url is not a permitted webhook target"));
+                    return;
+                }
+                String configId = params.path("id").asText("");
+                Registration registration = new Registration(
+                        new PushConfig(url, params.path("token").asText(null)), A2aVersion.V1_0,
+                        configId.isBlank() ? java.util.UUID.randomUUID().toString() : configId,
+                        params.path("authentication").path("scheme").asText(null),
+                        params.path("authentication").path("credentials").asText(null));
+                register(taskBinding, taskId, registration);
+                respond(exchange, 200, rpcResult(id, pushConfigV1(taskId, registration)));
+            }
+            case "GetTaskPushNotificationConfig", "DeleteTaskPushNotificationConfig" -> {
+                String taskId = params.path("taskId").asText("");
+                String configId = params.path("id").asText("");
+                Registration registration = pushConfigs.get(taskId);
+                if (registration == null || !registration.id().equals(configId)) {
+                    respond(exchange, 200, rpcError(id, -32001, "no push notification config '"
+                            + configId + "' for task '" + taskId + "'",
+                            wire.errorInfo("TASK_NOT_FOUND", java.util.Map.of("taskId", taskId))));
+                    return;
+                }
+                if ("GetTaskPushNotificationConfig".equals(method)) {
+                    respond(exchange, 200, rpcResult(id, pushConfigV1(taskId, registration)));
+                } else {
+                    // the watcher stops when its registration is no longer the task's
+                    pushConfigs.remove(taskId, registration);
+                    respond(exchange, 200, rpcResult(id, json.createObjectNode()));
+                }
+            }
+            case "ListTaskPushNotificationConfigs" -> {
+                String taskId = params.path("taskId").asText("");
+                if (taskBinding.get(taskId).isEmpty()) {
+                    respond(exchange, 200, taskNotFound(id, taskId));
+                    return;
+                }
+                ObjectNode result = json.createObjectNode();
+                com.fasterxml.jackson.databind.node.ArrayNode configs = result.putArray("configs");
+                Registration registration = pushConfigs.get(taskId);
+                if (registration != null) {
+                    configs.add(pushConfigV1(taskId, registration));
+                }
+                result.put("nextPageToken", "");
+                respond(exchange, 200, rpcResult(id, result));
+            }
+            case "ListTasks" -> respond(exchange, 200, rpcError(id, -32004,
+                    "ListTasks is not supported: this gateway does not scope tasks to a caller",
+                    wire.errorInfo("UNSUPPORTED_OPERATION", java.util.Map.of("method", method))));
+            case "GetExtendedAgentCard" -> respond(exchange, 200, rpcError(id, -32007,
+                    "this gateway has no extended agent card",
+                    wire.errorInfo("EXTENDED_AGENT_CARD_NOT_CONFIGURED", java.util.Map.of())));
+            default -> respond(exchange, 200, rpcError(id, -32601,
+                    "unknown A2A 1.0 method '" + method + "'"));
+        }
+    }
+
+    /** {@code TaskNotFoundError} with its {@code ErrorInfo} (A2A 1.0 §5.4, §9.5). */
+    private byte[] taskNotFound(JsonNode id, String taskId) throws IOException {
+        return rpcError(id, -32001, "task not found",
+                wire.errorInfo("TASK_NOT_FOUND", java.util.Map.of("taskId", taskId)));
+    }
+
+    /**
+     * A 1.0 {@code TaskPushNotificationConfig} as the gateway reports it: the
+     * callback token and the authentication credentials authenticate the
+     * gateway to the receiver, so they are never read back (ASF-037).
+     */
+    private ObjectNode pushConfigV1(String taskId, Registration registration) {
+        ObjectNode out = json.createObjectNode();
+        out.put("id", registration.id());
+        out.put("taskId", taskId);
+        out.put("url", registration.config().url());
+        if (registration.authScheme() != null && !registration.authScheme().isBlank()) {
+            out.putObject("authentication").put("scheme", registration.authScheme());
+        }
+        return out;
+    }
+
+    /** Replaces a task's push registration and starts its watcher. */
+    private void register(A2aTaskBinding taskBinding, String taskId, Registration registration) {
+        pushConfigs.put(taskId, registration);
+        watchAndPush(taskBinding, taskId, registration);
     }
 
     /** Authenticates the {@code Authorization: Bearer} credential against the gate. */
@@ -612,31 +849,37 @@ public final class A2aGateway implements AutoCloseable {
      * stream honest through worker crashes: a lapsed take lease streams a
      * {@code working} to {@code submitted} transition like any other.
      */
-    private void streamTask(HttpExchange exchange, JsonNode id,
-                            A2aTaskBinding taskBinding, String taskId) throws IOException {
+    private void streamTask(HttpExchange exchange, JsonNode id, A2aTaskBinding taskBinding,
+                            String taskId, A2aVersion version, JsonNode historyLength)
+            throws IOException {
         if (!streamSlots.tryAcquire()) {
             respond(exchange, 200, rpcError(id, -32000,
                     "too many concurrent streams; retry later"));
             return;
         }
         try {
-            streamTaskHolding(exchange, id, taskBinding, taskId);
+            streamTaskHolding(exchange, id, taskBinding, taskId, version, historyLength);
         } finally {
             streamSlots.release();
         }
     }
 
-    private void streamTaskHolding(HttpExchange exchange, JsonNode id,
-                            A2aTaskBinding taskBinding, String taskId) throws IOException {
+    private void streamTaskHolding(HttpExchange exchange, JsonNode id, A2aTaskBinding taskBinding,
+                                   String taskId, A2aVersion version, JsonNode historyLength)
+            throws IOException {
+        boolean v1 = version == A2aVersion.V1_0;
         exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
         exchange.getResponseHeaders().set("Cache-Control", "no-cache");
         exchange.sendResponseHeaders(200, 0);
         try (OutputStream out = exchange.getResponseBody()) {
             A2aMessages.Task task = taskBinding.get(taskId).orElseThrow();
-            event(out, rpcResult(id, task));
+            event(out, rpcResult(id, v1 ? wire.taskResponse(task, historyLength) : task));
             String lastState = task.status().state();
             if (terminal(lastState)) {
-                event(out, rpcResult(id, statusEvent(task, true)));
+                // 0.3 marks the end with final: true; 1.0 ends by closing the stream
+                if (!v1) {
+                    event(out, rpcResult(id, statusEvent(task, true)));
+                }
                 return;
             }
             long deadline = System.nanoTime() + STREAM_CAP.toNanos();
@@ -657,9 +900,9 @@ public final class A2aGateway implements AutoCloseable {
                 lastState = task.status().state();
                 boolean isFinal = terminal(lastState);
                 if (isFinal && !task.artifacts().isEmpty()) {
-                    event(out, rpcResult(id, artifactEvent(task)));
+                    event(out, rpcResult(id, v1 ? wire.artifactUpdate(task) : artifactEvent(task)));
                 }
-                event(out, rpcResult(id, statusEvent(task, isFinal)));
+                event(out, rpcResult(id, v1 ? wire.statusUpdate(task) : statusEvent(task, isFinal)));
                 if (isFinal) {
                     return;
                 }
@@ -677,7 +920,7 @@ public final class A2aGateway implements AutoCloseable {
      * update, when the registration is replaced, or at the watch cap.
      */
     private void watchAndPush(A2aTaskBinding taskBinding, String taskId,
-                              PushConfig config) {
+                              Registration config) {
         if (!watcherSlots.tryAcquire()) {
             return; // registration stands; no watcher slot, no push (ASF-040)
         }
@@ -691,7 +934,7 @@ public final class A2aGateway implements AutoCloseable {
     }
 
     private void watchLoop(A2aTaskBinding taskBinding, String taskId,
-                           PushConfig config) {
+                           Registration config) {
         String lastState = "";
         long deadline = System.nanoTime() + STREAM_CAP.toNanos();
         while (System.nanoTime() < deadline
@@ -716,15 +959,23 @@ public final class A2aGateway implements AutoCloseable {
         }
     }
 
-    private void postUpdate(PushConfig config, A2aMessages.Task task) {
+    private void postUpdate(Registration registration, A2aMessages.Task task) {
+        PushConfig config = registration.config();
+        boolean v1 = registration.version() == A2aVersion.V1_0;
         try {
+            // 0.3 posts the task document; 1.0 posts a StreamResponse (§4.3.3)
             java.net.http.HttpRequest.Builder request = java.net.http.HttpRequest
                     .newBuilder(java.net.URI.create(config.url()))
-                    .header("Content-Type", JSON)
+                    .header("Content-Type", v1 ? "application/a2a+json" : JSON)
                     .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(
-                            json.writeValueAsBytes(task)));
+                            json.writeValueAsBytes(v1 ? wire.taskResponse(task, MISSING) : task)));
             if (config.token() != null && !config.token().isBlank()) {
                 request.header("X-A2A-Notification-Token", config.token());
+            }
+            if (v1 && registration.authScheme() != null && !registration.authScheme().isBlank()
+                    && registration.authCredentials() != null) {
+                request.header("Authorization", registration.authScheme() + " "
+                        + registration.authCredentials());
             }
             pushHttp.send(request.build(),
                     java.net.http.HttpResponse.BodyHandlers.discarding());
@@ -761,10 +1012,15 @@ public final class A2aGateway implements AutoCloseable {
         out.flush();
     }
 
-    private static Optional<String> firstTextPart(JsonNode params) {
+    /**
+     * The first text part of {@code params.message}: 0.3 marks it
+     * {@code "kind": "text"}, 1.0 tells it by its {@code text} member.
+     */
+    private static Optional<String> firstTextPart(JsonNode params, A2aVersion version) {
         for (JsonNode part : params.path("message").path("parts")) {
-            if ("text".equals(part.path("kind").asText())
-                    && part.path("text").isTextual()) {
+            boolean textPart = version == A2aVersion.V1_0
+                    || "text".equals(part.path("kind").asText());
+            if (textPart && part.path("text").isTextual()) {
                 String text = part.path("text").asText();
                 if (text.length() > MAX_TEXT_LENGTH) {
                     return Optional.empty(); // oversized text is refused (ASF-007)
@@ -784,12 +1040,21 @@ public final class A2aGateway implements AutoCloseable {
     }
 
     private byte[] rpcError(JsonNode id, int code, String message) throws IOException {
+        return rpcError(id, code, message, null);
+    }
+
+    /** A JSON-RPC error; A2A 1.0's error details ride in {@code data} (§9.5). */
+    private byte[] rpcError(JsonNode id, int code, String message, JsonNode data)
+            throws IOException {
         ObjectNode response = json.createObjectNode();
         response.put("jsonrpc", "2.0");
         response.set("id", id);
         ObjectNode error = response.putObject("error");
         error.put("code", code);
         error.put("message", message);
+        if (data != null) {
+            error.set("data", data);
+        }
         return json.writeValueAsBytes(response);
     }
 

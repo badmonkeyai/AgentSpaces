@@ -493,7 +493,9 @@ public final class Pdt implements AutoCloseable {
                 result = c.tick();
             } else if (now - lastCollectMillis >= collectEvery.toMillis()) {
                 lastCollectMillis = now;
-                result = c.tick();
+                if (c.due()) { // idle-loop O3: no cycle when nothing could have become garbage
+                    result = c.tick();
+                }
             }
             if (result != null && result.cycleComplete() && result.removed() > 0) {
                 refs.forgetHeld();

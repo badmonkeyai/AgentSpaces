@@ -255,7 +255,7 @@ public final class WireCodec {
             return Optional.empty();
         }
         byte[] canonical = codec.toBytes(envelope);
-        boolean valid = Ed25519.verify(Ed25519.publicKeyFromRaw(raw), canonical, signed.signature());
+        boolean valid = Ed25519.verifyRaw(raw, canonical, signed.signature());
         return valid ? Optional.of(new Decoded(envelope, Auth.SIGNED)) : Optional.empty();
     }
 }

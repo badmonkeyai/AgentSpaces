@@ -4,7 +4,7 @@ An A2A client drives a peer-to-peer fleet through one gateway. Worker agents
 join a replicated task space over TCP and publish AgentCards. The gateway
 serves those cards on the standard A2A discovery interface
 (`/.well-known/agent-card.json`) and speaks the A2A task interface as
-JSON-RPC 2.0 over HTTP: `message/send` writes a leased task entry into the
+JSON-RPC 2.0 over HTTP. The example speaks A2A 0.3 (no `A2A-Version` header); the same URL serves A2A 1.0's `SendMessage` and the rest under `A2A-Version: 1.0`. `message/send` writes a leased task entry into the
 space, and `tasks/get` reads the task's state out of space semantics
 (`submitted` while unclaimed, `working` while an agent holds the take lease,
 `completed` once a result entry exists).

@@ -28,7 +28,8 @@ import java.util.Objects;
  * mapping is mechanical by design (spec §6.1 keeps the two shapes close):
  * goals become skills, consumed and produced entry schema names become skill
  * tags, and the AgentSpaces identity (agent URI, peer, group) rides in the
- * card's metadata so a round trip loses nothing an A2A client can carry.
+ * card's identity extension so a round trip loses nothing an A2A client can
+ * carry. Each card offers A2A 1.0 and 0.3 at the agent's one URL.
  */
 public final class A2aTranslator {
 
@@ -101,25 +102,23 @@ public final class A2aTranslator {
                     card.description(), List.copyOf(tags)));
         }
 
-        Map<String, String> metadata = new LinkedHashMap<>();
-        metadata.put("agentspaces.id", card.id());
-        metadata.put("agentspaces.agent", card.agent().encoded());
-        metadata.put("agentspaces.peer", card.issuer().value());
-        metadata.put("agentspaces.group", card.group().value());
-        
-        card.costHints().forEach((k, v) -> metadata.put("agentspaces.cost." + k, v));
+        Map<String, String> identity = new LinkedHashMap<>();
+        identity.put("agentspaces.id", card.id());
+        identity.put("agentspaces.agent", card.agent().encoded());
+        identity.put("agentspaces.peer", card.issuer().value());
+        identity.put("agentspaces.group", card.group().value());
+        card.costHints().forEach((k, v) -> identity.put("agentspaces.cost." + k, v));
+        // A2A 1.0 and 0.3 alike give a card's extension data a home in
+        // capabilities.extensions; the identity rides there
         return new A2aAgentCard(
-                A2aAgentCard.PROTOCOL_VERSION,
                 agentName,
                 card.description(),
-                baseUrl + "/agents/" + agentName,
-                "JSONRPC",
-                "0.1",
+                A2aAgentCard.jsonRpc(baseUrl + "/agents/" + agentName),
                 new A2aAgentCard.Provider(provider, baseUrl),
-                capabilities,
+                "0.1",
+                capabilities.with(A2aAgentCard.Extension.identity(identity)),
                 List.of("application/json"),
                 List.of("application/json"),
-                skills,
-                metadata);
+                skills);
     }
 }

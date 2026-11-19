@@ -968,6 +968,16 @@ public final class GossipBus {
      * stream it holds, a delta sent, or a pulled delta that changed its state). The runtime stretches the
      * anti-entropy period while nothing does.
      */
+    /** Whether {@link #consumeActivity()} would answer true, without consuming it (idle-loop O8). */
+    public boolean activityPending() {
+        return activity;
+    }
+
+    /** Whether {@link #consumeTraffic()} would answer true, without consuming it (idle-loop O8). */
+    public boolean trafficPending() {
+        return traffic;
+    }
+
     public boolean consumeActivity() {
         boolean was = activity;
         activity = false;

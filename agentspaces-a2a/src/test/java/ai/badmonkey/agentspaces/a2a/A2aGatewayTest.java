@@ -91,7 +91,9 @@ class A2aGatewayTest {
         JsonNode node = get("/.well-known/agent-card.json", 200);
 
         assertThat(node.get("name").asText()).isEqualTo("audit-fleet");
-        assertThat(node.get("protocolVersion").asText()).isEqualTo("1.0");
+        assertThat(node.get("supportedInterfaces").get(0).get("protocolVersion").asText()).isEqualTo("1.0");
+        assertThat(node.get("supportedInterfaces").get(1).get("protocolVersion").asText()).isEqualTo("0.3");
+        assertThat(node.get("protocolVersion").asText()).as("0.3's field names the 0.3 interface").isEqualTo("0.3");
         assertThat(node.get("skills")).hasSize(3);
         assertThat(node.get("capabilities").get("streaming").asBoolean()).isFalse();
     }
@@ -107,7 +109,10 @@ class A2aGatewayTest {
         JsonNode one = get("/agents/extractor", 200);
         assertThat(one.get("description").asText()).isEqualTo("Extracts fields from scans");
         assertThat(one.get("url").asText()).endsWith("/agents/extractor");
-        assertThat(one.get("metadata").get("agentspaces.group").asText()).isNotEmpty();
+        assertThat(one.get("metadata")).as("no non-standard top-level metadata").isNull();
+        JsonNode identity = one.get("capabilities").get("extensions").get(0);
+        assertThat(identity.get("uri").asText()).isEqualTo(A2aAgentCard.IDENTITY_EXTENSION);
+        assertThat(identity.get("params").get("agentspaces.group").asText()).isNotEmpty();
     }
 
     @Test

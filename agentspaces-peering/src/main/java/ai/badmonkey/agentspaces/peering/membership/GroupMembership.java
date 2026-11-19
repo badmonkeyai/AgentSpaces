@@ -78,6 +78,8 @@ public final class GroupMembership implements PeerSampler {
         private volatile List<PeerAdvertisement.Endpoint> endpoints;
         private volatile java.util.Set<PeerAdvertisement.PeerRole> roles = java.util.Set.of();
         private volatile long lastHeardMillis;
+        /** When a verified frame this member signed last reached this node, or MIN_VALUE before any (idle-loop O6). */
+        private volatile long lastContactMillis = Long.MIN_VALUE;
         private volatile boolean suspect;
         /** When this member entered the view, on the node's clock; a member that leaves and returns starts afresh. */
         private final long joinedMillis;
@@ -129,6 +131,20 @@ public final class GroupMembership implements PeerSampler {
          * @param nonce  the correlation nonce
          */
         void pingReq(PeerId relay, PeerId target, long nonce);
+
+        /**
+         * Whether a PING to this target would carry something beside liveness that the target has not already
+         * exchanged with this node in this period: the recently forwarded items it piggybacks, or digest hashes the
+         * target's own hash-carrying PING (answered with this node's) did not already compare. A probe of a member
+         * heard from in this period is skipped only when it would not.
+         *
+         * @param target      the member about to be probed
+         * @param sinceMillis this node's previous probe turn, on the node's clock
+         * @return true when the probe carries news
+         */
+        default boolean carriesNews(PeerId target, long sinceMillis) {
+            return false;
+        }
     }
 
     private record Pending(PeerId target, long deadlineMillis, boolean indirectStage,
@@ -258,6 +274,7 @@ public final class GroupMembership implements PeerSampler {
             if (existing == null) {
                 activeSinceProbe = true; // a newcomer: probe on the base interval again
                 quietCycles = 0;
+                viewVersion.incrementAndGet();
             }
             Member member = existing == null
                     ? new Member(id, ad.endpoints(), now) : existing;
@@ -277,7 +294,7 @@ public final class GroupMembership implements PeerSampler {
      */
     public void evict(PeerId peer) {
         ejected.add(Objects.requireNonNull(peer, "peer"));
-        members.remove(peer);
+        dropMember(peer);
     }
 
     /**
@@ -293,10 +310,55 @@ public final class GroupMembership implements PeerSampler {
     public void recordHeard(PeerId peer) {
         Member member = members.get(peer);
         if (member != null) {
+            long now = nowMillis();
+            member.lastHeardMillis = now;
+            member.lastContactMillis = now;
+            member.suspect = false;
+        }
+    }
+
+    /**
+     * Liveness without contact (idle-loop O6): an ACK, which answers this node's own probe, or an ACK a relay this
+     * node asked brought for the member. Neither is a frame the member sent of its own accord, so neither lets a later
+     * probe of it rest.
+     *
+     * @param peer the member
+     */
+    public void recordAnswered(PeerId peer) {
+        creditRelayed(peer);
+    }
+
+    private void creditRelayed(PeerId peer) {
+        Member member = members.get(peer);
+        if (member != null) {
             member.lastHeardMillis = nowMillis();
             member.suspect = false;
         }
     }
+
+    /** Whether a probe awaits its answer, so its timeout is judged on the coming ticks (idle-loop O8). */
+    public boolean probesPending() {
+        return !pendingProbes.isEmpty();
+    }
+
+    /**
+     * Whether the next {@link #tick} at {@code nowMillis} sends a probe, so a caller takes what the probe carries only
+     * then (idle-loop O8). An approximation the tick does not depend on: the tick decides again.
+     *
+     * @param nowMillis the node clock's now
+     * @return true when the probe period has run out
+     */
+    public synchronized boolean probeDue(long nowMillis) {
+        long interval = stretchedIntervalMillis(quietCycles);
+        return lastProbeMillis == Long.MIN_VALUE || nowMillis - lastProbeMillis >= interval;
+    }
+
+    /** Probes skipped because the member's own verified frame reached this node within the probe period (O6). */
+    public long probesRested() {
+        return probesRested.get();
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong probesRested = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Handles an ACK correlated to an outstanding probe. The liveness credit
@@ -320,7 +382,7 @@ public final class GroupMembership implements PeerSampler {
             return; // not who we asked: the probe stands
         }
         pendingProbes.remove(nonce);
-        recordHeard(pending.target());
+        creditRelayed(pending.target()); // an answer to this node's own probe: liveness, not contact
     }
 
     /**
@@ -334,8 +396,39 @@ public final class GroupMembership implements PeerSampler {
     private volatile int quietCycles;
     /** Whether anything moved (gossip activity, a member admitted) since the last probe. */
     private volatile boolean activeSinceProbe = true;
-    /** The probe interval stretches to the base times two to this at most (v0.1.17). */
-    public static final int MAX_QUIET_STRETCH = 2;
+    /**
+     * The probe interval stretches to the base times two to this at most (v0.1.17: 2; idle-loop item 3, 2026-11-18: 4).
+     * Past {@link #LEGACY_QUIET_STRETCH} doublings the stretch is also bounded by the member TTL
+     * ({@link #maxQuietIntervalMillis}), so every member is still heard twice inside its TTL.
+     */
+    public static final int MAX_QUIET_STRETCH = 4;
+    /** The stretch every quiet group may reach whatever its size: four times the base, as before item 3. */
+    public static final int LEGACY_QUIET_STRETCH = 2;
+
+    /**
+     * The longest probe interval a quiet group may stretch to with {@code others} members besides this node (idle-loop
+     * item 3): the base times two to the stretch ceiling, but past four times the base no longer than the member TTL
+     * over twice the others, so this node's probe cycle reaches every member twice inside the TTL. Groups too large
+     * for that keep the four-times stretch, and the advertisement refresh is their keepalive (ROBUSTNESS.md §6b).
+     *
+     * @param others the members besides this node
+     * @return the interval in milliseconds
+     */
+    public long maxQuietIntervalMillis(int others) {
+        int stretch = (int) probeStretchPace.get();
+        long base = probeIntervalPace.get();
+        long legacy = base * (1L << Math.min(stretch, LEGACY_QUIET_STRETCH));
+        long full = base * (1L << stretch);
+        long ttlBound = config.memberTtl().toMillis() / (2L * Math.max(1, others));
+        return Math.min(full, Math.max(legacy, ttlBound));
+    }
+
+    /** The probe interval in effect after {@code cycles} quiet probe cycles. */
+    private long stretchedIntervalMillis(int cycles) {
+        int stretch = (int) probeStretchPace.get();
+        long stretched = probeIntervalPace.get() * (1L << Math.min(cycles, stretch));
+        return Math.min(stretched, Math.max(probeIntervalPace.get(), maxQuietIntervalMillis(members.size())));
+    }
     /** The members still to probe in this cycle, in a shuffled order; refilled when exhausted. */
     private final java.util.ArrayDeque<PeerId> probeCycle = new java.util.ArrayDeque<>();
 
@@ -385,7 +478,11 @@ public final class GroupMembership implements PeerSampler {
         }
 
         // Expire members whose lease of our attention ran out.
-        members.values().removeIf(m -> now - m.lastHeardMillis > config.memberTtl().toMillis());
+        for (Member m : List.copyOf(members.values())) {
+            if (now - m.lastHeardMillis > config.memberTtl().toMillis()) {
+                dropMember(m.id);
+            }
+        }
 
         // Resolve timed-out probes: escalate direct to indirect, drop after indirect.
         for (Map.Entry<Long, Pending> e : List.copyOf(pendingProbes.entrySet())) {
@@ -404,7 +501,7 @@ public final class GroupMembership implements PeerSampler {
                 quietCycles = 0;
                 List<PeerId> relays = randomMembersExcluding(config.indirectPeers(), pending.target());
                 if (relays.isEmpty()) {
-                    members.remove(pending.target());
+                    dropMember(pending.target());
                     continue;
                 }
                 long nonce = nextNonce();
@@ -415,7 +512,7 @@ public final class GroupMembership implements PeerSampler {
                     prober.pingReq(relay, pending.target(), nonce);
                 }
             } else {
-                members.remove(pending.target());
+                dropMember(pending.target());
             }
         }
 
@@ -423,10 +520,11 @@ public final class GroupMembership implements PeerSampler {
         // was four fifths of an idle peer's frames, and detection speed comes from the suspicion
         // timeout, not the probe rate. Timeouts above are still judged on every tick.
         int stretch = (int) probeStretchPace.get();
-        long interval = probeIntervalPace.get() * (1L << Math.min(quietCycles, stretch));
+        long interval = stretchedIntervalMillis(quietCycles);
         if (lastProbeMillis != Long.MIN_VALUE && now - lastProbeMillis < interval) {
             return;
         }
+        long previousTurn = lastProbeMillis;
         lastProbeMillis = now;
         if (!activeSinceProbe) {
             quietCycles = Math.min(quietCycles + 1, stretch);
@@ -435,6 +533,18 @@ public final class GroupMembership implements PeerSampler {
         // Round-robin over a shuffled order (SWIM's protocol period), so every member is probed
         // once per cycle and detection time is bounded, rather than a random draw each period.
         PeerId target = nextProbeTarget();
+        Member probed = target == null ? null : members.get(target);
+        if (probed != null && previousTurn != Long.MIN_VALUE && probed.lastContactMillis != Long.MIN_VALUE
+                && probed.lastContactMillis >= previousTurn && !prober.carriesNews(target, previousTurn)) {
+            // Idle-loop O6 (reviews/IDLE-LOOP-2026-11-18.md): the member's own verified frame reached this node since
+            // this node's previous probe turn, so a probe would learn nothing the frame did not show; with nothing new
+            // to carry, it rests. Measured from the previous turn, not a sliding interval: two members whose turns fall
+            // together each see the other's probe of the same instant as news since their last turn, so one of them
+            // (or both, on alternate turns) rests; a sliding interval saw it one interval old and neither ever rested.
+            // Its turn is spent as if probed: one that falls silent now is found as it would have been after an answer.
+            probesRested.incrementAndGet();
+            return;
+        }
         if (target != null) {
             long nonce = nextNonce();
             pendingProbes.put(nonce, new Pending(target,
@@ -475,6 +585,59 @@ public final class GroupMembership implements PeerSampler {
     public long joinedAtMillis(PeerId peer) {
         Member member = members.get(peer);
         return member == null ? -1 : member.joinedMillis;
+    }
+
+    /**
+     * Takes a member out of the view: the view's version moves, the member joins the departures the node drains, and
+     * the probes awaiting its answer go with it, so one re-admitted soon after is not dropped again by a probe of its
+     * earlier stay (found by HorizonLaggingCopyTest, 2026-11-18).
+     */
+    private void dropMember(PeerId peer) {
+        if (members.remove(peer) != null) {
+            viewVersion.incrementAndGet();
+            departed.add(peer);
+            pendingProbes.values().removeIf(pending -> pending.target().equals(peer));
+        }
+    }
+
+    private final java.util.concurrent.ConcurrentLinkedQueue<PeerId> departed =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+    /**
+     * The members that left the view since the last call, each once per departure, oldest first. The node handles a
+     * loss from here rather than by comparing views from tick to tick: a member that left and came back between two
+     * ticks is a departure all the same, and its loss is recorded (and retried) even though both views hold it.
+     *
+     * @return the departures since the last drain
+     */
+    public List<PeerId> drainDeparted() {
+        List<PeerId> out = new ArrayList<>();
+        for (PeerId peer; (peer = departed.poll()) != null; ) {
+            out.add(peer);
+        }
+        return out;
+    }
+
+    /**
+     * Whether a member left the view and the node has not drained that departure yet: its loss is not recorded yet.
+     *
+     * @param peer the member
+     * @return true while the departure waits to be drained
+     */
+    public boolean departurePending(PeerId peer) {
+        return departed.contains(peer);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong viewVersion = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * A counter that moves whenever a member enters or leaves this view (idle-loop O5/O8): what is derived from the
+     * view is recomputed only when it moved. Only its equality between two reads means anything.
+     *
+     * @return the view's version
+     */
+    public long viewVersion() {
+        return viewVersion.get();
     }
 
     /** Returns a snapshot of all current members. */

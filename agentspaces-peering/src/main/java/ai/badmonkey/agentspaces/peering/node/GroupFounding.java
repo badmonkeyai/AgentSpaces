@@ -192,7 +192,7 @@ public final class GroupFounding {
         FoundingFields fields;
         try {
             fields = fieldsOf(ad);
-            if (!Ed25519.verify(Ed25519.publicKeyFromRaw(key), CODEC.toBytes(fields),
+            if (!Ed25519.verifyRaw(key, CODEC.toBytes(fields),
                     signed.signature())) {
                 return false;
             }

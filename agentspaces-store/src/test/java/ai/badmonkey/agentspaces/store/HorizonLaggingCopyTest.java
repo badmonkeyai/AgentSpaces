@@ -174,7 +174,9 @@ class HorizonLaggingCopyTest {
         long refusedBefore = a.space().collectedReoffersAcknowledged();
         long healedAt = clock.millis();
         network.heal();
-        assertThat(runUntil(400, Duration.ofMillis(250), () -> {
+        // 200 s: a lost member is re-dialed at most a minute apart (a quarter either way) in its first hour lost
+        // (PeerNode.LOST_RETRY_EARLY_CAP_MILLIS), so after this partition the fleet rejoins within about 75 s
+        assertThat(runUntil(800, Duration.ofMillis(250), () -> {
             assertThat(a.space().recordOf(id, true)).as("never back on the replica that withdrew it").isEmpty();
             return a.space().collectedReoffersAcknowledged() > refusedBefore;
         })).as("the lagging copy reached the door and was refused there").isTrue();

@@ -81,38 +81,58 @@ class AdversaryBatchLockTest {
         for (int i = 0; i < n; i++) {
             a.write(new TaskEntry("lock-" + i, i), Lease.of(Duration.ofHours(1)));
         }
-        // b learns the written entries in one delta: every check is made before the lock.
-        ReplicatedSpace b = replica("b");
-        byte[] writes = a.deltaFor(b.digest());
+        // a fresh replica learns the written entries in one delta: every check is made before the lock
+        byte[] writes = a.deltaFor(replica("probe").digest());
         assertThat(CODEC.fromWire(writes, SpaceWire.SyncDelta.class).states()).hasSize(n);
-        // warm the JIT on a throwaway replica first, then time b
+        // warm the JIT on a throwaway replica first
         ReplicatedSpace warm = replica("w");
         warm.applySyncDelta(writes);
-        assertThat(b.applySyncDelta(writes)).isTrue();
-        double writeLockedPerState = b.lastBatchLockedNanos() / 1_000.0 / n;
 
-        // a takes and completes every entry; b then learns the claims and the completed states in one delta.
+        // a takes and completes every entry; a replica that holds the writes then learns the claims and the
+        // completed states in one delta
         List<TakenEntry<TaskEntry>> taken = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             taken.add(a.take(Template.of(TaskEntry.class), Lease.of(Duration.ofMinutes(10)), Duration.ZERO)
                     .orElseThrow());
         }
         taken.forEach(a::complete);
-        byte[] completions = a.deltaFor(b.digest());
+        byte[] completions = a.deltaFor(warm.digest());
         SpaceWire.SyncDelta sync = CODEC.fromWire(completions, SpaceWire.SyncDelta.class);
         assertThat(sync.states()).hasSize(n);
         assertThat(sync.states()).allMatch(SpaceWire.EntryStateDto::completed);
         warm.applySyncDelta(completions);
-        long started = System.nanoTime();
-        assertThat(b.applySyncDelta(completions)).isTrue();
-        double wholePerState = (System.nanoTime() - started) / 1_000.0 / n;
-        double completionLockedPerState = b.lastBatchLockedNanos() / 1_000.0 / n;
-        assertThat(b.digest()).isEqualTo(a.digest());
 
-        System.out.printf("RE-M-08 lock hold per state: written %.1f us, completed %.1f us (whole applySyncDelta "
-                + "%.1f us per completed state)%n", writeLockedPerState, completionLockedPerState, wholePerState);
+        // One batch is a few milliseconds, so a single GC or JIT pause inside it can double its per-state figure
+        // (one reactor run read 10.9 us where 26 earlier runs read 5.0 to 6.7 us). The bound is judged on the
+        // median of several fresh replicas, so one pause cannot decide it; every sample is printed.
+        int rounds = 5;
+        List<Double> written = new ArrayList<>();
+        List<Double> completed = new ArrayList<>();
+        for (int r = 0; r < rounds; r++) {
+            ReplicatedSpace b = replica("b" + r);
+            assertThat(b.applySyncDelta(writes)).isTrue();
+            written.add(b.lastBatchLockedNanos() / 1_000.0 / n);
+            long started = System.nanoTime();
+            assertThat(b.applySyncDelta(completions)).isTrue();
+            double wholePerState = (System.nanoTime() - started) / 1_000.0 / n;
+            completed.add(b.lastBatchLockedNanos() / 1_000.0 / n);
+            assertThat(b.digest()).isEqualTo(a.digest());
+            System.out.printf("RE-M-08 lock hold per state: written %.1f us, completed %.1f us (whole applySyncDelta "
+                    + "%.1f us per completed state)%n", written.get(r), completed.get(r), wholePerState);
+        }
+        double writeLockedPerState = median(written);
+        double completionLockedPerState = median(completed);
+        System.out.printf("RE-M-08 medians over %d replicas: written %.1f us, completed %.1f us%n", rounds,
+                writeLockedPerState, completionLockedPerState);
         assertThat(completionLockedPerState)
-                .as("the lock hold per completed state, against %.1f us per written state", writeLockedPerState)
+                .as("the median lock hold per completed state, against %.1f us per written state", writeLockedPerState)
                 .isLessThan(Math.max(10.0, 4 * writeLockedPerState));
+    }
+
+    private static double median(List<Double> values) {
+        List<Double> sorted = new ArrayList<>(values);
+        sorted.sort(null);
+        int m = sorted.size() / 2;
+        return sorted.size() % 2 == 1 ? sorted.get(m) : (sorted.get(m - 1) + sorted.get(m)) / 2;
     }
 }

@@ -443,6 +443,17 @@ public final class Refs implements AutoCloseable {
         volatile Set<String> liveRoots = Set.of();
         volatile Subscription subscription;
         volatile long subscriptionRenewedMillis;
+        // ---- the quiet tick (idle-loop O4, reviews/IDLE-LOOP-2026-11-18.md): what the last full tick read
+        /** The space's change signals when the last full tick began, or -1 when no full tick has been judged quiet. */
+        long quietSignals = -1;
+        /** The earliest time a full tick has time-based work: a head lapses, a renewal, a cancel grace, a retry. */
+        long quietUntil = Long.MIN_VALUE;
+        /** The heads a read last computed, as the last full tick saw them. */
+        Heads quietLastHeads;
+        /** How many own entries there were after the last full tick. */
+        int quietOwn = -1;
+        /** The held-cache epoch when the last full tick began. */
+        long quietHeldEpoch = -1;
 
         State(String name, RefKind<T> kind, String configuredMode) {
             this.name = name;
@@ -586,6 +597,22 @@ public final class Refs implements AutoCloseable {
         synchronized (completeRoots) {
             completeRoots.clear();
         }
+        heldEpoch.incrementAndGet();
+    }
+
+    /** Advances whenever the remembered completeness is dropped, so a quiet ref looks at its heads again. */
+    private final AtomicLong heldEpoch = new AtomicLong();
+    /** Ref ticks skipped because nothing they read had changed and no time-based work was due (idle-loop O4). */
+    private final AtomicLong quietTicks = new AtomicLong();
+
+    /** Ref ticks skipped because nothing they read had changed and no time-based work was due (idle-loop O4). */
+    public long quietTicks() {
+        return quietTicks.get();
+    }
+
+    /** The space's change counter, or -1 when the space keeps none (then every tick is a full one). */
+    private long changeSignals() {
+        return space.changeSignals();
     }
 
     /** The settings. */
@@ -2447,6 +2474,69 @@ public final class Refs implements AutoCloseable {
     }
 
     private <T> void tick(State<T> state, long now) {
+        // idle-loop O4: a ref whose space has not changed, with nothing in flight and no time-based work due, has
+        // nothing to do; everything below reads only what those inputs cover
+        long signals = changeSignals();
+        long epoch = heldEpoch.get();
+        Heads heads = state.lastHeads;
+        int ownCount;
+        synchronized (state.own) {
+            ownCount = state.own.size();
+        }
+        if (signals >= 0 && signals == state.quietSignals && now < state.quietUntil && heads == state.quietLastHeads
+                && ownCount == state.quietOwn && epoch == state.quietHeldEpoch && state.recheck.isEmpty()
+                && state.pending.isEmpty() && state.chainWanted.isEmpty() && state.chainBatch == null) {
+            quietTicks.incrementAndGet();
+            return;
+        }
+        List<Heads.Head> live = fullTick(state, now);
+        state.quietSignals = signals;
+        state.quietLastHeads = heads;
+        state.quietHeldEpoch = epoch;
+        state.quietUntil = nextDue(state, live, now);
+        synchronized (state.own) {
+            state.quietOwn = state.own.size();
+        }
+    }
+
+    /**
+     * The earliest time the full tick has work that no change signals: a live head lapses (and may be rewritten), an
+     * own head is renewed at half-life or cancelled after its grace, a failed fetch's backoff ends, a lapsed head this
+     * peer knows of expires, or the notify subscription is renewed. At or after it the next tick is a full one.
+     */
+    private <T> long nextDue(State<T> state, List<Heads.Head> live, long now) {
+        long due = state.subscriptionRenewedMillis + SUBSCRIPTION_LEASE.toMillis() / 2;
+        for (Heads.Head head : live) {
+            due = Math.min(due, head.expiresAtMillis());
+        }
+        long halfLife = config.headLease().toMillis() / 2;
+        synchronized (state.own) {
+            for (Own own : state.own.values()) {
+                due = Math.min(due, own.supersededAtMillis != null
+                        ? own.supersededAtMillis + config.cancelGrace().toMillis()
+                        : own.lastRenewMillis + halfLife);
+            }
+        }
+        synchronized (state.unloadable) {
+            for (Retry retry : state.unloadable.values()) {
+                due = Math.min(due, retry.dueMillis);
+            }
+        }
+        Heads last = state.lastHeads;
+        if (last != null) {
+            synchronized (state.known) {
+                for (String root : last.roots()) {
+                    Heads.Head known = state.known.get(root);
+                    if (known != null && known.expiresAtMillis() > now) {
+                        due = Math.min(due, known.expiresAtMillis());
+                    }
+                }
+            }
+        }
+        return due;
+    }
+
+    private <T> List<Heads.Head> fullTick(State<T> state, long now) {
         fetchChainNodes(state);
         List<Heads.Head> live = liveEntries(state);
         Set<String> liveRoots = new HashSet<>();
@@ -2609,6 +2699,7 @@ public final class Refs implements AutoCloseable {
                 subscribe(state);
             }
         }
+        return live;
     }
 
     /**

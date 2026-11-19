@@ -297,10 +297,23 @@ public final class Pdts {
      * @return the store
      */
     NodeStore buildStore(AgentSpacesProperties.PersistentTrees config, String groupName, InstantSource clock) {
-        return open(config, groupName, clock).store();
+        return open(config, groupName, clock, null).store();
     }
 
-    private Built open(AgentSpacesProperties.PersistentTrees config, String groupName, InstantSource clock) {
+    /**
+     * The pack directory of a group's store: {@code <path>/<group>}, and under the default path
+     * {@code <path>/<group>/<peer>}, since the default is shared by every peer of the group on a host and one directory
+     * serves one store ({@link PackNodeStore} refuses a second). A path set explicitly names this peer's store as given.
+     */
+    static Path packDir(String path, String groupName, String peer) {
+        Path dir = Path.of(path).resolve(groupName.replaceAll("[^A-Za-z0-9._-]", "_"));
+        if (peer != null && AgentSpacesProperties.PersistentTrees.Store.DEFAULT_PATH.equals(path)) {
+            dir = dir.resolve(peer.replaceAll("[^A-Za-z0-9._-]", "_"));
+        }
+        return dir;
+    }
+
+    private Built open(AgentSpacesProperties.PersistentTrees config, String groupName, InstantSource clock, String peer) {
         AgentSpacesProperties.PersistentTrees.Store store = config.getStore();
         String kind = store.getKind() == null ? "" : store.getKind().trim().toLowerCase(java.util.Locale.ROOT);
         if (userStore != null) {
@@ -325,7 +338,7 @@ public final class Pdts {
                             + " to refuse this)", groupName);
                     return new Built(new NodeStore(new MemoryBlockStore(), clock), null);
                 }
-                Path dir = Path.of(store.getPath()).resolve(groupName.replaceAll("[^A-Za-z0-9._-]", "_"));
+                Path dir = packDir(store.getPath(), groupName, peer);
                 try {
                     PackNodeStore pack = PackNodeStore.open(dir);
                     return new Built(new NodeStore(pack, clock), pack);
@@ -388,7 +401,7 @@ public final class Pdts {
                      InstantSource clock, GroupKeyRing ring, ai.badmonkey.agentspaces.discovery.DiscoveryService discovery,
                      java.time.Duration challengeDeadline, ai.badmonkey.agentspaces.identity.PeerIdentity identity) {
         boolean groupSeals = ring != null && !ring.epochs().isEmpty();
-        Built built = open(config, groupName, clock);
+        Built built = open(config, groupName, clock, identity == null ? null : identity.peerId().value());
         if (config.getInlineDelta() < 0 || config.getInlineDelta() > PRef.INLINE_DELTA_BYTES) {
             throw new IllegalStateException("agentspaces.pdt.inline-delta: " + config.getInlineDelta()
                     + " is not between 0 and " + PRef.INLINE_DELTA_BYTES + " bytes");

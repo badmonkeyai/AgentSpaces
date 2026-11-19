@@ -236,10 +236,23 @@ class GroupMembershipTest {
     }
 
     /**
-     * v0.1.17: on a quiet fleet the probe interval doubles at each probe up to four times the
-     * base, and the first active tick snaps it back. Every ping is answered here, so nothing
+     * v0.1.17: on a quiet fleet the probe interval doubles at each probe, up to sixteen times the
+     * base where the member TTL allows (idle-loop item 3), and the first active tick snaps it back. Every ping is answered here, so nothing
      * is ever suspected; only the cadence is under test.
      */
+    /** Idle-loop item 3: past four times the base, the stretch keeps every member heard twice inside the TTL. */
+    @Test
+    void theQuietStretchIsBoundedByTheMemberTtlAndNeverBelowFourTimes() {
+        GroupMembership membership = membership(
+                new GroupMembership.Config(Duration.ofSeconds(30), Duration.ofSeconds(2), 2, Duration.ofSeconds(1)));
+        assertThat(membership.maxQuietIntervalMillis(1)).as("a pair: 30 s TTL over two").isEqualTo(15_000L);
+        assertThat(membership.maxQuietIntervalMillis(3)).as("four members").isEqualTo(5_000L);
+        assertThat(membership.maxQuietIntervalMillis(9)).as("ten members keep the four-times stretch")
+                .isEqualTo(4_000L);
+        membership.probeStretch(GroupMembership.LEGACY_QUIET_STRETCH);
+        assertThat(membership.maxQuietIntervalMillis(1)).as("a lowered ceiling holds").isEqualTo(4_000L);
+    }
+
     @Test
     void theProbeIntervalStretchesWhileQuietAndSnapsBackOnActivity() {
         GroupMembership membership = membership(
@@ -256,8 +269,11 @@ class GroupMembershipTest {
             }
             clock.advance(Duration.ofSeconds(1));
         }
-        assertThat(probeSeconds).as("base, base, then doubling to a cap of four seconds")
-                .containsExactly(0, 1, 3, 7, 11, 15, 19);
+        // idle-loop item 3: past four times the base the stretch is bounded by the member TTL; with a five-minute TTL
+        // and two other members the bound is far off, so the interval doubles to the ceiling of sixteen seconds
+        assertThat(membership.maxQuietIntervalMillis(2)).isEqualTo(16_000L);
+        assertThat(probeSeconds).as("base, base, then doubling: 2, 4, 8 and on to sixteen seconds")
+                .containsExactly(0, 1, 3, 7, 15);
         int before = prober.otherPings.size();
         membership.tick(prober, false); // something moved: back to the base interval at once
         assertThat(prober.otherPings.size()).isEqualTo(before + 1);

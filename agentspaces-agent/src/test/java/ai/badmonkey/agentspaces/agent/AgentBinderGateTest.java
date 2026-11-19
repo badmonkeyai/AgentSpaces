@@ -92,6 +92,33 @@ class AgentBinderGateTest {
         binder.constraintGate(gate);
     }
 
+    /**
+     * An ungated take waits long on the space's changes (idle-loop item 2); a gate installed while it waits interrupts
+     * it, so an entry written after the rules arrive is never claimed past them. And without a gate a write is taken
+     * at once, not at the end of the long wait.
+     */
+    @Test
+    void aGateInstalledWhileAnUngatedTakeWaitsHoldsTheNextClaim() throws Exception {
+        Payer payer = new Payer();
+        binder.bind(payer);
+        payments.write(new PaymentOrder("c-0", 1), Lease.of(Duration.ofMinutes(5)));
+        for (int i = 0; i < 50 && payer.paid.get() == 0; i++) {
+            Thread.sleep(20);
+        }
+        assertThat(payer.paid.get()).as("ungated: a write is taken at once").isEqualTo(1);
+        Thread.sleep(300); // the loop is back in its long ungated wait
+        publish(new Constraint(1, "rb", 1, "k1", Constraint.PRECEDENCE, "HumanApproval", List.of(), "PaymentOrder", List.of(),
+                0, "", "field:claimId", List.of("gate"), Map.of()));
+        payments.write(new PaymentOrder("c-1", 100), Lease.of(Duration.ofMinutes(5)));
+        Thread.sleep(700);
+        assertThat(payer.paid.get()).as("the waiting take saw the gate: not taken before an approval").isEqualTo(1);
+        approvals.write(new HumanApproval("c-1", "alice"), Lease.of(Duration.ofMinutes(5)));
+        for (int i = 0; i < 50 && payer.paid.get() == 1; i++) {
+            Thread.sleep(100);
+        }
+        assertThat(payer.paid.get()).isEqualTo(2);
+    }
+
     @Test
     void aPrecedenceHoldsTheClaimUntilTheApprovalArrives() throws Exception {
         publish(new Constraint(1, "rb", 1, "k1", Constraint.PRECEDENCE, "HumanApproval", List.of(), "PaymentOrder", List.of(),

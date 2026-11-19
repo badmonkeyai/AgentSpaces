@@ -428,6 +428,7 @@ public final class FleetConsoleServer implements AutoCloseable {
                 .mapToInt(ConsoleView.SpaceStats::written).sum());
         doc.put("perWorker", view.perWorker());
         doc.put("spaces", spaces.stream().map(this::spaceDoc).toList());
+        view.membership().ifPresent(status -> doc.put("membership", membershipDoc(status, false)));
         doc.put("lastEventSeq", view.lastSeq());
         doc.put("_links", links(Map.of(
                 "self", "/api/v1/overview",
@@ -471,8 +472,49 @@ public final class FleetConsoleServer implements AutoCloseable {
             row.put("residency", member.residency());
             return row;
         }).toList());
+        view.membership().ifPresent(status -> {
+            Map<String, Object> membership = membershipDoc(status, true);
+            doc.put("membership", membership);
+            doc.put("lost", membership.get("lostMembers"));
+            doc.put("retired", membership.get("retiredMembers"));
+        });
         doc.put("_links", links(Map.of("self", "/api/v1/peers", "root", "/api/v1")));
         respond(exchange, 200, HAL_JSON, jsonBytes(doc));
+    }
+
+    /** The console node's standing in its group; {@code full} adds the lost and retired members. */
+    private static Map<String, Object> membershipDoc(
+            ai.badmonkey.agentspaces.peering.node.PeerNode.MembershipStatus status, boolean full) {
+        Map<String, Object> doc = new LinkedHashMap<>();
+        doc.put("group", status.group().value());
+        doc.put("state", status.state().name());
+        doc.put("since", java.time.Instant.ofEpochMilli(status.sinceMillis()).toString());
+        doc.put("members", status.members());
+        doc.put("lost", status.lost().size());
+        doc.put("retired", status.retired().size());
+        doc.put("retirement", status.retirement());
+        doc.put("postRetirement", status.postRetirement());
+        if (full) {
+            doc.put("lostMembers", status.lost().stream().map(lost -> {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("peer", lost.peer().value());
+                row.put("lostAt", java.time.Instant.ofEpochMilli(lost.lostAtMillis()).toString());
+                row.put("attempts", lost.attempts());
+                row.put("nextAttempt", java.time.Instant.ofEpochMilli(lost.nextDueMillis()).toString());
+                row.put("endpoints", lost.endpoints().stream().map(e -> e.transport() + "://" + e.address()).toList());
+                return row;
+            }).toList());
+            doc.put("retiredMembers", status.retired().stream().map(retired -> {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("peer", retired.peer().value());
+                row.put("lastSeen", java.time.Instant.ofEpochMilli(retired.lastSeenMillis()).toString());
+                row.put("retiredAt", java.time.Instant.ofEpochMilli(retired.retiredAtMillis()).toString());
+                row.put("endpoints", retired.endpoints().stream().map(e -> e.transport() + "://" + e.address())
+                        .toList());
+                return row;
+            }).toList());
+        }
+        return doc;
     }
 
     private void ads(HttpExchange exchange) throws IOException {

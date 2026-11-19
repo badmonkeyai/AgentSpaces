@@ -108,9 +108,11 @@ class NodeStoreTest {
         NodeStore store = new NodeStore(backend, InstantSource.system());
         String cid = Cids.of(new byte[] {1}, Cids.RAW);
         backend.put(cid, new byte[] {2}, 0L);
-        assertThatThrownBy(() -> store.get(cid))
-                .isInstanceOf(NodeFormatException.class)
-                .hasMessageContaining("does not match");
+        // bytes that do not hash to the CID are never handed out: they are dropped and the node reads as not held, to
+        // be fetched again (a throw here made every tick fail; the PDT second-swap ticket, 2026-11-17)
+        assertThat(store.get(cid)).isEmpty();
+        assertThat(store.corruptDropped()).isEqualTo(1);
+        assertThat(backend.get(cid, 0L)).isEmpty();
     }
 
     @Test

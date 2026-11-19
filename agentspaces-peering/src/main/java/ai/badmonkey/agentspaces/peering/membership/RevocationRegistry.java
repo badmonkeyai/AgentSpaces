@@ -326,7 +326,7 @@ public final class RevocationRegistry implements ReconcilableState {
             return null;
         }
         if (!PeerId.fromPublicKey(signed.publicKey()).equals(ad.issuer())
-                || !Ed25519.verify(Ed25519.publicKeyFromRaw(signed.publicKey()),
+                || !Ed25519.verifyRaw(signed.publicKey(),
                         signed.adBytes(), signed.signature())
                 || !ad.group().equals(group.group())
                 || ad.issued().isAfter(clock.instant().plus(MAX_ISSUED_SKEW))) {

@@ -149,6 +149,7 @@ public final class FleetConsole {
                 .results("tasks", FindingEntry.class,
                         entry -> ((FindingEntry) entry).worker())
                 .members(() -> peer.runtime().membership().allMembers())
+                .membership(peer.node(), peer.runtime().id())
                 .discovery(peer.discovery())
                 .build();
     }

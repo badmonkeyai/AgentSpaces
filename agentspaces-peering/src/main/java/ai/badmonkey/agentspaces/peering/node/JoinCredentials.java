@@ -306,7 +306,7 @@ public final class JoinCredentials {
                 return Verdict.INVALID;
             }
             byte[] view = codec.toBytes(new CredentialView(candidate, groupAd.group()));
-            return Ed25519.verify(Ed25519.publicKeyFromRaw(credential.founderKey()),
+            return Ed25519.verifyRaw(credential.founderKey(),
                     view, credential.signature()) ? Verdict.VALID : Verdict.INVALID;
         } catch (RuntimeException e) {
             return Verdict.INVALID;

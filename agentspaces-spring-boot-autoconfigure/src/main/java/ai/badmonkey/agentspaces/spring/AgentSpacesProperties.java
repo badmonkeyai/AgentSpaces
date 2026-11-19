@@ -108,6 +108,8 @@ public class AgentSpacesProperties {
 
     /** Relay settings ({@code agentspaces.relay.*}). */
     private Relay relay = new Relay();
+    private Retirement retirement = new Retirement();
+    private PostRetirement postRetirement = new PostRetirement();
     /** The content swarm ({@code agentspaces.content.*}, srad/large-networks-bulk-data.md §7.2). */
     private ContentSwarm content = new ContentSwarm();
     /** Persistent data trees ({@code agentspaces.pdt.*}, srad/agentspaces-pdt.md appendix C). */
@@ -846,13 +848,20 @@ public class AgentSpacesProperties {
         /** {@code agentspaces.pdt.store.*}: the node store (PD-S-02, PD-S-05, PD-Q-AVL-02). */
         public static class Store {
             /**
+             * The default pack directory. Left at this default, each peer keeps its own directory under it,
+             * {@code <path>/<group>/<peer id>}, since one directory serves one store and several peers of a group may
+             * share a host; a path set explicitly is used as {@code <path>/<group>} for this one peer.
+             */
+            public static final String DEFAULT_PATH = System.getProperty("user.home") + "/.agentspaces/pdt";
+
+            /**
              * {@code pack}: the append-only pack store under {@code path/<group>};
              * {@code memory}: on the heap; {@code bean}: the application's
              * {@code NodeStore} bean, which also wins over the other two when present.
              */
             private String kind = "pack";
             /** The pack directory; blank with {@code kind=pack} falls back to memory with a warning, or refuses under {@code require}. */
-            private String path = System.getProperty("user.home") + "/.agentspaces/pdt";
+            private String path = DEFAULT_PATH;
             /**
              * The store quota in bytes (PD-S-05); 0 is unbounded. Every node the content swarm hands
              * the store passes it (PDT 2 phase 7, P2-X-08).
@@ -1119,6 +1128,69 @@ public class AgentSpacesProperties {
 
     public Relay getRelay() {
         return relay;
+    }
+
+    public Retirement getRetirement() {
+        return retirement;
+    }
+
+    public void setRetirement(Retirement retirement) {
+        this.retirement = retirement;
+    }
+
+    public PostRetirement getPostRetirement() {
+        return postRetirement;
+    }
+
+    public void setPostRetirement(PostRetirement postRetirement) {
+        this.postRetirement = postRetirement;
+    }
+
+    /**
+     * Retirement ({@code agentspaces.retirement.*}): a lost member is retried on a back-off of its own (5 s doubling
+     * to 5 min, at most eight per round) and, unanswered after {@code after}, retires to the retirement list kept in
+     * the state directory beside the admission memory. Off: a lost member is retried for ten minutes and forgotten.
+     */
+    public static class Retirement {
+        /** Whether lost members retire; default on. */
+        private boolean enabled = true;
+        /** How long a lost member is retried before it retires; default 24 hours. */
+        private java.time.Duration after = java.time.Duration.ofHours(24);
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public java.time.Duration getAfter() {
+            return after;
+        }
+
+        public void setAfter(java.time.Duration after) {
+            this.after = after;
+        }
+    }
+
+    /**
+     * Post-retirement ({@code agentspaces.post-retirement.*}): when a group's view has been empty for two minutes and
+     * its lost members, seeds and locator brought nobody back, introduce this node to retired members' last
+     * endpoints as a last resort before it is out of service in the group. Off by default (opt in): a retired
+     * member's address may by now belong to another host, which learns of this node from the card it is sent.
+     */
+    public static class PostRetirement {
+        /** Whether the retirement list is the last resort; default off. */
+        private boolean enabled;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
     }
 
     public void setRelay(Relay relay) {

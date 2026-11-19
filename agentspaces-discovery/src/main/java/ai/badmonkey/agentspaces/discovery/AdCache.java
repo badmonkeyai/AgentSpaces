@@ -270,7 +270,7 @@ public final class AdCache {
             return Optional.empty(); // ASF-047: a revoked peer publishes nothing here
         }
         if (!PeerId.fromPublicKey(stored.publicKey()).equals(ad.issuer())
-                || !Ed25519.verify(Ed25519.publicKeyFromRaw(stored.publicKey()),
+                || !Ed25519.verifyRaw(stored.publicKey(),
                         stored.adBytes(), stored.signature())
                 || ad.expired(clock.instant())) {
             return Optional.empty();

@@ -191,16 +191,42 @@ public class NodeStore {
      * against the CID: what a holder serves over the tree exchange and what a walk
      * follows links through (PD-X-03). Equal to {@link #get} unless the store seals.
      *
+     * <p>Held bytes that do not hash to the CID are not that node (PD-N-06): they are dropped from the backend,
+     * counted ({@link #corruptDropped()}) and logged once per CID, and the node reads as not held, so the walk that
+     * asked marks it missing and a fetch brings the real node back. Throwing instead made every tick of a peer that held
+     * one bad node fail for as long as the process ran (the PDT second-swap ticket, 2026-11-17).
+     *
      * @param cid the CID
-     * @return the bytes, when held
-     * @throws NodeFormatException when the held bytes do not hash to the CID (PD-N-06)
+     * @return the bytes, when held and verified
      */
     public Optional<byte[]> stored(String cid) {
         Objects.requireNonNull(cid, "cid");
         Optional<byte[]> held = backend.get(cid, clock.millis());
-        held.ifPresent(bytes -> verify(cid, bytes));
+        if (held.isPresent()) {
+            try {
+                verify(cid, held.get());
+            } catch (NodeFormatException corrupt) {
+                backend.remove(cid);
+                corruptDropped.incrementAndGet();
+                if (corruptLogged.size() < CORRUPT_LOG_BOUND && corruptLogged.add(cid)) {
+                    LOG.log(System.Logger.Level.WARNING, "dropped a held node that failed verification, to be fetched"
+                            + " again: {0}", corrupt.getMessage());
+                }
+                return Optional.empty();
+            }
+        }
         return held;
     }
+
+    /** The held nodes dropped because their bytes did not hash to their CID; each is fetched again when needed. */
+    public long corruptDropped() {
+        return corruptDropped.get();
+    }
+
+    private static final System.Logger LOG = System.getLogger(NodeStore.class.getName());
+    private static final int CORRUPT_LOG_BOUND = 1024;
+    private final AtomicLong corruptDropped = new AtomicLong();
+    private final Set<String> corruptLogged = ConcurrentHashMap.newKeySet();
 
     /**
      * Computes the CID of a plaintext node and the bytes the backend will hold under

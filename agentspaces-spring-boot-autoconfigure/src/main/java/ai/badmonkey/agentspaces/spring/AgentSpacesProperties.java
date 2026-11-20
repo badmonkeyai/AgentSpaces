@@ -110,6 +110,7 @@ public class AgentSpacesProperties {
     private Relay relay = new Relay();
     private Retirement retirement = new Retirement();
     private PostRetirement postRetirement = new PostRetirement();
+    private Health health = new Health();
     /** The content swarm ({@code agentspaces.content.*}, srad/large-networks-bulk-data.md §7.2). */
     private ContentSwarm content = new ContentSwarm();
     /** Persistent data trees ({@code agentspaces.pdt.*}, srad/agentspaces-pdt.md appendix C). */
@@ -1140,6 +1141,33 @@ public class AgentSpacesProperties {
 
     public PostRetirement getPostRetirement() {
         return postRetirement;
+    }
+
+    public Health getHealth() {
+        return health;
+    }
+
+    public void setHealth(Health health) {
+        this.health = health;
+    }
+
+    /**
+     * Health ({@code agentspaces.health.*}): how this node's membership shows in the application's availability.
+     */
+    public static class Health {
+        /**
+         * Whether readiness turns REFUSING_TRAFFIC while this node is isolated in a group, and back once none is;
+         * default on. Liveness is never touched.
+         */
+        private boolean refuseTrafficWhenIsolated = true;
+
+        public boolean isRefuseTrafficWhenIsolated() {
+            return refuseTrafficWhenIsolated;
+        }
+
+        public void setRefuseTrafficWhenIsolated(boolean refuseTrafficWhenIsolated) {
+            this.refuseTrafficWhenIsolated = refuseTrafficWhenIsolated;
+        }
     }
 
     public void setPostRetirement(PostRetirement postRetirement) {

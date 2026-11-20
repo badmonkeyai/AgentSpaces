@@ -1160,6 +1160,20 @@ public class AgentSpacesAutoConfiguration {
     }
 
     /**
+     * Readiness follows the node's membership (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md): REFUSING_TRAFFIC while
+     * the node is isolated in a group, ACCEPTING_TRAFFIC once none is; liveness untouched. On by default, off with
+     * {@code agentspaces.health.refuse-traffic-when-isolated=false}.
+     */
+    @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "agentspaces.health",
+            name = "refuse-traffic-when-isolated", havingValue = "true", matchIfMissing = true)
+    public MembershipReadiness agentSpacesMembershipReadiness(PeerNode node,
+                                                              org.springframework.context.ApplicationEventPublisher events) {
+        return new MembershipReadiness(node, events);
+    }
+
+    /**
      * Wires the shipped capability providers into one group (spec §10.5):
      * an explicit {@link CapabilityRuntime} registered through
      * {@link AgentSpaces#register(String, CapabilityRuntime)}, then each

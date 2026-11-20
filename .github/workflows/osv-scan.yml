@@ -48,6 +48,6 @@ jobs:
       - name: Resolve the dependency tree as an SBOM
         run: mvn -B -ntp org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
       - name: OSV scan
-        uses: google/osv-scanner-action/osv-scanner-action@9bb69575e74019c2ad085a1860787043adf47ccb # v2.2.4
+        uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
         with:
           scan-args: -L target/bom.cdx.json

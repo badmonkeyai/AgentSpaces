@@ -217,6 +217,26 @@ public final class DiscoveryService implements AutoCloseable {
     }
 
     /**
+     * The cache's generation: moves on every admission, replacement and removal (AdCache.generation).
+     *
+     * @return the generation
+     */
+    public long generation() {
+        return cache.generation();
+    }
+
+    /**
+     * Registers a listener run whenever {@link #generation()} moves (AdCache.onChange): a component that reads the
+     * cache wakes its own loop participant from it (srad/agentspaces-event-loop.md DW-2). It must only wake.
+     *
+     * @param listener the listener
+     * @return a handle that removes it
+     */
+    public AutoCloseable onChange(Runnable listener) {
+        return cache.onChange(listener);
+    }
+
+    /**
      * Installs the content swarm that serves this group's parts documents (SPEC §6.1a.5, v0.1.32): with it a card
      * above the spill threshold travels as a stub, and {@link #resolve} completes a stub; null removes it.
      *
@@ -344,17 +364,40 @@ public final class DiscoveryService implements AutoCloseable {
     private synchronized void tick() {
         if (tickRegistration == null) {
             gateOpen = AppCards.gateOpen(runtime);
-            tickRegistration = runtime.onTick(this::onTick);
+            gateEpoch = runtime.viewEpoch();
+            gateCards = runtime.appCardVersion();
+            ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration =
+                    runtime.onDueWall("discovery", cache.clock(), this::runDue);
+            spiller.onHold(registration::wake);
+            tickRegistration = registration;
         }
     }
 
-    private void onTick() {
-        boolean open = AppCards.gateOpen(runtime);
-        if (open != gateOpen) {
-            gateOpen = open;
-            gateListeners.forEach(listener -> listener.accept(open));
+    /** The view epoch and AppCard version the gate was last judged at (DW-5: this participant's own copies). */
+    private long gateEpoch;
+    private long gateCards;
+
+    /**
+     * The discovery participant (srad/agentspaces-event-loop.md EL-T-07, EL-T-09): the AppCard gate is re-judged only
+     * when the view or a member's AppCard level moved (both wake the group's participants), and the spill holds are
+     * swept at their earliest expiry. A direct run judges and sweeps as the tick did.
+     */
+    private long runDue(long nowMillis) {
+        long epoch = runtime.viewEpoch();
+        long cards = runtime.appCardVersion();
+        if (runtime.directRun() || epoch != gateEpoch || cards != gateCards) {
+            gateEpoch = epoch;
+            gateCards = cards;
+            boolean open = AppCards.gateOpen(runtime);
+            if (open != gateOpen) {
+                gateOpen = open;
+                gateListeners.forEach(listener -> listener.accept(open));
+            }
         }
-        spiller.sweep();
+        if (runtime.directRun() || spiller.nextExpiryMillis() <= nowMillis) {
+            spiller.sweep();
+        }
+        return spiller.nextExpiryMillis();
     }
 
     /**

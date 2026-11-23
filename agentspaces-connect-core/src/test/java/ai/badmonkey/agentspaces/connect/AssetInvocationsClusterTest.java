@@ -397,6 +397,74 @@ class AssetInvocationsClusterTest {
         }
     }
 
+    /** An operation that hangs and ignores interrupts, as one stuck in uninterruptible I/O does. */
+    private static final class HungProvider implements AssetProvider {
+        final InventoryProvider inner = new InventoryProvider();
+        final java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+
+        @Override
+        public List<AssetCard> describeAssets(GroupId group, PeerId issuer, Instant now) {
+            return inner.describeAssets(group, issuer, now);
+        }
+
+        @Override
+        public QueryResult query(String asset, Map<String, String> parameters) {
+            return inner.query(asset, parameters);
+        }
+
+        @Override
+        public InvokeResult invoke(String asset, String operation, Map<String, String> params, String invocationId) {
+            entered.countDown();
+            while (release.getCount() > 0) {
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                    // hung: the close's interrupt does not end it
+                }
+            }
+            return inner.invoke(asset, operation, params, invocationId);
+        }
+    }
+
+    /**
+     * Wire adversary of phase 2 (srad/agentspaces-event-loop.md §10.14): the claim's renewal ends with the connector.
+     * Before the fix the renewer looked only at its own interrupt, which only the operation's return sends, so a
+     * closed connector whose operation hung renewed the claim for as long as it hung and no replica could take it.
+     */
+    @Test
+    @Timeout(300)
+    void aClosedConnectorStopsRenewingTheClaimOfAHungOperation() throws Exception {
+        Wired connectorPeer = newPeer("conn", 1);
+        Wired agent = newPeer("agent", 2, "conn");
+        tickAll(4);
+        HungProvider provider = new HungProvider();
+        connector = new ConnectorRuntime(connectorPeer.data(), connectorPeer.discovery(), connectorPeer.identity(),
+                "cell-connector", provider, groupId, clock, Duration.ofMinutes(1))
+                .invokeLease(Duration.ofMillis(200));
+        connector.start();
+        try {
+            tickAll(2);
+            AssetCard card = agent.discovery().find(AssetCard.class, c -> c.asset().equals("inventory")).getFirst();
+            AssetInvocations.invoke(agent.data(), card, "reserve", Map.of("sku", "A-1", "qty", "1"),
+                    Duration.ofSeconds(30));
+            long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            while (provider.entered.getCount() > 0) {
+                assertThat(System.nanoTime()).as("the operation started").isLessThan(deadline);
+                tickAll(1);
+                Thread.sleep(10);
+            }
+            Thread.sleep(350); // renewed while the connector runs
+            assertThat(connector.renewals()).as("renewed every 100 ms while it ran").isGreaterThanOrEqualTo(2);
+            connector.close();
+            int atClose = connector.renewals();
+            Thread.sleep(1_000); // ten half-leases
+            assertThat(connector.renewals() - atClose).as("renewals after the connector closed").isLessThanOrEqualTo(1);
+        } finally {
+            provider.release.countDown();
+        }
+    }
+
     @Test
     @Timeout(300)
     void aLongOperationKeepsItsClaimRenewedUntilItsResultIsWritten() throws Exception {

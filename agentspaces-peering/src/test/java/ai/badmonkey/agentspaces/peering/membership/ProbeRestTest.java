@@ -19,6 +19,12 @@ import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
+import ai.badmonkey.agentspaces.measure.Direction;
+import ai.badmonkey.agentspaces.measure.Kind;
+import ai.badmonkey.agentspaces.measure.Measure;
+import ai.badmonkey.agentspaces.measure.Params;
+import ai.badmonkey.agentspaces.measure.Rec;
+import ai.badmonkey.agentspaces.measure.Unit;
 import ai.badmonkey.agentspaces.test.TestClock;
 import org.junit.jupiter.api.Test;
 
@@ -178,6 +184,10 @@ class ProbeRestTest {
             ticks++;
         }
         long detected = clock.millis() - diedAt;
+        // the unit form of core.detect.silent-member (srad/agentspaces-event-loop.md EL-M-03): one member, the 1 s
+        // probe interval and 1 s ping timeout of this class, on its fake clock; the fleet forms are in the spoilers
+        Measure.record("core.detect.silent-member", Unit.MS, Direction.LOWER, detected,
+                Rec.with().params(Params.of("members", 2, "harness", "unit")).kind(Kind.PERF));
         assertThat(membership.member(member)).isEmpty();
         // one period before the rest ends, then the direct and the indirect timeouts (no relay here: dropped at once)
         assertThat(detected).isLessThanOrEqualTo(INTERVAL.toMillis() * 2 + PING_TIMEOUT.toMillis() * 2 + 500);

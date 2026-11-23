@@ -96,7 +96,7 @@ public record ChannelCertificate(PrivateKey tlsKey, X509Certificate certificate)
         byte[] serial = new byte[9];
         new SecureRandom().nextBytes(serial);
 
-        Instant now = Instant.now().minus(1, ChronoUnit.HOURS);
+        Instant now = ai.badmonkey.agentspaces.common.time.TimeSource.system().instant().minus(1, ChronoUnit.HOURS);
         X500Name name = new X500Name(
                 "CN=" + Multibase.base58btc(identity.rawPublicKey()));
         X509v3CertificateBuilder builder = new X509v3CertificateBuilder(

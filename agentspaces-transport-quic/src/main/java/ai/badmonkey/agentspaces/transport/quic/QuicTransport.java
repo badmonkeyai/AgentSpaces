@@ -101,6 +101,9 @@ public final class QuicTransport implements Transport, AutoCloseable {
 
     private static final int MAX_FRAME = 8 * 1024 * 1024;
     private static final long DIAL_TIMEOUT_MILLIS = 10_000;
+
+    /** The default bound on a dial's handshake: 10 s. */
+    public static final java.time.Duration DEFAULT_DIAL_TIMEOUT = java.time.Duration.ofMillis(DIAL_TIMEOUT_MILLIS);
     private static final long SEND_TIMEOUT_MILLIS = 30_000;
     private static final long IDLE_TIMEOUT_MILLIS = 60_000;
 
@@ -112,6 +115,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
     /** The CA trust peers must validate against; null for identity-endorsed attestation. */
     private final Supplier<ChannelTrust> trust;
     private final boolean attesting;
+    private volatile java.time.Duration dialTimeout = DEFAULT_DIAL_TIMEOUT;
 
     /** Creates the transport in unattested mode: encryption only. */
     public QuicTransport() {
@@ -200,6 +204,27 @@ public final class QuicTransport implements Transport, AutoCloseable {
         return builder.earlyData(false).sessionCacheSize(1).sessionTimeout(1);
     }
 
+    /**
+     * Sets the bound on a dial's handshake (default {@link #DEFAULT_DIAL_TIMEOUT}): a dial to a port nobody serves
+     * fails after it. A test that dials such a port sets it short; later dials use the new bound.
+     *
+     * @param timeout the bound, 1 ms to 10 min
+     * @return this transport
+     */
+    public QuicTransport dialTimeout(java.time.Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.compareTo(java.time.Duration.ofMillis(1)) < 0 || timeout.compareTo(java.time.Duration.ofMinutes(10)) > 0) {
+            throw new IllegalArgumentException("dialTimeout must be 1ms to 10m, not " + timeout);
+        }
+        this.dialTimeout = timeout;
+        return this;
+    }
+
+    /** @return the bound on a dial's handshake */
+    public java.time.Duration dialTimeout() {
+        return dialTimeout;
+    }
+
     @Override
     public String scheme() {
         return "quic";
@@ -245,7 +270,7 @@ public final class QuicTransport implements Transport, AutoCloseable {
                     .streamHandler(new ChannelInboundHandlerAdapter())
                     .remoteAddress(target)
                     .connect()
-                    .get(DIAL_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+                    .get(dialTimeout.toMillis(), TimeUnit.MILLISECONDS);
             QuicConnection connection = new QuicConnection(address, udp);
             // The dialer's connect future completes with the handshake, so the
             // server's chain is final here.

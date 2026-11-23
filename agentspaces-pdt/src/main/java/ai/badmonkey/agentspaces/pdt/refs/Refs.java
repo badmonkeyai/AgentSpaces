@@ -168,6 +168,12 @@ public final class Refs implements AutoCloseable {
     /** The default head lease (PD-R-08). */
     public static final Duration DEFAULT_HEAD_LEASE = Duration.ofMinutes(10);
 
+    /**
+     * The default take lease of a linear swap (srad/agentspaces-event-loop.md EL-E-08): held only from the take to its
+     * complete, which the swap bounds by its own take and load timeouts (5 s and 10 s), so 30 s exceeds the hold.
+     */
+    public static final Duration DEFAULT_TAKE_LEASE = Duration.ofSeconds(30);
+
     /** The grace before a superseded own head is cancelled: two gossip rounds (PD-R-03). */
     public static final long CANCEL_GRACE_MILLIS = 2_000;
 
@@ -299,7 +305,7 @@ public final class Refs implements AutoCloseable {
         /** The defaults of §7.2. */
         public static Config defaults() {
             return new Config(Duration.ofSeconds(10), PRef.INLINE_DELTA_BYTES, true, PRef.SEALING_NONE,
-                    DEFAULT_HEAD_LEASE, Duration.ofSeconds(30), Duration.ofSeconds(5), 3, Map.of(), Map.of(),
+                    DEFAULT_HEAD_LEASE, DEFAULT_TAKE_LEASE, Duration.ofSeconds(5), 3, Map.of(), Map.of(),
                     Duration.ofMillis(CANCEL_GRACE_MILLIS));
         }
     }
@@ -1803,8 +1809,26 @@ public final class Refs implements AutoCloseable {
         if (pendings.isEmpty()) {
             return;
         }
-        long deadline = System.nanoTime() + config.loadTimeout().toNanos();
-        while (System.nanoTime() < deadline) {
+        awaitAll(pendings);
+    }
+
+    private void awaitFetch(Pending pending) {
+        awaitAll(List.of(pending));
+    }
+
+    /**
+     * Waits until every pending fetch has ended or its root is held, against one load timeout on the engine's time
+     * source: each fetch's end signals the wait (EL-W-03; was a 5 ms poll).
+     */
+    private void awaitAll(List<Pending> pendings) {
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        ai.badmonkey.agentspaces.common.time.ChangeSignal ended = new ai.badmonkey.agentspaces.common.time.ChangeSignal(waits);
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, config.loadTimeout());
+        for (Pending pending : pendings) {
+            pending.fetch.whenDone(ended);
+        }
+        while (true) {
+            long seen = ended.seen();
             boolean outstanding = false;
             for (Pending pending : pendings) {
                 if (!held(pending.head.root()) && !pending.fetch.isDoneOrFailed()) {
@@ -1816,22 +1840,9 @@ public final class Refs implements AutoCloseable {
                 return;
             }
             try {
-                Thread.sleep(5);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
-    }
-
-    private void awaitFetch(Pending pending) {
-        long deadline = System.nanoTime() + config.loadTimeout().toNanos();
-        while (!held(pending.head.root()) && !pending.fetch.isDoneOrFailed()) {
-            if (System.nanoTime() >= deadline) {
-                return;
-            }
-            try {
-                Thread.sleep(5);
+                if (!ended.await(seen, deadline)) {
+                    return;
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -2471,6 +2482,44 @@ public final class Refs implements AutoCloseable {
         for (State<?> state : states.values()) {
             tick(state, now);
         }
+    }
+
+    /** How often the engine is stepped while a fetch, a recheck or a chain batch is in flight: today's cadence. */
+    public static final long IN_FLIGHT_STEP_MILLIS = 250;
+
+    /**
+     * When {@link #tick()} next has work no change signal covers (srad/agentspaces-event-loop.md EL-T-08): the
+     * earliest quiet deadline of any ref (a lapse, a renewal at half-life, a cancel grace, a retry, the subscription's
+     * renewal) and the push receiver's next expiry; now when an input the quiet tick reads has moved; and a 250 ms
+     * step while anything is in flight, as the tick polled it.
+     *
+     * @return the next due, on this engine's clock
+     */
+    public long nextDueMillis() {
+        if (closed) {
+            return Long.MAX_VALUE;
+        }
+        long now = clock.millis();
+        long due = receiver == null ? Long.MAX_VALUE : receiver.nextExpiryMillis();
+        long signals = changeSignals();
+        long epoch = heldEpoch.get();
+        for (State<?> state : states.values()) {
+            if (!state.recheck.isEmpty() || !state.pending.isEmpty() || !state.chainWanted.isEmpty()
+                    || state.chainBatch != null) {
+                due = Math.min(due, now + IN_FLIGHT_STEP_MILLIS);
+                continue;
+            }
+            int ownCount;
+            synchronized (state.own) {
+                ownCount = state.own.size();
+            }
+            if (signals < 0 || signals != state.quietSignals || state.lastHeads != state.quietLastHeads
+                    || ownCount != state.quietOwn || epoch != state.quietHeldEpoch) {
+                return now;
+            }
+            due = Math.min(due, state.quietUntil);
+        }
+        return due;
     }
 
     private <T> void tick(State<T> state, long now) {

@@ -36,7 +36,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -73,9 +72,10 @@ public final class UdpTransport implements Transport, AutoCloseable {
     private final Set<Listener> listeners = ConcurrentHashMap.newKeySet();
     private final SecureRandom random = new SecureRandom();
     private volatile DtlsOptions options = DtlsOptions.defaults();
+    private volatile java.time.Duration dialTimeout = DtlsTransport.DEFAULT_DIAL_TIMEOUT;
     private volatile boolean used;
     private volatile boolean closed;
-    private ScheduledThreadPoolExecutor timers;
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource time = ai.badmonkey.agentspaces.common.time.TimeSource.system();
 
     /** Creates the binding with the default options. */
     public UdpTransport() {
@@ -94,6 +94,45 @@ public final class UdpTransport implements Transport, AutoCloseable {
         }
         this.options = Objects.requireNonNull(options, "options");
         return this;
+    }
+
+    /**
+     * Sets the time source the associations' retransmit, acknowledgement and idle deadlines run on (one-shots on its
+     * monotonic base, srad/agentspaces-event-loop.md EL-T-12); valid only before first use. The default is the
+     * process's {@code TimeSource.system()}, so no transport keeps a timer thread of its own.
+     *
+     * @param time the time source
+     * @return this transport
+     * @throws IllegalStateException after first use
+     */
+    public UdpTransport time(ai.badmonkey.agentspaces.common.time.TimeSource time) {
+        if (used) {
+            throw new IllegalStateException("the time source is fixed once the transport has dialed or listened");
+        }
+        this.time = Objects.requireNonNull(time, "time");
+        return this;
+    }
+
+    /**
+     * Sets the bound on a dial's HELLO exchange (default {@link DtlsTransport#DEFAULT_DIAL_TIMEOUT}): a dial to a
+     * peer that never answers fails after it. Valid only before first use. A test that dials a silent port sets it
+     * short.
+     *
+     * @param timeout the bound, 1 ms to 10 min
+     * @return this transport
+     * @throws IllegalStateException after first use
+     */
+    public UdpTransport dialTimeout(java.time.Duration timeout) {
+        if (used) {
+            throw new IllegalStateException("the dial timeout is fixed once the transport has dialed or listened");
+        }
+        this.dialTimeout = DtlsTransport.checkDialTimeout(timeout);
+        return this;
+    }
+
+    /** @return the bound on a dial's HELLO exchange */
+    public java.time.Duration dialTimeout() {
+        return dialTimeout;
     }
 
     /** @return this transport's counters */
@@ -129,7 +168,7 @@ public final class UdpTransport implements Transport, AutoCloseable {
                 .putShort((short) 0).putLong(nonce).array();
         long token = 0;
         boolean answered = false;
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DtlsTransport.DIAL_TIMEOUT_MILLIS);
+        long deadline = System.nanoTime() + dialTimeout.toNanos();
         int wait = 1_000;
         byte[] reply = new byte[PeerDatagramTransport.RECEIVE_LIMIT];
         try {
@@ -169,7 +208,7 @@ public final class UdpTransport implements Transport, AutoCloseable {
             throws IOException {
         DtlsAssociation[] self = new DtlsAssociation[1];
         DtlsAssociation association = new DtlsAssociation(new PlainRecordLayer(path, token, opts.mtu()), path,
-                Optional.empty(), new X509Certificate[0], opts, timers, counters,
+                Optional.empty(), new X509Certificate[0], opts, time, counters,
                 () -> {
                     associations.remove(self[0]);
                     released.run();
@@ -212,11 +251,6 @@ public final class UdpTransport implements Transport, AutoCloseable {
             listener.close();
         }
         listeners.clear();
-        synchronized (this) {
-            if (timers != null) {
-                timers.shutdownNow();
-            }
-        }
     }
 
     private synchronized void prepare() throws IOException {
@@ -224,14 +258,6 @@ public final class UdpTransport implements Transport, AutoCloseable {
             throw new IOException("transport closed");
         }
         used = true;
-        if (timers == null) {
-            timers = new ScheduledThreadPoolExecutor(1, runnable -> {
-                Thread thread = new Thread(runnable, "udp-timer");
-                thread.setDaemon(true);
-                return thread;
-            });
-            timers.setRemoveOnCancelPolicy(true);
-        }
     }
 
     /** One bound UDP port. */

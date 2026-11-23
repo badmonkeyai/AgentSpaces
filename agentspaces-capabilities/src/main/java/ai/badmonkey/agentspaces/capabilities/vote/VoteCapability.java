@@ -65,6 +65,9 @@ import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
  */
 public final class VoteCapability implements CapabilityProvider {
 
+    /** The capability card's time to live (srad/agentspaces-event-loop.md §3.11), as every shipped capability uses. */
+    public static final java.time.Duration ADVERTISEMENT_TTL = java.time.Duration.ofMinutes(15);
+
     /** The capability type URI. */
     public static final String TYPE = "aspace:cap/vote";
 
@@ -348,7 +351,7 @@ public final class VoteCapability implements CapabilityProvider {
                 // two advertisements, not one that the second overwrites.
                 "aspace://" + group.value() + "/cap/vote/" + selfPeer.value() + "/"
                         + voteSpace.name(),
-                selfPeer, group, clock.instant(), Duration.ofMinutes(15),
+                selfPeer, group, clock.instant(), ADVERTISEMENT_TTL,
                 TYPE, "0.1", "space:" + voteSpace.name(),
                 Map.of("modes", "QUORUM,MAJORITY_GOSSIP"), Map.of());
     }

@@ -201,7 +201,10 @@ public final class GossipBus {
     static final int RECENT_CAPACITY = 512;
     /** Items taken from one HAVE at most. */
     static final int HAVE_ITEMS_MAX = 256;
-    /** GRAFTs sent per tick at most, so an announcer cannot make this node sign thousands of asks. */
+    /**
+     * GRAFTs sent per {@link #GRAFT_WINDOW_MILLIS} window at most (per tick before the node's loop, EL-T-01), so an
+     * announcer cannot make this node sign thousands of asks however often the bus's participant runs.
+     */
     static final int GRAFTS_PER_TICK = 16;
     /*
      * Swarm retries (ROBUSTNESS.md §10.2, sites A1 to A3 of §10.3): the asks for an announced item wait in time, never
@@ -318,12 +321,16 @@ public final class GossipBus {
     /** Members this node holds a live link to, and members with no endpoint of their own (dial-only clients). */
     private volatile java.util.function.Predicate<PeerId> linked = peer -> true;
     private volatile java.util.function.Predicate<PeerId> dialOnly = peer -> false;
-    /** The tick each hint-less member was last pushed to, and last failed, for the fan-out's weak slot. */
+    /**
+     * For the fan-out's weak slot: the forwarding order stamp ({@link #order}) at which each hint-less member was last
+     * pushed to, and the bus clock's millis at which a push to it last failed (srad/agentspaces-event-loop.md
+     * EL-T-01). Both were tick counts; the bus's participant no longer runs every 250 ms, so a count of its runs
+     * stretched the exclusion to minutes in a quiet group.
+     */
     private final Map<PeerId, Long> plainServed = new ConcurrentHashMap<>();
     private final Map<PeerId, Long> plainFailed = new ConcurrentHashMap<>();
-    /** How long a failed push keeps a hint-less member out of the strong slots. */
-    static final int PLAIN_FAILURE_TICKS = 8;
-    private volatile long ticks;
+    /** How long a failed push keeps a hint-less member out of the strong slots: today's 8 ticks at 250 ms (EL-T-01). */
+    static final java.time.Duration PLAIN_FAILURE = java.time.Duration.ofSeconds(2);
     /** Streams whose items are also delivered point to point, so a duplicate on them says nothing about the tree. */
     private final java.util.Set<String> directStreams = ConcurrentHashMap.newKeySet();
     /** Streams pushed to every capable member whatever the tree says: security state never waits on repair. */
@@ -342,8 +349,16 @@ public final class GossipBus {
     }
     /** Capable members this node forwards announcements to instead of payloads: pruned tree edges. */
     private final java.util.Set<PeerId> lazy = ConcurrentHashMap.newKeySet();
-    private record Forwarded(Bodies.HaveItem item, long tick) {
+    /**
+     * An item forwarded, with its place in this bus's forwarding order (srad/agentspaces-event-loop.md EL-T-15): an
+     * order, not a time, so two items forwarded in the same millisecond keep theirs, and it moves with every forward
+     * however often the bus's own participant runs.
+     */
+    private record Forwarded(Bodies.HaveItem item, long order, long atMillis) {
     }
+
+    /** The next forwarding order stamp (EL-T-15). */
+    private final java.util.concurrent.atomic.AtomicLong order = new java.util.concurrent.atomic.AtomicLong();
 
     private final Map<String, Forwarded> pendingHaves = Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, false) {
@@ -466,11 +481,29 @@ public final class GossipBus {
                     return size() > RECENT_CAPACITY;
                 }
             });
-    /** Ticks after a topology change during which HAVE goes out on every tick. */
-    static final int YOUNG_TICKS = 8;
-    /** Ticks after a topology change during which HAVE goes out every {@link #SETTLING_EVERY} ticks; after that, probes carry it. */
-    static final int SETTLING_TICKS = 32;
-    static final int SETTLING_EVERY = 4;
+    /**
+     * How long after a topology change HAVE goes out every {@link #HAVE_EVERY_MILLIS} (srad/agentspaces-event-loop.md
+     * §3.7, EL-T-15): today's 8 ticks at 250 ms, in time, since the bus's own participant no longer runs on a 250 ms
+     * grid.
+     */
+    static final long YOUNG_MILLIS = 2_000;
+    /** How long after a topology change HAVE still goes out, once per {@link #SETTLING_EVERY_MILLIS}; then probes carry it. */
+    static final long SETTLING_MILLIS = 8_000;
+    /** The settling window's pace: once per second of it (today's every fourth tick). */
+    static final long SETTLING_EVERY_MILLIS = 1_000;
+    /** The young window's pace: at most one HAVE round per 250 ms (today's every tick). */
+    static final long HAVE_EVERY_MILLIS = 250;
+    /** The window {@link #GRAFTS_PER_TICK} counts in (EL-T-01's 16 per 250 ms window). */
+    static final long GRAFT_WINDOW_MILLIS = 250;
+    /**
+     * The window a probe leaves the items of: today's tick, 250 ms on the bus's clock (srad/agentspaces-event-loop.md
+     * §3.7, EL-T-15). Before the event loop a probe left out the items forwarded in the current tick, which gave the
+     * tree up to a tick to deliver a fresh item before any probe named it. The outbox rule alone, without that wait,
+     * named a busy announcer's burst to members whose tree copies were still on their way:
+     * GraftRepairSimulationTest's burst case missed 11,880 small deliveries against its bound of 8,379 (6,000 at
+     * HEAD). The window is the same grid of the same width, so the rule is the one the tick gave, in time.
+     */
+    static final long PIGGYBACK_WINDOW_MILLIS = 250;
     /** Items a probe carries at most. */
     static final int PIGGYBACK_ITEMS = 32;
     /**
@@ -489,9 +522,18 @@ public final class GossipBus {
      */
     public static final int PROBE_DIGEST_STREAMS_CEILING = 256;
     private volatile int probeDigestStreams = PROBE_DIGEST_STREAMS;
-    private volatile long lastTopologyChangeTick = Long.MIN_VALUE / 2;
-    /** The tick each member was admitted at: a member is told only of items forwarded since. */
-    private final Map<PeerId, Long> admittedAtTick = new ConcurrentHashMap<>();
+    /** When the tree last changed, on the bus's clock, or {@link Long#MIN_VALUE} before any change (EL-T-15). */
+    private volatile long lastTopologyChangeMillis = Long.MIN_VALUE;
+    /** Moves with every topology change, so a HAVE round of an earlier window does not pace the new one. */
+    private volatile long topologyEpoch;
+    // The HAVE rounds' pace; read and written by tick() and nextDueMillis() only, which the node's loop runs serially.
+    private long lastHaveMillis = Long.MIN_VALUE;
+    private long lastHaveBucket = -1;
+    private long lastHaveEpoch = -1;
+    private long graftWindowStartMillis = Long.MIN_VALUE;
+    private int graftsInWindow;
+    /** The forwarding order at each member's admission: a member is told only of items forwarded since. */
+    private final Map<PeerId, Long> admittedAtOrder = new ConcurrentHashMap<>();
 
     /**
      * Notes a member's admission (the owning node calls it): announcements and probe
@@ -503,7 +545,7 @@ public final class GossipBus {
      * @param member the member just admitted
      */
     public void memberAdmitted(PeerId member) {
-        admittedAtTick.put(Objects.requireNonNull(member, "member"), ticks);
+        admittedAtOrder.put(Objects.requireNonNull(member, "member"), order.get());
     }
 
     /**
@@ -515,7 +557,8 @@ public final class GossipBus {
      * @param member the member that left the view
      */
     public void memberLeft(PeerId member) {
-        admittedAtTick.remove(Objects.requireNonNull(member, "member"));
+        admittedAtOrder.remove(Objects.requireNonNull(member, "member"));
+        flushedThrough.remove(member);
         forwarderLost(member);
     }
 
@@ -545,11 +588,11 @@ public final class GossipBus {
     }
 
     private long admittedAt(PeerId member) {
-        Long tick = admittedAtTick.get(member);
-        return tick == null ? Long.MIN_VALUE : tick;
+        Long stamp = admittedAtOrder.get(member);
+        return stamp == null ? Long.MIN_VALUE : stamp;
     }
 
-    /** The items forwarded most recently, with the tick they were forwarded in, for the probe piggyback. */
+    /** The items forwarded most recently, with their forwarding order, for the probe piggyback. */
     private final Map<String, Forwarded> recentForwarded = Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, false) {
                 @Override
@@ -560,29 +603,70 @@ public final class GossipBus {
 
     /**
      * Notes a change of the gossip tree or the view (a prune or graft either way, a member
-     * admitted or dropped): announcements go out on every tick for {@link #YOUNG_TICKS} ticks
-     * after it, then every few ticks until {@link #SETTLING_TICKS}, then only on probes, since
-     * a member can only be cut off from the tree by such a change.
+     * admitted or dropped): announcements go out every {@link #HAVE_EVERY_MILLIS} for
+     * {@link #YOUNG_MILLIS} after it, then once a second until {@link #SETTLING_MILLIS}, then only
+     * on probes, since a member can only be cut off from the tree by such a change. The window
+     * starts at the change, on the bus's clock, and a change with announcements queued asks the
+     * bus's participant to run (srad/agentspaces-event-loop.md EL-T-15), so a frame-driven prune
+     * or graft in a quiet node still announces within {@link #HAVE_EVERY_MILLIS}.
      */
     public void topologyChanged() {
-        lastTopologyChangeTick = ticks;
+        lastTopologyChangeMillis = clock.getAsLong();
+        topologyEpoch++;
+        if (!pendingHaves.isEmpty()) {
+            hooks.gossipDue();
+        }
     }
 
     /**
-     * The items this node forwarded before the current tick and since {@code to} was admitted,
-     * newest last, for a probe to carry. An item forwarded in this tick is left out: its eager
-     * copy may still sit in a batch that the probe, which is never batched, would overtake, and
-     * the receiver would graft a copy already on its way.
+     * Sets the test of whether the outbox toward a member holds frames not yet flushed (the node's coalescing,
+     * srad/agentspaces-event-loop.md EL-T-15). Without one, every send leaves at once and nothing waits.
+     *
+     * @param holds true while the outbox toward the member holds frames
+     */
+    public void outbox(java.util.function.Predicate<PeerId> holds) {
+        this.outboxHolds = Objects.requireNonNull(holds, "holds");
+    }
+
+    /**
+     * Told by the node just before it takes the frames of its outbox toward {@code peer} to send them (EL-T-15):
+     * every item stamped before now was enqueued before the take, so it leaves with this flush or left with an
+     * earlier one.
+     *
+     * @param peer the member the outbox goes to
+     */
+    public void outboxTaking(PeerId peer) {
+        flushedThrough.put(peer, order.get());
+    }
+
+    private volatile java.util.function.Predicate<PeerId> outboxHolds = peer -> false;
+    /** Per member, the forwarding order as of the last take of the outbox toward it (EL-T-15). */
+    private final Map<PeerId, Long> flushedThrough = new ConcurrentHashMap<>();
+
+    /**
+     * The items this node forwarded since {@code to} was admitted, newest last, for a probe to carry, leaving out
+     * any item whose eager copy may still sit in the outbox toward {@code to}: one forwarded after that outbox was
+     * last taken, while it holds frames (srad/agentspaces-event-loop.md EL-T-15). The probe is never batched, so it
+     * would overtake such a copy and the receiver would graft a copy already on its way. This replaces "before the
+     * current tick", which stopped meaning anything once the bus's participant stopped running every 250 ms.
+     *
+     * <p>Every item stamped before the limit read first was enqueued before it: when the outbox is empty after that
+     * read, its copy has left; when it holds frames, only items stamped before its last take have.
      *
      * @param to the member the probe goes to
      */
     public List<Bodies.HaveItem> piggyback(PeerId to) {
-        long current = ticks;
+        long limit = order.get();
         long since = admittedAt(to);
+        if (outboxHolds.test(to)) {
+            limit = Math.min(limit, flushedThrough.getOrDefault(to, Long.MIN_VALUE));
+        }
+        long window = Math.floorDiv(clock.getAsLong(), PIGGYBACK_WINDOW_MILLIS);
         List<Bodies.HaveItem> items = new ArrayList<>();
         synchronized (recentForwarded) {
             for (Forwarded forwarded : recentForwarded.values()) {
-                if (forwarded.tick() < current && forwarded.tick() >= since) {
+                if (forwarded.order() < limit && forwarded.order() >= since
+                        && Math.floorDiv(forwarded.atMillis(), PIGGYBACK_WINDOW_MILLIS) < window) {
                     items.add(forwarded.item());
                 }
             }
@@ -806,7 +890,8 @@ public final class GossipBus {
      */
     public GossipBus(PeerSampler sampler, FrameSender sender, CborCodec codec,
                      int fanout, int defaultHops) {
-        this(sampler, sender, codec, fanout, defaultHops, System::currentTimeMillis, new java.util.Random());
+        this(sampler, sender, codec, fanout, defaultHops,
+                ai.badmonkey.agentspaces.common.time.TimeSource.system()::monoMillis, new java.util.Random());
     }
 
     /**
@@ -968,16 +1053,6 @@ public final class GossipBus {
      * stream it holds, a delta sent, or a pulled delta that changed its state). The runtime stretches the
      * anti-entropy period while nothing does.
      */
-    /** Whether {@link #consumeActivity()} would answer true, without consuming it (idle-loop O8). */
-    public boolean activityPending() {
-        return activity;
-    }
-
-    /** Whether {@link #consumeTraffic()} would answer true, without consuming it (idle-loop O8). */
-    public boolean trafficPending() {
-        return traffic;
-    }
-
     public boolean consumeActivity() {
         boolean was = activity;
         activity = false;
@@ -992,6 +1067,163 @@ public final class GossipBus {
         boolean was = traffic;
         traffic = false;
         return was;
+    }
+
+    // ---- change signals for the node's loop (srad/agentspaces-event-loop.md DW-5, EL-L-13, EL-T-15)
+
+    /**
+     * What the bus tells the owning node's loop. Each hook runs on the thread that raised it (a reader thread, the
+     * node's loop, an application thread) and must only wake a participant.
+     */
+    public interface LoopHooks {
+        /** The first activity or traffic after a reader re-armed its edge (EL-L-13). */
+        default void activity() {
+        }
+
+        /**
+         * Work for the bus's own participant that no deadline it reported covers: a topology change with
+         * announcements queued, an announcement queued while the tree is young, an announced item to ask for
+         * (EL-T-15).
+         */
+        default void gossipDue() {
+        }
+
+        /** A runtime pace moved (RE-F-03): a deadline derived from it may be earlier now. */
+        default void paceChanged() {
+        }
+    }
+
+    private volatile LoopHooks hooks = new LoopHooks() { };
+    /** Moves with every mark of {@link #activity}; a reader keeps its own copy and compares (DW-5). */
+    private final java.util.concurrent.atomic.AtomicLong activityGeneration =
+            new java.util.concurrent.atomic.AtomicLong(1);
+    /** Moves with every mark of {@link #traffic} (DW-5). */
+    private final java.util.concurrent.atomic.AtomicLong trafficGeneration =
+            new java.util.concurrent.atomic.AtomicLong(1);
+    /** Armed by a reader that found nothing new: the next activity calls {@link LoopHooks#activity()} once. */
+    private final java.util.concurrent.atomic.AtomicBoolean activityEdge = new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicBoolean trafficEdge = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Sets the hooks the owning node's loop listens on.
+     *
+     * @param hooks the hooks
+     */
+    public void loopHooks(LoopHooks hooks) {
+        this.hooks = Objects.requireNonNull(hooks, "hooks");
+    }
+
+    /**
+     * A counter that moves whenever something this node holds moves (see {@link #activity}). A reader keeps the
+     * value it last read and compares, so two readers never consume each other's signal (DW-5).
+     *
+     * @return the generation
+     */
+    public long activityGeneration() {
+        return activityGeneration.get();
+    }
+
+    /**
+     * A counter that moves whenever any gossip moves (see {@link #traffic}); read as {@link #activityGeneration()}.
+     *
+     * @return the generation
+     */
+    public long trafficGeneration() {
+        return trafficGeneration.get();
+    }
+
+    /**
+     * Re-arms the activity edge after a read that found the group quiet (EL-L-13): the next activity wakes the
+     * loop once. Activity that came after {@code seen} was read wakes it at once, so none is missed between the read
+     * and the arming. A busy group never re-arms, so it pays no wake per rumor.
+     *
+     * @param seen the generation the reader read
+     */
+    public void armActivityEdge(long seen) {
+        activityEdge.set(true);
+        if (activityGeneration.get() != seen && activityEdge.compareAndSet(true, false)) {
+            hooks.activity();
+        }
+    }
+
+    /**
+     * Re-arms the traffic edge after a quiet read, as {@link #armActivityEdge} does for activity.
+     *
+     * @param seen the generation the reader read
+     */
+    public void armTrafficEdge(long seen) {
+        trafficEdge.set(true);
+        if (trafficGeneration.get() != seen && trafficEdge.compareAndSet(true, false)) {
+            hooks.activity();
+        }
+    }
+
+    private void markActivity() {
+        activity = true;
+        activityGeneration.incrementAndGet();
+        if (activityEdge.get() && activityEdge.compareAndSet(true, false)) {
+            hooks.activity();
+        }
+    }
+
+    private void markTraffic() {
+        traffic = true;
+        trafficGeneration.incrementAndGet();
+        if (trafficEdge.get() && trafficEdge.compareAndSet(true, false)) {
+            hooks.activity();
+        }
+    }
+
+    /**
+     * When the bus's own participant is next due, on the bus's clock (srad/agentspaces-event-loop.md EL-L-01,
+     * EL-T-15): the earliest ask for an announced item, the end of a spent graft window, and the next HAVE round
+     * while the tree is young or settling and announcements are queued. {@link Long#MAX_VALUE} when nothing is.
+     * Read by the node's loop after each run of {@link #tick(long)}, on the same thread.
+     *
+     * @param nowMillis the bus's clock now
+     * @return the next due time in the clock's milliseconds, or {@link Long#MAX_VALUE}
+     */
+    public long nextDueMillis(long nowMillis) {
+        if (lazyCapable == null) {
+            return Long.MAX_VALUE;
+        }
+        long next = Long.MAX_VALUE;
+        boolean overdue = false;
+        synchronized (missing) {
+            for (Missing entry : missing.values()) {
+                if (entry.askAtMillis <= nowMillis) {
+                    overdue = true;
+                } else if (entry.askAtMillis < next) {
+                    next = entry.askAtMillis;
+                }
+            }
+        }
+        if (overdue) {
+            // the window's budget is spent: the rest go when the next window opens
+            long open = graftWindowStartMillis == Long.MIN_VALUE ? nowMillis
+                    : Math.max(nowMillis, graftWindowStartMillis + GRAFT_WINDOW_MILLIS);
+            next = Math.min(next, open);
+        }
+        long change = lastTopologyChangeMillis;
+        if (!pendingHaves.isEmpty() && !lazy.isEmpty() && change != Long.MIN_VALUE) {
+            long since = Math.max(0, nowMillis - change);
+            if (since < SETTLING_MILLIS) {
+                long at;
+                boolean sameWindow = lastHaveEpoch == topologyEpoch;
+                if (since < YOUNG_MILLIS) {
+                    at = !sameWindow || lastHaveMillis == Long.MIN_VALUE ? nowMillis
+                            : Math.max(nowMillis, lastHaveMillis + HAVE_EVERY_MILLIS);
+                } else {
+                    long bucket = since / SETTLING_EVERY_MILLIS;
+                    at = !sameWindow || bucket != lastHaveBucket ? nowMillis
+                            : change + (bucket + 1) * SETTLING_EVERY_MILLIS;
+                }
+                next = Math.min(next, at);
+            } else {
+                next = Math.min(next, nowMillis); // settled: the queue is dropped on the next run
+            }
+        }
+        return next;
     }
 
     /**
@@ -1286,6 +1518,7 @@ public final class GossipBus {
      */
     public void antiEntropyPeriod(java.time.Duration period) {
         antiEntropyPeriod.set(period.toMillis());
+        hooks.paceChanged();
     }
 
     /** The anti-entropy base period in effect. */
@@ -1302,6 +1535,7 @@ public final class GossipBus {
      */
     public void antiEntropyStretch(int multiple) {
         antiEntropyStretch.set(multiple);
+        hooks.paceChanged();
     }
 
     /** How far an idle group's anti-entropy period may stretch, as a multiple of the base. */
@@ -1782,8 +2016,8 @@ public final class GossipBus {
         if (deltas.isEmpty() && !(fetched && asked != null)) {
             return;
         }
-        activity = true;
-        traffic = true;
+        markActivity();
+        markTraffic();
         pullRespSent.incrementAndGet();
         pullRespDeltasSent.addAndGet(deltas.size());
         pullRespBytesSent.addAndGet(byteCount(deltas));
@@ -1903,7 +2137,7 @@ public final class GossipBus {
             // this replica refuses or already holds is no news, and counting it held a quiet group's anti-entropy
             // at its base period for good.
             if (state != null) {
-                traffic = true;
+                markTraffic();
                 boolean changed;
                 if (streamId.equals(fetchStream)) {
                     ReconcilableState.Applied applied = state.applyDeltaNamed(delta);
@@ -1913,7 +2147,7 @@ public final class GossipBus {
                     changed = state.applyDeltaChanged(delta);
                 }
                 if (changed) {
-                    activity = true;
+                    markActivity();
                 }
             }
         }
@@ -1994,8 +2228,8 @@ public final class GossipBus {
 
     public void publish(String streamId, String itemId, byte[] payload) {
         if (!directStreams.contains(streamId)) {
-            activity = true; // a direct stream (the peer advertisement) is liveness, not data
-            traffic = true;
+            markActivity(); // a direct stream (the peer advertisement) is liveness, not data
+            markTraffic();
         }
         byte[] hash = Digests.sha256(payload);
         String key = key(streamId, hash);
@@ -2067,9 +2301,9 @@ public final class GossipBus {
         // changed, so it does not keep this node's anti-entropy at its base period (IDLE-WORK 5a(b)): a single
         // busy space held by a few members used to hold every member of the group at full rate.
         if (!directStreams.contains(rumor.streamId())) {
-            traffic = true;
+            markTraffic();
             if (handlers.containsKey(rumor.streamId()) || states.containsKey(rumor.streamId())) {
-                activity = true;
+                markActivity();
             }
         }
         Missing arrived;
@@ -2207,6 +2441,7 @@ public final class GossipBus {
     public void onHave(PeerId from, Bodies.Have have) {
         long now = clock.getAsLong();
         int taken = 0;
+        boolean asksAdded = false;
         for (Bodies.HaveItem item : have.items()) {
             if (++taken > HAVE_ITEMS_MAX || item.streamId() == null || item.hash() == null) {
                 break;
@@ -2224,6 +2459,7 @@ public final class GossipBus {
                     entry = new Missing(item.streamId(), item.hash(), from, now, now + base() + spread());
                     missing.put(key, entry);
                     joinShare(key, entry);
+                    asksAdded = true;
                 } else if (!entry.announcers.contains(from) && shares.get(entry.firstHeard).alone.remove(key)) {
                     shares.get(entry.firstHeard).named.add(key); // another member named it: its share gives it up last
                 }
@@ -2232,6 +2468,9 @@ public final class GossipBus {
                     entry.announcers.add(from);
                 }
             }
+        }
+        if (asksAdded) {
+            hooks.gossipDue(); // a first ask the bus's participant has no deadline for yet (EL-T-15)
         }
     }
 
@@ -2442,7 +2681,6 @@ public final class GossipBus {
         if (capable == null) {
             return;
         }
-        long now = ++ticks;
         List<PeerId> members = sampler.members();
         if (!lazy.isEmpty()) {
             lazy.retainAll(members);
@@ -2452,13 +2690,20 @@ public final class GossipBus {
         List<String> keys = new ArrayList<>();
         java.util.Set<PeerId> view = new java.util.HashSet<>(members);
         unanswered.keySet().retainAll(view);
+        // At most GRAFTS_PER_TICK asks per 250 ms window (EL-T-01), however often the bus's participant runs.
+        if (graftWindowStartMillis == Long.MIN_VALUE || nowMillis - graftWindowStartMillis >= GRAFT_WINDOW_MILLIS
+                || nowMillis < graftWindowStartMillis) {
+            graftWindowStartMillis = nowMillis;
+            graftsInWindow = 0;
+        }
+        int budget = Math.max(0, GRAFTS_PER_TICK - graftsInWindow);
         synchronized (missing) {
             // first asks before retries (swarm retries, the gate's adversarial review): the retries of items a flood
             // of announcements named and nobody serves must not spend the budget a newly announced item needs
-            for (int pass = 0; pass < 2 && asks.size() < GRAFTS_PER_TICK; pass++) {
+            for (int pass = 0; pass < 2 && asks.size() < budget; pass++) {
                 boolean firstAsks = pass == 0;
                 java.util.Iterator<Map.Entry<String, Missing>> it = missing.entrySet().iterator();
-                while (it.hasNext() && asks.size() < GRAFTS_PER_TICK) {
+                while (it.hasNext() && asks.size() < budget) {
                     Map.Entry<String, Missing> next = it.next();
                     Missing entry = next.getValue();
                     if (entry.askAtMillis > nowMillis || firstAsks != (entry.asks == 0)) {
@@ -2486,6 +2731,7 @@ public final class GossipBus {
                 }
             }
         }
+        graftsInWindow += asks.size();
         for (int i = 0; i < asks.size(); i++) {
             if (lazy.remove(askers.get(i))) {
                 topologyChanged();
@@ -2504,13 +2750,26 @@ public final class GossipBus {
         }
         // Standalone announcements only while the tree is young: a member is cut off only by a
         // topology change, so a settled tree needs none, and the probes carry the recent items.
-        long since = now - lastTopologyChangeTick;
-        if (since >= SETTLING_TICKS || (since >= YOUNG_TICKS && now % SETTLING_EVERY != 0)) {
-            if (since >= SETTLING_TICKS) {
-                pendingHaves.clear();
-            }
+        // The windows are time from the change (EL-T-15): every 250 ms for 2 s, then once a second until 8 s.
+        long change = lastTopologyChangeMillis;
+        long since = change == Long.MIN_VALUE ? Long.MAX_VALUE : Math.max(0, nowMillis - change);
+        if (since >= SETTLING_MILLIS) {
+            pendingHaves.clear();
             return;
         }
+        long epoch = topologyEpoch;
+        boolean sameWindow = lastHaveEpoch == epoch;
+        if (since < YOUNG_MILLIS) {
+            if (sameWindow && lastHaveMillis != Long.MIN_VALUE && nowMillis - lastHaveMillis < HAVE_EVERY_MILLIS
+                    && nowMillis >= lastHaveMillis) {
+                return;
+            }
+        } else if (sameWindow && since / SETTLING_EVERY_MILLIS == lastHaveBucket) {
+            return;
+        }
+        lastHaveMillis = nowMillis;
+        lastHaveBucket = since / SETTLING_EVERY_MILLIS;
+        lastHaveEpoch = epoch;
         List<Forwarded> pending;
         synchronized (pendingHaves) {
             pending = List.copyOf(pendingHaves.values());
@@ -2523,7 +2782,7 @@ public final class GossipBus {
             long admitted = admittedAt(peer);
             List<Bodies.HaveItem> items = new ArrayList<>();
             for (Forwarded forwarded : pending) {
-                if (forwarded.tick() >= admitted) {
+                if (forwarded.order() >= admitted) {
                     items.add(forwarded.item());
                 }
             }
@@ -2564,9 +2823,17 @@ public final class GossipBus {
         pushToPlain(plain, rumor, exclude == null || !anyCapable);
         if (anyCapable && (!eager || !treeWorthwhile() && !eagerStreams.contains(rumor.streamId()))) {
             recent.put(key, rumor);
-            Forwarded forwarded = new Forwarded(new Bodies.HaveItem(rumor.streamId(), hash), ticks);
+            // stamped after the eager copies were enqueued, so an item stamped before an outbox's take left with it
+            Forwarded forwarded = new Forwarded(new Bodies.HaveItem(rumor.streamId(), hash), order.getAndIncrement(),
+                    clock.getAsLong());
+            boolean firstQueued = pendingHaves.isEmpty();
             pendingHaves.put(key, forwarded);
             recentForwarded.put(key, forwarded);
+            long change = lastTopologyChangeMillis;
+            if (firstQueued && !lazy.isEmpty() && change != Long.MIN_VALUE
+                    && clock.getAsLong() - change < SETTLING_MILLIS) {
+                hooks.gossipDue(); // an announcement queued while the tree is young (EL-T-15)
+            }
         }
     }
 
@@ -2587,7 +2854,7 @@ public final class GossipBus {
         if (plain.isEmpty()) {
             return;
         }
-        long now = ticks;
+        long now = clock.getAsLong();
         if (!origin) {
             for (PeerId peer : plain) {
                 if (dialOnly.test(peer) && linked.test(peer)) {
@@ -2600,7 +2867,7 @@ public final class GossipBus {
         List<PeerId> weak = new ArrayList<>(plain);
         for (PeerId peer : plain) {
             Long failed = plainFailed.get(peer);
-            if (linked.test(peer) && (failed == null || now - failed > PLAIN_FAILURE_TICKS)) {
+            if (linked.test(peer) && (failed == null || now - failed > PLAIN_FAILURE.toMillis())) {
                 strong.add(peer);
             }
         }
@@ -2630,7 +2897,7 @@ public final class GossipBus {
     private boolean push(PeerId peer, Bodies.Rumor rumor, long now) {
         if (sender.trySendRumor(peer, rumor)) {
             countRumor(rumor.streamId());
-            plainServed.put(peer, now);
+            plainServed.put(peer, order.getAndIncrement()); // the weak slot's order, not a time (EL-T-01)
             return true;
         }
         plainFailed.put(peer, now);

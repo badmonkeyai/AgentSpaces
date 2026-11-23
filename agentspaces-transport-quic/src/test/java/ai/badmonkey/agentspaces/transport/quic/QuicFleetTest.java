@@ -159,8 +159,7 @@ class QuicFleetTest {
     }
 
     private static int freeUdpPort() throws IOException {
-        try (DatagramSocket socket = new DatagramSocket(0)) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 }

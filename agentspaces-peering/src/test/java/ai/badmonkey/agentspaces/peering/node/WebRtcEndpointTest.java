@@ -202,6 +202,13 @@ class WebRtcEndpointTest {
         }
         tickAll(1);
         assertThat(b.relayedWithInLastMinute(groupId, a.peerId())).isGreaterThanOrEqualTo(11);
+        // W09b (phase-6 gate, EL-L-03): the frame that took a over the threshold signalled the offload participant.
+        // A link change signals offload, reach and the mesh together, so offload's wakes beyond reach's are the
+        // threshold's.
+        java.util.Map<String, Long> wakeCalls = b.loopStats().wakeCalls();
+        assertThat(wakeCalls.getOrDefault(groupId.value() + "/offload", 0L)
+                - wakeCalls.getOrDefault(groupId.value() + "/reach", 0L))
+                .as("the threshold frame signalled the offload").isPositive();
         awaitDials(dialer, 1);
         assertThat(dialer.targets).as("past the threshold the tick dialed, with the member's PeerID")
                 .containsExactly(a.peerId());

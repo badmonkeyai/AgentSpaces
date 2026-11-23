@@ -15,6 +15,8 @@
  */
 package ai.badmonkey.agentspaces.agent;
 
+import ai.badmonkey.agentspaces.measure.Wait;
+import ai.badmonkey.agentspaces.measure.Measure;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
@@ -208,11 +210,10 @@ class AgentBinderReduceClusterTest {
         // Until every member holds the sums and no ticket is left anywhere: a ticket
         // whose take lease lapsed under the test clock reappears and is completed on a
         // later drain, so the drain is part of what settles.
-        long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
-        while (System.nanoTime() < deadline && !(settled(members, expected) && ticketsDrained(members))) {
+        Measure.await("agent.reduce.cluster-1", Duration.ofSeconds(90), () -> {
             tickAll(1);
-            Thread.sleep(20);
-        }
+            return settled(members, expected) && ticketsDrained(members);
+        }, Wait.with().poll(Duration.ofMillis(20)));
         if (!settled(members, expected) || members.stream().anyMatch(m -> !m.space().readAll(Template.of(JoinTicket.class), 20).isEmpty())) {
             for (Member m : members) {
                 System.err.println("=== STATE at " + m.identity().peerId().display()
@@ -270,11 +271,10 @@ class AgentBinderReduceClusterTest {
             b.space().write(new Payment("acct-" + (i % 2), i), Lease.of(Duration.ofMinutes(10)));
             expected[i % 2] += i;
         }
-        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-        while (System.nanoTime() < deadline && !(foldedAt(a, 3) && ticketsDrained(List.of(a, b)))) {
+        Measure.await("agent.reduce.cluster-2", Duration.ofSeconds(60), () -> {
             tickAll(1);
-            Thread.sleep(20);
-        }
+            return foldedAt(a, 3) && ticketsDrained(List.of(a, b));
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(foldedAt(a, 3)).as("the early reducer folded the first six").isTrue();
         // Close returns once the early reducer can fold nothing more, so the rest can be written at once.
         earlyBinding.close();
@@ -302,11 +302,10 @@ class AgentBinderReduceClusterTest {
         assertThat(c.space().knownEntries()).as("bound before anything arrived").isZero();
 
         List<Member> members = List.of(a, b, c);
-        deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
-        while (System.nanoTime() < deadline && !(settledAt(members, expected, 5) && ticketsDrained(members))) {
+        Measure.await("agent.reduce.cluster-3", Duration.ofSeconds(90), () -> {
             tickAll(1);
-            Thread.sleep(20);
-        }
+            return settledAt(members, expected, 5) && ticketsDrained(members);
+        }, Wait.with().poll(Duration.ofMillis(20)));
 
         FirstView view = first.get();
         assertThat(view).as("the late member heard the ledger").isNotNull();
@@ -526,17 +525,15 @@ class AgentBinderReduceClusterTest {
         UnwritableTeller teller = new UnwritableTeller();
         closeables.add(a.group().bind(teller));
         a.space().write(new Payment("acct-u", 9), Lease.of(Duration.ofMinutes(10)));
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (System.nanoTime() < deadline && teller.calls.get() < 2) {
+        Measure.await("agent.reduce.cluster-4", Duration.ofSeconds(30), () -> {
             tickAll(1);          // the lease lapses on the sweep; the element reappears and is tried again
-            Thread.sleep(20);
-        }
+            return teller.calls.get() >= 2;
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(teller.calls.get()).as("the step was tried, failed to write, and tried again").isGreaterThanOrEqualTo(2);
-        deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (System.nanoTime() < deadline && a.space().readAll(Template.of(Payment.class), 10).isEmpty()) {
+        Measure.await("agent.reduce.cluster-5", Duration.ofSeconds(30), () -> {
             tickAll(1);
-            Thread.sleep(20);
-        }
+            return !(a.space().readAll(Template.of(Payment.class), 10).isEmpty());
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(a.space().readAll(Template.of(Payment.class), 10))
                 .as("a result that cannot be written never consumes the element").containsExactly(new Payment("acct-u", 9));
         assertThat(Reductions.current(a.space(), Unwritable.class, "unwritable", "acct-u")).isEmpty();

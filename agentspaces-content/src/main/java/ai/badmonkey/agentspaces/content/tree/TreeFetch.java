@@ -37,7 +37,8 @@ public interface TreeFetch {
 
     /**
      * Waits for completion. As {@code Fetch.await}, a zero or negative timeout
-     * waits without bound.
+     * waits without bound. The swarm's session waits on the swarm's time source,
+     * so on a virtual time the timeout is virtual too.
      *
      * @param timeout how long to wait; zero waits forever
      * @return whether the fetch completed within the timeout
@@ -50,6 +51,32 @@ public interface TreeFetch {
 
     /** Whether the fetch has ended in any way: complete, failed, or cancelled. */
     boolean isDoneOrFailed();
+
+    /**
+     * Runs the action once the fetch has ended in any way (at once when it already has), so a caller waits on a
+     * change instead of polling {@link #isDoneOrFailed()} (srad/agentspaces-event-loop.md EL-W-03). The action must be
+     * quick: it may run on the thread that ended the fetch.
+     *
+     * <p>The default waits for the end on a virtual thread of its own.
+     *
+     * @param action the action
+     */
+    default void whenDone(Runnable action) {
+        java.util.Objects.requireNonNull(action, "action");
+        if (isDoneOrFailed()) {
+            action.run();
+            return;
+        }
+        Thread.ofVirtual().name("tree-fetch-done").start(() -> {
+            try {
+                await(Duration.ZERO);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                action.run();
+            }
+        });
+    }
 
     /** The failure, when the fetch ended without completing. */
     Optional<Throwable> failure();

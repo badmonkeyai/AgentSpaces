@@ -129,6 +129,31 @@ class AgentBinderCardsTest {
         assertThat(cached.get(0).id()).isEqualTo(bound.card().id());
     }
 
+    /**
+     * The same-millisecond audit (srad/agentspaces-event-loop.md §10.16): a card issued again in the millisecond of the
+     * last one, or less than a millisecond after it, is issued a millisecond later, so every cache takes it; the gossip
+     * item is named by the issue millisecond, and a cache keeps the card it holds on an equal instant.
+     */
+    @Test
+    void aCardReissuedInTheMillisecondOfTheLastOneIsAMillisecondLater() {
+        binder.bind(new Researcher());
+        long first = discovery.find(AgentCard.class, c -> true).get(0).issued().toEpochMilli();
+
+        binder.refreshCards(); // the clock has not moved
+        assertThat(discovery.find(AgentCard.class, c -> true)).singleElement()
+                .satisfies(c -> assertThat(c.issued().toEpochMilli()).isEqualTo(first + 1));
+
+        clock.advance(Duration.ofNanos(300_000)); // inside the same millisecond
+        binder.refreshCards();
+        assertThat(discovery.find(AgentCard.class, c -> true)).singleElement()
+                .satisfies(c -> assertThat(c.issued().toEpochMilli()).isEqualTo(first + 2));
+
+        clock.advance(Duration.ofSeconds(1)); // a moved clock is used as it is
+        binder.refreshCards();
+        assertThat(discovery.find(AgentCard.class, c -> true)).singleElement()
+                .satisfies(c -> assertThat(c.issued()).isEqualTo(clock.instant()));
+    }
+
     /** SPEC §4.2 v0.1.13: once a renewing identity renews, refreshCards publishes the card with the new certificate. */
     @Test
     void refreshCardsCarriesTheRenewedCertificate() {

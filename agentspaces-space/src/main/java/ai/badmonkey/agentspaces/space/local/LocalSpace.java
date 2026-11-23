@@ -49,9 +49,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -91,10 +88,15 @@ public final class LocalSpace implements Space, AutoCloseable {
     private final SpaceId id;
     private final AgentId issuer;
     private final InstantSource clock;
+    /** The base of this space's subscription leases (EL-C-04, §10.18): see {@link #localMillis()}. */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource localTime;
     private final HybridLogicalClock hlc;
     private final CborCodec codec;
     private final SchemaRegistry schemas;
-    private final ScheduledExecutorService sweeper;
+    /** The sweeper's time source and its next one-shot (EL-T-12, EL-T-13); null without {@code sweepEvery}. */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource sweepTime;
+    private final Duration sweepInterval;
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled sweeper;
 
     private static final System.Logger LOG = System.getLogger(LocalSpace.class.getName());
 
@@ -109,6 +111,10 @@ public final class LocalSpace implements Space, AutoCloseable {
     private final AtomicBoolean renewShorteningLogged = new AtomicBoolean();
 
     private final Object lock = new Object();
+    /** Moves on every change this space signals its waiters with (srad/agentspaces-event-loop.md DW-2). */
+    private final java.util.concurrent.atomic.AtomicLong changes = new java.util.concurrent.atomic.AtomicLong();
+    /** Told after each change; each only wakes (a registration's wake or a flag). */
+    private final java.util.List<Runnable> changeListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final Map<EntryId, Stored> entries = new HashMap<>();
     /**
      * The type-partitioned index (PERF1 phase 2): the same {@link Stored}
@@ -125,20 +131,17 @@ public final class LocalSpace implements Space, AutoCloseable {
         this.id = SpaceId.local(builder.name);
         this.issuer = builder.issuer;
         this.clock = builder.clock;
+        this.localTime = ai.badmonkey.agentspaces.common.time.TimeSources.of(builder.clock);
         this.hlc = new HybridLogicalClock(builder.clock, builder.issuer.encoded());
         this.codec = CborCodec.defaultCodec();
         this.schemas = builder.schemas;
         this.renewShorteningLog = builder.renewShorteningLog;
-        if (builder.sweepInterval != null) {
-            this.sweeper = Executors.newSingleThreadScheduledExecutor(runnable -> {
-                Thread thread = new Thread(runnable, "local-space-sweeper-" + builder.name);
-                thread.setDaemon(true);
-                return thread;
-            });
-            long millis = builder.sweepInterval.toMillis();
-            this.sweeper.scheduleAtFixedRate(this::sweepNow, millis, millis, TimeUnit.MILLISECONDS);
-        } else {
-            this.sweeper = null;
+        this.sweepInterval = builder.sweepInterval;
+        this.sweepTime = builder.time != null ? builder.time
+                : builder.clock instanceof ai.badmonkey.agentspaces.common.time.TimeSource source ? source
+                : ai.badmonkey.agentspaces.common.time.TimeSource.system();
+        if (sweepInterval != null) {
+            armSweep();
         }
     }
 
@@ -160,6 +163,7 @@ public final class LocalSpace implements Space, AutoCloseable {
         private InstantSource clock = InstantSource.system();
         private SchemaRegistry schemas = new SimpleSchemaRegistry();
         private Duration sweepInterval;
+        private ai.badmonkey.agentspaces.common.time.TimeSource time;
         private boolean renewShorteningLog = true;
 
         private Builder(String name, AgentId issuer) {
@@ -199,6 +203,18 @@ public final class LocalSpace implements Space, AutoCloseable {
          */
         public Builder sweepEvery(Duration interval) {
             this.sweepInterval = Objects.requireNonNull(interval, "interval");
+            return this;
+        }
+
+        /**
+         * The time source the sweeper runs on (srad/agentspaces-event-loop.md EL-T-12); by default the clock when it
+         * is one, else the system's.
+         *
+         * @param time the time source
+         * @return this builder
+         */
+        public Builder time(ai.badmonkey.agentspaces.common.time.TimeSource time) {
+            this.time = Objects.requireNonNull(time, "time");
             return this;
         }
 
@@ -283,7 +299,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             stored.attested = attested;
             indexPut(entryId, stored);
             events.add(eventsFor(SpaceEvent.Kind.WRITTEN, entryId, stored));
-            lock.notifyAll();
+            signalChangeLocked();
         }
         deliver(events);
         return new Handle(entryId, writer);
@@ -438,7 +454,7 @@ public final class LocalSpace implements Space, AutoCloseable {
         Objects.requireNonNull(listener, "listener");
         Objects.requireNonNull(lease, "lease");
         ensureOpen();
-        Sub sub = new Sub(template, listener, nowMillis() + lease.duration().toMillis());
+        Sub sub = new Sub(template, listener, localMillis() + lease.duration().toMillis());
         subscriptions.add(sub);
         return sub;
     }
@@ -452,15 +468,35 @@ public final class LocalSpace implements Space, AutoCloseable {
         deliver(events);
     }
 
+    /**
+     * Arms the next sweep: a one-shot on the time source, re-armed from the end of each sweep on its virtual thread
+     * (srad/agentspaces-event-loop.md EL-T-12, EL-T-13), in place of a platform thread at a fixed rate.
+     */
+    private void armSweep() {
+        if (closed) {
+            return;
+        }
+        sweeper = sweepTime.schedule(sweepInterval, () -> {
+            try {
+                sweepNow();
+            } catch (RuntimeException e) {
+                // a sweep that failed is retried at the next interval
+            } finally {
+                armSweep();
+            }
+        });
+    }
+
     /** Closes the space: pending blockers wake and further operations fail. */
     @Override
     public void close() {
         closed = true;
-        if (sweeper != null) {
-            sweeper.shutdownNow();
+        ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled pending = sweeper;
+        if (pending != null) {
+            pending.cancel();
         }
         synchronized (lock) {
-            lock.notifyAll();
+            signalChangeLocked();
         }
     }
 
@@ -539,38 +575,81 @@ public final class LocalSpace implements Space, AutoCloseable {
                 events.add(eventsFor(SpaceEvent.Kind.WRITTEN, resultId, written));
                 resultHandle = new Handle(resultId, written.record.issuer());
             }
-            lock.notifyAll();
+            signalChangeLocked();
         }
         deliver(events);
         return resultHandle;
     }
 
     /**
-     * Polls an operation until it yields a value or the timeout elapses, waking on
-     * every space mutation. Blocking is real-time (wall clock); lease expiry stays
-     * on the injected clock.
+     * Polls an operation until it yields a value or the timeout elapses, waking on every space mutation. The wait is
+     * reckoned and parked on the space's time source ({@link ai.badmonkey.agentspaces.common.time.Waits#base}: the
+     * clock itself when it is a time source, a virtual one among them, else the system's), never longer than
+     * {@link #AWAIT_LOOK_MILLIS} between looks, so a lease the injected clock lapses is seen (group W, EL-C-10).
      */
     private <V> Optional<V> awaiting(Duration timeout, java.util.function.Supplier<Optional<V>> poll) {
-        long deadline = System.nanoTime() + timeout.toNanos();
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, timeout);
         while (true) {
             Optional<V> result = poll.get();
             if (result.isPresent()) {
                 return result;
             }
-            long remainingNanos = deadline - System.nanoTime();
-            if (remainingNanos <= 0 || closed) {
+            long now = waits.monoNanos();
+            if (deadline - now <= 0 || closed) {
                 return Optional.empty();
             }
             synchronized (lock) {
                 try {
-                    long waitMillis = Math.min(TimeUnit.NANOSECONDS.toMillis(remainingNanos) + 1, 50L);
-                    lock.wait(waitMillis);
+                    waits.waitOn(lock, Math.min(deadline, now + AWAIT_LOOK_MILLIS * 1_000_000L));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return Optional.empty();
                 }
             }
         }
+    }
+
+    /** The longest a waiting take or read goes between looks: a lease lapses on the clock, which signals nobody. */
+    static final long AWAIT_LOOK_MILLIS = 50;
+
+    /**
+     * Signals a change to the waiters and the change listeners (DW-2): every place that woke the waiters does so here.
+     * Callers hold {@link #lock}.
+     */
+    private void signalChangeLocked() {
+        changes.incrementAndGet();
+        lock.notifyAll();
+        for (Runnable listener : changeListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                // a listener only wakes; one that throws does not stop the others
+            }
+        }
+    }
+
+    @Override
+    public long changeSignals() {
+        return changes.get();
+    }
+
+    @Override
+    public void awaitChange(long seen, Duration max) throws InterruptedException {
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, max);
+        synchronized (lock) {
+            while (changes.get() == seen && !closed && deadline - waits.monoNanos() > 0) {
+                waits.waitOn(lock, deadline);
+            }
+        }
+    }
+
+    @Override
+    public AutoCloseable onChangeSignal(Runnable listener) {
+        java.util.Objects.requireNonNull(listener, "listener");
+        changeListeners.add(listener);
+        return () -> changeListeners.remove(listener);
     }
 
     private <T> Optional<T> firstMatchLocked(Template<T> template) {
@@ -655,9 +734,10 @@ public final class LocalSpace implements Space, AutoCloseable {
                 events.add(eventsFor(SpaceEvent.Kind.REAPPEARED, e.getKey(), stored));
             }
         }
-        subscriptions.removeIf(sub -> sub.expiryMillis <= now || sub.closedFlag);
+        long local = localMillis();
+        subscriptions.removeIf(sub -> sub.expiryMillis <= local || sub.closedFlag);
         if (!events.isEmpty()) {
-            lock.notifyAll();
+            signalChangeLocked();
         }
         return events;
     }
@@ -728,6 +808,15 @@ public final class LocalSpace implements Space, AutoCloseable {
 
     private long nowMillis() {
         return clock.instant().toEpochMilli();
+    }
+
+    /**
+     * The local now a subscription's lease is judged on (srad/agentspaces-event-loop.md EL-C-04, §10.18): the clock's
+     * monotonic base, as the renewer's, so a wall step or a suspend lapses no subscription; a plain clock a test moves
+     * by hand keeps its subscriptions on that clock.
+     */
+    private long localMillis() {
+        return localTime.monoMillis();
     }
 
     /**
@@ -824,7 +913,7 @@ public final class LocalSpace implements Space, AutoCloseable {
                 if (stored != null) {
                     indexRemove(entryId, stored);
                     events.add(eventsFor(SpaceEvent.Kind.EXPIRED, entryId, stored));
-                    lock.notifyAll();
+                    signalChangeLocked();
                 }
             }
             deliver(events);
@@ -891,7 +980,7 @@ public final class LocalSpace implements Space, AutoCloseable {
             // Synchronized so that two renewals at once cannot both read the old expiry and the shorter one write
             // last: the max rule promises the lease never shortens, and the read and the write must be one step.
             Objects.requireNonNull(extension, "extension");
-            long now = nowMillis();
+            long now = localMillis();
             if (closedFlag || expiryMillis <= now) {
                 throw new LeaseExpiredException("subscription lease lapsed");
             }

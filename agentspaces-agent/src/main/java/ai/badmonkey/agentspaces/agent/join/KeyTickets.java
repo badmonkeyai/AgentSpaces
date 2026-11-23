@@ -81,6 +81,14 @@ public final class KeyTickets implements AutoCloseable {
     private final Lease takeLease;
     private final OrderedTakes coordinator;
     private final InstantSource clock;
+    /**
+     * The source the ORDERED waits and the pending claims' age use (EL-W-03): the binder's time source, or the system's
+     * for a plain clock, so a test clock that runs ahead of the wall still ages a claim in real time.
+     */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource waits;
+    /** Moves when a claim commits or the coordinator's space changes (a ticket's record replicating here). */
+    private final ai.badmonkey.agentspaces.common.time.ChangeSignal changed;
+    private AutoCloseable spaceListener;
     private final Template<JoinTicket> template;
 
     private final Object lock = new Object();
@@ -114,6 +122,8 @@ public final class KeyTickets implements AutoCloseable {
         this.takeLease = Objects.requireNonNull(takeLease, "takeLease");
         this.coordinator = coordinator;
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        this.changed = new ai.badmonkey.agentspaces.common.time.ChangeSignal(waits);
         this.requested = boundedMap(maxOpen);
         this.firstCommitted = boundedMap(maxOpen);
         this.committed = boundedMap(maxOpen);
@@ -139,16 +149,19 @@ public final class KeyTickets implements AutoCloseable {
     public void start() {
         if (coordinator != null) {
             commitListener = coordinator.onCommitted(this::onCommittedClaim);
+            spaceListener = coordinator.space().onChangeSignal(changed); // only a wake (Space.onChangeSignal)
         }
     }
 
     @Override
     public void close() {
-        if (commitListener != null) {
-            try {
-                commitListener.close();
-            } catch (Exception e) {
-                // nothing to do: the coordinator is closing too
+        for (AutoCloseable c : new AutoCloseable[] {commitListener, spaceListener}) {
+            if (c != null) {
+                try {
+                    c.close();
+                } catch (Exception e) {
+                    // nothing to do: the coordinator is closing too
+                }
             }
         }
     }
@@ -237,9 +250,9 @@ public final class KeyTickets implements AutoCloseable {
      * null when still undecided, which the caller treats as "release and retry".
      */
     public EntryId awaitFirstCommitted(String key) {
-        long wait = Math.max(Duration.ofSeconds(1).toNanos(), takeLease.duration().toNanos() / 2);
-        long deadline = System.nanoTime() + wait;
+        long deadline = waitDeadline();
         while (true) {
+            long seen = changed.seen(); // before the look: a commit or a record landing meanwhile is not missed
             resolvePendingClaims();
             synchronized (lock) {
                 EntryId firing = firstCommitted.get(key);
@@ -247,15 +260,44 @@ public final class KeyTickets implements AutoCloseable {
                     return firing;
                 }
             }
-            if (System.nanoTime() >= deadline) {
+            if (!awaitChange(seen, deadline)) {
                 return null;
             }
-            try {
-                Thread.sleep(20);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return null;
+        }
+    }
+
+    /** Half the take lease, at least a second, on {@link #waits}. */
+    private long waitDeadline() {
+        long wait = Math.max(Duration.ofSeconds(1).toNanos(), takeLease.duration().toNanos() / 2);
+        return ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, Duration.ofNanos(wait));
+    }
+
+    /**
+     * Waits for a committed claim or a change to the coordinator's space (EL-W-03; was a 20 ms poll), or until the
+     * oldest pending claim ages out (its drop may decide the key), or the deadline.
+     *
+     * @return false when the deadline passed or the wait was interrupted (status kept)
+     */
+    private boolean awaitChange(long seen, long deadline) {
+        long now = waits.monoNanos();
+        if (now - deadline >= 0) {
+            return false;
+        }
+        long until = deadline;
+        synchronized (lock) {
+            if (!pendingClaims.isEmpty()) {
+                long drop = pendingClaims.get(0).sinceNanos() + PENDING_CLAIM_MAX_AGE.toNanos() + 1;
+                if (drop - until < 0) {
+                    until = Math.max(drop, now);
+                }
             }
+        }
+        try {
+            changed.await(seen, until);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 
@@ -290,9 +332,9 @@ public final class KeyTickets implements AutoCloseable {
      * {@code mine} has not resolved by then (release and retry).
      */
     public EntryId awaitEarliestLive(String key, EntryId mine) {
-        long wait = Math.max(Duration.ofSeconds(1).toNanos(), takeLease.duration().toNanos() / 2);
-        long deadline = System.nanoTime() + wait;
+        long deadline = waitDeadline();
         while (true) {
+            long seen = changed.seen();
             Optional<EntryId> earliest = earliestLive(key);
             boolean mineResolved;
             synchronized (lock) {
@@ -301,13 +343,7 @@ public final class KeyTickets implements AutoCloseable {
             if (earliest.isPresent() && mineResolved) {
                 return earliest.get();
             }
-            if (System.nanoTime() >= deadline) {
-                return null;
-            }
-            try {
-                Thread.sleep(20);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            if (!awaitChange(seen, deadline)) {
                 return null;
             }
         }
@@ -315,12 +351,13 @@ public final class KeyTickets implements AutoCloseable {
 
     private void onCommittedClaim(EntryId entryId, TakeClaim claim) {
         synchronized (lock) {
-            pendingClaims.add(new PendingClaim(entryId, System.nanoTime()));
+            pendingClaims.add(new PendingClaim(entryId, waits.monoNanos()));
             if (pendingClaims.size() > READ_LIMIT * 4) {
                 pendingClaims.remove(0);
             }
         }
         resolvePendingClaims();
+        changed.run(); // after the write: a waiter looks again
     }
 
     /**
@@ -330,7 +367,7 @@ public final class KeyTickets implements AutoCloseable {
      * record never arrives is dropped after {@link #PENDING_CLAIM_MAX_AGE}.
      */
     private void resolvePendingClaims() {
-        long now = System.nanoTime();
+        long now = waits.monoNanos(); // a local expiry (EL-C-08), on the waits' base
         synchronized (lock) {
             var it = pendingClaims.iterator();
             while (it.hasNext()) {

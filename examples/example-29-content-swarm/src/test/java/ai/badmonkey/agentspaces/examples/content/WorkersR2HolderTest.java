@@ -57,9 +57,8 @@ class WorkersR2HolderTest {
     private static final int MEBIBYTES = 3;
 
     private static int freeTcp() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private static boolean nodeRuns() {

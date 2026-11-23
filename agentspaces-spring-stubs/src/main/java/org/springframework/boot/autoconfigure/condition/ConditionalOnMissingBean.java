@@ -27,4 +27,11 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface ConditionalOnMissingBean {
+
+    /**
+     * The bean types whose absence the condition checks, as Spring Boot's own annotation declares it.
+     *
+     * @return the types
+     */
+    Class<?>[] value() default {};
 }

@@ -21,9 +21,6 @@ import org.springframework.context.SmartLifecycle;
 
 import java.time.Duration;
 import java.util.Objects;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Drives the fabric with the application's lifecycle: on context start, the
@@ -43,7 +40,8 @@ public class AgentSpacesLifecycle implements SmartLifecycle {
     private final Duration cardRefreshPeriod;
     /** Runs after each card refresh (TODO-EFG §4: the OIDC token-file re-read). */
     private final Runnable onCardRefresh;
-    private ScheduledExecutorService refresher;
+    /** The next card refresh: a one-shot on the node's time source, re-armed after each (EL-T-12, EL-T-13). */
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled refresher;
     private volatile boolean running;
 
     /**
@@ -102,15 +100,26 @@ public class AgentSpacesLifecycle implements SmartLifecycle {
             return;
         }
         node.startTicking(tickPeriod);
-        refresher = Executors.newSingleThreadScheduledExecutor(task -> {
-            Thread thread = new Thread(task, "agentspaces-card-refresh");
-            thread.setDaemon(true);
-            return thread;
-        });
-        long millis = cardRefreshPeriod.toMillis();
-        refresher.scheduleAtFixedRate(this::refresh, millis, millis,
-                TimeUnit.MILLISECONDS);
         running = true;
+        armRefresh();
+    }
+
+    /**
+     * Arms the next card refresh on the node's time source (srad/agentspaces-event-loop.md EL-T-12, EL-T-13): a
+     * one-shot re-armed from the end of each refresh, on a virtual thread, so the {@code agentspaces-card-refresh}
+     * platform thread is gone and a late refresh never runs twice back to back.
+     */
+    private synchronized void armRefresh() {
+        if (!running) {
+            return;
+        }
+        refresher = node.time().schedule(cardRefreshPeriod, () -> {
+            try {
+                refresh();
+            } finally {
+                armRefresh();
+            }
+        });
     }
 
     @Override
@@ -120,7 +129,7 @@ public class AgentSpacesLifecycle implements SmartLifecycle {
         }
         running = false;
         if (refresher != null) {
-            refresher.shutdownNow();
+            refresher.cancel();
             refresher = null;
         }
         spaces.close();

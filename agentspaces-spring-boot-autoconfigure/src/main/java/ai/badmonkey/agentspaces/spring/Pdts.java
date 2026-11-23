@@ -500,9 +500,11 @@ public final class Pdts {
             }
         }
         pdt.start();
-        runtime.onTick(pdt::tick);
+        // its own deadlines on the loop, not every tick (srad/agentspaces-event-loop.md EL-T-08)
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration loopRegistration = pdt.joinLoop(runtime);
         AutoCloseable backend = backends.remove(pdt);
         Runnable closer = () -> {
+            loopRegistration.close();
             pdt.close();
             if (backend != null) {
                 try {

@@ -95,8 +95,13 @@ class DbRefTest {
 
     @Test
     void aSwapWritesAVersionTwoLinearHeadOfKindDbThatAReaderLoads() throws Exception {
-        RefFleet.Peer w = fleet.newPeer("w", 1);
-        RefFleet.Peer r = fleet.newPeer("r", 2, "w");
+        // The first swap of a linear ref nobody ever versioned takes twice before it writes the first head (a take
+        // outstanding elsewhere hides the entry), each take waiting its timeout: 2 x 5 s of wall time by default. A
+        // 300 ms take wait keeps both attempts and the rule, as LinearRefTest does.
+        RefFleet.Spec quickTakes = RefFleet.Spec.defaults().pdt(b -> b.take(Refs.Config.defaults().takeLease(),
+                Duration.ofMillis(300), Refs.Config.defaults().takeRetries()));
+        RefFleet.Peer w = fleet.newPeer("w", 1, quickTakes);
+        RefFleet.Peer r = fleet.newPeer("r", 2, quickTakes, "w");
         fleet.settle(12);
         Ref<PDb> onW = w.pdt().dbRef(NAME, null);
         Ref<PDb> onR = r.pdt().dbRef(NAME, null);

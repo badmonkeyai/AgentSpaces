@@ -461,13 +461,22 @@ class PeerClusterTest {
         assertThat(ra.membership().allMembers()).hasSize(2);
 
         // Once nobody can reach B, the indirect stage fails and A drops B long
-        // before the 30-second lease of attention runs out.
+        // before the 30-second lease of attention runs out. A quiet group's probe
+        // interval stretches to the TTL over twice the others (7.5 s here, idle-loop
+        // item 3), and B's turn in the round robin may be two intervals away, so the
+        // drop comes within two stretched intervals and both timeouts (17 s) at
+        // worst. The test once allowed 8 s and failed about one run in eight, at
+        // HEAD as on the event loop (srad/agentspaces-event-loop.md §10.7), whenever
+        // the shuffle put B's turn late.
         network.partition("b", "c");
-        for (int i = 0; i < 4; i++) {
+        long partitionedAt = clock.millis();
+        for (int i = 0; i < 9 && ra.membership().member(b.peerId()).isPresent(); i++) {
             nodes.forEach(PeerNode::tick);
             clock.advance(Duration.ofSeconds(2));
         }
         assertThat(ra.membership().member(b.peerId())).isEmpty();
+        assertThat(clock.millis() - partitionedAt).as("by the probe, well inside the 30 s TTL")
+                .isLessThanOrEqualTo(18_000);
         assertThat(ra.membership().member(c.peerId())).as("the honest relay is untouched").isPresent();
     }
 

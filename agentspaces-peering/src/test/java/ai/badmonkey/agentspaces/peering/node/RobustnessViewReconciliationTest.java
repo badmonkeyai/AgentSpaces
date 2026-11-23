@@ -45,6 +45,12 @@ class RobustnessViewReconciliationTest {
         fleet.publish("b", "from-b");
         fleet.tickAll(3);
         assertThat(fleet.news.get("c")).contains("from-b");
-        fleet.assertInvariants();
+        // The news is a rumor and reaches C at once; the inventory is reconciled state, carried only by anti-entropy,
+        // whose period a quiet group has stretched (up to 32 times; settle(20) above left it quiet), so a fixed 3
+        // ticks missed A in 14 to 23 runs in 100 depending on the members' random identities (one more tick in every
+        // case; srad/agentspaces-event-loop.md §10.16). The invariants are judged once the stretched round came. On
+        // the nodes' own loops (EL-Q-TST-03) that round comes when it is due, so the budget is SPEC §5.3's floor of
+        // one round in 32 periods, plus two; settle returns at the round, so the budget costs nothing when it is early.
+        assertThat(fleet.settle(34)).as("the inventories converge by anti-entropy").isTrue();
     }
 }

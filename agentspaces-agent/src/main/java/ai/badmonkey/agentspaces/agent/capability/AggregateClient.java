@@ -71,19 +71,7 @@ public final class AggregateClient {
      * @return the estimate once the exchange has run
      */
     public OptionalDouble awaitEstimate(String epochId, java.time.Duration timeout) {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (true) {
-            OptionalDouble estimate = aggregate.estimate(epochId);
-            if (estimate.isPresent() || System.nanoTime() >= deadline) {
-                return estimate;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return OptionalDouble.empty();
-            }
-        }
+        return aggregate.awaitEstimate(epochId, timeout); // a change wait on the time source (EL-W-03)
     }
 
     /**

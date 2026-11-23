@@ -64,6 +64,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class SemanticDiscovery implements CapabilityProvider {
 
+    /** The capability card's time to live (srad/agentspaces-event-loop.md §3.11), as every shipped capability uses. */
+    public static final java.time.Duration ADVERTISEMENT_TTL = java.time.Duration.ofMinutes(15);
+
     /** The capability type URI. */
     public static final String TYPE = "aspace:cap/semantic-discovery";
 
@@ -140,7 +143,7 @@ public final class SemanticDiscovery implements CapabilityProvider {
     public CapabilityAdvertisement describe(GroupId group) {
         return new CapabilityAdvertisement(
                 "aspace://" + group.value() + "/cap/semantic-discovery/" + self.value(),
-                self, group, clock.instant(), Duration.ofMinutes(15),
+                self, group, clock.instant(), ADVERTISEMENT_TTL,
                 TYPE, "0.1", "pipe",
                 Map.of("embedder", embedder.identity(),
                         "dimensions", String.valueOf(embedder.dimensions()),

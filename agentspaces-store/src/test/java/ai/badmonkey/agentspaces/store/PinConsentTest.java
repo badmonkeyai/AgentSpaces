@@ -205,11 +205,8 @@ class PinConsentTest {
         // mallory copies the signed pin a third of a minute later, inside its deadline, more than a quarter lease on
         fleet.clock.advance(Duration.ofSeconds(20));
         mallory.contentSpace().write(signed, Lease.of(Duration.ofSeconds(30)), signed.tags());
-        long stop = System.nanoTime() + Duration.ofSeconds(2).toNanos();
-        while (System.nanoTime() < stop) {
-            fleet.peers.forEach(p -> p.node().tick()); // frames move, the test clock stands
-            Thread.sleep(20);
-        }
+        // frames move and the store scans for two seconds of fleet time, well inside the signature's deadline
+        fleet.runFor(Duration.ofSeconds(2));
 
         assertThat(store.contentStore().ledger().holding(root, alice.id()).orElseThrow().until())
                 .as("alice signed one minute once").isEqualTo(until);
@@ -229,12 +226,14 @@ class PinConsentTest {
                 Map.of(Stores.STORES_ATTR, store.id().value()));
         SignedPin signed = SignedPin.sign(terms, fleet.groupId, fleet.clock.millis() + 10_000, alice.identity());
         alice.contentSpace().write(signed, Lease.of(Duration.ofSeconds(10)), signed.tags());
-        long stop = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (!alice.contentSpace().readAll(Template.of(SignedPin.class), 4).isEmpty() && System.nanoTime() < stop) {
-            fleet.peers.forEach(p -> p.node().tick()); // frames move, the test clock stands
-            Thread.sleep(20);
+        // frames move and the store scans, a tick at a time, until it takes the pin, well inside the ten seconds
+        long from = fleet.clock.millis();
+        while (!alice.contentSpace().readAll(Template.of(SignedPin.class), 4).isEmpty()
+                && fleet.clock.millis() - from < 5_000) {
+            fleet.tickAll();
         }
         assertThat(alice.contentSpace().readAll(Template.of(SignedPin.class), 4)).as("the store took the pin").isEmpty();
+        assertThat(fleet.clock.millis() - from).as("taken inside the signature's deadline").isLessThan(10_000);
         fleet.clock.advance(Duration.ofSeconds(15));
         alice.content().holdTree(root);
 
@@ -258,7 +257,10 @@ class PinConsentTest {
 
         assertThat(fleet.runUntil(Duration.ofSeconds(60), () -> StoreFleet.receiptHolders(alice, root).size() == 2))
                 .as(a.contentStore().status() + " / " + b.contentStore().status()).isTrue();
-        assertThat(a.contentStore().status().abandoned() + b.contentStore().status().abandoned()).isZero();
+        // Both stores may take the same pin entry at one instant (the fleet's spaces settle for zero time); the loser
+        // finds at its completion that the other won, abandons its take, and the pin is served once (the repair
+        // path, srad/agentspaces-event-loop.md §10.17, defect 2). So at most one abandoned take, and two copies held.
+        assertThat(a.contentStore().status().abandoned() + b.contentStore().status().abandoned()).isLessThanOrEqualTo(1);
         assertThat(a.contentStore().status().taken() + b.contentStore().status().taken()).isEqualTo(2);
     }
 }

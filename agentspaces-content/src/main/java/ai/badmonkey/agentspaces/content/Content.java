@@ -83,7 +83,7 @@ import java.util.logging.Logger;
  * are handled in the order they arrived, so a holder's breadth-first stream
  * reaches the fetcher parents first.
  */
-public final class Content implements CapabilityProvider, AutoCloseable {
+public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider, AutoCloseable {
 
     /** The capability type. */
     public static final String TYPE = "aspace:cap/content-swarm";
@@ -113,6 +113,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
     /** Advertisement TTL, as every shipped capability uses. */
     static final Duration ADVERTISEMENT_TTL = Duration.ofMinutes(15);
+    /** The default lease of a holding record (srad/agentspaces-event-loop.md §3.11), rewritten every 10 s. */
+    public static final Duration DEFAULT_HOLDING_LEASE = Duration.ofMinutes(5);
 
     /** The holding refresh rules (LB-H-02, LB-H-03). */
     static final int PIECES_PER_HOLDING_WRITE = 32;
@@ -137,6 +139,8 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     private static final Logger LOG = Logger.getLogger(Content.class.getName());
 
     private static final class Holder {
+        /** When the participant next looks at this holding on a started loop (EL-T-08): its half-life, or a retry. */
+        volatile long nextLookMillis = Long.MIN_VALUE;
         EntryHandle handle;
         Holding last;
         long writtenAtMillis = NEVER;
@@ -244,6 +248,11 @@ public final class Content implements CapabilityProvider, AutoCloseable {
 
         synchronized boolean idle(long now) {
             return !draining && frames.isEmpty() && now - lastUsedMillis >= TREE_QUEUE_IDLE_MILLIS;
+        }
+
+        /** When this queue may next be found idle, for the participant's deadline (EL-T-08). */
+        synchronized long idleAt() {
+            return lastUsedMillis + TREE_QUEUE_IDLE_MILLIS;
         }
     }
 
@@ -411,8 +420,43 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
     private long uploadDay = NEVER;
     private long uploadedToday;
-    private long manifestsCheckedAtMillis = NEVER;
     private volatile boolean closed;
+
+    // ---- due work (srad/agentspaces-event-loop.md EL-T-08 to EL-T-11; owner answer 5, 2026-11-22)
+
+    /** The step of fetches, tree fetches and sketch sessions while any is open: today's cadence. */
+    static final long SESSION_STEP_MILLIS = 250;
+    /** A manifest this peer keeps is renewed below half its lease: 3.5 days of the 7-day keepalive lease (EL-T-10). */
+    static final Duration MANIFEST_KEEPALIVE_LEASE = Duration.ofDays(7);
+    /** The backstop scan for lost manifests; a lapse or cancel in the content space asks at once (owner answer 5). */
+    static final long MANIFEST_REPAIR_SCAN_MILLIS = 300_000;
+    /** The driver of the capability participant; null for a swarm stepped only by {@link #tick()}. */
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver;
+    /** When each manifest this peer keeps was written or renewed, and for how long. */
+    private final Map<String, long[]> manifestKept = new ConcurrentHashMap<>();
+    /** Moves on every change of the content space (a lapse or cancel among them) and of the advertisement cache. */
+    private final AtomicLong spaceSignals = new AtomicLong();
+    private final AtomicLong adSignals = new AtomicLong();
+    /**
+     * The participant's own copies (DW-5) and deadlines. Only the participant touches them. The seals deadline is an
+     * advertisement's expiry, a wall instant; the session step, the pass after the last session, the seals reread and
+     * the manifest scan are local periods on the loop's monotonic base, so a wall step moves none of them
+     * (srad/agentspaces-event-loop.md EL-C-04, EL-C-05).
+     */
+    private long spaceSignalsSeen = -1;
+    private long adSignalsSeen = -1;
+    private long sealsDueMillis = NEVER;
+    private long nextSessionStepMillis = NEVER;
+    private long lastActiveMillis = NEVER;
+    private long manifestScanAtMillis = NEVER;
+    private long sealsRereadAtMillis = NEVER;
+    /** Manifest scans the participant ran (the change-woken looks and the 5-minute backstop), for tests. */
+    private final AtomicLong manifestScans = new AtomicLong();
+    private final java.util.List<AutoCloseable> signalHandles = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** The discovery service the seals signal and the advertisements come from, when built on one. */
+    private final DiscoveryService discoveryService;
+    /** Runs of the participant that did work, for tests. */
+    private final AtomicLong dueWork = new AtomicLong();
 
     private Content(Builder b) {
         this.pieceSize = b.pieceSize;
@@ -421,22 +465,25 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         this.spaces = new ContentSpaces(Objects.requireNonNull(b.space, "space"));
         this.self = Objects.requireNonNull(b.self, "self");
         this.codec = b.codec == null ? CborCodec.defaultCodec() : b.codec;
-        this.clock = b.clock == null ? InstantSource.system() : b.clock;
+        // EL-C-06: the node's own time source unless one is given (the system's for a node on a plain test clock).
+        this.clock = b.clock == null ? this.runtime.defaultClock() : b.clock;
         this.store = b.store == null ? new MemoryPieceStore(this.clock, 0) : b.store;
         this.policy = b.policy == null ? ContentPolicy.DEFAULT : b.policy;
         this.blocks = b.blocks;
         this.keyRing = b.keyRing;
         this.authorizer = b.authorizer;
-        this.holdingLease = b.holdingLease == null ? Lease.of(Duration.ofMinutes(5)) : b.holdingLease;
+        this.holdingLease = b.holdingLease == null ? Lease.of(DEFAULT_HOLDING_LEASE) : b.holdingLease;
         this.random = b.random == null ? new Random() : b.random;
         this.advertisements = b.advertisements != null ? b.advertisements
                 : b.discovery == null ? null : advertisementsIn(b.discovery, this.clock);
         this.treeStore = b.treeStore;
         this.pdtLevel = b.pdtLevel;
         this.reconcileSet = b.reconcileSet != null ? b.reconcileSet : this::heldRoots;
-        this.sketchServer = new ai.badmonkey.agentspaces.content.tree.sync.SketchServer(this.reconcileSet, this.clock::millis);
+        this.sketchServer = new ai.badmonkey.agentspaces.content.tree.sync.SketchServer(this.reconcileSet,
+                ai.badmonkey.agentspaces.common.time.TimeSources.of(this.clock)::monoMillis); // a local cache age (EL-C-07)
         this.groupSealsLookup = b.groupSeals != null ? b.groupSeals
                 : b.discovery == null ? null : groupSealsIn(b.discovery, this.clock);
+        this.discoveryService = b.groupSeals == null ? b.discovery : null;
         this.treeServer = new TreeServer(this.treeStore, treeHost);
         pipes.onCapability(TYPE, (from, payload) -> {
             if (closed) {
@@ -445,7 +492,12 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             try {
                 int tag = Messages.peekTag(codec, payload).orElse(0);
                 if (tag >= Messages.NODE_WANT && tag <= Messages.TREE_END) {
-                    if (!treeQueues.computeIfAbsent(from, TreeQueue::new).offer(payload, clock.millis())) {
+                    TreeQueue queue = treeQueues.get(from);
+                    if (queue == null) {
+                        queue = treeQueues.computeIfAbsent(from, TreeQueue::new);
+                        wakeDue(); // its idle deadline joins the participant's (EL-L-03)
+                    }
+                    if (!queue.offer(payload, clock.millis())) {
                         treeMessagesDropped.incrementAndGet();
                     }
                 } else {
@@ -639,6 +691,17 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     }
 
+    /**
+     * The node's time source this swarm's group runs on, for a deadline a caller of the swarm waits on (the spill
+     * store's fetch bound): a virtual clock moves it, and no JDK timer thread is started (srad/agentspaces-event-loop.md
+     * §10.23, R4).
+     *
+     * @return the time source
+     */
+    ai.badmonkey.agentspaces.common.time.TimeSource timeSource() {
+        return runtime.time();
+    }
+
     // ------------------------------------------------------------ CapabilityProvider
 
     @Override
@@ -817,7 +880,303 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
         if (now - manifestsCheckedAtMillis >= MANIFEST_KEEPALIVE_INTERVAL_MILLIS) {
             manifestsCheckedAtMillis = now;
-            keepManifestsAlive();
+            keepManifestsAlive(now, true);
+        }
+    }
+
+    private long manifestsCheckedAtMillis = NEVER;
+
+    @Override
+    public void attach(ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver) {
+        this.driver = Objects.requireNonNull(driver, "driver");
+        // Entries and advertisements that arrive by gossip wake no participant by themselves (DW-2): a lapse or cancel
+        // in the content space asks for the manifest repair, a moved cache for the seals signal.
+        signalHandles.add(spaces.space().onChangeSignal(() -> {
+            spaceSignals.incrementAndGet();
+            driver.wake();
+        }));
+        if (discoveryService != null) {
+            signalHandles.add(discoveryService.onChange(() -> {
+                adSignals.incrementAndGet();
+                driver.wake();
+            }));
+        }
+    }
+
+    /**
+     * Joins a group's loop without a capability runtime, for a host that drives the swarm itself (example 29): the
+     * swarm runs as its own participant at its own deadlines, as it does when registered.
+     *
+     * @param runtime the group
+     * @return the registration; closing it leaves the loop
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration joinLoop(
+            ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime) {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration[] self = new ai.badmonkey.agentspaces.api.spi.DueWork.Registration[1];
+        attach(new ai.badmonkey.agentspaces.api.spi.DueWork.Driver() {
+            @Override
+            public void wake() {
+                if (self[0] != null) {
+                    self[0].wake();
+                }
+            }
+
+            @Override
+            public void describeChanged() {
+                wake();
+            }
+
+            @Override
+            public long monoNanos() {
+                return runtime.monoNanos();
+            }
+
+            @Override
+            public long dueAt(long wallMillis) {
+                return runtime.dueAt(runtime.time(), wallMillis);
+            }
+
+            @Override
+            public boolean timed() {
+                return runtime.loopRunning() && !runtime.directRun();
+            }
+
+            @Override
+            public ai.badmonkey.agentspaces.common.time.TimeSource time() {
+                return runtime.time();
+            }
+        });
+        // EL-O-05, WD-4: the holdings' renewals are what a peer judges. The stretch is capped at half the holding
+        // lease, and the refresh renews every holding now, so a renewed holding covers twice any stretched period.
+        self[0] = runtime.onDue("content", now -> driver.timed() ? run(now) : legacyStep(),
+                ai.badmonkey.agentspaces.peering.node.NodeLoop.Timing.wireVisible(holdingLease.duration().dividedBy(2),
+                        period -> renewHoldingsNow()));
+        return self[0];
+    }
+
+    /**
+     * The refresh action of the swarm's participant (srad/agentspaces-event-loop.md EL-O-05, WD-4): every holding this
+     * peer keeps is renewed now, on the loop, before the loop stretches the participant's period or runs its first run
+     * after a re-initialisation that found a renewal overdue.
+     */
+    private void renewHoldingsNow() {
+        if (closed) {
+            return;
+        }
+        long now = clock.millis();
+        for (Map.Entry<String, Holder> e : List.copyOf(holders.entrySet())) {
+            Holder holder = e.getValue();
+            if (holder.handle == null) {
+                refreshHolding(e.getKey(), false); // nothing held yet: the usual write
+                continue;
+            }
+            try {
+                holder.handle.renew(holdingLease.duration()); // one renewal, not a rewrite
+                holder.renewedAtMillis = now;
+                holder.nextLookMillis = now + holdingLease.duration().toMillis() / 2;
+            } catch (RuntimeException lapsed) {
+                holder.handle = null;
+                refreshHolding(e.getKey(), false);
+            }
+        }
+        holdingRefreshes.incrementAndGet();
+    }
+
+    /** Refresh actions the loop ran (EL-O-05, WD-4); for tests. */
+    private final AtomicLong holdingRefreshes = new AtomicLong();
+
+    /**
+     * How many times the loop ran the swarm's refresh action, renewing every holding at once; for tests.
+     *
+     * @return the count
+     */
+    long holdingRefreshes() {
+        return holdingRefreshes.get();
+    }
+
+    private long legacyStep() {
+        tick();
+        return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+    }
+
+    /** Asks the participant to run again: a fetch, a session or a challenge started (EL-L-03). */
+    private void wakeDue() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d != null) {
+            d.wake();
+        }
+    }
+
+    /** Runs of the participant that found something due; for tests. */
+    long dueWork() {
+        return dueWork.get();
+    }
+
+    /**
+     * The swarm on a started loop (srad/agentspaces-event-loop.md EL-T-08 to EL-T-10). While a fetch, a tree fetch
+     * or a sketch session is open, it steps them and walks the holdings every {@link #SESSION_STEP_MILLIS}, as the
+     * tick did. Otherwise it runs only at its deadlines: a challenge's, an idle tree queue's, the seals signal's (an
+     * advertisement change or the cache's next expiry), each holding's half-life, a kept manifest's half-lease, the
+     * repair of a lost manifest (a change in the content space or the 5-minute scan), and one holdings pass
+     * {@link #HOLDING_WRITE_INTERVAL_MILLIS} after the last open session, so a partial holding written late is not
+     * held until its half-life.
+     */
+    @Override
+    public long run(long nowNanos) {
+        if (closed) {
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        long now = clock.millis();
+        long local = localMillis(); // EL-C-04: the local periods' base
+        long next = Long.MAX_VALUE; // the next wall deadline (a lease's or an expiry's)
+        long nextLocal = Long.MAX_VALUE; // the next local one
+        boolean worked = false;
+        boolean active = !fetches.isEmpty() || !treeFetches.isEmpty() || !sketchSessions.isEmpty();
+        if (active) {
+            if (nextSessionStepMillis == NEVER || local >= nextSessionStepMillis) {
+                stepSessions(now);
+                walkHoldings();
+                nextSessionStepMillis = local + SESSION_STEP_MILLIS;
+                lastActiveMillis = local;
+                worked = true;
+            }
+            nextLocal = nextSessionStepMillis;
+        } else {
+            nextSessionStepMillis = NEVER;
+            if (lastActiveMillis != NEVER && local >= lastActiveMillis + HOLDING_WRITE_INTERVAL_MILLIS) {
+                lastActiveMillis = NEVER;
+                walkHoldings(); // the pass after the last open session (a partial holding's late write)
+                worked = true;
+            } else if (lastActiveMillis != NEVER) {
+                nextLocal = Math.min(nextLocal, lastActiveMillis + HOLDING_WRITE_INTERVAL_MILLIS);
+            }
+        }
+        if (!treeQueues.isEmpty()) {
+            treeQueues.values().removeIf(q -> q.idle(now));
+            for (TreeQueue q : treeQueues.values()) {
+                next = Math.min(next, q.idleAt());
+            }
+        }
+        if (!challenges.isEmpty()) {
+            expireChallenges(now);
+            for (PendingChallenge c : challenges.values()) {
+                next = Math.min(next, c.deadlineMillis + 1);
+            }
+        }
+        if (groupSealsLookup != null) {
+            long ads = adSignals.get();
+            if (discoveryService != null) {
+                if (ads != adSignalsSeen || sealsDueMillis == NEVER || now >= sealsDueMillis) {
+                    adSignalsSeen = ads;
+                    groupSealsReadAtMillis = now;
+                    groupSeals = groupSealsLookup.getAsBoolean();
+                    sealsDueMillis = discoveryService.cache().nextExpiry().map(java.time.Instant::toEpochMilli)
+                            .orElse(Long.MAX_VALUE);
+                    worked = true;
+                }
+                next = Math.min(next, sealsDueMillis);
+            } else {
+                if (sealsRereadAtMillis == NEVER || local - sealsRereadAtMillis >= GROUP_SEALS_REREAD_MILLIS) {
+                    sealsRereadAtMillis = local;
+                    groupSealsReadAtMillis = now;
+                    groupSeals = groupSealsLookup.getAsBoolean();
+                }
+                nextLocal = Math.min(nextLocal, sealsRereadAtMillis + GROUP_SEALS_REREAD_MILLIS);
+            }
+        }
+        if (!active) {
+            int visited = 0;
+            for (Map.Entry<String, Holder> e : holders.entrySet()) {
+                Holder holder = e.getValue();
+                if (now >= holder.nextLookMillis) {
+                    if (visited >= HOLDINGS_PER_TICK) {
+                        nextLocal = Math.min(nextLocal, local + SESSION_STEP_MILLIS); // LB-H-05: the rest next window
+                        continue;
+                    }
+                    visited++;
+                    refreshHolding(e.getKey(), false);
+                    worked = true;
+                }
+                next = Math.min(next, holder.nextLookMillis);
+            }
+        }
+        long signals = spaceSignals.get();
+        boolean repair = signals != spaceSignalsSeen || manifestScanAtMillis == NEVER || local >= manifestScanAtMillis;
+        if (repair) {
+            spaceSignalsSeen = signals;
+            manifestScanAtMillis = local + MANIFEST_REPAIR_SCAN_MILLIS;
+            manifestScans.incrementAndGet();
+            worked = true;
+        }
+        next = Math.min(next, keepManifestsAlive(now, repair));
+        nextLocal = Math.min(nextLocal, manifestScanAtMillis);
+        if (worked) {
+            dueWork.incrementAndGet();
+        }
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d == null || next == Long.MAX_VALUE && nextLocal == Long.MAX_VALUE) {
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        // The wall deadlines are on this swarm's clock: convert them against it and the loop's base, read together
+        // (§10.8). The local ones are already on that base.
+        long mono = d.monoNanos();
+        long due = next == Long.MAX_VALUE ? Long.MAX_VALUE
+                : ai.badmonkey.agentspaces.common.time.TimeSources.monoDue(mono, clock.millis(), next);
+        if (nextLocal != Long.MAX_VALUE) {
+            long ahead = Math.min(nextLocal - Math.floorDiv(mono, 1_000_000L),
+                    ai.badmonkey.agentspaces.common.time.TimeSources.MAX_DUE_AHEAD_MILLIS);
+            due = Math.min(due, ahead <= 0 ? mono : mono + ahead * 1_000_000L);
+        }
+        return due;
+    }
+
+    /** The loop's monotonic now in milliseconds, the base of the participant's local periods (EL-C-04). */
+    private long localMillis() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        return d != null ? Math.floorDiv(d.monoNanos(), 1_000_000L)
+                : ai.badmonkey.agentspaces.common.time.TimeSources.of(clock).monoMillis();
+    }
+
+    /**
+     * Manifest scans the participant ran: each change of the content space asks for one, and a 5-minute local
+     * backstop runs one; for tests.
+     *
+     * @return the count
+     */
+    long manifestScans() {
+        return manifestScans.get();
+    }
+
+    /** One step of every open fetch, tree fetch and sketch session, as the tick did. */
+    private void stepSessions(long now) {
+        for (Pending pending : List.copyOf(fetches.values())) {
+            drive(pending, now);
+        }
+        for (TreePending pending : List.copyOf(treeFetches.values())) {
+            pending.session.tick();
+            if (pending.session.isDone()) {
+                finishTree(pending);
+            }
+        }
+        for (ai.badmonkey.agentspaces.content.tree.sync.SketchSession session : List.copyOf(sketchSessions.values())) {
+            session.tick(now);
+            if (session.outcome().isDone()) {
+                sketchSessions.remove(session.req(), session);
+            }
+        }
+    }
+
+    /** LB-H-05: the holdings walk of one step, at most {@link #HOLDINGS_PER_TICK} roots, in turn. */
+    private void walkHoldings() {
+        List<String> roots = List.copyOf(holders.keySet());
+        if (roots.size() <= HOLDINGS_PER_TICK) {
+            roots.forEach(root -> refreshHolding(root, false));
+        } else {
+            int start = Math.floorMod(holdingCursor, roots.size());
+            for (int i = 0; i < HOLDINGS_PER_TICK; i++) {
+                refreshHolding(roots.get((start + i) % roots.size()), false);
+            }
+            holdingCursor = start + HOLDINGS_PER_TICK;
         }
     }
 
@@ -857,6 +1216,15 @@ public final class Content implements CapabilityProvider, AutoCloseable {
     /** This peer. */
     public PeerId self() {
         return self;
+    }
+
+    /**
+     * This swarm's wall clock: manifest stamps, holding leases and card issue times are on it.
+     *
+     * @return the clock
+     */
+    public InstantSource clock() {
+        return clock;
     }
 
     /** The store. */
@@ -1186,6 +1554,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             return raced.session;
         }
         session.start();
+        wakeDue(); // a tree fetch started: the participant steps it (EL-L-03)
         if (session.isDone()) {
             finishTree(pending);
         }
@@ -1229,7 +1598,9 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         Subscription subscription = spaces.watchHoldings(cids.get(0), ev -> session.holdingsChanged(), Lease.of(Duration.ofHours(24)));
         TreePending pending = new TreePending(session, subscription);
         treeFetches.put(key, pending);
+        wakeDue(); // a session started: the participant steps it (EL-L-03)
         session.start();
+        wakeDue(); // a tree fetch started: the participant steps it (EL-L-03)
         if (session.isDone()) {
             finishTree(pending);
         }
@@ -1419,6 +1790,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
                     }
                 });
         sketchSessions.put(req, session);
+        wakeDue(); // a session started: the participant steps it (EL-L-03)
         session.start();
         return session.outcome().thenApply(o -> new Reconciliation(peer, o.have(), o.need().stream().map(this::resolveRoot).toList(),
                 o.rounds(), o.bytesSent() + o.bytesReceived(), o.encoding()));
@@ -1512,6 +1884,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             return pending.result;
         }
         challenges.put(req, pending);
+        wakeDue(); // a session started: the participant steps it (EL-L-03)
         pipes.send(holder, TYPE, codec.toBytes(message));
         return pending.result;
     }
@@ -1683,6 +2056,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             }
         }
         fetches.put(root, pending);
+        wakeDue(); // a session started: the participant steps it (EL-L-03)
         drive(pending, clock.millis());
         return session;
     }
@@ -2275,6 +2649,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         store.pin(manifest.root());
         if (options.replicate() && spaces.manifest(manifest.root()).isEmpty()) {
             manifestHandles.put(manifest.root(), spaces.writeManifest(manifest, options.lease()));
+            manifestKept.put(manifest.root(), new long[] {clock.millis(), options.lease().duration().toMillis()});
         }
         refreshHolding(manifest.root(), true);
         return manifest;
@@ -2302,6 +2677,17 @@ public final class Content implements CapabilityProvider, AutoCloseable {
      * root completed; a renewal at half-life otherwise.
      */
     private void refreshHolding(String root, boolean force) {
+        refreshHoldingOnce(root, force);
+        Holder holder = holders.get(root);
+        if (holder != null) {
+            long now = clock.millis();
+            long half = holder.renewedAtMillis + holdingLease.duration().toMillis() / 2;
+            // its half-life, or a retry when nothing was written or renewed (a deferred write, no pieces yet)
+            holder.nextLookMillis = half > now ? half : now + HOLDING_WRITE_INTERVAL_MILLIS;
+        }
+    }
+
+    private void refreshHoldingOnce(String root, boolean force) {
         if (policy.seedMode() == ContentPolicy.SeedMode.NEVER) {
             return;
         }
@@ -2418,30 +2804,80 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         }
     }
 
-    /** A complete holder rewrites a manifest the replica has lost (the publisher may be gone). */
-    private void keepManifestsAlive() {
+    /**
+     * The manifest keepalive (srad/agentspaces-event-loop.md EL-T-10; owner answer 5, 2026-11-22): a manifest this
+     * peer keeps is renewed only once less than half the 7-day lease is left (3.5 days), not every 30 s; with
+     * {@code repair}, a complete holder rewrites a manifest the replica has lost (the publisher may be gone). The
+     * participant repairs on every change of the content space, which a lapse or a cancel moves, and on a 5-minute
+     * scan.
+     *
+     * @return the earliest renewal deadline, on this swarm's clock
+     */
+    private long keepManifestsAlive(long now, boolean repair) {
+        long next = Long.MAX_VALUE;
+        for (Map.Entry<String, EntryHandle> e : manifestHandles.entrySet()) {
+            String root = e.getKey();
+            long[] kept = manifestKept.computeIfAbsent(root, r -> new long[] {now, MANIFEST_KEEPALIVE_LEASE.toMillis()});
+            if (now >= renewAt(kept)) {
+                try {
+                    e.getValue().renew(MANIFEST_KEEPALIVE_LEASE);
+                    kept[0] = now;
+                    kept[1] = MANIFEST_KEEPALIVE_LEASE.toMillis();
+                } catch (RuntimeException failed) {
+                    manifestHandles.remove(root, e.getValue());
+                    manifestKept.remove(root);
+                    repair = true;
+                    continue;
+                }
+            }
+            next = Math.min(next, renewAt(kept));
+        }
+        if (!repair) {
+            return next;
+        }
         for (String root : store.roots()) {
             Optional<Manifest> manifest = store.manifest(root);
             if (manifest.isEmpty() || store.have(root).cardinality() < manifest.get().pieces()) {
                 continue;
             }
-            EntryHandle handle = manifestHandles.get(root);
-            if (handle != null) {
-                try {
-                    handle.renew(Duration.ofDays(7));
-                    continue;
-                } catch (RuntimeException e) {
-                    manifestHandles.remove(root);
-                }
+            if (spaces.manifest(root).isPresent()) {
+                continue;
             }
-            if (spaces.manifest(root).isEmpty()) {
-                try {
-                    manifestHandles.put(root, spaces.writeManifest(manifest.get(), Lease.of(Duration.ofDays(7))));
-                } catch (RuntimeException e) {
-                    LOG.fine(() -> "manifest keepalive deferred for " + root + ": " + e.getMessage());
-                }
+            manifestHandles.remove(root); // what it named is gone from the replica
+            try {
+                manifestHandles.put(root, spaces.writeManifest(manifest.get(), Lease.of(MANIFEST_KEEPALIVE_LEASE)));
+                manifestKept.put(root, new long[] {now, MANIFEST_KEEPALIVE_LEASE.toMillis()});
+                manifestsRepaired.incrementAndGet();
+                next = Math.min(next, now + MANIFEST_KEEPALIVE_LEASE.toMillis() / 2);
+            } catch (RuntimeException e) {
+                LOG.fine(() -> "manifest keepalive deferred for " + root + ": " + e.getMessage());
             }
         }
+        return next;
+    }
+
+    /**
+     * When a kept manifest is renewed: once less than half the 7-day keepalive lease is left (EL-T-10), so a 7-day
+     * lease is renewed at 3.5 days, a shorter publish (2 days) at once, and a longer one (90 days) only near its end,
+     * never asked for less than it holds.
+     *
+     * @param kept the manifest's last write or renewal and its lease, in millis
+     * @return the renewal deadline, on this swarm's clock
+     */
+    private static long renewAt(long[] kept) {
+        return kept[0] + kept[1] - MANIFEST_KEEPALIVE_LEASE.toMillis() / 2;
+    }
+
+    /** Manifests this peer rewrote because the replica had lost them; for tests and status. */
+    private final AtomicLong manifestsRepaired = new AtomicLong();
+
+    /**
+     * Manifests this peer rewrote because the replica had lost them (EL-T-10).
+     *
+     * @return the count
+     */
+    public long manifestsRepaired() {
+        return manifestsRepaired.get();
     }
 
     // ------------------------------------------------------------ fetching
@@ -2537,6 +2973,7 @@ public final class Content implements CapabilityProvider, AutoCloseable {
             }
             if (next != null) {
                 fetches.put(next.session.root(), next);
+                wakeDue();
                 drive(next, clock.millis());
             }
         }
@@ -2747,6 +3184,11 @@ public final class Content implements CapabilityProvider, AutoCloseable {
         @Override
         public PeerId self() {
             return self;
+        }
+
+        @Override
+        public ai.badmonkey.agentspaces.common.time.TimeSource waitTime() {
+            return ai.badmonkey.agentspaces.common.time.Waits.base(clock); // a caller's wait on this swarm's time
         }
 
         @Override

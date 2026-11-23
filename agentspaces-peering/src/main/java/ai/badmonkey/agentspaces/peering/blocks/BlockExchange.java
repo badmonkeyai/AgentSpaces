@@ -31,7 +31,6 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -216,7 +215,12 @@ public final class BlockExchange {
         requestedAt.put(cid, clock.millis());
         byte[] want = codec.toBytes(new Want(cid));
         long stagger = Math.min(MAX_STAGGER_MILLIS, Math.max(1, timeoutMillis / 2));
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        // A caller's wait on a future, on the node's time source (group W): a virtual source releases it at the
+        // deadline an advance passes; a node on a hand-moved clock waits on the system's.
+        ai.badmonkey.agentspaces.common.time.TimeSource waits =
+                ai.badmonkey.agentspaces.common.time.Waits.base(runtime.time());
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits,
+                java.time.Duration.ofMillis(timeoutMillis));
         List<PeerId> targets = new ArrayList<>(candidates);
         try {
             int next = 0;
@@ -224,26 +228,27 @@ public final class BlockExchange {
                 if (next < targets.size()) {
                     runtime.send(targets.get(next++), Envelope.Kind.BLOCK_WANT, want);
                 }
-                long remaining = deadline - System.nanoTime();
-                if (remaining <= 0) {
+                long now = waits.monoNanos();
+                if (deadline - now <= 0) {
                     return Optional.empty();
                 }
-                long wait = next < targets.size()
-                        ? Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(stagger))
-                        : remaining;
-                try {
-                    return Optional.of(future.get(wait, TimeUnit.NANOSECONDS));
-                } catch (TimeoutException e) {
-                    if (next >= targets.size()) {
+                long until = next < targets.size()
+                        ? Math.min(deadline, now + TimeUnit.MILLISECONDS.toNanos(stagger))
+                        : deadline;
+                if (ai.badmonkey.agentspaces.common.time.Waits.awaitDone(waits, future, until)) {
+                    try {
+                        return Optional.of(future.join());
+                    } catch (java.util.concurrent.CompletionException | java.util.concurrent.CancellationException e) {
                         return Optional.empty();
                     }
-                    // the next candidate is asked on the next loop
                 }
+                if (next >= targets.size()) {
+                    return Optional.empty();
+                }
+                // the next candidate is asked on the next loop
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return Optional.empty();
-        } catch (java.util.concurrent.ExecutionException e) {
             return Optional.empty();
         } finally {
             pending.remove(cid, future);

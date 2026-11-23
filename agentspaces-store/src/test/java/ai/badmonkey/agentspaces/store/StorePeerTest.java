@@ -185,10 +185,22 @@ class StorePeerTest {
                 .as("the loser completes on its own claim: " + loser.contentStore().status()).isTrue();
         System.out.printf("store race: the loser completed after %d ms%n", (System.nanoTime() - started) / 1_000_000);
         assertThat(loser.contentStore().ledger().holds(root)).isTrue();
-
-        // the winner's claim arrives: the winner acknowledges the loser's completion and writes no receipt, and
-        // the loser keeps the holding it completed
+        // the winner's claim arrives in two steps, so the scenario's premise is made rather than assumed: first the
+        // winner's link to the loser opens and the loser's completion (its receipt) reaches the winner while the
+        // winner's frames to the writer, its tree wants among them, stay held; then the rest. Released at once, the
+        // winner's wants queued at the writer could finish its fetch before it heard of the completion under a
+        // loaded host (forked reactor, 2026-11-22): then both receipts exist, rule three applies and the loser
+        // rightly gives up, which is the next test's case, not this one's.
+        // The loser's receipt is an entry of its own and proves nothing about the take: the premise is that the
+        // winner's space has learned of the loser's authentic completion (StorePeerTest flake of 2026-11-22: the
+        // receipt arrived while the completion came only under the winner's claim, which does not authenticate it).
         fleet.network.release(winner.name(), loser.name(), ai.badmonkey.agentspaces.test.SimNetwork.Order.FIFO, 1);
+        assertThat(fleet.runUntil("store.race.completion-reaches-winner", Duration.ofSeconds(30),
+                () -> StoreFleet.receiptHolders(winner, root).contains(loser.id())
+                        && winner.contentSpace().knowsDisplacedCompletion(handle.entryId())))
+                .as("the loser's completion reached the winner, which learned it is authentic").isTrue();
+        assertThat(winner.contentStore().status().taken()).as("the winner had not completed when it heard").isZero();
+        // the winner acknowledges the loser's completion and writes no receipt, and the loser keeps its holding
         fleet.network.release(winner.name(), "writer", ai.badmonkey.agentspaces.test.SimNetwork.Order.FIFO, 1);
         assertThat(fleet.runUntil("store.race.claim-reaches-loser", Duration.ofSeconds(30), () -> loser.contentSpace().currentClaim(handle.entryId())
                 .map(c -> c.holder().peer().equals(winner.id())).orElse(false)))
@@ -196,7 +208,9 @@ class StorePeerTest {
         assertOneHolder(writer, root, a, b);
         // two more holding intervals, so the loser's race watch has run with the winner's claim in view
         fleet.settle(2 * (int) (StoreFleet.HOLDING.toMillis() / 250));
-        assertThat(loser.contentStore().ledger().holds(root)).as("the loser's watch kept the holding").isTrue();
+        assertThat(loser.contentStore().ledger().holds(root)).as("the loser's watch kept the holding (winner "
+                + winner.contentStore().status() + ", duplicate completions " + winner.contentSpace().duplicateCompletions()
+                + "; loser " + loser.contentStore().status() + ")").isTrue();
         assertThat(StoreFleet.receiptHolders(writer, root)).containsExactly(loser.id());
         assertThat(loser.contentStore().status().taken()).as("the loser's completion stands").isEqualTo(1);
         assertThat(loser.contentStore().status().abandoned()).isZero();

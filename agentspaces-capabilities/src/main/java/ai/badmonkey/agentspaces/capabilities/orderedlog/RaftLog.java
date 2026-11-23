@@ -58,13 +58,13 @@ import java.util.function.ObjLongConsumer;
  * <p>The leader lease is an advertisement (spec §8): {@link #describe} carries
  * {@code role} ({@code leader|follower|candidate}), {@code term}, and, for the
  * leader only, {@code leaseUntil} = the issue instant plus this member's election
- * timeout expressed in wall time ({@code electionTimeout × tickPeriod}), so a
- * consumer finds the current leader through discovery instead of probing, and a
- * leader that stops refreshing lapses like any other offer. That arithmetic is
- * only honest if {@code tickPeriod} is the cadence the log is really driven at,
- * so a log registered on a {@code CapabilityRuntime} is told the true cadence
- * through {@link #driverCadence(Duration)} and the constructor's value becomes a
- * fallback for hand-driven hosts (QA3 A3-4).
+ * timeout expressed in wall time, so a consumer finds the current leader through
+ * discovery instead of probing, and a leader that stops refreshing lapses like any
+ * other offer. On a started loop the timeout is 5 to 9 times {@link #HEARTBEAT}
+ * (1.25 to 2.25 s) whatever {@code tick-millis} says (owner decision 2,
+ * 2026-11-23); a log stepped by {@link #tick()} counts it in ticks, and states it
+ * in the cadence it was told through {@link #driverCadence(Duration)} or, for a
+ * hand-driven host, the constructor's value (QA3 A3-4).
  *
  * <p>Durability (srad/agentspaces-js.md JS-N-06): the term, the vote, and the
  * entries live in a {@link LogStore}, written before any reply that depends on
@@ -84,7 +84,10 @@ import java.util.function.ObjLongConsumer;
  * <p>Thread-safety: all mutation happens under one lock; the applied listener is
  * invoked outside it.
  */
-public final class RaftLog implements CapabilityProvider {
+public final class RaftLog implements ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider {
+
+    /** The capability card's time to live (srad/agentspaces-event-loop.md §3.11), as every shipped capability uses. */
+    public static final java.time.Duration ADVERTISEMENT_TTL = java.time.Duration.ofMinutes(15);
 
     private static final System.Logger LOG = System.getLogger(RaftLog.class.getName());
 
@@ -139,6 +142,28 @@ public final class RaftLog implements CapabilityProvider {
     private final java.util.Set<PeerId> votesGranted = new java.util.HashSet<>();
     private int electionElapsed;
     private int electionTimeout;
+
+    // ---- timed mode (srad/agentspaces-event-loop.md EL-T-02, EL-T-14, EL-H-09; owner answers 2 and 4, 2026-11-22)
+
+    /** The leader's heartbeat period on a started loop: today's every tick at 250 ms, its own deadline. */
+    public static final Duration HEARTBEAT = Duration.ofMillis(250);
+    /** The driver of the capability participant, once registered; null for a log driven only by {@link #tick()}. */
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver;
+    /** When a follower or candidate starts an election, on the loop's base; 0 until first armed. Under the lock. */
+    private long electionDeadlineNanos;
+    /** The leader's last heartbeat and the next one's deadline (volatile mirrors for the guard and the watchdog). */
+    private volatile long lastHeartbeatNanos;
+    private volatile long heartbeatDueNanos = Long.MAX_VALUE;
+    /** The lease the last advertisement carried, on the loop's base: when issued and for how long (0: none). */
+    private volatile long leaseIssuedNanos;
+    private volatile long leaseSpanNanos;
+    /** A role mirror for lock-free readers (WD-1). */
+    private volatile boolean leading;
+    /** The lease guard: a one-shot step-down task re-armed at each heartbeat (owner answer 2). */
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled leaseGuard;
+    /** Step-downs the guard or the act-time check made ({@code core.raft.stepdowns-forced}, together with the watchdog's). */
+    private final java.util.concurrent.atomic.AtomicLong guardStepdowns = new java.util.concurrent.atomic.AtomicLong();
+    private volatile ai.badmonkey.agentspaces.common.time.Watchdog.Registration watchdogLease;
     private final Map<PeerId, Long> nextIndex = new HashMap<>();
     private final Map<PeerId, Long> matchIndex = new HashMap<>();
 
@@ -335,13 +360,20 @@ public final class RaftLog implements CapabilityProvider {
             parameters.put("role", role.name().toLowerCase(java.util.Locale.ROOT));
             parameters.put("term", String.valueOf(term));
             if (role == Role.LEADER) {
-                parameters.put("leaseUntil",
-                        issued.plus(tickPeriod.multipliedBy(electionTimeout)).toString());
+                Duration span = electionBase().multipliedBy(electionTimeout);
+                parameters.put("leaseUntil", issued.plus(span).toString());
+                leaseIssuedNanos = mono();
+                leaseSpanNanos = span.toNanos();
+                if (heartbeatDueNanos != Long.MAX_VALUE) {
+                    armLeaseGuard(lastHeartbeatNanos); // the new card moves the lease's end: the guard follows it
+                }
+            } else {
+                leaseSpanNanos = 0;
             }
         }
         return new CapabilityAdvertisement(
                 "aspace://" + group.value() + "/cap/ordered-log/" + self.value(),
-                self, group, issued, Duration.ofMinutes(15),
+                self, group, issued, ADVERTISEMENT_TTL,
                 TYPE, "0.1", "pipe", parameters, Map.of());
     }
 
@@ -407,6 +439,9 @@ public final class RaftLog implements CapabilityProvider {
         Objects.requireNonNull(command, "command");
         PeerId forwardTo = null;
         synchronized (lock) {
+            if (role == Role.LEADER && leaseLapsedLocked()) {
+                stepDownLocked(); // the act-time lease check (owner answer 2): a stale leader never appends
+            }
             if (role == Role.LEADER) {
                 LogEntry entry = new LogEntry(term, command);
                 log.add(entry);
@@ -438,11 +473,9 @@ public final class RaftLog implements CapabilityProvider {
     }
 
     /**
-     * Adopts the cadence the driver actually ticks at, so the advertised leader
-     * lease ({@code electionTimeout × tickPeriod}) describes this log's real
-     * election timeout rather than the one assumed at construction (QA3 A3-4).
-     * The election timeout itself is counted in ticks and is unchanged; only the
-     * wall-clock translation moves.
+     * Adopts the cadence {@link #tick()} is called at. On a driver (a node's loop) the election timeout and the lease
+     * are a fixed 5 to 9 times {@link #HEARTBEAT} and do not move with it (owner decision 2, 2026-11-23); a log stepped
+     * only by {@link #tick()} counts its timeout in ticks and states its lease in this period (QA3 A3-4).
      *
      * @param period the true period between {@link #tick()} calls
      */
@@ -452,7 +485,9 @@ public final class RaftLog implements CapabilityProvider {
         if (period.isZero() || period.isNegative()) {
             throw new IllegalArgumentException("cadence must be positive: " + period);
         }
-        this.tickPeriod = period;
+        if (!period.equals(tickPeriod)) {
+            this.tickPeriod = period; // on a started loop the base is fixed, so the election timer is not touched
+        }
     }
 
     @Override
@@ -465,6 +500,7 @@ public final class RaftLog implements CapabilityProvider {
                         sends.add(appendFor(member));
                     }
                 }
+                heartbeatSentLocked(mono());
             } else {
                 electionElapsed++;
                 if (electionElapsed >= electionTimeout) {
@@ -574,7 +610,7 @@ public final class RaftLog implements CapabilityProvider {
             if (grant) {
                 PeerId priorVote = votedFor;
                 votedFor = request.candidate();
-                electionElapsed = 0;
+                resetElectionLocked();
                 // The vote is durable before the reply leaves (JS-N-06): a voter
                 // that restarts cannot grant this term to a second candidate.
                 if (!persistTermVoteLocked(term, priorVote)) {
@@ -601,6 +637,7 @@ public final class RaftLog implements CapabilityProvider {
             }
             if (votesGranted.size() > members.size() / 2) {
                 role = Role.LEADER;
+                leading = true;
                 leaderHint = self;
                 for (PeerId member : members) {
                     nextIndex.put(member, (long) log.size() + 1);
@@ -612,6 +649,8 @@ public final class RaftLog implements CapabilityProvider {
                         sends.add(appendFor(member));
                     }
                 }
+                heartbeatSentLocked(mono()); // the heartbeat deadline is armed with the role (EL-T-14)
+                describeChanged();
             }
         }
         sends.forEach(Runnable::run);
@@ -628,7 +667,7 @@ public final class RaftLog implements CapabilityProvider {
                 reply = Frame.of(new AppendReply(term, self, false, 0));
             } else {
                 leaderHint = append.leader();
-                electionElapsed = 0;
+                resetElectionLocked();
                 boolean prevMatches = append.prevLogIndex() == 0
                         || (append.prevLogIndex() <= log.size()
                                 && log.get((int) append.prevLogIndex() - 1).term()
@@ -688,6 +727,10 @@ public final class RaftLog implements CapabilityProvider {
             if (role != Role.LEADER || reply.term() != term) {
                 return;
             }
+            if (leaseLapsedLocked()) {
+                stepDownLocked(); // the act-time lease check on commit (owner answer 2)
+                return;
+            }
             // The follower identity is the authenticated frame sender; the
             // reply's own follower field is unauthenticated payload (ASF-005).
             if (reply.success()) {
@@ -710,8 +753,9 @@ public final class RaftLog implements CapabilityProvider {
         votedFor = self;
         votesGranted.clear();
         votesGranted.add(self);
-        electionElapsed = 0;
         electionTimeout = newElectionTimeout();
+        resetElectionLocked();
+        describeChanged(); // a role and term change republishes the card (EL-T-14)
         // The candidacy (new term, vote for self) is durable before any request
         // leaves (JS-N-06); if it cannot be, no request leaves and the timer
         // simply runs again.
@@ -743,10 +787,15 @@ public final class RaftLog implements CapabilityProvider {
             term = newTerm;
             votedFor = null;
         }
+        boolean wasLeader = role == Role.LEADER;
         role = Role.FOLLOWER;
+        leaving();
         votesGranted.clear();
-        electionElapsed = 0;
         electionTimeout = newElectionTimeout();
+        resetElectionLocked();
+        if (wasLeader || newTerm != priorTerm) {
+            describeChanged(); // a role or term change republishes the card (EL-T-14)
+        }
         return term == priorTerm || persistTermVoteLocked(priorTerm, priorVote);
     }
 
@@ -868,7 +917,291 @@ public final class RaftLog implements CapabilityProvider {
     }
 
     private int newElectionTimeout() {
-        return 5 + random.nextInt(5);
+        return ELECTION_TIMEOUT_MIN_PERIODS + random.nextInt(ELECTION_TIMEOUT_MAX_PERIODS - ELECTION_TIMEOUT_MIN_PERIODS + 1);
+    }
+
+    // ---------------------------------------------------------------- timed mode
+
+    /** The loop's monotonic now when driven, else the process's. */
+    private long mono() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        return d == null ? ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos() : d.monoNanos();
+    }
+
+    /** Whether the log runs on a started loop, keeping its rules in time (owner answer 4). */
+    private boolean timed() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        return d != null && d.timed();
+    }
+
+    /**
+     * The base the election timeout and the leader's lease are counted in (owner decision 2, 2026-11-23): on a started
+     * loop a fixed {@link #HEARTBEAT}, so the timeout is 1.25 to 2.25 s whatever {@code tick-millis} says and a short
+     * tick can never bring it within a few heartbeats; on a log stepped by {@link #tick()} (a hand-driven node, a
+     * direct run) the cadence its host declared, as the timeout is counted in ticks there.
+     */
+    private Duration electionBase() {
+        return timed() ? HEARTBEAT : tickPeriod;
+    }
+
+    /** The election timeout in time: the drawn count times the base (EL-T-02, decision 2: 1.25 to 2.25 s). */
+    private long electionSpanNanos() {
+        return electionBase().toNanos() * electionTimeout;
+    }
+
+    /** The shortest election timeout any member draws: 5 times the base (1.25 s). */
+    private long minElectionTimeoutNanos() {
+        return electionBase().toNanos() * ELECTION_TIMEOUT_MIN_PERIODS;
+    }
+
+    /**
+     * The shortest election timeout, in base periods; the leader's lease ({@code leaseUntil}) spans this member's drawn
+     * timeout, 5 to 9 periods (srad/agentspaces-event-loop.md §3.11, a registered exception to the 60 s floor: a
+     * leader lease must end before the followers' election timeout, or two leaders overlap).
+     */
+    public static final int ELECTION_TIMEOUT_MIN_PERIODS = 5;
+    /** The longest election timeout, in base periods. */
+    public static final int ELECTION_TIMEOUT_MAX_PERIODS = 9;
+
+    /** Restarts the election timer, in ticks for {@link #tick()} and in time for {@link #run(long)}. Under the lock. */
+    private void resetElectionLocked() {
+        electionElapsed = 0;
+        electionDeadlineNanos = mono() + electionSpanNanos();
+    }
+
+    /** A heartbeat went out at {@code now}: the next one's deadline, and the lease guard re-armed. Under the lock. */
+    private void heartbeatSentLocked(long now) {
+        heartbeats.incrementAndGet();
+        lastHeartbeatNanos = now;
+        heartbeatDueNanos = now + HEARTBEAT.toNanos();
+        armLeaseGuard(now);
+    }
+
+    /**
+     * The lease guard (owner answer 2, 2026-11-22): a one-shot task on the time source at this heartbeat plus the
+     * minimum election timeout (the earliest a follower that heard it can start an election), or at the end of the
+     * lease the last card advertised when that is sooner, on a virtual thread of its own (TS-2), so a leader whose loop
+     * is wedged in another participant steps down before a follower can elect another leader and never acts past the
+     * {@code leaseUntil} its followers read (EL-SP-24). The second bound is the phase-2 gate's (srad/agentspaces-event-
+     * loop.md §10.15): a loop wedged just before the half-lease republish let the last card's lease end before the
+     * heartbeat bound, and the followers read a lapsed lease from a leader still acting.
+     */
+    private void armLeaseGuard(long heartbeatNanos) {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d == null || !d.timed()) {
+            return;
+        }
+        ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled previous = leaseGuard;
+        if (previous != null) {
+            previous.cancel();
+        }
+        long due = heartbeatNanos + minElectionTimeoutNanos();
+        if (leaseSpanNanos > 0) {
+            due = Math.min(due, leaseIssuedNanos + leaseSpanNanos);
+        }
+        // TS-2: on a virtual thread of its own, never the loop's or the timer's
+        leaseGuard = d.time().scheduleAt(due, this::stepDownIfStale);
+    }
+
+    /** The guard's check: steps down a leader whose heartbeat is a minimum election timeout overdue. */
+    private void stepDownIfStale() {
+        synchronized (lock) {
+            if (role == Role.LEADER && leaseLapsedLocked()) {
+                stepDownLocked();
+            }
+        }
+    }
+
+    /**
+     * Whether this leader's last heartbeat is a minimum election timeout old, so a follower that heard it may already
+     * have started an election, or the lease its last card advertised has ended: it must not act on its lease (owner
+     * answer 2; EL-SP-24). Only in timed mode.
+     */
+    private boolean leaseLapsedLocked() {
+        if (heartbeatDueNanos == Long.MAX_VALUE || !timed()) {
+            return false;
+        }
+        long now = mono();
+        return now - lastHeartbeatNanos >= minElectionTimeoutNanos()
+                || (leaseSpanNanos > 0 && now >= leaseIssuedNanos + leaseSpanNanos);
+    }
+
+    /** Steps down and counts it. Under the lock. */
+    private void stepDownLocked() {
+        guardStepdowns.incrementAndGet();
+        LOG.log(System.Logger.Level.WARNING, "ordered log " + self.display() + ": leader of term " + term
+                + " stepped down: its heartbeat is a minimum election timeout overdue, or its advertised lease ended");
+        becomeFollowerLocked(term);
+        leaderHint = null;
+    }
+
+    /** No longer leading: the heartbeat, the guard and the mirror go. Under the lock. */
+    private void leaving() {
+        leading = false;
+        heartbeatDueNanos = Long.MAX_VALUE;
+        leaseSpanNanos = 0; // the lease ended with the role: a later win's guard must not judge a stale card's end
+        ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled guard = leaseGuard;
+        if (guard != null) {
+            guard.cancel();
+            leaseGuard = null;
+        }
+    }
+
+    /** Tells the capability runtime the card changed, so it republishes it in the next run (EL-T-14). */
+    private void describeChanged() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d != null) {
+            d.describeChanged(); // never blocks: safe under the lock
+        }
+    }
+
+    /**
+     * Steps this member down to follower when it leads (EL-H-09): the watchdog's lease duty and the lease guard call
+     * it; the next {@link #describe} says follower.
+     */
+    public void stepDown() {
+        synchronized (lock) {
+            if (role == Role.LEADER) {
+                guardStepdowns.incrementAndGet();
+                becomeFollowerLocked(term);
+                leaderHint = null;
+            }
+        }
+    }
+
+    /** The leader's last heartbeat on the loop's base; for tests. */
+    long lastHeartbeatNanos() {
+        return lastHeartbeatNanos;
+    }
+
+    /** Heartbeat rounds this member sent as leader; for tests. */
+    long heartbeats() {
+        return heartbeats.get();
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong heartbeats = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Leaders stepped down by the lease guard, the act-time check or {@link #stepDown()}.
+     *
+     * @return the count
+     */
+    public long stepdowns() {
+        return guardStepdowns.get();
+    }
+
+    /** Leaves the watchdog's lease duty and cancels the lease guard; the card lapses by itself. */
+    @Override
+    public void stop() {
+        ai.badmonkey.agentspaces.common.time.Watchdog.Registration lease = watchdogLease;
+        watchdogLease = null;
+        if (lease != null) {
+            lease.close();
+        }
+        synchronized (lock) {
+            ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled guard = leaseGuard;
+            if (guard != null) {
+                guard.cancel();
+                leaseGuard = null;
+            }
+        }
+    }
+
+    @Override
+    public void attach(ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver) {
+        this.driver = Objects.requireNonNull(driver, "driver");
+        synchronized (lock) {
+            electionDeadlineNanos = driver.monoNanos() + electionSpanNanos();
+        }
+        ai.badmonkey.agentspaces.common.time.Watchdog.Registration previous = watchdogLease;
+        if (previous != null) {
+            previous.close();
+        }
+        watchdogLease = driver.time().watchdog().registerLease(new ai.badmonkey.agentspaces.common.time.Watchdog.LeaseHolder() {
+            @Override
+            public String name() {
+                return "raft:" + self.display();
+            }
+
+            @Override
+            public boolean leading() {
+                return leading && timed();
+            }
+
+            @Override
+            public long leaseIssuedNanos() {
+                return leaseIssuedNanos;
+            }
+
+            @Override
+            public long leaseSpanNanos() {
+                return leaseSpanNanos;
+            }
+
+            @Override
+            public long heartbeatDueNanos() {
+                return heartbeatDueNanos;
+            }
+
+            @Override
+            public long minElectionTimeoutNanos() {
+                return RaftLog.this.minElectionTimeoutNanos();
+            }
+
+            @Override
+            public void forceRefresh() {
+                describeChanged();
+            }
+
+            @Override
+            public void stepDown() {
+                RaftLog.this.stepDown();
+            }
+        });
+    }
+
+    /**
+     * The log on a started loop (EL-T-02, EL-T-14): a leader sends its heartbeat every {@link #HEARTBEAT} and asks
+     * for its card again at half its lease; a follower or candidate starts an election when its timer, drawn per term
+     * as 5 to 9 times the base (1.25 to 2.25 s at 250 ms), runs out. Nothing is sent between those deadlines.
+     */
+    @Override
+    public long run(long now) {
+        List<Runnable> sends = new ArrayList<>();
+        long next;
+        boolean halfLease = false;
+        synchronized (lock) {
+            if (role == Role.LEADER) {
+                if (now >= heartbeatDueNanos) {
+                    for (PeerId member : members) {
+                        if (!member.equals(self)) {
+                            sends.add(appendFor(member));
+                        }
+                    }
+                    heartbeatSentLocked(now);
+                }
+                long half = leaseSpanNanos == 0 ? Long.MAX_VALUE : leaseIssuedNanos + leaseSpanNanos / 2;
+                if (now >= half) {
+                    halfLease = true;
+                    half = Long.MAX_VALUE; // the republish files the next half
+                }
+                next = Math.min(heartbeatDueNanos, half);
+            } else {
+                if (electionDeadlineNanos == 0) {
+                    electionDeadlineNanos = now + electionSpanNanos();
+                }
+                if (now >= electionDeadlineNanos) {
+                    startElectionLocked(sends);
+                }
+                next = role == Role.LEADER ? heartbeatDueNanos : electionDeadlineNanos;
+            }
+        }
+        if (halfLease) {
+            describeChanged(); // republish before half the lease has passed (EL-T-14)
+        }
+        sends.forEach(Runnable::run);
+        applyCommitted();
+        return next;
     }
 
     private void send(PeerId to, Frame frame) {

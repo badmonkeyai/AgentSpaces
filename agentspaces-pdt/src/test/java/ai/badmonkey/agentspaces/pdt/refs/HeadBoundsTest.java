@@ -145,17 +145,18 @@ class HeadBoundsTest {
             handles.add(a.refSpace().write(unloadable, Lease.of(Duration.ofMinutes(10)), unloadable.tags()));
         }
         assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> RefFleet.headEntries(b, NAME).size() == n + 1)).isTrue();
-        long started = System.nanoTime();
-        PMap<String, String> seen = onB.deref();
-        long waited = (System.nanoTime() - started) / 1_000_000;
+        // the read waits on the fleet's time, so it runs as a task of it and its wait is fleet time (EL-Q-TST-03)
+        var read = fleet.call(Duration.ofSeconds(10), onB::deref);
+        PMap<String, String> seen = read.value();
+        long waited = read.took().toMillis();
         assertThat(seen.root()).isEqualTo(v1.root());
         assertThat(waited).as("ten unloadable heads waited one load timeout together").isGreaterThanOrEqualTo(250).isLessThan(1_200);
         // swarm retries (ROBUSTNESS.md §10.3 P1): roots still loading are late, apart from the heads ignored for a fault
         assertThat(b.pdt().stats().headsIgnored()).isZero();
         assertThat(b.pdt().refs().headsLate().total()).as("each late entry counts once per cause").isBetween((long) n, 2L * n);
-        started = System.nanoTime();
-        assertThat(onB.deref().root()).isEqualTo(v1.root());
-        assertThat((System.nanoTime() - started) / 1_000_000).as("a second deref does not wait").isLessThan(250);
+        var again = fleet.call(Duration.ofSeconds(10), onB::deref);
+        assertThat(again.value().root()).isEqualTo(v1.root());
+        assertThat(again.took().toMillis()).as("a second deref does not wait").isLessThan(250);
         // the sessions fail at the load timeout on the clock and are reaped; once the heads go, nothing of them stays
         for (EntryHandle handle : handles) {
             handle.cancel();
@@ -204,9 +205,9 @@ class HeadBoundsTest {
         assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> RefFleet.headEntries(b, NAME).size() == 3)).isTrue();
 
         Ref<PMap<String, String>> onB = b.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
-        long started = System.nanoTime();
-        PMap<String, String> seen = onB.deref();
-        long waited = (System.nanoTime() - started) / 1_000_000;
+        var read = fleet.call(Duration.ofSeconds(30), onB::deref); // a read on the fleet's time (EL-Q-TST-03)
+        PMap<String, String> seen = read.value();
+        long waited = read.took().toMillis();
 
         assertThat(seen.root()).isEqualTo(held);
         assertThat(seen.toMap()).isEqualTo(java.util.Map.of("k1", "v1"));

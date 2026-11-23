@@ -100,7 +100,8 @@ public final class PeerIdentity {
      * @return the subordinate identity
      */
     public ai.badmonkey.agentspaces.api.spi.AgentIdentity subordinate(String localName) {
-        return subordinate(localName, java.time.Instant.now(), java.time.Duration.ofHours(1));
+        return subordinate(localName, ai.badmonkey.agentspaces.common.time.TimeSource.system().instant(),
+                java.time.Duration.ofHours(1));
     }
 
     /**

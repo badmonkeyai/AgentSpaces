@@ -198,11 +198,11 @@ class ShareTest {
             assertThat(bridgeInFirst.store().complete(root)).as("the lazy bridge holds the tree in part").isFalse();
             first.kill(writer);
 
-            long started = System.nanoTime();
+            long started = first.clock.millis(); // the refusal's wait is fleet time (EL-Q-TST-03)
             CompletableFuture<Ref<PMap<String, String>>> share = CompletableFuture.supplyAsync(
                     () -> bridgeInFirst.pdt().share(onBridge, bridgeInSecond.pdt()), r -> Thread.ofVirtual().start(r));
             assertThat(first.runUntil(Duration.ofSeconds(30), share::isDone)).isTrue();
-            long waited = (System.nanoTime() - started) / 1_000_000;
+            long waited = first.clock.millis() - started;
 
             assertThatThrownBy(share::get).hasCauseInstanceOf(NodeUnavailableException.class)
                     .hasMessageContaining(root);

@@ -152,17 +152,17 @@ class InlineDeltaTest {
                 PRef.MODE_MULTI, PRef.SEALING_NONE, null, null);
         a.refSpace().write(unloadable, Lease.of(Duration.ofMinutes(10)), unloadable.tags());
         assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> RefFleet.headEntries(b, NAME).size() == 2)).isTrue();
-        long started = System.nanoTime();
-        PMap<String, String> seen = onB.deref();
-        long waited = (System.nanoTime() - started) / 1_000_000;
+        var read = fleet.call(Duration.ofSeconds(30), onB::deref); // a read on the fleet's time (EL-Q-TST-03)
+        PMap<String, String> seen = read.value();
+        long waited = read.took().toMillis();
         assertThat(seen.root()).as("the unloadable head is left out and v1 stays the head").isEqualTo(v1.root());
         // swarm retries (ROBUSTNESS.md §10.3 P1): a root still loading is late, apart from the heads ignored for a fault
         assertThat(b.pdt().stats().headsIgnored()).isZero();
         assertThat(b.pdt().stats().headsLate()).isEqualTo(1);
         assertThat(waited).as("deref waited the load timeout once").isGreaterThanOrEqualTo(250).isLessThan(5_000);
-        started = System.nanoTime();
-        assertThat(onB.deref().root()).isEqualTo(v1.root());
-        assertThat((System.nanoTime() - started) / 1_000_000).as("a second deref does not wait again").isLessThan(250);
+        var again = fleet.call(Duration.ofSeconds(30), onB::deref);
+        assertThat(again.value().root()).isEqualTo(v1.root());
+        assertThat(again.took().toMillis()).as("a second deref does not wait again").isLessThan(250);
         fleet.settle(4);
         assertThat(onB.deref().root()).isEqualTo(v1.root());
         assertThat(b.pdt().stats().headsIgnored()).isZero();

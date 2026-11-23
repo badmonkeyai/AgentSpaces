@@ -30,6 +30,7 @@ import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import ai.badmonkey.agentspaces.test.SimNetwork;
+import ai.badmonkey.agentspaces.test.SkewedClocks;
 import ai.badmonkey.agentspaces.test.TestClock;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -61,31 +62,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class HorizonLaggingCopyTest {
 
-    private static final long LAG_MILLIS = Duration.ofMinutes(4).toMillis();
-
     /**
-     * The lag the drifted clock reaches while it is cut off: past the five-minute lapse grace and within MAX_DRIFT (ten
-     * minutes, SPEC §11). Since the drift floor of SPEC §7.3 the actor collects a withdrawal ten minutes past its
-     * lease, and a replica still four minutes behind has dropped its own lapsed copy a minute before that, so nothing
-     * is left to re-offer. One that has drifted to eight minutes behind still holds the copy within its grace, and
-     * offers it once the healed link has carried the actor's stamps to its clock.
+     * The probe's clocks, one shared skewed fixture (srad/agentspaces-event-loop.md EL-A-04): the actor's clock,
+     * a bridge four minutes behind it throughout, and the lagging replica, four minutes behind until the partition
+     * and drifting to eight while it is cut off ({@link SkewedClocks} says why each is set so).
      */
-    private static final long DRIFTED_LAG_MILLIS = Duration.ofMinutes(8).toMillis();
-
-    private final TestClock clock = TestClock.create();
-    /** The lagging clock's lag now, and the lag it drifts to; it grows by half of each step, so it never runs back. */
-    private volatile long lag = LAG_MILLIS;
-    private volatile long lagTarget = LAG_MILLIS;
-    private final InstantSource lagging = () -> clock.instant().minusMillis(lag);
-    /**
-     * The bridge's clock, four minutes behind the actor's throughout. A replica whose clock trails the actor's by more
-     * than the five-minute frame age is heard by the actor only while its frames carry newer stamps than its own clock
-     * reads: stamps its hybrid logical clock took from members it hears. Cut off together with the bridge, the lagging
-     * replica's stamps follow the bridge's, within five minutes of the actor's, so when the partition heals the actor
-     * hears it again and it offers the copy it still holds. Alone, its stamps would fall eight minutes behind and the
-     * actor would drop its frames as too old, so the copy would never reach the door.
-     */
-    private final InstantSource bridging = () -> clock.instant().minusMillis(LAG_MILLIS);
+    private final SkewedClocks clocks = SkewedClocks.create();
+    private final TestClock clock = clocks.reference();
+    private final InstantSource lagging = clocks.lagging();
+    private final InstantSource bridging = clocks.bridging();
     private final SimNetwork network = new SimNetwork();
     private final GroupAdvertisement groupAd = new GroupAdvertisement("aspace://zHorizonContent",
             PeerIdentity.generate().peerId(), GroupId.of("zHorizonContent"), Instant.EPOCH, Duration.ofDays(1),
@@ -122,8 +107,7 @@ class HorizonLaggingCopyTest {
     private boolean runUntil(int ticks, Duration step, BooleanSupplier until) {
         for (int i = 0; i < ticks && !until.getAsBoolean(); i++) {
             nodes.forEach(PeerNode::tick);
-            clock.advance(step);
-            lag = Math.min(lagTarget, lag + step.toMillis() / 2);
+            clocks.advance(step);
         }
         return until.getAsBoolean();
     }
@@ -163,7 +147,7 @@ class HorizonLaggingCopyTest {
         // the withdrawal and the lagging replica's hybrid logical clock keeps following the bridge's.
         network.partition("a", "c");
         network.partition("a", "b");
-        lagTarget = DRIFTED_LAG_MILLIS; // the cut-off clock slows, as a drifting clock does, never stepping back
+        clocks.driftTo(SkewedClocks.DRIFTED_LAG); // the cut-off clock slows, as a drifting clock does, never stepping back
         holding.cancel();
         assertThat(runUntil(1_000, Duration.ofSeconds(1), () -> a.space().signedState(id).isEmpty()))
                 .as("collected under the per-entry horizon").isTrue();
@@ -187,7 +171,7 @@ class HorizonLaggingCopyTest {
                 + c.space().recordOf(id).isPresent() + "), rounds " + c.runtime().gossip().antiEntropyRounds()
                 + "; a rounds " + a.runtime().gossip().antiEntropyRounds() + ", form toward c "
                 + a.runtime().gossip().lastFormToward(c.identity().peerId()) + ", stale at b " + b.node().framesStale()
-                + ", b holds " + b.space().signedState(id).isPresent() + ", lag " + lag + " ms")
+                + ", b holds " + b.space().signedState(id).isPresent() + ", lag " + clocks.lagMillis() + " ms")
                 .isTrue();
         System.out.println("P38 content: the lagging copy was refused at the door " + (clock.millis() - healedAt)
                 + " ms after the heal, on the fake clock");

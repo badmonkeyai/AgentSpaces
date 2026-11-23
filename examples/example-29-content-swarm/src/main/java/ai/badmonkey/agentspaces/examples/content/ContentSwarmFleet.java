@@ -45,9 +45,6 @@ import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Example 29: a large artifact across a fleet (srad/large-networks-bulk-data.md
@@ -76,7 +73,6 @@ public final class ContentSwarmFleet {
         private final PeerNode node;
         private final List<Joined> joined = new ArrayList<>();
         private final PieceStore store;
-        private final ScheduledExecutorService ticker;
 
         private record Joined(String founding, GroupRuntime runtime, Content content) {
         }
@@ -84,13 +80,12 @@ public final class ContentSwarmFleet {
         private final List<AutoCloseable> transports;
         private ai.badmonkey.agentspaces.content.ContentPolicy policy = ai.badmonkey.agentspaces.content.ContentPolicy.DEFAULT;
 
-        private Peer(String name, PeerNode node, PieceStore store, ScheduledExecutorService ticker,
+        private Peer(String name, PeerNode node, PieceStore store,
                      List<AutoCloseable> transports) {
             this.transports = transports;
             this.name = name;
             this.node = node;
             this.store = store;
-            this.ticker = ticker;
         }
 
         public String name() {
@@ -138,14 +133,13 @@ public final class ContentSwarmFleet {
                     .blocks(blocks).build();
             Content content = Content.builder(new CapabilityPipes(runtime, CODEC), runtime, contentSpace, identity.peerId())
                     .codec(CODEC).store(store).blocks(blocks).policy(policy).random(new Random(name.hashCode())).build();
-            runtime.onTick(content::tick);
+            content.joinLoop(runtime); // its own deadlines on the node's loop (srad/agentspaces-event-loop.md EL-T-08)
             content.start();
             joined.add(new Joined(founding, runtime, content));
         }
 
         @Override
         public void close() {
-            ticker.shutdownNow();
             joined.forEach(j -> j.content().close());
             node.close();
             for (AutoCloseable transport : transports) {
@@ -221,24 +215,14 @@ public final class ContentSwarmFleet {
         }
         Files.createDirectories(storeDir);
         PieceStore store = new FilePieceStore(storeDir, CODEC, InstantSource.system(), 0);
-        ScheduledExecutorService ticker = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "tick-" + name);
-            t.setDaemon(true);
-            return t;
-        });
-        Peer peer = new Peer(name, node, store, ticker, transports);
+        Peer peer = new Peer(name, node, store, transports);
         peer.policy = policy;
         peer.join(FOUNDING, seeds, identity);
         if (missionSeeds != null) {
             peer.join(MISSION_FOUNDING, missionSeeds, identity);
         }
-        ticker.scheduleAtFixedRate(() -> {
-            try {
-                node.tick();
-            } catch (RuntimeException e) {
-                System.err.println(name + " tick failed: " + e.getMessage());
-            }
-        }, 0, 100, TimeUnit.MILLISECONDS);
+        // the node's own loop runs each participant at its own deadline (srad/agentspaces-event-loop.md EL-X-07)
+        node.startTicking(Duration.ofMillis(250));
         return peer;
     }
 

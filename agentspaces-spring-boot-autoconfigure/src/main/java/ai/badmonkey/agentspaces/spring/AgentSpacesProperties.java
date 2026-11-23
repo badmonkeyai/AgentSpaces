@@ -67,6 +67,12 @@ public class AgentSpacesProperties {
      */
     private String advertise;
     private List<String> roles = new ArrayList<>();
+    /**
+     * The cadence (ms) of the deprecated {@code GroupRuntime.onTick} adapters, and the period {@code startTicking}
+     * is given. Since 0.7.0 it no longer paces the node: the node loop runs each piece of due work at its own
+     * deadline, and Raft's election timeout is a fixed 1.25 to 2.25 s whatever this says
+     * (srad/agentspaces-event-loop.md EL-T-02, EL-T-05). A smaller value speeds nothing but the old adapters.
+     */
     private long tickMillis = 250;
     private long cardRefreshMillis = 300_000;
     /** How often a node re-floods its peer advertisement (ms); between refreshes newcomers get it directly. */
@@ -111,6 +117,7 @@ public class AgentSpacesProperties {
     private Retirement retirement = new Retirement();
     private PostRetirement postRetirement = new PostRetirement();
     private Health health = new Health();
+    private Watchdog watchdog = new Watchdog();
     /** The content swarm ({@code agentspaces.content.*}, srad/large-networks-bulk-data.md §7.2). */
     private ContentSwarm content = new ContentSwarm();
     /** Persistent data trees ({@code agentspaces.pdt.*}, srad/agentspaces-pdt.md appendix C). */
@@ -1147,6 +1154,95 @@ public class AgentSpacesProperties {
         return health;
     }
 
+    public Watchdog getWatchdog() {
+        return watchdog;
+    }
+
+    private Ttl ttl = new Ttl();
+
+    public Ttl getTtl() {
+        return ttl;
+    }
+
+    public void setTtl(Ttl ttl) {
+        this.ttl = ttl;
+    }
+
+    /**
+     * The TTL floor ({@code agentspaces.ttl.*}, srad/agentspaces-event-loop.md EL-E-03, EL-E-04, decision 18): at start,
+     * every configured TTL, lease and expiry under 60 s that differs from its registered default logs a WARN, or refuses
+     * to start when {@code strict}, unless an expert override names its key and a reason.
+     */
+    public static class Ttl {
+        /** Whether a value under 60 s with no override refuses to start; off by default (a WARN). */
+        private boolean strict;
+        /**
+         * Key to reason: the property name ({@code agentspaces.relay.path-ttl}) or the binder's key
+         * ({@code binder.<AgentClass>.<method>.<member>}). Write a dotted key in brackets.
+         */
+        private java.util.Map<String, String> expertOverrides = new java.util.LinkedHashMap<>();
+
+        public boolean isStrict() {
+            return strict;
+        }
+
+        public void setStrict(boolean strict) {
+            this.strict = strict;
+        }
+
+        public java.util.Map<String, String> getExpertOverrides() {
+            return expertOverrides;
+        }
+
+        public void setExpertOverrides(java.util.Map<String, String> expertOverrides) {
+            this.expertOverrides = expertOverrides;
+        }
+    }
+
+    public void setWatchdog(Watchdog watchdog) {
+        this.watchdog = watchdog;
+    }
+
+    /**
+     * The node loop's watchdog ({@code agentspaces.watchdog.*}, srad/agentspaces-event-loop.md §3.9, decision 4). Its
+     * period and bounds are per process and read from the {@code agentspaces.watchdog.*-millis} system properties, as
+     * are the elastic loop pool's and the stretch's ({@code agentspaces.loop.pool-max}, {@code .pool-idle-millis},
+     * {@code .grow-lateness-millis}, {@code .stretch-lateness-millis}, {@code .stretch-cap}; decision 2, EL-O-10).
+     */
+    public static class Watchdog {
+        /**
+         * What the node does when the watchdog escalates its loop (three re-initialisations within 10 minutes, or a
+         * participant fenced for 2 minutes): {@code report} (default: an ERROR log, the loop's health DOWN and
+         * liveness BROKEN, so the supervisor restarts the process) or {@code exit} (as report, then the node closes
+         * within 2 s and the process exits with status 70; for hosts with no liveness probe).
+         */
+        private String escalation = "report";
+
+        /**
+         * The hold limit of an {@code @OrderedTake} handler (srad/agentspaces-event-loop.md §10.16, owner decision 2
+         * of 2026-11-22): a handler that has held its entry this long is taken as hung, its take lease is no longer
+         * renewed and the entry lapses to another member. Unset (the default): no limit, a handler keeps its entry
+         * while it runs. The watchdog names a handler held past a minute either way.
+         */
+        private java.time.Duration holdLimit;
+
+        public String getEscalation() {
+            return escalation;
+        }
+
+        public void setEscalation(String escalation) {
+            this.escalation = escalation;
+        }
+
+        public java.time.Duration getHoldLimit() {
+            return holdLimit;
+        }
+
+        public void setHoldLimit(java.time.Duration holdLimit) {
+            this.holdLimit = holdLimit;
+        }
+    }
+
     public void setHealth(Health health) {
         this.health = health;
     }
@@ -1767,9 +1863,12 @@ public class AgentSpacesProperties {
      * The LAN multicast bootstrap beacon ({@code agentspaces.multicast.*},
      * spec §10.1 {@code bootstrap: multicast}; off by default). When enabled
      * the node announces its listening endpoints on the multicast
-     * {@code group} every {@code interval-millis} and dials peers it hears,
-     * so a LAN fleet needs no seeds; every advertisement learned this way is
-     * still verified on its own terms. The beacon carries seed addresses only.
+     * {@code group} and dials peers it hears, so a LAN fleet needs no seeds;
+     * every advertisement learned this way is still verified on its own
+     * terms. The beacon carries seed addresses only. It announces when it
+     * joins a group, then retries after {@code interval-millis}, 2, 10 and 20
+     * times it, and from the top again (1, 2, 10 and 20 min at the default;
+     * srad/agentspaces-event-loop.md EL-O-11).
      */
     public static class Multicast {
 
@@ -1789,7 +1888,8 @@ public class AgentSpacesProperties {
         public void setSeal(boolean seal) {
             this.seal = seal;
         }
-        private long intervalMillis = 5_000;
+        /** The beacon's first retry interval (EL-O-11); the later ones are 2, 10 and 20 times it. */
+        private long intervalMillis = 60_000;
 
         public boolean isEnabled() {
             return enabled;
@@ -2151,7 +2251,7 @@ public class AgentSpacesProperties {
 
         private String channelAuth;
         private Tls tls = new Tls();
-        private Listener quic = new Listener();
+        private Quic quic = new Quic();
         private Dtls dtls = new Dtls();
         private Udp udp = new Udp();
         private Http ws = new Http("/aspace");
@@ -2443,12 +2543,30 @@ public class AgentSpacesProperties {
         }
 
         /** The QUIC listener block ({@code agentspaces.transport.quic.*}); needs agentspaces-transport-quic. */
-        public Listener getQuic() {
+        public Quic getQuic() {
             return quic;
         }
 
-        public void setQuic(Listener quic) {
+        public void setQuic(Quic quic) {
             this.quic = quic;
+        }
+
+        /** The QUIC block: the listener keys plus the dial bound. */
+        public static class Quic extends Listener {
+
+            private java.time.Duration dialTimeout;
+
+            /**
+             * The bound on a dial's handshake: a dial to a port nobody serves fails after it, 1 ms to 10 min.
+             * Unset: the transport's default ({@code QuicTransport.DEFAULT_DIAL_TIMEOUT}).
+             */
+            public java.time.Duration getDialTimeout() {
+                return dialTimeout;
+            }
+
+            public void setDialTimeout(java.time.Duration dialTimeout) {
+                this.dialTimeout = dialTimeout;
+            }
         }
 
         /** The DTLS listener block ({@code agentspaces.transport.dtls.*}); needs agentspaces-transport-dtls. */
@@ -2525,6 +2643,7 @@ public class AgentSpacesProperties {
             private int mtu = 1_200;
             private int window = 64;
             private java.time.Duration idleTimeout = java.time.Duration.ofSeconds(60);
+            private java.time.Duration dialTimeout;
             private int maxHalfOpen = 1_024;
             private int helloRatePerSource = 8;
 
@@ -2539,6 +2658,19 @@ public class AgentSpacesProperties {
 
             public void setAttestation(String attestation) {
                 this.attestation = attestation;
+            }
+
+            /**
+             * The bound on a dial's handshake (DTLS) or HELLO exchange (bare UDP, which takes this block's datagram
+             * settings): a dial to a peer that never answers fails after it, 1 ms to 10 min. Unset: the transport's
+             * default ({@code DtlsTransport.DEFAULT_DIAL_TIMEOUT}).
+             */
+            public java.time.Duration getDialTimeout() {
+                return dialTimeout;
+            }
+
+            public void setDialTimeout(java.time.Duration dialTimeout) {
+                this.dialTimeout = dialTimeout;
             }
 
             /** DTLS versions offered; DTLSv1.2 is what BouncyCastle negotiates today. */

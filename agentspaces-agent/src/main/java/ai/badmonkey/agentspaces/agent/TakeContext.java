@@ -40,8 +40,14 @@ import java.util.Optional;
  * @param lease     the binding's take lease, the natural renewal extension
  * @param agent     the bound agent running the method
  * @param spaceName the space the entry was taken from
+ * @param renewable whether {@link #renew()} may still renew: false once the binder has stopped renewing the take
+ *                  itself (the hold limit passed, or the agent was unbound), so a library renewing from inside the
+ *                  method (Spring AI's take-lease advisor, LangChain4j's take-lease listener, Embabel's invoker)
+ *                  cannot keep a hung handler's entry past the limit the binder enforces
+ *                  (srad/agentspaces-event-loop.md §10.33, I-05)
  */
-public record TakeContext(TakenEntry<?> taken, Duration lease, AgentId agent, String spaceName) {
+public record TakeContext(TakenEntry<?> taken, Duration lease, AgentId agent, String spaceName,
+                          java.util.function.BooleanSupplier renewable) {
 
     private static final ThreadLocal<TakeContext> CURRENT = new ThreadLocal<>();
 
@@ -51,6 +57,19 @@ public record TakeContext(TakenEntry<?> taken, Duration lease, AgentId agent, St
         Objects.requireNonNull(lease, "lease");
         Objects.requireNonNull(agent, "agent");
         Objects.requireNonNull(spaceName, "spaceName");
+        Objects.requireNonNull(renewable, "renewable");
+    }
+
+    /**
+     * A take with no renewal limit of its own: {@link #renew()} always renews.
+     *
+     * @param taken     the in-flight take
+     * @param lease     the binding's take lease
+     * @param agent     the bound agent
+     * @param spaceName the space the entry was taken from
+     */
+    public TakeContext(TakenEntry<?> taken, Duration lease, AgentId agent, String spaceName) {
+        this(taken, lease, agent, spaceName, () -> true);
     }
 
     /** Returns the take running on this thread, if a worker method is running. */
@@ -83,8 +102,14 @@ public record TakeContext(TakenEntry<?> taken, Duration lease, AgentId agent, St
         return taken.entryId();
     }
 
-    /** Renews the take lease by the binding's lease duration. */
+    /**
+     * Renews the take lease by the binding's lease duration, unless the binder has stopped renewing this take (its
+     * hold limit passed, or its agent was unbound): then nothing is renewed and the lease lapses to another taker, as
+     * the binder's own renewal would let it. Kept {@code void}, so integrations compiled against 0.6.0 still link.
+     */
     public void renew() {
-        taken.renew(lease);
+        if (renewable.getAsBoolean()) {
+            taken.renew(lease);
+        }
     }
 }

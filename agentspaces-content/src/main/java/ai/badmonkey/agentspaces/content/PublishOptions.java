@@ -44,9 +44,12 @@ public record PublishOptions(Lease lease, int pieceSize, String name, String med
         this(lease, pieceSize, name, mediaType, attrs, inPlace, replicate, false);
     }
 
+    /** The default manifest lease (srad/agentspaces-event-loop.md §3.11): renewed below half of it (EL-T-10). */
+    public static final Duration DEFAULT_LEASE = Duration.ofDays(7);
+
     /** Seven days, 1 MiB pieces, no name, copied into the store, replicated. */
     public static PublishOptions defaults() {
-        return new PublishOptions(Lease.of(Duration.ofDays(7)), ContentRoots.DEFAULT_PIECE_SIZE,
+        return new PublishOptions(Lease.of(DEFAULT_LEASE), ContentRoots.DEFAULT_PIECE_SIZE,
                 null, null, null, false, true);
     }
 

@@ -172,6 +172,52 @@ class OrderedTakesClusterTest {
         }
     }
 
+    /** A take on its own thread, so a test can stop it once a rival holds the entry. */
+    private record Taker(Thread thread, CompletableFuture<Optional<TakenEntry<TaskEntry>>> result) {
+        Optional<TakenEntry<TaskEntry>> get() throws Exception {
+            return result.get();
+        }
+    }
+
+    private static Taker takeOn(String name, java.util.function.Supplier<Optional<TakenEntry<TaskEntry>>> take) {
+        CompletableFuture<Optional<TakenEntry<TaskEntry>>> result = new CompletableFuture<>();
+        Thread thread = Thread.ofPlatform().daemon().name("take-" + name).start(() -> {
+            try {
+                result.complete(take.get());
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+        });
+        return new Taker(thread, result);
+    }
+
+    /**
+     * Ticks Raft until one racing take holds the entry, then interrupts the rest and ticks until they return. An
+     * interrupted take submits nothing new and ends its wait for a change; a claim it already has out is still waited
+     * on for its attempt window and handed back when the log grants it, so a second grant still shows as a second
+     * present result. Before, each loser waited out its full timeout (20 s) of wall time after the winner returned.
+     */
+    private static void tickUntilOneWins(List<Member> members, int rounds, Taker... takers) throws Exception {
+        CompletableFuture<?>[] futures = java.util.Arrays.stream(takers).map(Taker::result)
+                .toArray(CompletableFuture<?>[]::new);
+        int i = 0;
+        for (; i < rounds; i++) {
+            members.forEach(m -> m.raft().tick());
+            Thread.sleep(15);
+            boolean won = java.util.Arrays.stream(takers).anyMatch(t -> t.result().isDone()
+                    && !t.result().isCompletedExceptionally() && t.result().join().isPresent());
+            if (won || java.util.Arrays.stream(futures).allMatch(CompletableFuture::isDone)) {
+                break;
+            }
+        }
+        for (Taker taker : takers) {
+            if (!taker.result().isDone()) {
+                taker.thread().interrupt();
+            }
+        }
+        tickUntilDone(members, rounds - i, futures);
+    }
+
     /**
      * The 0.6.0 regression, 2026-11-10: a take whose claim the log commits after the caller's timeout returned empty
      * while the committed claim named the caller, so nobody adopted, drained or completed the entry until the claim's
@@ -213,13 +259,11 @@ class OrderedTakesClusterTest {
         a.space().write(new TaskEntry("commit-me", 1), MINUTES_30);
         assertThat(b.space().read(Template.of(TaskEntry.class))).isPresent();
 
-        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byB = CompletableFuture.supplyAsync(
-                () -> b.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
-                        Duration.ofSeconds(20)));
-        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byC = CompletableFuture.supplyAsync(
-                () -> c.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
-                        Duration.ofSeconds(20)));
-        tickUntilDone(members, 1500, byB, byC);
+        Taker byB = takeOn("b", () -> b.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(20)));
+        Taker byC = takeOn("c", () -> c.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(20)));
+        tickUntilOneWins(members, 1500, byB, byC);
 
         Optional<TakenEntry<TaskEntry>> takenB = byB.get();
         Optional<TakenEntry<TaskEntry>> takenC = byC.get();
@@ -471,13 +515,11 @@ class OrderedTakesClusterTest {
         // is taken, entryIdOf no longer returns it.
         EntryId entry = a.space().entryIdOf(new TaskEntry("determinism", 1)).orElseThrow();
 
-        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byB = CompletableFuture.supplyAsync(
-                () -> b.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
-                        Duration.ofSeconds(20)));
-        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byC = CompletableFuture.supplyAsync(
-                () -> c.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
-                        Duration.ofSeconds(20)));
-        tickUntilDone(members, 1500, byB, byC);
+        Taker byB = takeOn("b", () -> b.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(20)));
+        Taker byC = takeOn("c", () -> c.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(20)));
+        tickUntilOneWins(members, 1500, byB, byC);
         byB.get();
         byC.get();
 
@@ -876,13 +918,11 @@ class OrderedTakesClusterTest {
             network.partition("n" + members.indexOf(survivor), leaderAddr);
         }
 
-        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byX = CompletableFuture.supplyAsync(
-                () -> x.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
-                        Duration.ofSeconds(12)));
-        CompletableFuture<Optional<TakenEntry<TaskEntry>>> byY = CompletableFuture.supplyAsync(
-                () -> y.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
-                        Duration.ofSeconds(12)));
-        tickUntilDone(survivors, 1500, byX, byY);
+        Taker byX = takeOn("x", () -> x.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(12)));
+        Taker byY = takeOn("y", () -> y.ordered().take(Template.of(TaskEntry.class), MINUTES_10,
+                Duration.ofSeconds(12)));
+        tickUntilOneWins(survivors, 1500, byX, byY);
 
         Optional<TakenEntry<TaskEntry>> takenX = byX.get();
         Optional<TakenEntry<TaskEntry>> takenY = byY.get();

@@ -77,13 +77,22 @@ import java.util.function.UnaryOperator;
  *
  * @param <M> the model type
  */
-public final class GossipLearner<M> implements CapabilityProvider {
+public final class GossipLearner<M> implements ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider {
+
+    /** The capability card's time to live (srad/agentspaces-event-loop.md §3.11), as every shipped capability uses. */
+    public static final java.time.Duration ADVERTISEMENT_TTL = java.time.Duration.ofMinutes(15);
 
     /** The capability type URI. */
     public static final String TYPE = "aspace:cap/gossip-learn";
 
     /** Ticks an outstanding offer waits for its reply before it is abandoned. */
     public static final int PENDING_TIMEOUT_TICKS = 3;
+
+    /** The same timeout in time, for a started loop: today's 3 ticks at 250 ms (srad/agentspaces-event-loop.md EL-T-04). */
+    public static final Duration PENDING_TIMEOUT = Duration.ofMillis(750);
+
+    /** On a started loop, one offer per model per this period (owner answer 7, 2026-11-22; the tick offered every 250 ms). */
+    public static final Duration OFFER_PERIOD = Duration.ofSeconds(1);
 
     /** How long a receiver waits for a content-addressed model's block. */
     public static final Duration DEFAULT_BLOCK_FETCH_TIMEOUT = Duration.ofSeconds(5);
@@ -113,6 +122,9 @@ public final class GossipLearner<M> implements CapabilityProvider {
         long round;
         long pendingToken;
         int pendingAge;
+        /** Timed mode: when the outstanding offer went out, and when the last offer did, on the loop's base. */
+        long pendingSentNanos;
+        long lastOfferNanos = Long.MIN_VALUE;
 
         Model(M value) {
             this.value = value;
@@ -263,7 +275,7 @@ public final class GossipLearner<M> implements CapabilityProvider {
     public CapabilityAdvertisement describe(GroupId group) {
         return new CapabilityAdvertisement(
                 "aspace://" + group.value() + "/cap/gossip-learn/" + self.value(),
-                self, group, clock.instant(), Duration.ofMinutes(15),
+                self, group, clock.instant(), ADVERTISEMENT_TTL,
                 TYPE, "0.1", "pipe",
                 Map.of("merge", mergeable.name(),
                         "exchange", "offer-accept",
@@ -286,6 +298,10 @@ public final class GossipLearner<M> implements CapabilityProvider {
         Objects.requireNonNull(modelId, "modelId");
         Objects.requireNonNull(model, "model");
         models.put(modelId, new Model<>(model));
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d != null) {
+            d.wake(); // its first offer is due now (DW-2)
+        }
     }
 
     /**
@@ -299,6 +315,57 @@ public final class GossipLearner<M> implements CapabilityProvider {
     @Override
     public boolean requiresTick() {
         return true;
+    }
+
+    /** The capability participant's driver; null while only {@link #tick()} drives the learner. */
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver;
+
+    @Override
+    public void attach(ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver) {
+        this.driver = driver; // a new model wakes it, and so does a BUSY reply (its retry is sooner); the card is static
+    }
+
+    /**
+     * The learner on a started loop (EL-T-04; owner answer 7): one offer per model every {@link #OFFER_PERIOD} (a refused
+     * one retries sooner, at a random point; see {@code onBusy}), and an
+     * outstanding offer abandoned {@link #PENDING_TIMEOUT} after it went out, judged by time, not by counting steps.
+     */
+    @Override
+    public long run(long now) {
+        long next = ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        long timeout = PENDING_TIMEOUT.toNanos();
+        long period = OFFER_PERIOD.toNanos();
+        for (Map.Entry<String, Model<M>> e : models.entrySet()) {
+            Model<M> model = e.getValue();
+            Outgoing offer = null;
+            synchronized (model) {
+                if (model.pendingToken != 0 && now - model.pendingSentNanos <= timeout) {
+                    // Still waiting for the reply. No run at the timeout: a frame that arrives after it judges it
+                    // (expireLatePending), so the next run that matters is the next offer, a period after this one.
+                    next = Math.min(next, model.lastOfferNanos + period);
+                    continue;
+                }
+                model.pendingToken = 0; // answered, or abandoned: nothing was merged
+                if (model.lastOfferNanos != Long.MIN_VALUE && now - model.lastOfferNanos < period) {
+                    next = Math.min(next, model.lastOfferNanos + period);
+                    continue;
+                }
+                List<PeerId> target = sampler.randomMembers(1);
+                model.lastOfferNanos = now;
+                next = Math.min(next, now + period);
+                if (!target.isEmpty()) {
+                    long token = tokens.incrementAndGet();
+                    model.pendingToken = token;
+                    model.pendingAge = 0;
+                    model.pendingSentNanos = now;
+                    offer = new Outgoing(target.get(0), frame(e.getKey(), token, OFFER, model.round, model.value));
+                }
+            }
+            if (offer != null) {
+                send(offer);
+            }
+        }
+        return next;
     }
 
     @Override
@@ -436,6 +503,7 @@ public final class GossipLearner<M> implements CapabilityProvider {
             return new Outgoing(from, busy); // not participating: unlock the offerer
         }
         synchronized (model) {
+            expireLatePending(model);
             if (model.pendingToken != 0) {
                 return new Outgoing(from, busy); // our own offer is outstanding
             }
@@ -461,6 +529,7 @@ public final class GossipLearner<M> implements CapabilityProvider {
             return;
         }
         synchronized (model) {
+            expireLatePending(model);
             if (model.pendingToken == 0 || model.pendingToken != accept.token()) {
                 return; // stale or unsolicited: the offer it answers is gone
             }
@@ -480,14 +549,46 @@ public final class GossipLearner<M> implements CapabilityProvider {
         }
     }
 
+    /**
+     * On a started loop an outstanding offer is abandoned {@link #PENDING_TIMEOUT} after it went out (EL-T-04): the
+     * participant does not wake at that instant (its next run is the next offer, a second after the last), so a frame
+     * that arrives in between judges the timeout itself. A late accept is then stale, and an offer is answered rather
+     * than refused as busy. Called under the model's lock.
+     */
+    private void expireLatePending(Model<M> model) {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (model.pendingToken != 0 && d != null && d.timed()
+                && d.monoNanos() - model.pendingSentNanos > PENDING_TIMEOUT.toNanos()) {
+            model.pendingToken = 0;
+        }
+    }
+
     private void onBusy(Exchange busy, Model<M> model) {
         if (model == null) {
             return;
         }
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        boolean retry = false;
         synchronized (model) {
             if (model.pendingToken == busy.token()) {
                 model.pendingToken = 0;
+                if (d != null && d.timed()) {
+                    // A refused offer retries at a random point 100 to 500 ms out, not a whole period after the last
+                    // offer: learners whose models started at one instant offer in step, their offers cross, each
+                    // answers BUSY, and in step they would stay (example 14 over TCP; the phase-2 gate of
+                    // srad/agentspaces-event-loop.md, §10.15). The tick hid it: each ticker ran on its own phase.
+                    long period = OFFER_PERIOD.toNanos();
+                    long at = d.monoNanos() + period / 10
+                            + java.util.concurrent.ThreadLocalRandom.current().nextLong(period * 2 / 5);
+                    if (at < model.lastOfferNanos + period) {
+                        model.lastOfferNanos = at - period;
+                        retry = true;
+                    }
+                }
             }
+        }
+        if (retry) {
+            d.wake(); // the next run files the retry's deadline
         }
     }
 

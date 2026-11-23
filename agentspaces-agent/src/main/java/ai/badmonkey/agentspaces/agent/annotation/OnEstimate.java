@@ -27,12 +27,14 @@ import java.lang.annotation.Target;
  * method takes the {@code PushSumAggregate.Estimate} and returns the next act
  * as any bound method does (an entry, a {@code Motion}, a {@code Contribution},
  * or {@code null}). An estimate has settled when it has changed by no more than
- * {@link #tolerance()} (relative) for {@link #settleTicks()} consecutive
- * protocol ticks; {@code settleTicks = 0} fires on the first estimate present.
- * The capability evaluates the rule on its own tick, so no thread polls.
+ * {@link #tolerance()} (relative) for {@link #settle()} (by default 8 s: eight
+ * gossip rounds of about a second); {@code settle = "PT0S"} fires on the first
+ * estimate present. The capability evaluates the rule after each round and at
+ * the estimate's last move plus the span, so no thread polls
+ * (srad/agentspaces-event-loop.md EL-T-06, EL-T-16).
  *
  * <pre>{@code
- * @OnEstimate(prefix = "reserve:", settleTicks = 8)
+ * @OnEstimate(prefix = "reserve:", settle = "PT8S")
  * public ReserveReport report(PushSumAggregate.Estimate reserve) {
  *     return new ReserveReport(reserve.epochId(), reserve.value(), name);
  * }
@@ -45,8 +47,21 @@ public @interface OnEstimate {
     /** Only epochs whose id starts with this prefix; empty means every epoch. */
     String prefix() default "";
 
-    /** Settle steps (gossip rounds, about one a second) the estimate must stay within {@link #tolerance()} to count as settled. */
-    int settleTicks() default 8;
+    /**
+     * How long the estimate must stay within {@link #tolerance()} to count as settled: an ISO-8601 or simple-style
+     * duration ({@code "PT8S"}, {@code "8s"}); empty means the default of 8 s, or {@link #settleTicks()} when given.
+     * Giving both is refused at start-up (srad/agentspaces-event-loop.md EL-T-06).
+     */
+    String settle() default "";
+
+    /**
+     * Settle steps (gossip rounds of about a second) the estimate must stay within {@link #tolerance()}; -1 means not
+     * given. Read as n × {@code ROUND_PERIOD} (1 s; owner answer 1, 2026-11-22).
+     *
+     * @deprecated give {@link #settle()} as a duration
+     */
+    @Deprecated(since = "0.7.0")
+    int settleTicks() default -1;
 
     /** The relative change (of the larger of 1 and the last value) that still counts as unchanged. */
     double tolerance() default 0.001;

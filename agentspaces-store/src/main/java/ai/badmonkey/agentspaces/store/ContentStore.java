@@ -148,8 +148,16 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
     public static final String OP_STATUS = "status";
     public static final String OP_CHALLENGE = "challenge";
 
-    /** How often the store refreshes its card and judges leases, unless the builder says otherwise. */
+    /** How often the store judges lapsed leases and lost races, unless the builder says otherwise. */
     public static final Duration DEFAULT_HOLDING_INTERVAL = Duration.ofSeconds(10);
+    /**
+     * The time to live of a live {@code content-store} card. The card is published again when what it says changes
+     * (free bytes, keyed, waiting) and otherwise at half this (srad/agentspaces-event-loop.md, owner answer 6 of
+     * 2026-11-22), not every holding interval.
+     */
+    public static final Duration CARD_TTL = Duration.ofMinutes(15);
+    /** The default take lease of a pin this store takes (srad/agentspaces-event-loop.md §3.11). */
+    public static final Duration DEFAULT_TAKE_LEASE = Duration.ofMinutes(1);
 
     /** The bytes a {@code challenge} invoke returns at most, base64 in its result. */
     public static final int MAX_INVOKE_CHALLENGE_BYTES = 64 * 1024;
@@ -365,7 +373,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         private Authorizer authorizer;
         private Predicate<PeerId> requesters = peer -> true;
         private Duration holdingInterval = DEFAULT_HOLDING_INTERVAL;
-        private Duration takeLease = Duration.ofMinutes(1);
+        private Duration takeLease = DEFAULT_TAKE_LEASE;
         private Duration fetchTimeout = Duration.ofMinutes(10);
         private Duration reconcileEvery = DEFAULT_RECONCILE_EVERY;
 
@@ -481,9 +489,15 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
             runtime.authorizer(authorizer);
         }
         runtime.start();
+        publishedCard = cardFingerprint();
         refreshedMillis = clock.millis();
         reconciledMillis = refreshedMillis;
+        // The race check shares the card's deadline, so an idle store on a loop wakes once a holding interval, not
+        // twice (EL-T-09); no take has completed at start, so the first check has nothing to look at before then.
+        racesCheckedMillis = refreshedMillis;
         loop = Thread.ofVirtual().name("content-store-" + name).start(this::takeLoop);
+        // A store that joined its loop before it started read NEVER there (not running yet): its deadlines begin now.
+        wakeLoop();
     }
 
     /**
@@ -501,6 +515,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         }
         if (waited && running) {
             LOG.log(System.Logger.Level.INFO, "store " + name + " has an authorizer and admits pins");
+            publishedCard = cardFingerprint();
             runtime.refreshCards();
             refreshedMillis = clock.millis();
         }
@@ -511,7 +526,120 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         return policy.acceptRequesters() == StorePolicy.Accept.GRANT && authorizer == null;
     }
 
-    /** The periodic work, on the group's tick: drives fetches, renews takes, releases lapsed leases, refreshes the card. */
+    /** The step while a take or a repair is in flight: today's cadence. */
+    static final long IN_FLIGHT_STEP_MILLIS = 250;
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Registration loopRegistration;
+
+    private void wakeLoop() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration r = loopRegistration;
+        if (r != null) {
+            r.wake();
+        }
+    }
+
+    /**
+     * Joins a group's loop as one participant (srad/agentspaces-event-loop.md EL-T-08, EL-T-09), in place of
+     * {@code runtime.onTick(store::tick)}: {@link #tick()} runs every 250 ms while a take or a repair is in flight,
+     * and otherwise at the earliest of the card refresh (half {@link #CARD_TTL}, or when the card's content
+     * changed, at most once per {@code holdingInterval}), the race check ({@code holdingInterval}, while a completed take is watched), the first holding's lapse,
+     * the reconcile turn and the earliest consent's {@code notAfter}. A direct run ({@code tick()}) is the same tick.
+     *
+     * @param runtime the store's group
+     * @return the registration; closing it leaves the loop
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration joinLoop(
+            ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime) {
+        java.util.Objects.requireNonNull(runtime, "runtime");
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration = runtime.onDueWall("store", clock, now -> {
+            if (runtime.directRun()) {
+                tick();
+                return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+            }
+            if (!running) {
+                return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+            }
+            if (!inFlight.isEmpty() || !repairs.isEmpty() || now >= timedDueMillis()) {
+                tick();
+                dueTicks.incrementAndGet();
+            }
+            long next = timedDueMillis();
+            if (!inFlight.isEmpty() || !repairs.isEmpty()) {
+                next = Math.min(next, now + IN_FLIGHT_STEP_MILLIS);
+            }
+            return next <= now ? now + IN_FLIGHT_STEP_MILLIS : next;
+        }, ai.badmonkey.agentspaces.peering.node.NodeLoop.Timing.wireVisible(CARD_TTL.dividedBy(2),
+                period -> refreshCardNow())); // EL-O-05, WD-4: the card's re-issue is what a peer judges
+        loopRegistration = registration;
+        return registration;
+    }
+
+    /** Cards the tick published, on a change or at half the TTL; for tests. */
+    private final java.util.concurrent.atomic.AtomicLong cardsPublished = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How many cards the store's tick published, on a change of what the card says or at half its TTL (§10.14); for
+     * tests.
+     *
+     * @return the count
+     */
+    public long cardsPublished() {
+        return cardsPublished.get();
+    }
+
+    /** Runs of the participant that ticked the store; for tests. */
+    private final java.util.concurrent.atomic.AtomicLong dueTicks = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How many runs of the loop participant ticked the store (EL-T-08); for tests.
+     *
+     * @return the count
+     */
+    public long dueTicks() {
+        return dueTicks.get();
+    }
+
+    /**
+     * The refresh action of the store's participant (srad/agentspaces-event-loop.md EL-O-05, WD-4): the card is
+     * re-issued now, with its full {@link #CARD_TTL}, before the loop stretches the participant's period or runs its
+     * first run after a re-initialisation that found the card's refresh overdue. The stretch is capped at half the
+     * TTL, so the re-issued card covers twice any stretched period.
+     */
+    private void refreshCardNow() {
+        if (!running) {
+            return;
+        }
+        refreshedMillis = clock.millis();
+        publishedCard = cardFingerprint();
+        runtime.refreshCards();
+        cardsPublished.incrementAndGet();
+    }
+
+    /** The earliest deadline of the tick's timed work (EL-T-09). */
+    private long timedDueMillis() {
+        long hold = holdingInterval.toMillis();
+        long next = refreshedMillis + CARD_TTL.toMillis() / 2;
+        if (!cardFingerprint().equals(publishedCard)) {
+            // what the card says changed (a pin, or an unpin by invoke): publish now, or one holding interval after the
+            // last card if that is later (§10.14)
+            next = Math.min(next, refreshedMillis + hold);
+        }
+        if (!completedTakes.isEmpty()) {
+            next = Math.min(next, racesCheckedMillis + hold);
+        }
+        long until = ledger.earliestUntilMillis();
+        if (until != Long.MAX_VALUE) {
+            next = Math.min(next, until + hold + 1); // lapsed(now - hold) releases it then
+        }
+        if (!reconcileEvery.isZero() && reconciling == null) {
+            next = Math.min(next, reconciledMillis + reconcileEvery.toMillis());
+        }
+        for (Consent consent : consentsTaken) {
+            next = Math.min(next, consent.notAfter() + 1);
+        }
+        return next;
+    }
+
+    /** The periodic work, on the group's loop (see joinLoop) or a direct tick: drives fetches, renews takes, releases lapsed leases, refreshes the card. */
     public void tick() {
         if (!running) {
             return;
@@ -542,9 +670,16 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
                 });
             });
         }
-        if (now - refreshedMillis >= holdingInterval.toMillis()) {
+        String fingerprint = cardFingerprint();
+        if (now - refreshedMillis >= CARD_TTL.toMillis() / 2
+                || (!fingerprint.equals(publishedCard) && now - refreshedMillis >= holdingInterval.toMillis())) {
+            // owner answer 6 (2026-11-22): on a change of what the card says, and at half its time to live. A change
+            // republishes at most once per holding interval (§10.14): every pin moves free, and a burst of pins would
+            // otherwise sign and gossip a card on every 250 ms run, where the store before phase 2 sent one per interval
             refreshedMillis = now;
+            publishedCard = fingerprint;
             runtime.refreshCards();
+            cardsPublished.incrementAndGet();
         }
         if (now - racesCheckedMillis >= holdingInterval.toMillis()) {
             // once a holding interval, as the card: a claim that lost reaches this store by anti-entropy, which is
@@ -639,7 +774,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         // withdrawn: a last card with no free bytes supersedes the live one and lapses after two holding
         // intervals, since a cache refuses a card that arrives expired
         return List.of(withdrawn ? card(group, issuer, now, holdingInterval.multipliedBy(2), name, policy, 0,
-                content.keyRing().isPresent(), holdingInterval, waiting()) : card(group, issuer, now, Duration.ofMinutes(15)));
+                content.keyRing().isPresent(), holdingInterval, waiting()) : card(group, issuer, now, CARD_TTL));
     }
 
     /** This store's card now. */
@@ -867,6 +1002,14 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         return Math.max(0, policy.usableBytes() - ledger.usedBytes());
     }
 
+    /** What the live card says that can change while the store runs; the card is published again when it moves. */
+    private String cardFingerprint() {
+        return free() + "|" + content.keyRing().isPresent() + "|" + waiting();
+    }
+
+    /** The fingerprint of the card last published; null before the first. */
+    private volatile String publishedCard;
+
     // ------------------------------------------------------------ reconciling (P2-K-03)
 
     /**
@@ -917,6 +1060,9 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
             started[0] = true;
             return StorePin.KIND_TREE.equals(held.kind()) ? content.fetchTree(root, List.of(), options) : content.fetch(root, options);
         });
+        if (started[0]) {
+            wakeLoop(); // the participant steps the repair (EL-L-03)
+        }
         return started[0];
     }
 
@@ -956,6 +1102,15 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
 
     // ------------------------------------------------------------ taking pins
 
+    /**
+     * The pause between scans, on the store's time source (srad/agentspaces-event-loop.md group W): real time on the
+     * system clock, as before; on a virtual one an advance ends it, so a sim fleet's store scans once per tick of fleet
+     * time and its clock never outruns the scans.
+     */
+    private void pauseScan() throws InterruptedException {
+        ai.badmonkey.agentspaces.common.time.Waits.base(clock).sleep(SCAN_PAUSE);
+    }
+
     private void takeLoop() {
         while (running) {
             try {
@@ -968,7 +1123,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
                     }
                 }
                 if (wanted.isEmpty()) {
-                    Thread.sleep(SCAN_PAUSE);
+                    pauseScan();
                     continue;
                 }
                 Optional<TakenEntry<SignedPin>> took = space.take(Template.of(SignedPin.class)
@@ -985,7 +1140,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
                 // an authorizer or a space that fails costs one scan a pause, as an idle scan does
                 LOG.log(System.Logger.Level.WARNING, "store " + name + ": taking pins failed", e);
                 try {
-                    Thread.sleep(SCAN_PAUSE);
+                    pauseScan();
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     return;
@@ -1131,6 +1286,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         if (inFlight.putIfAbsent(pin.root(), f) != null) {
             return;
         }
+        wakeLoop(); // the participant steps the take (EL-L-03)
         if (ledger.holds(pin.root())) {
             finish(f, now);
             return;
@@ -1275,6 +1431,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         if (!unhold(held)) {
             return;
         }
+        wakeLoop(); // the card's free bytes moved: its next run publishes it (owner answer 6)
         released.incrementAndGet();
         LOG.log(System.Logger.Level.INFO, "store " + name + " released " + held.root() + " for "
                 + held.requester().display() + ": " + why);

@@ -35,12 +35,22 @@ final class QuicBlocks {
     private QuicBlocks() {
     }
 
-    static Transport build(PeerIdentity identity, ServingCredential serving, Supplier<ChannelTrust> trust) {
+    static Transport build(PeerIdentity identity, AgentSpacesProperties.Transport.Quic block, ServingCredential serving,
+                           Supplier<ChannelTrust> trust) {
+        QuicTransport transport;
         try {
-            return trust == null ? new QuicTransport(identity)
+            transport = trust == null ? new QuicTransport(identity)
                     : QuicTransport.withRefreshableTrust(identity, serving, trust);
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("cannot create the QUIC channel credential", e);
         }
+        if (block.getDialTimeout() != null) {
+            try {
+                transport.dialTimeout(block.getDialTimeout());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("agentspaces.transport.quic.dial-timeout: " + e.getMessage(), e);
+            }
+        }
+        return transport;
     }
 }

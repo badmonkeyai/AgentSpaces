@@ -135,7 +135,7 @@ public final class ContentStores {
         }
         ContentStore store = builder.build();
         store.start();
-        runtime.onTick(store::tick);
+        store.joinLoop(runtime); // its own deadlines on the loop (srad/agentspaces-event-loop.md EL-T-09)
         runtime.onClose(store::close);
         node.closeWith(store::close);
         byGroup.put(groupName, store);

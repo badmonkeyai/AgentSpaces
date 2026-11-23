@@ -217,10 +217,11 @@ public final class RemoteAction {
         ai.badmonkey.agentspaces.api.space.EntryHandle written = null;
         try {
             written = tags.isEmpty() ? taskSpace.write(input, writeLease) : taskSpace.write(input, writeLease, tags);
-            long deadline = System.nanoTime() + timeout.toNanos();
+            // The caller's timeout, waited out with real sleeps: on the system's time source (EL-C-08).
+            long deadline = ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos() + timeout.toNanos();
             // The poll backstop backs off from 100 ms to 2 s (review §7.5, A5); a subscription event resets it.
             long backoffMillis = 100;
-            while (System.nanoTime() < deadline) {
+            while (ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos() < deadline) {
                 Object event;
                 while ((event = observed.poll()) != null) {
                     if (correlation.matches(input, event)) {
@@ -237,7 +238,7 @@ public final class RemoteAction {
                         return Optional.of(candidate);
                     }
                 }
-                long remaining = Math.max(1, (deadline - System.nanoTime()) / 1_000_000);
+                long remaining = Math.max(1, (deadline - ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos()) / 1_000_000);
                 sleep(Duration.ofMillis(Math.min(backoffMillis, remaining)));
                 backoffMillis = observed.isEmpty() ? Math.min(backoffMillis * 2, 2_000) : 100;
             }

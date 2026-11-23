@@ -26,7 +26,7 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.test.FleetInvariants;
 import ai.badmonkey.agentspaces.test.FleetProbe;
 import ai.badmonkey.agentspaces.test.SimNetwork;
-import ai.badmonkey.agentspaces.test.TestClock;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -49,6 +49,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * its quiet points: every live member's view is exactly the live set, every inventory is the
  * same set, no honest member is quarantined anywhere, no node holds more connections than it
  * has members, and the bounded caches stayed bounded.
+ *
+ * <p>Every node runs its own loop on one {@link VirtualTime} (srad/agentspaces-event-loop.md EL-Q-TST-03): a round
+ * moves the time a second and each node runs what falls due in it, as a deployed node does, where a round once ran
+ * every participant of every node by hand.
  */
 final class RobustnessFleet {
 
@@ -84,7 +88,12 @@ final class RobustnessFleet {
         }
     }
 
-    final TestClock clock = TestClock.create();
+    /** The node loops' period: the product's tick-millis. */
+    static final Duration LOOP_PERIOD = Duration.ofMillis(250);
+    /** One round of fleet time. */
+    static final Duration ROUND = Duration.ofSeconds(1);
+
+    final VirtualTime clock = VirtualTime.create();
     final SimNetwork network = new SimNetwork();
     final GroupId groupId;
     final GroupAdvertisement groupAd;
@@ -113,6 +122,7 @@ final class RobustnessFleet {
         PeerIdentity identity = identities.computeIfAbsent(address, a -> PeerIdentity.generate());
         PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seeds++).channelAuth(mode)
                 .lazyPush(lazyPush).build();
+        node.startTicking(LOOP_PERIOD); // its own loop on the fleet's virtual time
         node.listen(network.register(address), address);
         GroupRuntime runtime = node.joinGroup(groupAd, config, seedAddress == null ? List.of()
                 : List.of(new PeerAdvertisement.Endpoint("mem", seedAddress, 0)));
@@ -148,12 +158,10 @@ final class RobustnessFleet {
         runtimes.get(from).gossip().publish("news", text, text.getBytes(StandardCharsets.UTF_8));
     }
 
+    /** Moves the fleet's time a round at a time; every node's loop runs what falls due on the way. */
     void tickAll(int rounds) {
         for (int i = 0; i < rounds; i++) {
-            for (PeerNode node : List.copyOf(nodes.values())) {
-                node.tick();
-            }
-            clock.advance(Duration.ofSeconds(1));
+            clock.advance(ROUND);
         }
     }
 

@@ -112,4 +112,41 @@ class TakeContextTest {
         }
         assertThat(TakeContext.current()).isEmpty();
     }
+
+    /** A worker that holds its take until released, as a handler inside a long model call does. */
+    @AgentSpec(name = "holder", description = "Holds its take")
+    public static class Holder {
+        final AtomicReference<TakeContext> seen = new AtomicReference<>();
+        final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+
+        @SpaceTake(space = "tasks", lease = "2m", pollTimeout = "PT0.1S")
+        public FindingEntry work(TaskEntry task) throws InterruptedException {
+            seen.set(TakeContext.current().orElseThrow());
+            release.await();
+            return new FindingEntry(task.topic(), "held");
+        }
+    }
+
+    /**
+     * srad/agentspaces-event-loop.md §10.33 (I-05): a renewal from inside a {@code @SpaceTake} method (a model call's
+     * take-lease advisor) ends with the binding, as the ordered path's renewal does, so an unbound agent's hung
+     * handler cannot keep its entry. Before, the context renewed for as long as the handler ran.
+     */
+    @Test
+    @Timeout(20)
+    void aTakeContextStopsRenewingOnceItsAgentIsUnbound() throws Exception {
+        Holder holder = new Holder();
+        AgentBinder.Bound bound = binder.bind(holder);
+        tasks.write(new TaskEntry("held", 1), Lease.of(Duration.ofMinutes(5)));
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (holder.seen.get() == null && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        TakeContext context = holder.seen.get();
+        assertThat(context).as("the handler is running").isNotNull();
+        assertThat(context.renewable().getAsBoolean()).as("renewable while bound").isTrue();
+        bound.close();
+        assertThat(context.renewable().getAsBoolean()).as("not after the binding closed").isFalse();
+        holder.release.countDown();
+    }
 }

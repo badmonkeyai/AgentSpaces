@@ -32,6 +32,7 @@ import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
 import ai.badmonkey.agentspaces.capabilities.vote.VoteCapability;
 import org.junit.jupiter.api.AfterEach;
+import ai.badmonkey.agentspaces.measure.Measure;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -236,11 +237,14 @@ class AgentBinderTest {
         }
     }
 
-    private static void await(BooleanSupplier condition, Duration timeout) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
-            Thread.sleep(25);
-        }
+    /** A measured wait (srad/feature-measurements.md §3.5); the vote tests assert what they waited for next. */
+    private static void await(BooleanSupplier condition, Duration timeout) {
+        Measure.await("agent.vote.condition", ceiling(timeout), condition);
+    }
+
+    /** The helper's liveness cap: at least the 30 s policy floor. */
+    private static Duration ceiling(Duration timeout) {
+        return timeout.compareTo(Duration.ofSeconds(30)) < 0 ? Duration.ofSeconds(30) : timeout;
     }
 
     // ------------------------------------------------------- QA4 A4-7 phase 3: agents with keys of their own
@@ -477,12 +481,9 @@ class AgentBinderTest {
             tasks.write(new TaskEntry("topic-" + i, i), Lease.of(Duration.ofMinutes(10)));
         }
 
-        List<FindingEntry> findings = List.of();
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        while (findings.size() < 3 && System.nanoTime() < deadline) {
-            findings = tasks.readAll(Template.of(FindingEntry.class), 10);
-            Thread.sleep(50);
-        }
+        Measure.await("agent.take.three-results", Duration.ofSeconds(30),
+                () -> tasks.readAll(Template.of(FindingEntry.class), 10).size() >= 3);
+        List<FindingEntry> findings = tasks.readAll(Template.of(FindingEntry.class), 10);
 
         assertThat(findings).hasSize(3);
         assertThat(researcher.seen).containsExactlyInAnyOrder("topic-0", "topic-1", "topic-2");
@@ -498,12 +499,9 @@ class AgentBinderTest {
 
         tasks.write(new TaskEntry("fragile", 1), Lease.of(Duration.ofMinutes(10)));
 
-        List<FindingEntry> findings = List.of();
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        while (findings.isEmpty() && System.nanoTime() < deadline) {
-            findings = tasks.readAll(Template.of(FindingEntry.class), 10);
-            Thread.sleep(50);
-        }
+        Measure.await("agent.take.one-result", Duration.ofSeconds(30),
+                () -> !tasks.readAll(Template.of(FindingEntry.class), 10).isEmpty());
+        List<FindingEntry> findings = tasks.readAll(Template.of(FindingEntry.class), 10);
 
         assertThat(findings).hasSize(1);
         assertThat(findings.get(0).summary()).isEqualTo("recovered on attempt 2");
@@ -519,10 +517,7 @@ class AgentBinderTest {
 
         tasks.write(new TaskEntry("observed", 1), Lease.of(Duration.ofMinutes(10)));
 
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (watcher.written.isEmpty() && System.nanoTime() < deadline) {
-            Thread.sleep(20);
-        }
+        Measure.await("agent.notify.written", Duration.ofSeconds(30), () -> !watcher.written.isEmpty());
 
         assertThat(watcher.written).containsExactly("observed");
         assertThat(tasks.read(Template.of(TaskEntry.class))).isPresent();
@@ -657,13 +652,10 @@ class AgentBinderTest {
 
         tasks.write(new TaskEntry("zero-config", 1), Lease.of(Duration.ofMinutes(10)));
 
-        List<FindingEntry> findings = List.of();
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        while (findings.stream().noneMatch(f -> f.summary().startsWith("worked:"))
-                && System.nanoTime() < deadline) {
-            findings = tasks.readAll(Template.of(FindingEntry.class), 10);
-            Thread.sleep(50);
-        }
+        Measure.await("agent.take.zero-config-result", Duration.ofSeconds(30),
+                () -> tasks.readAll(Template.of(FindingEntry.class), 10).stream()
+                        .anyMatch(f -> f.summary().startsWith("worked:")));
+        List<FindingEntry> findings = tasks.readAll(Template.of(FindingEntry.class), 10);
         assertThat(findings).extracting(FindingEntry::summary)
                 .contains("worked: zero-config");
         // The @SpaceRef handle wrote the mid-method progress marker too.
@@ -680,12 +672,9 @@ class AgentBinderTest {
 
         tasks.write(new TaskEntry("choreographed", 1), Lease.of(Duration.ofMinutes(10)));
 
-        List<FindingEntry> findings = List.of();
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (findings.isEmpty() && System.nanoTime() < deadline) {
-            findings = tasks.readAll(Template.of(FindingEntry.class), 10);
-            Thread.sleep(20);
-        }
+        Measure.await("agent.notify.result-written", Duration.ofSeconds(30),
+                () -> !tasks.readAll(Template.of(FindingEntry.class), 10).isEmpty());
+        List<FindingEntry> findings = tasks.readAll(Template.of(FindingEntry.class), 10);
 
         // React-and-write in one method: the return value became the next entry,
         // the reacted-to entry was not consumed, and the reaction ran on the
@@ -1137,15 +1126,8 @@ class AgentBinderTest {
 
     // ------------------------------------------------------------------ helpers
 
-    private static void awaitTrue(BooleanSupplier condition, Duration timeout)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
-            }
-            Thread.sleep(20);
-        }
+    private static void awaitTrue(BooleanSupplier condition, Duration timeout) {
+        Measure.await("agent.binder.condition", ceiling(timeout), condition);
     }
 
     /**

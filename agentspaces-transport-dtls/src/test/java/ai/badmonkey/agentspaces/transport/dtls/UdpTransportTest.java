@@ -132,13 +132,19 @@ class UdpTransportTest {
     @Test
     @Timeout(30)
     void anUnansweredHelloFailsTheDial() throws Exception {
-        UdpTransport dialer = new UdpTransport();
+        // A short dial timeout (the 10 s default is pinned in DtlsTransportTest without waiting it out): the dial
+        // fails at the bound, judged relative to it.
+        java.time.Duration timeout = java.time.Duration.ofMillis(1_500);
+        UdpTransport dialer = new UdpTransport().dialTimeout(timeout);
         closeables.add(dialer);
         // A socket that holds the port and never answers, so the dial ends at its timeout and not by a port unreachable.
         DatagramSocket silent = new DatagramSocket(new java.net.InetSocketAddress("127.0.0.1", 0));
         closeables.add(silent);
+        long start = System.nanoTime();
         assertThatThrownBy(() -> dialer.dial("127.0.0.1:" + silent.getLocalPort()))
                 .isInstanceOf(java.io.IOException.class).hasMessageContaining("over UDP: no HELLO_ACK");
+        java.time.Duration took = java.time.Duration.ofNanos(System.nanoTime() - start);
+        assertThat(took).isGreaterThanOrEqualTo(timeout.minusMillis(50)).isLessThan(timeout.plusSeconds(5));
     }
 
     @Test

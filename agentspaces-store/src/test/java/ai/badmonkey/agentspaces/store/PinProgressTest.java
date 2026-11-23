@@ -78,8 +78,7 @@ class PinProgressTest {
         long start = fleet.clock.millis();
         while (!s.contentStore().ledger().holds(root) && fleet.clock.millis() - start < 60_000) {
             fleet.settle(4);
-            deliverHeld("writer", "slow-store");
-            Thread.sleep(20); // the store's take loop runs on its own thread
+            deliverHeld("writer", "slow-store"); // the store's take loop settles with each tick
         }
         long took = fleet.clock.millis() - start;
         assertThat(s.contentStore().ledger().holds(root)).as("held after %d ms: %s", took, s.contentStore().status()).isTrue();

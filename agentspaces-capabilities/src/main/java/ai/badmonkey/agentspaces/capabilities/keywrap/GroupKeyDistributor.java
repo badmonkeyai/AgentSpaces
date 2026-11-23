@@ -74,7 +74,10 @@ import java.util.function.Predicate;
  *
  * <p>Authorization stays a policy the deployment supplies (P6).
  */
-public final class GroupKeyDistributor implements CapabilityProvider {
+public final class GroupKeyDistributor implements ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider {
+
+    /** The capability card's time to live (srad/agentspaces-event-loop.md §3.11), as every shipped capability uses. */
+    public static final java.time.Duration ADVERTISEMENT_TTL = java.time.Duration.ofMinutes(15);
 
     private static final System.Logger LOG = System.getLogger(GroupKeyDistributor.class.getName());
 
@@ -229,7 +232,7 @@ public final class GroupKeyDistributor implements CapabilityProvider {
         }
         return new CapabilityAdvertisement(
                 "aspace://" + group.value() + "/cap/key-wrap/" + self.value(),
-                self, group, clock.instant(), Duration.ofMinutes(15),
+                self, group, clock.instant(), ADVERTISEMENT_TTL,
                 TYPE, "0.2", "pipe", Map.copyOf(parameters), Map.of());
     }
 
@@ -380,6 +383,7 @@ public final class GroupKeyDistributor implements CapabilityProvider {
                     + pipes.group().value() + " in a ring no keystore persists: it is lost on"
                     + " restart unless another member holds it");
         }
+        wakeDue(); // the ring moved: the participant republishes the card in its next run (EL-T-07)
         return epoch;
     }
 
@@ -402,6 +406,7 @@ public final class GroupKeyDistributor implements CapabilityProvider {
             throw new IllegalArgumentException("rotation period must be positive and delay non-negative");
         }
         this.autoRotation = new AutoRotation(rotator, every, cutoverDelay, clock.instant());
+        wakeDue(); // a rotation deadline now exists
         return this;
     }
 
@@ -475,12 +480,19 @@ public final class GroupKeyDistributor implements CapabilityProvider {
             throw new IllegalStateException("this distributor already serves another ring");
         }
         ring.onMissingEpoch(this::fetchInBackground);
+        listen();
+        wakeDue();
         return this;
     }
 
     @Override
     public void tick() {
         autoRotateIfDue();
+        walkHolders();
+    }
+
+    /** Follows the holders' advertisements: announced cutovers and the epochs this ring lacks. */
+    private void walkHolders() {
         DiscoveryService watched = discovery;
         GroupKeyRing followed = ring;
         if (watched == null || followed == null) {
@@ -554,8 +566,87 @@ public final class GroupKeyDistributor implements CapabilityProvider {
                 }
             } finally {
                 fetching.remove(epoch);
+                wakeDue(); // the ring may hold a new epoch: the participant republishes the card
             }
         });
+    }
+
+    // ------------------------------------------------------------ due work (srad/agentspaces-event-loop.md EL-T-07)
+
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver;
+    private final java.util.concurrent.atomic.AtomicLong adChanges = new java.util.concurrent.atomic.AtomicLong();
+    private long adChangesSeen = -1;
+    private String ringSeen;
+    private volatile AutoCloseable discoveryListener;
+
+    @Override
+    public void attach(ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver) {
+        this.driver = Objects.requireNonNull(driver, "driver");
+        listen();
+    }
+
+    /** Wakes the participant when a holder's advertisement moves (DW-2): no 250 ms walk of the cache. */
+    private void listen() {
+        DiscoveryService watched = discovery;
+        if (watched != null && driver != null && discoveryListener == null) {
+            discoveryListener = watched.onChange(() -> {
+                adChanges.incrementAndGet();
+                wakeDue();
+            });
+        }
+    }
+
+    private void wakeDue() {
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d != null) {
+            d.wake();
+        }
+    }
+
+    /** What this peer's card says about the ring: the epochs and the newest cutover. */
+    private String ringFingerprint() {
+        GroupKeyRing held = ring;
+        if (held == null) {
+            return "";
+        }
+        long newest = held.newestEpoch();
+        return held.epochs() + "|" + held.cutover(newest).map(Instant::toString).orElse("");
+    }
+
+    /**
+     * The distributor on a started loop (EL-T-07): the holders' advertisements are walked only when the cache moved
+     * (or on the first run), a rotation runs at its deadline when this peer rotates, and the card is republished when
+     * the ring's epochs or cutover moved. No 250 ms polling.
+     */
+    @Override
+    public long run(long now) {
+        autoRotateIfDue();
+        long changes = adChanges.get();
+        if (changes != adChangesSeen) {
+            adChangesSeen = changes;
+            walkHolders();
+        }
+        String fingerprint = ringFingerprint();
+        if (!fingerprint.equals(ringSeen)) {
+            boolean first = ringSeen == null;
+            ringSeen = fingerprint;
+            ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+            if (!first && d != null) {
+                d.describeChanged();
+            }
+        }
+        AutoRotation schedule = autoRotation;
+        GroupKeyRing held = ring;
+        if (schedule == null || held == null || !rotators.test(self)) {
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        long newest = held.newestEpoch();
+        Instant since = newest <= 0 ? schedule.since() : held.cutover(newest).orElse(schedule.since());
+        long ahead = since.plus(schedule.every()).toEpochMilli() - clock.millis();
+        // Still due after this run's rotation means the rotation did not take (it moves the cutover ahead): retry at the
+        // legacy step rather than at once, which would spin the loop.
+        return ahead <= 0 ? now + 250_000_000L
+                : now + Math.min(ahead, ai.badmonkey.agentspaces.common.time.TimeSources.MAX_DUE_AHEAD_MILLIS) * 1_000_000L;
     }
 
     private static int heldKeys(GroupKeyRing ring, long epoch) {

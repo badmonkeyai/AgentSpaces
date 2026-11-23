@@ -225,7 +225,8 @@ class EmbabelAgentSpacesAutoConfigurationTest {
         ConditionalOnProperty condition = EmbabelAgentSpacesAutoConfiguration.class
                 .getMethod("embabelRemoteActionsDeployer",
                         org.springframework.beans.factory.ObjectProvider.class,
-                        org.springframework.beans.factory.ObjectProvider.class)
+                        org.springframework.beans.factory.ObjectProvider.class,
+                        org.springframework.beans.factory.ObjectProvider.class) // properties, bridges, the clock
                 .getAnnotation(ConditionalOnProperty.class);
         assertThat(condition).isNotNull();
         assertThat(condition.prefix()).isEqualTo("agentspaces.embabel");

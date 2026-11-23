@@ -15,6 +15,8 @@
  */
 package ai.badmonkey.agentspaces.common.crypto;
 
+import ai.badmonkey.agentspaces.common.time.TimeSource;
+
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -315,6 +317,19 @@ public final class GroupKeyRing {
         installListeners.add(Objects.requireNonNull(listener, "listener"));
     }
 
+    /**
+     * As {@link #onInstalled}, with a handle that removes the listener: a replicated space wakes its waiting takes and
+     * reads when a key arrives for a sealed payload (srad/agentspaces-event-loop.md EL-W-07), and stops when it closes.
+     *
+     * @param listener the listener; it must be quick
+     * @return the handle that removes it
+     */
+    public AutoCloseable onInstall(java.util.function.Consumer<Held> listener) {
+        java.util.function.Consumer<Held> l = Objects.requireNonNull(listener, "listener");
+        installListeners.add(l);
+        return () -> installListeners.remove(l);
+    }
+
     private volatile boolean persistent;
 
     /** Marks the ring as saved on every install, so minted epochs survive a restart. */
@@ -354,7 +369,7 @@ public final class GroupKeyRing {
     }
 
     private void reportMissing(long epoch) {
-        long now = System.nanoTime();
+        long now = TimeSource.system().monoNanos(); // a local throttle (EL-C-08)
         boolean[] due = {false};
         // Atomic per epoch, and bounded: the epoch numbers come from member-signed
         // records, so the map must not grow with whatever numbers they name.

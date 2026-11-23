@@ -183,17 +183,32 @@ public final class ClaimsFlow {
      * and the auction.
      */
     public static List<AutoCloseable> staff(Peer a, Peer b, Peer c, Intake.Hook hook) {
-        return staff(a, b, c, hook, true, true, Duration.ofSeconds(10));
+        return staff(a, b, c, hook, true, true, Duration.ofSeconds(10), true);
     }
 
     /** The fleet with no panelists at all and a short reminder, so the deadline shows. */
     public static List<AutoCloseable> staffWithoutPanel(Peer a, Peer b, Peer c, Intake.Hook hook,
                                                         Duration reminderLease) {
-        return staff(a, b, c, hook, true, false, reminderLease);
+        return staff(a, b, c, hook, true, false, reminderLease, true);
+    }
+
+    /**
+     * The fleet of {@link #staff} (or, with {@code orderedJoin}, of {@link #staffWithOrderedJoin}) without the
+     * supervisor, for a caller that binds its own: the supervisor's forty settled rounds are the demo's pacing, and a
+     * test binds one with a short settle once the estimate has converged instead of waiting them out.
+     */
+    static List<AutoCloseable> staffWithoutSupervisor(Peer a, Peer b, Peer c, Intake.Hook hook, boolean orderedJoin) {
+        List<AutoCloseable> bound = new ArrayList<>(staff(a, b, c, hook, !orderedJoin, true, Duration.ofSeconds(10),
+                false));
+        if (orderedJoin) {
+            bindOrderedAssemblers(a, b, bound);
+        }
+        return bound;
     }
 
     private static List<AutoCloseable> staff(Peer a, Peer b, Peer c, Intake.Hook hook,
-                                             boolean localJoiner, boolean panel, Duration reminderLease) {
+                                             boolean localJoiner, boolean panel, Duration reminderLease,
+                                             boolean supervisor) {
         List<AutoCloseable> bound = new ArrayList<>();
         bound.add(a.group().bind(new Intake.Registrar("registrar-a", hook)));
         bound.add(b.group().bind(new Intake.Registrar("registrar-b", hook)));
@@ -227,7 +242,9 @@ public final class ClaimsFlow {
         }
         bound.add(c.group().bind(new Settlement.Ledger()));
         bound.add(c.group().bind(new Settlement.Exposure()));
-        bound.add(c.group().bind(new Settlement.Supervisor("supervisor")));
+        if (supervisor) {
+            bound.add(c.group().bind(new Settlement.Supervisor("supervisor")));
+        }
         return bound;
     }
 
@@ -236,10 +253,14 @@ public final class ClaimsFlow {
      * of one {@code LOCAL} joiner; the joiners' tickets ride the payments log.
      */
     public static List<AutoCloseable> staffWithOrderedJoin(Peer a, Peer b, Peer c, Intake.Hook hook) {
-        List<AutoCloseable> bound = new ArrayList<>(staff(a, b, c, hook, false, true, Duration.ofSeconds(10)));
+        List<AutoCloseable> bound = new ArrayList<>(staff(a, b, c, hook, false, true, Duration.ofSeconds(10), true));
+        bindOrderedAssemblers(a, b, bound);
+        return bound;
+    }
+
+    private static void bindOrderedAssemblers(Peer a, Peer b, List<AutoCloseable> bound) {
         bound.add(a.group().bind(new Intake.OrderedAssembler("assembler-a")));
         bound.add(b.group().bind(new Intake.OrderedAssembler("assembler-b")));
-        return bound;
     }
 
     /** A hook that throws once, on the first claim any registrar takes. */

@@ -369,8 +369,7 @@ public final class PersistentValuesFleet {
         ReplicatedSpace plans = null;
         if (refs) {
             pdt.attach(content).start();
-            Pdt facade = pdt;
-            runtime.onTick(facade::tick);
+            pdt.joinLoop(runtime); // its own deadlines on the node's loop (srad/agentspaces-event-loop.md EL-T-08)
             swarm = pdt.swarm();
             // the opted-in space: trees above the threshold, the flat swarm when a member lacks the exchange (PD-E-06)
             plans = ReplicatedSpace.builder(runtime, PLANS_SPACE, identity, "plans")
@@ -379,6 +378,9 @@ public final class PersistentValuesFleet {
         } else {
             swarm = PdtSwarm.attach(content, store, LOAD_TIMEOUT);
         }
+        // Open (srad/agentspaces-event-loop.md §10.29): this example keeps its fixed-rate ticker. On the node's own loop
+        // its DTLS bindings test failed in 1 of about 6 runs (12 of 12 green on this ticker): a reader's tree fetches got
+        // no node from any holder for 120 s. Until that is root-caused the example drives its node by hand.
         ScheduledExecutorService ticker = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "tick-" + name);
             t.setDaemon(true);

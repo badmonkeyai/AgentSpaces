@@ -279,6 +279,45 @@ class EmbabelRemoteActionsTest {
         }
     }
 
+    /**
+     * srad/agentspaces-event-loop.md EL-X-03, EL-C-06, audit I-19: the deployer's checks are one-shots on its time
+     * source, re-armed after each run, so virtual time drives them: no check runs before the poll interval passes,
+     * one runs when it does, and a stopped deployer arms nothing more.
+     */
+    @Test
+    @Timeout(60)
+    void theDeployerRunsOnItsTimeSourceWithNoThreadOfItsOwn() throws Exception {
+        Peer lonely = startPeer(freePort(), 0);
+        RemoteActions remote = new RemoteActions(lonely.discovery(),
+                lonely.identity().peerId(), Map.of("work", lonely.work()));
+        EmbabelRemoteActions bridge = new EmbabelRemoteActions(remote,
+                Duration.ofSeconds(1), "remoteFleet", "virtual");
+        List<Object> deployed = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentPlatform platform = deployed::add;
+        ai.badmonkey.agentspaces.test.VirtualTime virtual = ai.badmonkey.agentspaces.test.VirtualTime.startingAt(Instant.now());
+        try (EmbabelRemoteActionsDeployer deployer =
+                     new EmbabelRemoteActionsDeployer(bridge, Duration.ofSeconds(30)).time(virtual)
+                             .minInterval(Duration.ZERO).absenceGrace(Duration.ZERO)) {
+            deployer.deployWhenReady(platform);
+            deployer.start();
+            virtual.runDue();
+            assertThat(deployed).as("nothing advertised, nothing deployed").isEmpty();
+            assertThat(Thread.getAllStackTraces().keySet()).noneMatch(
+                    t -> t.getName().startsWith("embabel-remote-actions-deployer"));
+
+            publishForeignCard(lonely, PeerIdentity.generate(), "researcher");
+            virtual.advance(Duration.ofSeconds(29));
+            assertThat(deployer.deployments()).as("the next check is due at the poll interval").isZero();
+            virtual.advance(Duration.ofSeconds(1));
+            assertThat(deployer.deployments()).isEqualTo(1);
+
+            deployer.stop();
+            publishForeignCard(lonely, PeerIdentity.generate(), "summarizer", Summary.class);
+            virtual.advance(Duration.ofMinutes(5));
+            assertThat(deployer.deployments()).as("a stopped deployer arms nothing").isEqualTo(1);
+        }
+    }
+
     /** Review §7.9: a platform that already holds the bridge's name is a user's agent; the deployer refuses it. */
     @Test
     @Timeout(60)
@@ -421,8 +460,7 @@ class EmbabelRemoteActionsTest {
     }
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 }

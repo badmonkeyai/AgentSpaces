@@ -152,14 +152,12 @@ class DtlsMixedFleetTest {
     }
 
     private static int freeUdpPort() throws IOException {
-        try (DatagramSocket socket = new DatagramSocket(0)) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private static int freeTcpPort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 }

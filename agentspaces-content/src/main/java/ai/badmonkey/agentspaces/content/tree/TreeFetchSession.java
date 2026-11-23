@@ -35,8 +35,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -168,6 +166,17 @@ public final class TreeFetchSession implements TreeFetch {
         /** Whether this peer reads the level-2 forms (P2-F-05), so a session applies {@code NODES.deltas} (P2-Z-01). */
         default boolean readsDeltas() {
             return false;
+        }
+
+        /**
+         * The source a caller's {@link TreeFetchSession#await} waits on (srad/agentspaces-event-loop.md group W): the
+         * swarm's own, so on a virtual time a wait ends at an advance past its timeout, as the session's own timeouts
+         * do, and never in real time beside them. The system's by default.
+         *
+         * @return the source
+         */
+        default ai.badmonkey.agentspaces.common.time.TimeSource waitTime() {
+            return ai.badmonkey.agentspaces.common.time.TimeSource.system();
         }
     }
 
@@ -332,14 +341,16 @@ public final class TreeFetchSession implements TreeFetch {
 
     @Override
     public boolean await(Duration timeout) throws InterruptedException {
+        ai.badmonkey.agentspaces.common.time.TimeSource time = fabric.waitTime();
+        long deadline = timeout.isZero() || timeout.isNegative() ? Long.MAX_VALUE
+                : ai.badmonkey.agentspaces.common.time.Waits.deadline(time, timeout);
+        if (!ai.badmonkey.agentspaces.common.time.Waits.awaitDone(time, done, deadline)) {
+            return false;
+        }
         try {
-            if (timeout.isZero() || timeout.isNegative()) {
-                done.get();
-            } else {
-                done.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-            }
+            done.get(); // done: returns at once, or throws for a failed or cancelled fetch
             return true;
-        } catch (TimeoutException | java.util.concurrent.ExecutionException e) {
+        } catch (java.util.concurrent.ExecutionException e) {
             return false;
         }
     }
@@ -352,6 +363,12 @@ public final class TreeFetchSession implements TreeFetch {
     @Override
     public boolean isDoneOrFailed() {
         return done.isDone();
+    }
+
+    @Override
+    public void whenDone(Runnable action) {
+        java.util.Objects.requireNonNull(action, "action");
+        done.whenComplete((v, e) -> action.run());
     }
 
     @Override

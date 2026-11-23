@@ -126,7 +126,19 @@ public final class ConnectorRuntime implements AutoCloseable {
      * permitted {@code CONNECTOR_SERVE} for are advertised. */
     private volatile Authorizer authorizer;
     private volatile Space invocationSpace;
-    private volatile Duration invokeLease = Duration.ofSeconds(30);
+    /**
+     * The default claim lease of a running invocation (srad/agentspaces-event-loop.md EL-E-08): renewed at half the
+     * lease while the operation runs ({@code runHeld}), so 30 s exceeds the 15 s cycle that renews it.
+     */
+    public static final Duration DEFAULT_INVOKE_LEASE = Duration.ofSeconds(30);
+    /**
+     * The lease of a failed query's or invocation's result (EL-E-09): never renewed, a short life so a retry reaches
+     * the source again soon; not a liveness TTL.
+     */
+    public static final Duration FAILURE_RESULT_LEASE = Duration.ofSeconds(30);
+    /** The take lease of a query this connector answers (srad/agentspaces-event-loop.md §3.11). */
+    public static final Duration QUERY_TAKE_LEASE = Duration.ofMinutes(1);
+    private volatile Duration invokeLease = DEFAULT_INVOKE_LEASE;
     private volatile Duration invocationRetention = Duration.ofHours(24);
     private volatile boolean running = true;
     private Thread loop;
@@ -326,8 +338,9 @@ public final class ConnectorRuntime implements AutoCloseable {
      */
     public void refreshCards() {
         Authorizer gate = authorizer;
-        for (AssetCard card : provider.describeAssets(group, identity.peerId(),
+        for (AssetCard described : provider.describeAssets(group, identity.peerId(),
                 clock.instant())) {
+            AssetCard card = afterLastIssue(described);
             if (gate != null && !gate.permits(identity.peerId(),
                     Authorizer.Operation.CONNECTOR_SERVE, card.asset())) {
                 LOG.log(System.Logger.Level.WARNING, "connector " + connectorName
@@ -339,6 +352,23 @@ public final class ConnectorRuntime implements AutoCloseable {
             invokeOpsByAsset.put(card.asset(), Set.copyOf(AssetInvocations.invokeOps(card)));
             discovery.publish(signer.sign(card, identity));
         }
+    }
+
+    /**
+     * The issue millisecond of every AssetCard this runtime signed (srad/agentspaces-event-loop.md §10.16, the
+     * same-millisecond audit): two refreshes in one millisecond (a provider change and the scheduled refresh) would
+     * give a changed card the gossip item id and issue instant of the one before it, and no cache would take it.
+     */
+    private final ai.badmonkey.agentspaces.common.time.IssueClock cardIssues =
+            new ai.badmonkey.agentspaces.common.time.IssueClock();
+
+    private AssetCard afterLastIssue(AssetCard card) {
+        java.time.Instant issued = cardIssues.next(card.id(), card.issued());
+        if (issued.equals(card.issued())) {
+            return card;
+        }
+        return new AssetCard(card.id(), card.issuer(), card.group(), issued, card.ttl(), card.asset(), card.uri(),
+                card.description(), card.shape(), card.freshness(), card.costHints(), card.access());
     }
 
     /** How many invocations ran against the provider. */
@@ -425,7 +455,7 @@ public final class ConnectorRuntime implements AutoCloseable {
                     Thread.sleep(Duration.ofSeconds(1));
                     continue;
                 }
-                taken = dataSpace.take(mine, Lease.of(Duration.ofMinutes(1)), Duration.ofSeconds(1));
+                taken = dataSpace.take(mine, Lease.of(QUERY_TAKE_LEASE), Duration.ofSeconds(1));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -491,7 +521,7 @@ public final class ConnectorRuntime implements AutoCloseable {
             try {
                 dataSpace.complete(taken, new DataResult(hash, query.asset(),
                         java.util.List.of(), String.valueOf(e.getMessage()),
-                        connectorName), Lease.of(Duration.ofSeconds(30)));
+                        connectorName), Lease.of(FAILURE_RESULT_LEASE));
             } catch (RuntimeException lapsed) {
                 // The take lease lapsed; the query reappears for a retry.
             }
@@ -688,11 +718,14 @@ public final class ConnectorRuntime implements AutoCloseable {
 
     private void writeMirror(AssetInvocationResult result) {
         Duration lease = result.ok()
-                ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : Duration.ofSeconds(30);
+                ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : FAILURE_RESULT_LEASE;
+        // Counted before the write, so a requester that already reads the mirrored result never sees the count lag
+        // it (found under parallel test load, AssetInvocationsClusterTest, 2026-11-22); a failed write is uncounted.
+        mirrored.incrementAndGet();
         try {
             invocationSpace.write(result, Lease.of(lease));
-            mirrored.incrementAndGet();
         } catch (RuntimeException e) {
+            mirrored.decrementAndGet();
             LOG.log(System.Logger.Level.WARNING, "mirroring result " + result.invocationId() + " failed", e);
         }
     }
@@ -706,11 +739,36 @@ public final class ConnectorRuntime implements AutoCloseable {
                                           PeerId requester) {
         Duration lease = invokeLease;
         Duration every = lease.dividedBy(2).isZero() ? lease : lease.dividedBy(2);
+        Duration limit = holdLimit;
+        // §10.16, owner decision 2 (2026-11-22): the watchdog names an operation that holds its claim long, and an
+        // optional hold limit (off by default) stops the renewal of a hung one.
+        ai.badmonkey.agentspaces.common.time.TimeSource time =
+                clock instanceof ai.badmonkey.agentspaces.common.time.TimeSource source
+                        && !ai.badmonkey.agentspaces.common.time.TimeSources.followsWall(source)
+                        ? source : ai.badmonkey.agentspaces.common.time.TimeSource.system();
+        long heldSince = time.monoNanos();
+        ai.badmonkey.agentspaces.common.time.Watchdog.Registration heldWatch = time.watchdog().registerHeld(
+                new ai.badmonkey.agentspaces.common.time.Watchdog.Held(connectorName,
+                        invocation.asset() + "/" + invocation.operation(), String.valueOf(taken.entryId()),
+                        heldSince));
+        // The renewal ends with the operation or with this connector, whichever comes first: close() interrupts the
+        // invoke loop, but an operation that ignores the interrupt would otherwise hold its claim for as long as it
+        // hung, and no replica could take it (srad/agentspaces-event-loop.md §10.14).
         Thread renewer = Thread.ofVirtual().name("connector-renew-" + invocation.invocationId()).start(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
+            while (!Thread.currentThread().isInterrupted() && running) {
                 try {
-                    Thread.sleep(every);
+                    time.sleep(every);
                 } catch (InterruptedException e) {
+                    return;
+                }
+                if (!running) {
+                    return; // closed while this slept
+                }
+                if (limit != null && time.monoNanos() - heldSince >= limit.toNanos()) {
+                    holdLimitStops.incrementAndGet();
+                    LOG.log(System.Logger.Level.WARNING, "operation " + invocation.operation() + " on asset "
+                            + invocation.asset() + " held invocation " + invocation.invocationId() + " past the hold"
+                            + " limit of " + limit.toMillis() + " ms; its claim is no longer renewed and lapses");
                     return;
                 }
                 try {
@@ -727,7 +785,38 @@ public final class ConnectorRuntime implements AutoCloseable {
             return run(invocation, requester);
         } finally {
             renewer.interrupt();
+            heldWatch.close();
         }
+    }
+
+    /** The hold limit of a held operation; null: off (the default). */
+    private volatile Duration holdLimit;
+    private final java.util.concurrent.atomic.AtomicLong holdLimitStops = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Sets the hold limit of a held operation (srad/agentspaces-event-loop.md §10.16, owner decision 2 of 2026-11-22):
+     * once an operation has held its invocation this long, the claim is no longer renewed and lapses to another
+     * replica at the lease's end; the operation itself is left running. Off by default, so a long operation keeps its
+     * claim while it runs.
+     *
+     * @param limit the limit, or null or zero for none
+     * @return this runtime
+     */
+    public ConnectorRuntime holdLimit(Duration limit) {
+        if (limit != null && limit.isNegative()) {
+            throw new IllegalArgumentException("the hold limit must not be negative: " + limit);
+        }
+        this.holdLimit = limit == null || limit.isZero() ? null : limit;
+        return this;
+    }
+
+    /**
+     * How many claim renewals the hold limit stopped.
+     *
+     * @return the count
+     */
+    public long holdLimitStops() {
+        return holdLimitStops.get();
     }
 
     private AssetInvocationResult run(AssetInvocation invocation, PeerId requester) {
@@ -758,7 +847,7 @@ public final class ConnectorRuntime implements AutoCloseable {
      */
     private boolean finish(Space space, TakenEntry<AssetInvocation> taken, AssetInvocationResult result) {
         Duration lease = result.ok()
-                ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : Duration.ofSeconds(30);
+                ? freshnessByAsset.getOrDefault(result.asset(), defaultFreshness) : FAILURE_RESULT_LEASE;
         try {
             space.complete(taken, result, Lease.of(lease));
             return true;

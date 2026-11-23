@@ -102,6 +102,42 @@ class BlockExchangeTest {
                 .isEmpty();
     }
 
+    /**
+     * srad/agentspaces-event-loop.md group W, EL-C-08 carried: a fetch waits on its node's time source. On a virtual
+     * one it times out when an advance passes its deadline, in no real time; it used to wait out the timeout in real
+     * time on the system's source, which a virtual advance cannot release (it fails the advance's quiescence bound).
+     */
+    @Test
+    void aFetchWaitsOnTheNodesTimeSource() throws Exception {
+        ai.badmonkey.agentspaces.test.VirtualTime time =
+                ai.badmonkey.agentspaces.test.VirtualTime.startingAt(java.time.Instant.parse("2026-11-23T00:00:00Z"));
+        List<BlockExchange> exchanges = new ArrayList<>();
+        List<PeerNode> pair = new ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            PeerIdentity identity = PeerIdentity.generate();
+            PeerNode node = PeerNode.builder(identity).clock(time).time(time).randomSeed(20 + i).build();
+            String address = "v" + i;
+            node.listen(network.register(address), address);
+            GroupRuntime runtime = node.joinGroup(groupAd, GroupMembership.Config.defaults(),
+                    i == 0 ? List.of() : List.of(new PeerAdvertisement.Endpoint("mem", "v0", 0)));
+            nodes.add(node);
+            pair.add(node);
+            exchanges.add(new BlockExchange(runtime, codec, time, 0, BlockExchange.DEFAULT_MAX_BLOCK_BYTES));
+            node.startTicking(Duration.ofMillis(250));
+        }
+        time.advance(Duration.ofSeconds(2));
+        long started = System.nanoTime();
+        ai.badmonkey.agentspaces.test.VirtualTime.Outcome<java.util.Optional<byte[]>> out = time.run(
+                Duration.ofSeconds(1), Duration.ofMinutes(2),
+                () -> exchanges.get(1).fetch("zNoSuchBlock", List.of(pair.get(0).peerId()), 60_000));
+        long realMillis = (System.nanoTime() - started) / 1_000_000;
+        System.out.printf("[blocks] a missing block timed out after %d ms of virtual time, %d ms real%n",
+                out.took().toMillis(), realMillis);
+        assertThat(out.value()).isEmpty();
+        assertThat(out.took()).as("the timeout, on the node's source").isBetween(Duration.ofSeconds(60),
+                Duration.ofSeconds(61));
+    }
+
     // ---- srad/large-networks-bulk-data.md group B (LB-B-08) ----
 
     @Test

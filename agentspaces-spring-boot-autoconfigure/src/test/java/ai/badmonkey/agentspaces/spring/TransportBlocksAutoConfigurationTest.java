@@ -56,15 +56,13 @@ class TransportBlocksAutoConfigurationTest {
     }
 
     private static int freeTcp() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private static int freeUdp() throws IOException {
-        try (DatagramSocket socket = new DatagramSocket(0)) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private static AgentSpacesProperties properties(String seed) {
@@ -185,6 +183,41 @@ class TransportBlocksAutoConfigurationTest {
         dtls13.getTransport().getDtls().setProtocols(List.of("DTLSv1.3"));
         assertThatThrownBy(() -> node(dtls13, List.of()))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("DTLSv1.3");
+    }
+
+    /**
+     * The dial bound the program gave the DTLS, UDP and QUIC transports (srad/agentspaces-event-loop.md, phase 6
+     * integration audit I-20) is a property of each block: unset keeps the transport's default, a value reaches the
+     * transport, and one out of range refuses at start naming the key.
+     */
+    @Test
+    void theDialTimeoutOfTheDtlsUdpAndQuicBlocksReachesTheTransport() throws Exception {
+        PeerIdentity identity = PeerIdentity.generate();
+        AgentSpacesProperties.Transport.Dtls dtls = new AgentSpacesProperties.Transport.Dtls();
+        DtlsTransport byDefault = (DtlsTransport) DtlsBlocks.build(identity, dtls, null, null);
+        closeables.add(byDefault);
+        assertThat(byDefault.dialTimeout()).isEqualTo(DtlsTransport.DEFAULT_DIAL_TIMEOUT);
+
+        dtls.setDialTimeout(Duration.ofSeconds(3));
+        DtlsTransport set = (DtlsTransport) DtlsBlocks.build(identity, dtls, null, null);
+        closeables.add(set);
+        assertThat(set.dialTimeout()).isEqualTo(Duration.ofSeconds(3));
+        ai.badmonkey.agentspaces.transport.dtls.UdpTransport udp =
+                (ai.badmonkey.agentspaces.transport.dtls.UdpTransport) DtlsBlocks.buildUdp(dtls);
+        closeables.add(udp);
+        assertThat(udp.dialTimeout()).isEqualTo(Duration.ofSeconds(3));
+
+        dtls.setDialTimeout(Duration.ofHours(1));
+        assertThatThrownBy(() -> DtlsBlocks.build(identity, dtls, null, null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("agentspaces.transport.dtls.dial-timeout");
+
+        AgentSpacesProperties.Transport.Quic quic = new AgentSpacesProperties.Transport.Quic();
+        quic.setDialTimeout(Duration.ofSeconds(4));
+        ai.badmonkey.agentspaces.transport.quic.QuicTransport quicTransport =
+                (ai.badmonkey.agentspaces.transport.quic.QuicTransport) QuicBlocks.build(identity, quic, null, null);
+        closeables.add(quicTransport);
+        assertThat(quicTransport.dialTimeout()).isEqualTo(Duration.ofSeconds(4));
     }
 
     @Test

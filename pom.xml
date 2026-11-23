@@ -112,6 +112,8 @@
     <module>embabel-agentspaces</module>
     <!-- Spoiler peers (srad/spoiler-peers.md SP-G-01): test-only, never deployed, downstream of every core module. -->
     <module>agentspaces-spoilers</module>
+    <!-- Reactor-wide checks of the core (srad/agentspaces-event-loop.md): IdleCostIT, opt-in. -->
+    <module>integration-tests/core-it</module>
     <module>examples</module>
   </modules>
 
@@ -142,6 +144,13 @@
     <!-- Plugin versions -->
     <maven-compiler-plugin.version>3.14.0</maven-compiler-plugin.version>
     <maven-surefire-plugin.version>3.5.4</maven-surefire-plugin.version>
+    <!-- Test JVMs per module (docs/build.md, "Build time"): three forks, each reused for its share of the
+         module's test classes. With -T 2 that is at most six test JVMs beside Maven's own. Override with
+         -Dsurefire.forkCount=1 to run a module's classes one after another in one JVM. -->
+    <surefire.forkCount>3</surefire.forkCount>
+    <!-- JUnit tags left out of the default build: "soak" marks the long simulations the -Psoak profile adds back
+         (phase gates). -->
+    <surefire.excludedGroups>soak</surefire.excludedGroups>
     <maven-clean-plugin.version>3.2.0</maven-clean-plugin.version>
     <maven-resources-plugin.version>3.3.0</maven-resources-plugin.version>
     <maven-jar-plugin.version>3.3.0</maven-jar-plugin.version>
@@ -304,6 +313,11 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>${maven-surefire-plugin.version}</version>
+          <configuration>
+            <forkCount>${surefire.forkCount}</forkCount>
+            <reuseForks>true</reuseForks>
+            <excludedGroups>${surefire.excludedGroups}</excludedGroups>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -362,6 +376,16 @@
   </build>
 
   <profiles>
+    <!-- The soak tests (@Tag("soak")): the long real- and virtual-time simulations the default build leaves out
+         (TargetedRelaySpoilerTest at 12 and 16 members, ClockSpoilerTest's two-hour forward step (FUTURE EL-F-08),
+         RaftLeaseSpoilerTest's ten-minute idle, ClaimsFlowTest's demo supervisor). Phase gates run them:
+         -Psoak runs every test, and -Psoak -Dgroups=soak runs the soak tests alone. -->
+    <profile>
+      <id>soak</id>
+      <properties>
+        <surefire.excludedGroups>none</surefire.excludedGroups>
+      </properties>
+    </profile>
     <!-- The Spring context integration test needs real Spring Boot artifacts
          from Maven Central, so it lives behind this profile: activated
          automatically in CI, or explicitly with -Pspring-it on a laptop.

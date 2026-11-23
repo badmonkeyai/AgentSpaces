@@ -56,6 +56,14 @@ public final class MulticastLocator implements BeaconLocator {
         return NAME;
     }
 
+    /**
+     * The TTL of a hint learned from beacons that name none (srad/agentspaces-event-loop.md EL-O-11, the TTL rule):
+     * about 1.5 times the beacon's longest retry interval at the defaults (20 min), so a sender whose beacon has backed
+     * off never lets it lapse. What the node holds from each datagram follows the same rule
+     * ({@link MulticastBeacon#learnedHold()}).
+     */
+    public static final Duration DEFAULT_LEARNED_TTL = Duration.ofMinutes(30);
+
     @Override
     public BeaconHint locate(BeaconRequest request) {
         if (request.groupId().isEmpty()) {
@@ -67,7 +75,7 @@ public final class MulticastLocator implements BeaconLocator {
             return BeaconHint.none();
         }
         return new BeaconHint(endpoints, Optional.empty(), Optional.empty(), Map.of(),
-                learned.ttl().isZero() ? Duration.ofSeconds(30) : learned.ttl(),
+                learned.ttl().isZero() ? DEFAULT_LEARNED_TTL : learned.ttl(),
                 "beacon datagrams from " + learned.peers() + " peer(s)");
     }
 }

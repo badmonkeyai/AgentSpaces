@@ -104,6 +104,30 @@ class AppCardsGateTest {
                 .withFormats(List.of("text/html", "application/geo+json"));
     }
 
+    /**
+     * The same-millisecond audit (srad/agentspaces-event-loop.md §10.16): a card issued less than a millisecond after
+     * the last one under its id was strictly later as an instant but shared its gossip item id (the id and the issue
+     * millisecond), so the change reached nobody. The publisher now compares milliseconds.
+     */
+    @Test
+    void aChangedCardIssuedInsideTheMillisecondOfTheLastOneReachesTheGroup() throws Exception {
+        Wired a = peer("g0", 2);
+        Wired b = peer("g1", 2);
+        assertThat(until(() -> a.discovery().appCardGateOpen() && a.runtime().membership().allMembers().size() == 1
+                && b.runtime().membership().allMembers().size() == 1)).isTrue();
+        AppCardPublisher publisher = new AppCardPublisher(a.identity(), a.runtime(), a.discovery());
+        AppCard first = imported(a);
+        AppCard published = publisher.publish(first).join();
+        assertThat(until(() -> cardAt(b, first.id()).isPresent())).isTrue();
+        AppCard changed = imported(a).withFormats(List.of("text/html"));
+        AppCard later = AppCards.issuedAt(changed, published.issued().plusNanos(300_000)); // inside the millisecond
+        AppCard second = publisher.publish(later).join();
+        assertThat(second.issued().toEpochMilli()).isEqualTo(published.issued().toEpochMilli() + 1);
+        assertThat(until(() -> cardAt(b, first.id()).map(c -> List.of("text/html").equals(c.formats())).orElse(false)))
+                .as("the change reached the member").isTrue();
+        publisher.close();
+    }
+
     @Test
     void aLevelOneJoinerGetsTheCardWithoutItsGatedFieldsAndTheFullCardReturnsWhenItLeaves() throws Exception {
         Wired a = peer("g0", 2);

@@ -54,8 +54,17 @@ class DtlsRelayTest {
     }
 
     private Link link(double loss, DtlsOptions options) throws Exception {
+        return link(loss, options, null);
+    }
+
+    /** As above; with a time source, the dialer's association timers (retransmit, keepalive, idle) run on it. */
+    private Link link(double loss, DtlsOptions options, ai.badmonkey.agentspaces.common.time.TimeSource dialerTime)
+            throws Exception {
         DtlsTransport listener = new DtlsTransport(PeerIdentity.generate()).options(options);
         DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate()).options(options);
+        if (dialerTime != null) {
+            dialer.time(dialerTime);
+        }
         closeables.add(dialer);
         closeables.add(listener);
         BlockingQueue<TransportConnection> accepted = new LinkedBlockingQueue<>();
@@ -136,33 +145,72 @@ class DtlsRelayTest {
         closeables.add(listener);
         DtlsTransport.Bound bound = listener.listenBound("127.0.0.1:0", c -> c.onReceive(f -> { }));
         closeables.add(bound.listener());
-        int succeeded = 0;
+        // The ten handshakes run at once, each through its own seeded relay: one after another they waited out each
+        // lost flight's retransmit in turn (23 s). Each still has the default 10 s dial timeout of DT-Q-REL-02. Once
+        // nine have completed the verdict is in, so the rest are stopped rather than waited out to their timeout.
+        java.util.concurrent.atomic.AtomicInteger succeeded = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger ended = new java.util.concurrent.atomic.AtomicInteger();
+        List<Thread> dials = new ArrayList<>();
+        Object progress = new Object();
         for (int i = 0; i < 10; i++) {
-            try (UdpRelay relay = new UdpRelay(bound.port(), 0.10, 1_000 + i);
-                 DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate())) {
-                try {
+            int seed = 1_000 + i;
+            DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate());
+            closeables.add(dialer);
+            dials.add(Thread.ofVirtual().name("lossy-dial-" + i).start(() -> {
+                try (UdpRelay relay = new UdpRelay(bound.port(), 0.10, seed); dialer) {
                     dialer.dial(relay.address()).close();
-                    succeeded++;
-                } catch (java.io.IOException e) {
+                    succeeded.incrementAndGet();
+                } catch (Exception e) {
                     // counted below
+                } finally {
+                    ended.incrementAndGet();
+                    synchronized (progress) {
+                        progress.notifyAll();
+                    }
                 }
+            }));
+        }
+        long start = System.nanoTime();
+        synchronized (progress) {
+            while (ended.get() < dials.size() && succeeded.get() < 9) {
+                progress.wait(1_000);
             }
         }
+        int verdict = succeeded.get();
+        System.out.printf("10 lossy dials: %d succeeded, %d ended, after %d ms%n", verdict, ended.get(),
+                Duration.ofNanos(System.nanoTime() - start).toMillis());
+        for (Thread dial : dials) {
+            dial.interrupt(); // a dial still in its handshake ends at its own timeout; nobody waits for it here
+        }
         // SRAD DT-Q-REL-02 as built: at least 9 of 10 within the 10 s dial timeout at 10 percent loss.
-        assertThat(succeeded).isGreaterThanOrEqualTo(9);
+        assertThat(verdict).isGreaterThanOrEqualTo(9);
     }
 
     @Test
     @Timeout(60)
     void aSilentPeerFailsTheAssociationAfterTheIdleTimeout() throws Exception {
-        Link link = link(0, DtlsOptions.defaults().withIdleTimeout(Duration.ofSeconds(10)));
+        // The dialer's timers run on virtual time, so the 10 s idle timeout (the shortest DtlsOptions allows) is
+        // judged exactly and costs no wall time: the handshake is real, the silence is advanced through.
+        Duration idle = Duration.ofSeconds(10);
+        ai.badmonkey.agentspaces.test.VirtualTime time = ai.badmonkey.agentspaces.test.VirtualTime.create();
+        Link link = link(0, DtlsOptions.defaults().withIdleTimeout(idle), time);
+        java.util.concurrent.atomic.AtomicLong closedAt = new java.util.concurrent.atomic.AtomicLong(-1);
         CountDownLatch closed = new CountDownLatch(1);
-        link.dialed().onClose(closed::countDown);
+        link.dialed().onClose(() -> {
+            closedAt.compareAndSet(-1, time.monoNanos());
+            closed.countDown();
+        });
         link.relay().loss = 1.0; // the link goes dark
-        long start = System.nanoTime();
-        assertThat(closed.await(30, TimeUnit.SECONDS)).isTrue();
-        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-        assertThat(elapsed).isBetween(9_000L, 22_000L);
+        long start = time.monoNanos();
+        Duration step = Duration.ofMillis(250);
+        for (long advanced = 0; closed.getCount() > 0 && advanced < 3 * idle.toMillis(); advanced += step.toMillis()) {
+            time.advance(step);
+        }
+        assertThat(closed.await(5, TimeUnit.SECONDS)).as("the association failed").isTrue();
+        long elapsed = TimeUnit.NANOSECONDS.toMillis(closedAt.get() - start);
+        // Not before the idle timeout after the last datagram heard (at or after the start), and within one
+        // keepalive period (a quarter of it) of it should a datagram in flight have landed after the start.
+        assertThat(elapsed).isBetween(idle.toMillis(), idle.toMillis() + idle.toMillis() / 4 + step.toMillis());
         assertThat(link.dialer().counters().failedIdle()).isEqualTo(1);
     }
 

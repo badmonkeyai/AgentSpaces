@@ -90,6 +90,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public final class AgentBinder implements AutoCloseable {
 
+    /** The AgentCard's time to live (srad/agentspaces-event-loop.md §3.11): the starter refreshes it every 5 minutes. */
+    public static final java.time.Duration CARD_TTL = java.time.Duration.ofMinutes(15);
+
     private static final System.Logger LOG = System.getLogger(AgentBinder.class.getName());
     /** Remembered entry ids per notify subscription, for at-least-once dedup. */
     private static final int NOTIFY_DEDUP_CAPACITY = 4096;
@@ -346,9 +349,16 @@ public final class AgentBinder implements AutoCloseable {
      */
     public AgentBinder constraintGate(ai.badmonkey.agentspaces.constraints.ConstraintGate gate) {
         this.constraintGate = gate;
+        AutoCloseable previous = gateChanges;
+        gateChanges = null;
+        if (previous != null) {
+            closeQuietly(previous);
+        }
         if (gate != null) {
             gate.onReload(this::rouseUngatedTakes);
+            gateChanges = gate.onChange(this::gateChanged); // EL-W-07: a gated take wakes on what moves the judgement
         }
+        gateChanged(); // a gated take waiting on the old gate looks at the new one now
         rouseUngatedTakes(); // a take waiting long without a gate looks at the new one now
         return this;
     }
@@ -356,11 +366,12 @@ public final class AgentBinder implements AutoCloseable {
     // ---- ungated takes wait on changes (idle-loop item 2, reviews/IDLE-LOOP-2026-11-18.md §6)
 
     /**
-     * How long an ungated take waits for a matching entry before its loop looks again. It wakes at once on a change to
-     * the space, and a gate installed or reloaded interrupts it, so the length only bounds what neither covers. A gated
-     * take keeps its {@code pollTimeout}.
+     * How long an ungated take waits for a matching entry before its loop looks again: the one take-wait rule's
+     * backstop (srad/agentspaces-event-loop.md EL-W-07, {@link ai.badmonkey.agentspaces.common.time.Waits#BACKSTOP}).
+     * It wakes at once on a change to the space, and a gate installed or reloaded interrupts it, so the length only
+     * bounds what neither covers. A gated take keeps its {@code pollTimeout}.
      */
-    static final Duration UNGATED_TAKE_WAIT = Duration.ofSeconds(30);
+    static final Duration UNGATED_TAKE_WAIT = ai.badmonkey.agentspaces.common.time.Waits.BACKSTOP;
 
     /** One take loop's wait, so a gate change interrupts it only while it waits, never in its action. */
     private static final class TakeWait {
@@ -395,10 +406,11 @@ public final class AgentBinder implements AutoCloseable {
                 }
                 wait.waiting = false;
                 wait.thread.interrupt();
-                long deadline = System.nanoTime() + ROUSE_WAIT_MILLIS * 1_000_000L;
+                // A real-time bound on a thread leaving its take, on the system's time source (EL-C-08).
+                long deadline = ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos() + ROUSE_WAIT_MILLIS * 1_000_000L;
                 boolean interrupted = false;
                 while (wait.inTake) {
-                    long left = (deadline - System.nanoTime()) / 1_000_000L;
+                    long left = (deadline - ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos()) / 1_000_000L;
                     if (left <= 0) {
                         break;
                     }
@@ -426,20 +438,55 @@ public final class AgentBinder implements AutoCloseable {
 
     private volatile ai.badmonkey.agentspaces.constraints.ConstraintGate constraintGate;
 
+    /** The installed gate's {@code onChange} registration, or null. */
+    private volatile AutoCloseable gateChanges;
+
+    /** Each take loop's change signal, run on a change of the gate (EL-W-07); a loop's space runs it too. */
+    private final Set<ai.badmonkey.agentspaces.common.time.ChangeSignal> gatedWaiters =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** The gate changed (an event of a lane, a version, a jury decision): every gated take looks again. */
+    private void gateChanged() {
+        for (ai.badmonkey.agentspaces.common.time.ChangeSignal waiter : gatedWaiters) {
+            waiter.run();
+        }
+    }
+
+    /**
+     * A take loop's change signal: run by its space's changes and the gate's, so its gated look waits for either
+     * (EL-W-07). Close the handle when the loop ends.
+     */
+    private AutoCloseable gatedWaiter(Space space, ai.badmonkey.agentspaces.common.time.ChangeSignal signal) {
+        gatedWaiters.add(signal);
+        AutoCloseable spaceChanges = space.onChangeSignal(signal); // only a wake (Space.onChangeSignal)
+        return () -> {
+            gatedWaiters.remove(signal);
+            spaceChanges.close();
+        };
+    }
+
+    /**
+     * The one take-wait rule for a gated take (srad/agentspaces-event-loop.md EL-W-07): when the gate admits nothing,
+     * the take waits for a change of its space or of the gate ({@link
+     * ai.badmonkey.agentspaces.constraints.ConstraintGate#onChange}: a lane's event, a version, a jury decision), or for
+     * the gate's own next due ({@link ai.badmonkey.agentspaces.constraints.ConstraintGate#nextClaimDue}), under the one
+     * backstop, {@link ai.badmonkey.agentspaces.common.time.Waits#BACKSTOP}. It was a 1 s look (§10.17).
+     */
+    static final Duration GATED_TAKE_WAIT = ai.badmonkey.agentspaces.common.time.Waits.BACKSTOP;
+
     /**
      * The gate's look before a claim (§9.4): the entries the template matches are read, the first the gate admits
-     * narrows the take to its key, and when every candidate is refused the loop waits one poll. Returns the
-     * template to take with, or empty when nothing may be taken now.
+     * narrows the take to its key, and when every candidate is refused the loop waits as {@link #GATED_TAKE_WAIT}
+     * says. Returns the template to take with, or empty when nothing may be taken now.
      */
-    /** The longest a gated take waits for a change before it looks again (idle-loop O9). */
-    static final long GATED_LOOK_MAX_MILLIS = 1_000;
-
-    private Optional<Template<?>> gated(Space space, Template<?> template, Duration pollTimeout) {
+    private Optional<Template<?>> gated(Space space, Template<?> template, Duration pollTimeout,
+                                        ai.badmonkey.agentspaces.common.time.ChangeSignal changed) {
         ai.badmonkey.agentspaces.constraints.ConstraintGate gate = constraintGate;
         if (gate == null || gate.loaded().isEmpty()) {
             return Optional.of(template);
         }
-        long seen = space.changeSignals();
+        long seen = changed.seen(); // before the look: a change of the space or the gate meanwhile is not missed
+        boolean signals = space.changeSignals() >= 0;
         List<? extends Space.Entry<?>> candidates;
         try {
             candidates = space.readAllEntries(template, 16);
@@ -452,15 +499,24 @@ public final class AgentBinder implements AutoCloseable {
             }
         }
         // nothing admitted now (nothing there, or every candidate refused): wait and look again, rather than a
-        // blocking take that would claim an entry the gate never saw. The wait ends at the space's next change, so a
-        // new entry is looked at at once, and after at most the poll timeout (a second at most), for what changes
-        // outside the space: the gate's rules, or a judgement that moves with time (idle-loop O9; was a 250 ms sleep).
+        // blocking take that would claim an entry the gate never saw. The wait ends at the next change of the space
+        // (a new entry is looked at at once) or of the gate (a lane's event, a version, a jury decision), at the
+        // gate's own next due, or at the backstop (EL-W-07; was a 1 s look, and before that a 250 ms sleep).
         try {
-            long cap = Math.max(20, Math.min(pollTimeout.toMillis(), GATED_LOOK_MAX_MILLIS));
-            if (seen < 0) {
-                Thread.sleep(Math.max(20, Math.min(pollTimeout.toMillis(), 250)));
+            if (!signals) {
+                // a space that keeps no change counter signals nothing: a short look, as before
+                waits().sleep(Duration.ofMillis(Math.max(20, Math.min(pollTimeout.toMillis(), 250))));
             } else {
-                space.awaitChange(seen, Duration.ofMillis(cap));
+                ai.badmonkey.agentspaces.common.time.TimeSource time = changed.time();
+                long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(time,
+                        pollTimeout.compareTo(GATED_TAKE_WAIT) > 0 ? pollTimeout : GATED_TAKE_WAIT);
+                Optional<java.time.Instant> due = gate.nextClaimDue();
+                if (due.isPresent()) {
+                    long ahead = Math.max(0, java.time.Duration.between(time.instant(), due.get()).toMillis());
+                    deadline = Math.min(deadline, ai.badmonkey.agentspaces.common.time.Waits.deadline(time,
+                            Duration.ofMillis(ahead)));
+                }
+                changed.await(seen, deadline);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -598,6 +654,71 @@ public final class AgentBinder implements AutoCloseable {
     public AgentBinder vote(String spaceName, VoteCapability vote) {
         votes.put(Objects.requireNonNull(spaceName, "spaceName"), Objects.requireNonNull(vote, "vote"));
         return this;
+    }
+
+    /** The TTL floor's check of the verb annotations' leases at bind time (EL-E-03, decision 18); lenient by default. */
+    private volatile ai.badmonkey.agentspaces.common.time.TtlFloor ttlFloor =
+            ai.badmonkey.agentspaces.common.time.TtlFloor.lenient();
+
+    /**
+     * Sets how a lease or TTL under 60 s on a bound method's verb annotation is judged (srad/agentspaces-event-loop.md
+     * EL-E-03, EL-E-04): lenient by default (a WARN), refused under a strict check. A {@code @TtlOverride(reason)} beside
+     * the annotation, or an expert override keyed {@code binder.<AgentClass>.<method>.<member>}, passes it.
+     *
+     * @param floor the check
+     * @return this binder
+     */
+    public AgentBinder ttlFloor(ai.badmonkey.agentspaces.common.time.TtlFloor floor) {
+        this.ttlFloor = Objects.requireNonNull(floor, "floor");
+        return this;
+    }
+
+    /** The verb annotations whose lease and TTL members the floor checks. */
+    private static final List<Class<? extends java.lang.annotation.Annotation>> LEASED = List.of(OrderedTake.class,
+            SpaceReduce.class, SpaceJoin.class, SpaceTake.class, SpaceNotify.class, OnDecision.class, OnEstimate.class,
+            Ballot.class, Propose.class);
+
+    /**
+     * Checks every lease and TTL member of the type's verb annotations against the floor, after the bind's attribute
+     * overrides (EL-E-03): a value equal to the annotation's own default passes (the TTL register carries its reason).
+     */
+    private void checkTtls(Class<?> type) {
+        ai.badmonkey.agentspaces.common.time.TtlFloor floor = ttlFloor;
+        for (Method method : type.getMethods()) {
+            ai.badmonkey.agentspaces.api.ttl.TtlOverride override =
+                    method.getAnnotation(ai.badmonkey.agentspaces.api.ttl.TtlOverride.class);
+            for (Class<? extends java.lang.annotation.Annotation> kind : LEASED) {
+                java.lang.annotation.Annotation found = annotationOf(method, kind);
+                if (found == null) {
+                    continue;
+                }
+                for (Method member : kind.getDeclaredMethods()) {
+                    String name = member.getName().toLowerCase(java.util.Locale.ROOT);
+                    if (!(name.contains("lease") || name.contains("ttl")) || member.getReturnType() != String.class) {
+                        continue;
+                    }
+                    String value;
+                    try {
+                        value = (String) member.invoke(found);
+                    } catch (ReflectiveOperationException e) {
+                        throw new IllegalStateException("reading " + kind.getSimpleName() + "." + member.getName(), e);
+                    }
+                    if (value == null || value.isBlank()) {
+                        continue;
+                    }
+                    Duration parsed;
+                    try {
+                        parsed = Durations.parse(value);
+                    } catch (IllegalArgumentException malformed) {
+                        continue; // the binding that reads it refuses it, naming the method
+                    }
+                    Object fallback = member.getDefaultValue();
+                    Duration registered = fallback instanceof String s && !s.isBlank() ? Durations.parse(s) : null;
+                    floor.check("binder." + type.getSimpleName() + "." + method.getName() + "." + member.getName(),
+                            parsed, registered, override == null ? null : override.reason());
+                }
+            }
+        }
     }
 
     /**
@@ -738,6 +859,7 @@ public final class AgentBinder implements AutoCloseable {
                         + type.getName() + " under another name");
             }
         }
+        checkTtls(type); // EL-E-03: a lease under 60 s warns, or refuses under a strict floor, before anything runs
         Optional<ai.badmonkey.agentspaces.agent.spi.AgentDeclaration> declaration = declarationOf(type);
         // Review §7.3: the implied takes a declaration reader asks for, as @SpaceTake annotations scoped by tag.
         Map<Method, SpaceTake> impliedTakes = new java.util.HashMap<>();
@@ -981,6 +1103,7 @@ public final class AgentBinder implements AutoCloseable {
                     throw new IllegalArgumentException(
                             "an @OnEstimate method takes a PushSumAggregate.Estimate: " + method);
                 }
+                settleOf(onEstimate, method); // a start-up refusal for both forms or a bad span (EL-T-06)
                 if (aggregate == null) {
                     throw new IllegalArgumentException("@OnEstimate at " + method + " but no aggregate is"
                             + " registered; register it with binder.aggregate(aggregate) or"
@@ -1070,6 +1193,7 @@ public final class AgentBinder implements AutoCloseable {
         Objects.requireNonNull(card, "card");
         Bound handle = new Bound(identity.agentIdentity(card.agent().localName()));
         handle.card = card;
+        cardIssues.issued(card.id(), card.issued()); // a refresh is later than the adopted card
         publishCard(handle);
         bound.add(handle);
         return handle;
@@ -1104,10 +1228,10 @@ public final class AgentBinder implements AutoCloseable {
         // SPEC §4.2 v0.1.13: an extra renewal driver; renewing identities
         // also renew themselves lazily whenever they sign.
         handle.identity.renewIfDue(clock.instant());
-        java.time.Instant issuedAt = clock.instant();
-        if (strictlyNewer && !issuedAt.isAfter(current.issued())) {
-            issuedAt = current.issued().plusMillis(1);
-        }
+        // A refresh is a millisecond past the last card issued under the id, even on a clock that has not moved or
+        // within the millisecond of the last issue, so every cache takes it (§10.16); a reissue for the AppCard level
+        // (strictlyNewer) needs exactly that.
+        java.time.Instant issuedAt = cardIssues.next(current.id(), clock.instant());
         handle.card = new AgentCard(current.id(), identity.peerId(), group,
                 issuedAt, current.ttl(), current.agent(), current.description(),
                 current.goals(), current.consumes(), current.produces(),
@@ -1145,6 +1269,11 @@ public final class AgentBinder implements AutoCloseable {
     public void close() {
         bound.forEach(Bound::close);
         bound.clear();
+        AutoCloseable changes = gateChanges;
+        gateChanges = null;
+        if (changes != null) {
+            closeQuietly(changes);
+        }
         if (gateRegistration != null) {
             try {
                 gateRegistration.close();
@@ -1230,6 +1359,7 @@ public final class AgentBinder implements AutoCloseable {
 
         private final String label;
         private final boolean quietFirst;
+        private final ai.badmonkey.agentspaces.common.time.TimeSource time;
         private long pauseMillis;
         private long run;
         private long lastWarnNanos;
@@ -1240,8 +1370,16 @@ public final class AgentBinder implements AutoCloseable {
          *                   refusal, such as a leader election in flight)
          */
         TakeFailures(String label, boolean quietFirst) {
+            this(label, quietFirst, ai.badmonkey.agentspaces.common.time.TimeSource.system());
+        }
+
+        /**
+         * @param time the source the pause sleeps on (the binder's, EL-W-01) and the warning throttle reads
+         */
+        TakeFailures(String label, boolean quietFirst, ai.badmonkey.agentspaces.common.time.TimeSource time) {
             this.label = label;
             this.quietFirst = quietFirst;
+            this.time = time;
         }
 
         /** Records a good poll: the next fault starts a new run with the shortest pause. */
@@ -1265,7 +1403,7 @@ public final class AgentBinder implements AutoCloseable {
                 return false;
             }
             run++;
-            long now = System.nanoTime();
+            long now = time.monoNanos(); // a log throttle (EL-C-08)
             if (run == 1) {
                 LOG.log(quietFirst ? System.Logger.Level.DEBUG : System.Logger.Level.WARNING,
                         label + ": take failed; retrying with backoff", e);
@@ -1277,7 +1415,7 @@ public final class AgentBinder implements AutoCloseable {
             }
             pauseMillis = pauseMillis == 0 ? FIRST_PAUSE_MILLIS : Math.min(MAX_PAUSE_MILLIS, pauseMillis * 2);
             try {
-                Thread.sleep(pauseMillis);
+                time.sleep(Duration.ofMillis(pauseMillis));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return false;
@@ -1333,14 +1471,16 @@ public final class AgentBinder implements AutoCloseable {
         Template<?> template = templateFor(entryType, take.tags(), take.where(), method);
 
         return Thread.ofVirtual().name("space-take-" + label).start(() -> {
-            TakeFailures failures = new TakeFailures(label, false);
+            TakeFailures failures = new TakeFailures(label, false, waits());
             TakeWait wait = new TakeWait(Thread.currentThread());
             ungatedWaits.add(wait);
+            ai.badmonkey.agentspaces.common.time.ChangeSignal changed = new ai.badmonkey.agentspaces.common.time.ChangeSignal(waits());
+            AutoCloseable waiter = gatedWaiter(space, changed);
             try {
                 while (handle.running) {
                     Optional<? extends TakenEntry<?>> taken;
                     try {
-                        Optional<Template<?>> admitted = gated(space, template, pollTimeout);
+                        Optional<Template<?>> admitted = gated(space, template, pollTimeout, changed);
                         if (admitted.isEmpty()) {
                             continue;
                         }
@@ -1388,7 +1528,9 @@ public final class AgentBinder implements AutoCloseable {
                         continue;
                     }
                     try {
-                        TakeContext context = new TakeContext(taken.get(), takeLease.duration(), handle.agentId, space.name());
+                        // §10.33: a renewal from inside the method ends with the binding, as the ordered path's does
+                        TakeContext context = new TakeContext(taken.get(), takeLease.duration(), handle.agentId,
+                                space.name(), () -> handle.running);
                         Optional<ai.badmonkey.agentspaces.agent.spi.TakeInvoker> invoker = invokerFor(agent, method);
                         Object result = invoker.isPresent()
                                 ? invokeThrough(invoker.get(), context, agent, method, taken.get().entry())
@@ -1405,6 +1547,7 @@ public final class AgentBinder implements AutoCloseable {
                 }
             } finally {
                 ungatedWaits.remove(wait);
+                closeQuietly(waiter);
             }
         });
     }
@@ -1481,26 +1624,7 @@ public final class AgentBinder implements AutoCloseable {
             }
             onEvent.accept(spaceEvent);
         }, lease);
-        long halfLeaseMillis = Math.max(1L, lease.duration().toMillis() / 2);
-        handle.threads.add(Thread.ofVirtual().name(threadPrefix + "-renew-" + label).start(() -> {
-            while (handle.running) {
-                try {
-                    Thread.sleep(halfLeaseMillis);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                if (!handle.running) {
-                    return;
-                }
-                try {
-                    subscription.renew(lease.duration());
-                } catch (RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING,
-                            label + ": subscription renewal failed; reactions stop", e);
-                    return;
-                }
-            }
-        }));
+        renewWhileBound(subscription, lease.duration(), handle, threadPrefix + "-renew-" + label);
         return subscription;
     }
 
@@ -1618,6 +1742,37 @@ public final class AgentBinder implements AutoCloseable {
      * evaluates the settle rule on its own tick and calls back once per epoch
      * on a virtual thread; the binder dispatches the return as for any binding.
      */
+    /** The default settle span of {@code @OnEstimate}: eight rounds, 8 s. */
+    static final java.time.Duration DEFAULT_SETTLE = java.time.Duration.ofSeconds(8);
+
+    /**
+     * An {@code @OnEstimate}'s settle rule (srad/agentspaces-event-loop.md EL-T-06): the {@code settle} duration, or
+     * the deprecated {@code settleTicks} read as rounds of {@code ROUND_PERIOD} (owner answer 1, 2026-11-22), or the
+     * 8 s default. Both given is refused, naming the method.
+     */
+    @SuppressWarnings("deprecation")
+    static PushSumAggregate.Settle settleOf(OnEstimate on, Method method) {
+        boolean span = !on.settle().isBlank();
+        if (span && on.settleTicks() >= 0) {
+            throw new IllegalArgumentException("@OnEstimate at " + method + " gives both settle and settleTicks;"
+                    + " give settle alone");
+        }
+        if (span) {
+            java.time.Duration parsed;
+            try {
+                parsed = Durations.parse(on.settle());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("@OnEstimate at " + method + ": settle '" + on.settle()
+                        + "' is not a duration", e);
+            }
+            return PushSumAggregate.Settle.after(parsed, on.tolerance());
+        }
+        if (on.settleTicks() >= 0) {
+            return PushSumAggregate.Settle.after(on.settleTicks(), on.tolerance());
+        }
+        return PushSumAggregate.Settle.after(DEFAULT_SETTLE, on.tolerance());
+    }
+
     private AutoCloseable startEstimateWatch(Object agent, Method method, OnEstimate on, Bound handle,
                                              String resultSpaceName) {
         Space resultSpace = resultSpaceName == null ? null
@@ -1625,7 +1780,7 @@ public final class AgentBinder implements AutoCloseable {
         Lease resultLease = Lease.of(Durations.parse(on.resultLease()));
         String label = handle.agentId.localName() + "." + method.getName();
         return aggregate.onEstimate(id -> id.startsWith(on.prefix()),
-                PushSumAggregate.Settle.after(on.settleTicks(), on.tolerance()), estimate -> {
+                settleOf(on, method), estimate -> {
                     try {
                         Object result = invoke(agent, method, estimate);
                         dispatch(result, null, resultSpace, resultLease, null, handle, method, label);
@@ -1735,15 +1890,24 @@ public final class AgentBinder implements AutoCloseable {
         return buildCard(agentIdentity, spec, consumes, produces, spaceBindings, Map.of());
     }
 
+    /**
+     * The issue millisecond of every card this binder signed, so a card issued again in the same millisecond (a bind
+     * and a refresh, two reissues for the AppCard level) is a millisecond later and reaches every cache
+     * (srad/agentspaces-event-loop.md §10.16, the same-millisecond audit).
+     */
+    private final ai.badmonkey.agentspaces.common.time.IssueClock cardIssues =
+            new ai.badmonkey.agentspaces.common.time.IssueClock();
+
     private AgentCard buildCard(ai.badmonkey.agentspaces.api.spi.AgentIdentity agentIdentity, Spec spec,
                                 Set<String> consumes, Set<String> produces,
                                 Map<String, String> spaceBindings, Map<String, String> costHints) {
         AgentId agentId = agentIdentity.id();
-        java.time.Instant issuedAt = clock.instant();
+        String cardId = "aspace://" + group.value() + "/agent/" + identity.peerId().value()
+                + "/" + agentId.localName();
+        java.time.Instant issuedAt = cardIssues.next(cardId, clock.instant());
         AgentCard card = new AgentCard(
-                "aspace://" + group.value() + "/agent/" + identity.peerId().value()
-                        + "/" + agentId.localName(),
-                identity.peerId(), group, issuedAt, Duration.ofMinutes(15),
+                cardId,
+                identity.peerId(), group, issuedAt, CARD_TTL,
                 agentId,
                 spec == null ? "" : spec.description(),
                 spec == null ? List.of() : spec.goals(),
@@ -2231,11 +2395,14 @@ public final class AgentBinder implements AutoCloseable {
         return Thread.ofVirtual().name("space-ordered-take-" + label).start(() -> {
             // a leader election in flight refuses a take or two, so the first
             // fault of a run is quiet here: the next poll resubmits
-            TakeFailures failures = new TakeFailures(label, true);
+            TakeFailures failures = new TakeFailures(label, true, waits());
+            ai.badmonkey.agentspaces.common.time.ChangeSignal changed = new ai.badmonkey.agentspaces.common.time.ChangeSignal(waits());
+            AutoCloseable waiter = gatedWaiter(space, changed);
+            try {
             while (handle.running) {
                 Optional<? extends TakenEntry<?>> taken;
                 try {
-                    Optional<Template<?>> admitted = gated(space, template, pollTimeout);
+                    Optional<Template<?>> admitted = gated(space, template, pollTimeout, changed);
                     if (admitted.isEmpty()) {
                         continue;
                     }
@@ -2251,9 +2418,34 @@ public final class AgentBinder implements AutoCloseable {
                     continue;
                 }
                 try {
-                    Object result = invokeWithin(new TakeContext(taken.get(),
-                            takeLease.duration(), handle.agentId, spaceName),
-                            agent, method, taken.get().entry());
+                    // srad/agentspaces-event-loop.md EL-E-08, owner answer 12 (2026-11-22): the take lease is renewed
+                    // at half the lease while the handler runs, as ConnectorRuntime renews an invocation's claim, so a
+                    // handler that outlasts the 30 s lease keeps its entry; a hung handler keeps it while it hangs and
+                    // its agent stays bound, never past the binding's end (§10.14)
+                    // §10.16, owner decision 2 (2026-11-22): the watchdog names a handler that holds its entry long,
+                    // and an optional hold limit (off by default) stops the renewal of a hung one
+                    ai.badmonkey.agentspaces.common.time.TimeSource time = heldTime();
+                    long heldSince = time.monoNanos();
+                    ai.badmonkey.agentspaces.common.time.Watchdog.Registration heldWatch =
+                            time.watchdog().registerHeld(new ai.badmonkey.agentspaces.common.time.Watchdog.Held(
+                                    handle.agentId.toString(), method.getName(),
+                                    String.valueOf(taken.get().entryId()), heldSince));
+                    AutoCloseable renewer = renewTakeWhileRunning(taken.get(), takeLease.duration(), label, handle,
+                            time, heldSince);
+                    Duration limit = holdLimit;
+                    // §10.33 (I-05): a renewal from inside the method (an LLM advisor or listener during a model
+                    // stream) obeys the same end as the binder's own renewer: the agent unbound, or the hold limit
+                    java.util.function.BooleanSupplier renewable = () -> handle.running
+                            && (limit == null || time.monoNanos() - heldSince < limit.toNanos());
+                    Object result;
+                    try {
+                        result = invokeWithin(new TakeContext(taken.get(),
+                                takeLease.duration(), handle.agentId, spaceName, renewable),
+                                agent, method, taken.get().entry());
+                    } finally {
+                        closeQuietly(renewer);
+                        heldWatch.close();
+                    }
                     dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
                 } catch (RuntimeException | Error e) {
                     // The crash idiom, exactly once: no complete, the TAKE lease
@@ -2261,6 +2453,9 @@ public final class AgentBinder implements AutoCloseable {
                     LOG.log(System.Logger.Level.WARNING,
                             label + ": action failed; lease will lapse", e);
                 }
+            }
+            } finally {
+                closeQuietly(waiter);
             }
         });
     }
@@ -2275,25 +2470,134 @@ public final class AgentBinder implements AutoCloseable {
         target.start(contribution.epochId(), contribution.value());
     }
 
-    /** Renews a leased subscription at half-lease for as long as the agent stays bound. */
+    /** The hold limit of a running {@code @OrderedTake} handler; null: off (the default). */
+    private volatile Duration holdLimit;
+    private final java.util.concurrent.atomic.AtomicLong holdLimitStops = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Sets the hold limit of an {@code @OrderedTake} handler (srad/agentspaces-event-loop.md §10.16, owner decision 2
+     * of 2026-11-22): once a handler has held its entry this long, the binder stops renewing the take lease, so the
+     * entry lapses to another member's clerk at the lease's end, as if the handler had crashed; the handler itself is
+     * left running. Off by default, so a long handler keeps its entry while it runs (owner answer 12). Applies to
+     * handlers that take an entry after the call.
+     *
+     * @param limit the limit, or null or zero for none
+     * @return this binder
+     */
+    public AgentBinder holdLimit(Duration limit) {
+        if (limit != null && limit.isNegative()) {
+            throw new IllegalArgumentException("the hold limit must not be negative: " + limit);
+        }
+        this.holdLimit = limit == null || limit.isZero() ? null : limit;
+        return this;
+    }
+
+    /**
+     * The hold limit in force, or null when off (the default); hosts that configure it read it back.
+     *
+     * @return the limit, or null
+     */
+    public Duration holdLimit() {
+        return holdLimit;
+    }
+
+    /**
+     * How many renewals the hold limit stopped.
+     *
+     * @return the count
+     */
+    public long holdLimitStops() {
+        return holdLimitStops.get();
+    }
+
+    /** The time a held handler is judged on: the binder's own time source, else the system's. */
+    private ai.badmonkey.agentspaces.common.time.TimeSource heldTime() {
+        return waits();
+    }
+
+    /**
+     * The source the binder's waits and renewers use (srad/agentspaces-event-loop.md EL-W-01, EL-W-02): its clock when
+     * that is a time source of its own, else the system's.
+     */
+    private ai.badmonkey.agentspaces.common.time.TimeSource waits() {
+        return ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        try {
+            closeable.close();
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.DEBUG, "closing a renewer failed", e);
+        }
+    }
+
+    /** How many times a running {@code @OrderedTake} handler's take lease was renewed by the binder. */
+    private final java.util.concurrent.atomic.AtomicLong takeRenewals = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How many times the binder renewed a running {@code @OrderedTake} handler's take lease (EL-E-08, owner answer
+     * 12); for tests and status.
+     *
+     * @return the count
+     */
+    public long takeRenewals() {
+        return takeRenewals.get();
+    }
+
+    /**
+     * Renews a take at half its lease until interrupted (EL-E-08, owner answer 12): what keeps an {@code @OrderedTake}
+     * handler's entry while it runs, so the 30 s default exceeds the 15 s cycle that renews it. The renewal also ends
+     * with the binding (closed, or unbound by a revocation): the unbind interrupts the handler's thread, but a handler
+     * that ignores the interrupt would otherwise keep its entry for as long as it hung, and no other member could ever
+     * take it (srad/agentspaces-event-loop.md §10.14, the phase 2 wire adversary).
+     */
+    private AutoCloseable renewTakeWhileRunning(TakenEntry<?> taken, Duration lease, String label, Bound handle,
+                                                ai.badmonkey.agentspaces.common.time.TimeSource time, long heldSince) {
+        Duration every = lease.dividedBy(2).isZero() ? lease : lease.dividedBy(2);
+        Duration limit = holdLimit;
+        // A task on the binder's time source (EL-W-02): renewal and expiry judged on one source; closed when the
+        // handler returns.
+        return ai.badmonkey.agentspaces.common.time.Periodic.every(time, every, "space-ordered-renew-" + label, () -> {
+            if (!handle.running) {
+                return false; // its agent was unbound while the handler ran
+            }
+            if (limit != null && time.monoNanos() - heldSince >= limit.toNanos()) {
+                // The hold limit (owner decision 2, 2026-11-22; off by default): the handler is taken as hung, the
+                // renewal stops, and the entry lapses to another member's clerk at the lease's end.
+                holdLimitStops.incrementAndGet();
+                LOG.log(System.Logger.Level.WARNING, label + ": held entry " + taken.entryId() + " for "
+                        + Duration.ofNanos(time.monoNanos() - heldSince).toMillis() + " ms, past the hold limit of "
+                        + limit.toMillis() + " ms; the take lease is no longer renewed and lapses to another taker");
+                return false;
+            }
+            try {
+                taken.renew(lease);
+                takeRenewals.incrementAndGet();
+                return true;
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, label + ": renewing the take lease failed", e);
+                return false;
+            }
+        });
+    }
+
+    /**
+     * Renews a leased subscription at half-lease for as long as the agent stays bound: a task on the binder's time
+     * source (srad/agentspaces-event-loop.md EL-W-02), so the renewal's cadence and the lease it renews are judged on
+     * one source and a virtual source releases it on its advance; the binding's close cancels it.
+     */
     private void renewWhileBound(Subscription subscription, Duration lease, Bound handle, String name) {
-        long halfLeaseMillis = Math.max(1L, lease.toMillis() / 2);
-        handle.threads.add(Thread.ofVirtual().name(name).start(() -> {
-            while (handle.running) {
-                try {
-                    Thread.sleep(halfLeaseMillis);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                if (!handle.running) {
-                    return;
-                }
-                try {
-                    subscription.renew(lease);
-                } catch (RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, name + ": renewal failed; reactions stop", e);
-                    return;
-                }
+        Duration half = lease.dividedBy(2);
+        handle.closeables.add(ai.badmonkey.agentspaces.common.time.Periodic.every(waits(), half, name, () -> {
+            if (!handle.running) {
+                return false;
+            }
+            try {
+                subscription.renew(lease);
+                return true;
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, name + ": renewal failed; reactions stop", e);
+                return false;
             }
         }));
     }

@@ -27,6 +27,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -106,6 +107,51 @@ class AdmissionMemoryTest {
         reloaded.drop(group);
         assertThat(file).as("leaving deletes the file").doesNotExist();
         assertThat(reloaded.forGroup(group)).isEmpty();
+    }
+
+    /**
+     * Time adversary of phase 3 (srad/agentspaces-event-loop.md §10.18): the flush cadence is a local period, and a wall
+     * step back must not hold a dirty group unwritten until the wall clock passes the last write again. Before the fix a
+     * 2-hour back step (an NTP correction after EL-SP-13's forward step) left every change unpersisted for 2 hours, so a
+     * crash in that span lost them. The values written stay on wall time.
+     */
+    @Test
+    void aBackStepDoesNotHoldADirtyGroupUnwritten(@TempDir Path state) throws Exception {
+        AdmissionMemory memory = new AdmissionMemory(state, 10, clock);
+        memory.load(group);
+        PeerId a = peer();
+        PeerId b = peer();
+        memory.record(group, a, "aa");
+        long writtenAt = clock.millis();
+        memory.flushIfDue(group, writtenAt, 1_000);
+        Path file = state.resolve(AdmissionMemory.DIRECTORY).resolve(group.value() + ".json");
+        assertThat(Files.readString(file, StandardCharsets.UTF_8)).doesNotContain(b.value());
+
+        long stepped = writtenAt - Duration.ofHours(2).toMillis(); // the wall clock stepped back 2 hours
+        memory.record(group, b, "bb");
+        memory.flushIfDue(group, stepped + 5_000, 1_000);
+        assertThat(Files.readString(file, StandardCharsets.UTF_8)).as("written at the next due run after the step")
+                .contains(b.value());
+        assertThat(memory.nextFlushDueMillis(group, 1_000)).as("clean again").isEqualTo(Long.MAX_VALUE);
+    }
+
+    /** The same rule for the retirement list (§10.18). */
+    @Test
+    void aBackStepDoesNotHoldADirtyRetirementListUnwritten(@TempDir Path state) throws Exception {
+        RetirementList list = new RetirementList(state, 10);
+        long now = clock.millis();
+        list.load(group, now);
+        PeerId a = peer();
+        PeerId b = peer();
+        list.retire(group, new RetirementList.Retired(a, List.of(), now, now, now));
+        list.flushIfDue(group, now, 1_000);
+        Path file = state.resolve(RetirementList.DIRECTORY).resolve(group.value() + ".json");
+        assertThat(Files.readString(file, StandardCharsets.UTF_8)).contains(a.value()).doesNotContain(b.value());
+
+        long stepped = now - Duration.ofHours(2).toMillis();
+        list.retire(group, new RetirementList.Retired(b, List.of(), stepped, stepped, stepped));
+        list.flushIfDue(group, stepped + 5_000, 1_000);
+        assertThat(Files.readString(file, StandardCharsets.UTF_8)).contains(b.value());
     }
 
     /** A foreign or corrupt file leaves the group empty rather than refusing to start. */

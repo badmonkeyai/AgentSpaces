@@ -93,7 +93,10 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * {@code sha-256(peerId)}). The {@code AVG} denominator of template mode
  * travels as an ordinary push-sum epoch named {@code <epochId>#n}.
  */
-public final class PushSumAggregate implements CapabilityProvider {
+public final class PushSumAggregate implements ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider {
+
+    /** The capability card's time to live (srad/agentspaces-event-loop.md §3.11), as every shipped capability uses. */
+    public static final java.time.Duration ADVERTISEMENT_TTL = java.time.Duration.ofMinutes(15);
 
     /** The capability type URI. */
     public static final String TYPE = "aspace:cap/aggregate";
@@ -231,10 +234,10 @@ public final class PushSumAggregate implements CapabilityProvider {
         private double lastValue = Double.NaN;
         private int stableTicks;
 
-        /** Records this tick's state; returns how many consecutive ticks it has been unchanged. */
-        synchronized int observe(Object fingerprint) {
+        /** Records this step's state; returns how many consecutive steps it has been unchanged. */
+        synchronized int observe(Object fingerprint, int steps) {
             if (java.util.Objects.equals(last, fingerprint)) {
-                stableTicks++;
+                stableTicks += steps;
             } else {
                 last = fingerprint;
                 stableTicks = 0;
@@ -243,12 +246,12 @@ public final class PushSumAggregate implements CapabilityProvider {
         }
 
         /** The same for a numeric estimate: unchanged when within a relative tolerance of the last value. */
-        synchronized int observe(double value, double tolerance) {
+        synchronized int observe(double value, double tolerance, int steps) {
             boolean same = Double.isNaN(value) ? Double.isNaN(lastValue)
                     : !Double.isNaN(lastValue)
                     && Math.abs(value - lastValue) <= tolerance * Math.max(Math.max(Math.abs(value), Math.abs(lastValue)), 1e-12);
             if (same) {
-                stableTicks++;
+                stableTicks += steps;
             } else {
                 lastValue = value;
                 stableTicks = 0;
@@ -383,6 +386,25 @@ public final class PushSumAggregate implements CapabilityProvider {
             return new Settle(ticks, tolerance);
         }
 
+        /**
+         * A settle rule in time (srad/agentspaces-event-loop.md EL-T-06, decision 6): the estimate unchanged for
+         * {@code span}, counted in gossip rounds of {@link PushSumAggregate#ROUND_PERIOD}, rounded up. The count form
+         * reads each step as one round of about a second (owner answer 1, 2026-11-22), so {@code after(8, t)} and
+         * {@code after(Duration.ofSeconds(8), t)} are the same rule.
+         *
+         * @param span      how long the estimate must stay unchanged
+         * @param tolerance the relative change that counts as unchanged
+         * @return the rule
+         */
+        public static Settle after(Duration span, double tolerance) {
+            Objects.requireNonNull(span, "span");
+            if (span.isNegative()) {
+                throw new IllegalArgumentException("span is not negative: " + span);
+            }
+            long round = ROUND_PERIOD.toMillis();
+            return new Settle((int) Math.min(Integer.MAX_VALUE, (span.toMillis() + round - 1) / round), tolerance);
+        }
+
         boolean unchanged(double now, double last) {
             return !Double.isNaN(last) && Math.abs(now - last) <= tolerance * Math.max(1.0, Math.abs(last));
         }
@@ -482,7 +504,7 @@ public final class PushSumAggregate implements CapabilityProvider {
     public CapabilityAdvertisement describe(GroupId group) {
         return new CapabilityAdvertisement(
                 "aspace://" + group.value() + "/cap/aggregate/" + self.value(),
-                self, group, clock.instant(), Duration.ofMinutes(15),
+                self, group, clock.instant(), ADVERTISEMENT_TTL,
                 TYPE, "0.1", "pipe", Map.of("modes", "sum,avg,count,min,max,quantile"), Map.of());
     }
 
@@ -527,6 +549,7 @@ public final class PushSumAggregate implements CapabilityProvider {
             case MIN, MAX -> extremum(epochId, mode == Mode.MAX).merge(localValue);
             default -> throw new IllegalStateException(mode.name());
         }
+        wakeDue(); // after the write (DW-2)
     }
 
     /**
@@ -543,6 +566,7 @@ public final class PushSumAggregate implements CapabilityProvider {
         double[] unit = new double[quantile.buckets()];
         unit[quantile.bucketOf(localValue)] = 1.0;
         histogram(epochId, quantile).add(unit);
+        wakeDue(); // after the write (DW-2)
     }
 
     /**
@@ -596,6 +620,7 @@ public final class PushSumAggregate implements CapabilityProvider {
             case MAX -> extremum(epochId, true).merge(max);
             default -> throw new IllegalStateException(mode.name());
         }
+        wakeDue(); // after the write (DW-2)
     }
 
     /**
@@ -619,6 +644,7 @@ public final class PushSumAggregate implements CapabilityProvider {
         }
         declare(epochId, Mode.QUANTILE, quantile, true);
         histogram(epochId, quantile).add(units);
+        wakeDue(); // after the write (DW-2)
     }
 
     private static <T> List<T> readLocal(Space space, Template<T> template) {
@@ -713,7 +739,9 @@ public final class PushSumAggregate implements CapabilityProvider {
     /** Whether gossip for this key has stopped because its state settled (for tests and panels). */
     public boolean quiet(String key) {
         Quiet q = quiet.get(key);
-        return q != null && q.stableTicks >= quietAfterTicks;
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        int threshold = d != null && d.timed() ? roundsOf(quietAfterTicks) : quietAfterTicks;
+        return q != null && q.stableTicks >= threshold;
     }
 
     /** How many ticks a key has gone silent for: its unchanged ticks once quiet, else zero. */
@@ -726,26 +754,189 @@ public final class PushSumAggregate implements CapabilityProvider {
         synchronized (q) {
             stable = q.stableTicks;
         }
-        return stable >= quietAfterTicks ? stable : 0;
+        return stable >= quietAfter() ? stable : 0;
     }
 
     /** Observes a key's state; returns true when it should be gossiped this tick, evicting it when due. */
     private boolean active(String key, Object fingerprint, Runnable evict) {
-        return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(fingerprint), evict);
+        return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(fingerprint, stepRounds), evict);
     }
 
     /** The same for a numeric estimate, judged within the relative tolerance. */
     private boolean activeValue(String key, double estimate, Runnable evict) {
-        return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(estimate, quietTolerance), evict);
+        return judge(key, quiet.computeIfAbsent(key, k -> new Quiet()).observe(estimate, quietTolerance, stepRounds),
+                evict);
     }
 
     private boolean judge(String key, int stableTicks, Runnable evict) {
-        if (stableTicks >= evictAfterTicks) {
+        if (stableTicks >= evictAfter()) {
             quiet.remove(key);
             evict.run();
             return false;
         }
-        return stableTicks < quietAfterTicks;
+        return stableTicks < quietAfter();
+    }
+
+    // ---- timed mode (srad/agentspaces-event-loop.md EL-T-03, EL-T-04, EL-T-16; owner answer 4, 2026-11-22)
+
+    /** The driver of the capability participant; null while only {@link #tick()} drives the aggregate. */
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver;
+    /** How many rounds the current step counts for: 1, or the rounds a quiet aggregate slept through. */
+    private int stepRounds = 1;
+    /** Whether the current step is a timed one: one step is one {@link #ROUND_PERIOD}, not one 250 ms tick. */
+    private boolean timedStep;
+    /** The loop's monotonic instant of the last timed step; 0 before the first. */
+    private long lastStepNanos;
+    /** Set when every state was quiet at the last timed step, so a frame that arrives asks for a step (DW-2). */
+    private volatile boolean allQuiet;
+
+    /** The legacy step's length the tick counts convert at: today's 250 ms (decision 6). */
+    private static final long TICK_MILLIS = 250;
+
+    /** A tick count as rounds of {@link #ROUND_PERIOD}, rounded up: the same span of time. */
+    private static int roundsOf(int ticks) {
+        return (int) Math.max(1, (ticks * TICK_MILLIS + ROUND_PERIOD.toMillis() - 1) / ROUND_PERIOD.toMillis());
+    }
+
+    /** The quiet threshold in this step's unit: ticks for {@link #tick()}, rounds for a timed step. */
+    private int quietAfter() {
+        return timedStep ? roundsOf(quietAfterTicks) : quietAfterTicks;
+    }
+
+    private int evictAfter() {
+        return timedStep ? roundsOf(evictAfterTicks) : evictAfterTicks;
+    }
+
+    /** Steps of the settle span: rounds for a timed step, rounds at the driver's cadence for {@link #tick()}. */
+    private int roundSteps() {
+        return timedStep ? 1 : roundEveryTicks;
+    }
+
+    @Override
+    public void attach(ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver) {
+        this.driver = Objects.requireNonNull(driver, "driver");
+    }
+
+    /**
+     * Tunes when a settled state goes silent and when it is forgotten, in time (decision 6, EL-T-03): kept as the
+     * equal count of 250 ms ticks, so a hand-driven {@link #tick()} and a started loop judge the same span.
+     *
+     * @param quietAfter how long an unchanged estimate is gossiped before it goes silent
+     * @param tolerance  the relative change that counts as unchanged
+     * @param evictAfter how long an unchanged estimate is kept before it is forgotten
+     * @return this aggregate
+     */
+    public PushSumAggregate quiet(Duration quietAfter, double tolerance, Duration evictAfter) {
+        return quiet((int) Math.max(1, quietAfter.toMillis() / TICK_MILLIS), tolerance,
+                (int) Math.max(1, evictAfter.toMillis() / TICK_MILLIS));
+    }
+
+    /**
+     * The aggregate on a started loop: one gossip round per {@link #ROUND_PERIOD} while any state is active or a watch
+     * waits; once everything is quiet, it sleeps to the earliest eviction and counts the rounds it slept through
+     * (an unchanged state stays unchanged), and a frame that arrives wakes it (DW-2). Watches are judged after each
+     * round, as the tick judged them, so a heard epoch that went quiet settles at its last move plus the settle span
+     * with no further frame (EL-T-16).
+     */
+    @Override
+    public long run(long now) {
+        long round = ROUND_PERIOD.toNanos();
+        if (lastStepNanos == 0) {
+            lastStepNanos = now - round;
+        }
+        long elapsed = (now - lastStepNanos) / round;
+        if (elapsed >= 1) {
+            synchronized (this) {
+                timedStep = true;
+                stepRounds = (int) Math.min(elapsed, Integer.MAX_VALUE / 4);
+                try {
+                    step(true);
+                    timedSteps.incrementAndGet();
+                } finally {
+                    timedStep = false;
+                    stepRounds = 1;
+                }
+            }
+            lastStepNanos = elapsed == 1 ? lastStepNanos + round : now;
+            changes().run(); // a round may have made an estimate readable (awaitEstimate)
+        }
+        long next = nextStepNanos(round);
+        allQuiet = next != lastStepNanos + round;
+        return next;
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong timedSteps = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Timed steps taken on a started loop; for tests. */
+    long timedSteps() {
+        return timedSteps.get();
+    }
+
+    /**
+     * Whether a state exists that no step has judged yet: one started or first heard between steps has no quiet record,
+     * so without this the participant slept to NEVER and the state never gossiped (found by the starter's
+     * {@code theStarterDrivesAggregateToConvergenceWithNoApplicationClock}).
+     */
+    private boolean unjudged() {
+        for (String key : epochs.keySet()) {
+            if (!quiet.containsKey(key)) {
+                return true;
+            }
+        }
+        for (String key : extrema.keySet()) {
+            if (!quiet.containsKey("x:" + key)) {
+                return true;
+            }
+        }
+        for (String key : histograms.keySet()) {
+            if (!quiet.containsKey("h:" + key)) {
+                return true;
+            }
+        }
+        for (String key : rosters.keySet()) {
+            if (!quiet.containsKey("r:" + key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** One round from now while anything gossips or a watch waits; otherwise the earliest eviction; else never. */
+    private long nextStepNanos(long round) {
+        if (knownEpochs().isEmpty()) {
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        boolean waiting = false;
+        for (Watch watch : watches) {
+            for (String epochId : knownEpochs()) {
+                if (watch.epochs.test(epochId)) {
+                    Track track = watch.tracks.get(epochId);
+                    if (track == null || !track.fired) {
+                        waiting = true;
+                    }
+                }
+            }
+        }
+        if (waiting || unjudged()) {
+            return lastStepNanos + round; // a watch still counts its rounds, or a new state has not had its first round
+        }
+        int quietRounds = roundsOf(quietAfterTicks);
+        int evictRounds = roundsOf(evictAfterTicks);
+        long sleep = Long.MAX_VALUE;
+        for (Map.Entry<String, Quiet> e : quiet.entrySet()) {
+            int stable;
+            synchronized (e.getValue()) {
+                stable = e.getValue().stableTicks;
+            }
+            if (stable < quietRounds || waiting) {
+                return lastStepNanos + round; // gossiping, or a watch still counts its rounds
+            }
+            sleep = Math.min(sleep, evictRounds - stable);
+        }
+        if (sleep == Long.MAX_VALUE) {
+            return waiting ? lastStepNanos + round : ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        return lastStepNanos + Math.max(1, sleep) * round;
     }
 
     @Override
@@ -757,8 +948,62 @@ public final class PushSumAggregate implements CapabilityProvider {
 
     @Override
     public void tick() {
+        step((ticks++ % roundEveryTicks) == 0);
+        changes().run(); // a round may have made an estimate readable (awaitEstimate)
+    }
+
+    /**
+     * Moves whenever a state is started or touched and after every step, so a caller waiting for an estimate waits on
+     * a change through the time source instead of polling (srad/agentspaces-event-loop.md EL-W-03).
+     */
+    private volatile ai.badmonkey.agentspaces.common.time.ChangeSignal changes;
+
+    private ai.badmonkey.agentspaces.common.time.ChangeSignal changes() {
+        ai.badmonkey.agentspaces.common.time.ChangeSignal c = changes;
+        if (c == null) {
+            synchronized (this) {
+                c = changes;
+                if (c == null) {
+                    c = new ai.badmonkey.agentspaces.common.time.ChangeSignal(
+                            ai.badmonkey.agentspaces.common.time.Waits.base(clock));
+                    changes = c;
+                }
+            }
+        }
+        return c;
+    }
+
+    /**
+     * Waits for this node's estimate of an epoch to become readable: the first exchange of its rounds. Empty if none
+     * arrives within the timeout. The wait is a change wait on the aggregate's time source (EL-W-03; was a 50 ms poll).
+     *
+     * @param epochId the epoch
+     * @param timeout how long to wait, on the aggregate's time source
+     * @return the estimate, or empty
+     */
+    public OptionalDouble awaitEstimate(String epochId, Duration timeout) {
+        ai.badmonkey.agentspaces.common.time.ChangeSignal signal = changes();
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(signal.time(), timeout);
+        while (true) {
+            long seen = signal.seen();
+            OptionalDouble estimate = estimate(epochId);
+            if (estimate.isPresent()) {
+                return estimate;
+            }
+            try {
+                if (!signal.await(seen, deadline)) {
+                    return estimate(epochId);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return OptionalDouble.empty();
+            }
+        }
+    }
+
+    /** One step: a legacy tick, or a timed round ({@link #run}); {@code round} says whether it gossips. */
+    private void step(boolean round) {
         exchanged = true;
-        boolean round = (ticks++ % roundEveryTicks) == 0;
         for (Map.Entry<String, Epoch> e : epochs.entrySet()) {
             Epoch epoch = e.getValue();
             double estimate = epoch.weight == 0.0 ? Double.NaN : epoch.value / epoch.weight;
@@ -882,7 +1127,7 @@ public final class PushSumAggregate implements CapabilityProvider {
                 // gap between the first and the last priced claim, and it reported a plateau of 0.0 after
                 // 30 s while the claims that would move it were still on their way (R1, 2026-11-14).
                 boolean settledAfterHearing = receipts > 0
-                        && silentTicks(epochId) >= (long) watch.settle.ticks() * roundEveryTicks;
+                        && silentTicks(epochId) >= (long) watch.settle.ticks() * roundSteps();
                 boolean roundHeard = receipts > 0 && round;
                 if (!roundHeard && !alone && !settledAfterHearing) {
                     continue; // between rounds, or never heard: the streak neither grows nor resets
@@ -1074,6 +1319,7 @@ public final class PushSumAggregate implements CapabilityProvider {
                 : frame.extremum() != null ? frame.extremum().epochId()
                 : frame.histogram() != null ? frame.histogram().epochId()
                 : frame.roster() != null ? frame.roster().epochId() : null;
+        boolean fresh = heard != null && !knownEpochs().contains(heard);
         if (heard != null) {
             received.merge(heard, 1L, Long::sum);
         }
@@ -1096,6 +1342,11 @@ public final class PushSumAggregate implements CapabilityProvider {
                 && frame.roster().members() != null) {
             roster(frame.roster().epochId()).add(frame.roster().members());
         }
+        if (allQuiet || fresh) {
+            wakeDue(); // after the write: a share may move a quiet state, or start one (DW-2)
+        } else {
+            changes().run(); // a waiter for an estimate looks again (EL-W-03)
+        }
     }
 
     private Epoch epoch(String epochId) {
@@ -1113,5 +1364,20 @@ public final class PushSumAggregate implements CapabilityProvider {
 
     private RosterState roster(String epochId) {
         return rosters.computeIfAbsent(epochId, id -> new RosterState());
+    }
+
+    /**
+     * A state was started or touched: its next round may be due now (DW-2). Called after the state is written, never
+     * before: a wake taken before the write let the participant run on another thread in between, see no state, and
+     * sleep to NEVER with its wake spent, so the epoch never stepped and its watch never fired (the Micronaut host's
+     * {@code aContributionFeedsTheAggregateAndOnEstimateReportsWhenItSettles}, srad/agentspaces-event-loop.md
+     * §10.16).
+     */
+    private void wakeDue() {
+        changes().run(); // a waiter for an estimate looks again (EL-W-03)
+        ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
+        if (d != null) {
+            d.wake();
+        }
     }
 }

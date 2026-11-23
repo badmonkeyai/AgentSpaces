@@ -34,7 +34,9 @@ import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.peering.node.PeerNodeProbe;
 import ai.badmonkey.agentspaces.test.FleetProbe;
 import ai.badmonkey.agentspaces.test.SimNetwork;
-import ai.badmonkey.agentspaces.test.TestClock;
+import ai.badmonkey.agentspaces.measure.SimWait;
+import ai.badmonkey.agentspaces.measure.Wait;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -50,16 +52,22 @@ import java.util.stream.Collectors;
 
 /**
  * The fleet of the space scenarios (srad/spoiler-peers.md §3.8 A, B and H): members on one {@link SimNetwork} under
- * one {@link TestClock}, each with a replicated space, discovery, a capability runtime and an agent context, as an
- * application assembles them. Ticks run on the test thread and move the clock one period; takes, settles and the
- * binders' loops run on their own threads, as in a host (§3.4.4: their order is scripted, their durations measured).
+ * one {@link VirtualTime}, each with a replicated space, discovery, a capability runtime and an agent context, as an
+ * application assembles them. Ticks run on the test thread and move the clock one period.
+ *
+ * <p>The clock seam of srad/spoiler-peers.md decision 10, granted by srad/agentspaces-event-loop.md decision 12
+ * (EL-W-01, §10.17): the settle window, the take's poll, the log's attempt window and the binders' waits and renewers
+ * all wait on this fleet's virtual time. A take the test drives runs as a task of that time ({@link #call},
+ * {@link #callTicking}), so its duration is a hard bound in virtual time, not a wall duration to measure. The binders'
+ * own threads are not the time's tasks: their waits are released by each advance and they run between ticks
+ * ({@link #tickSlowly}).
  */
 final class SpaceFleet implements AutoCloseable {
 
     /** One tick of fleet time. */
     static final Duration PERIOD = Duration.ofMillis(300);
 
-    final TestClock clock = TestClock.create();
+    final VirtualTime clock = VirtualTime.create();
     final SimNetwork network = new SimNetwork();
     final CborCodec codec = CborCodec.defaultCodec();
     final GroupId groupId;
@@ -154,6 +162,35 @@ final class SpaceFleet implements AutoCloseable {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted while ticking", e);
         }
+    }
+
+    /**
+     * Runs a blocking call (a take, which settles on this fleet's time) as a task of the fleet's time, moving time alone
+     * in 10 ms steps until it returns; no member ticks meanwhile.
+     *
+     * @param call the call
+     * @param <T>  its value
+     * @return its value and the virtual time it took
+     */
+    <T> VirtualTime.Outcome<T> call(java.util.concurrent.Callable<T> call) {
+        return clock.run(Duration.ofMillis(10), Duration.ofMinutes(1), call);
+    }
+
+    /**
+     * Starts a blocking call as a task of the fleet's time and ticks the fleet until it returns, within a bound in ticks
+     * (a hard bound in virtual time): a take that needs protocol rounds, such as one through the ordered log.
+     *
+     * @param metric   the measurement's name
+     * @param maxTicks the bound
+     * @param call     the call
+     * @param <T>      its value
+     * @return its value and the virtual time it took
+     */
+    <T> VirtualTime.Outcome<T> callTicking(String metric, int maxTicks, java.util.concurrent.Callable<T> call) {
+        java.util.concurrent.CompletableFuture<VirtualTime.Outcome<T>> done = clock.start(call);
+        clock.runDue();
+        SimWait.ticks(metric, maxTicks, this::tickAll, done::isDone, Wait.with());
+        return done.join();
     }
 
     void own(AutoCloseable closeable) {

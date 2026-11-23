@@ -1,6 +1,13 @@
 {
   "properties": [
     {
+      "name": "agentspaces.tick-millis",
+      "type": "java.lang.Long",
+      "description": "The cadence (ms) of the deprecated GroupRuntime.onTick adapters, and the period startTicking is given. Since 0.7.0 it no longer paces the node: the node loop runs each piece of due work at its own deadline, and Raft's election timeout is a fixed 1.25 to 2.25 s whatever this says (srad/agentspaces-event-loop.md EL-T-02, EL-T-05). A smaller value speeds nothing but the old adapters.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": 250
+    },
+    {
       "name": "agentspaces.gossip.probe-hash-streams",
       "type": "java.lang.Integer",
       "description": "Per-stream probe hashes up to this many streams; above it a probe carries the root alone (srad/replication-by-entry.md RE-T-07). From 0 to 256. An unknown key under agentspaces.gossip refuses at start.",
@@ -46,26 +53,32 @@
       "name": "agentspaces.transport.quic.enabled",
       "type": "java.lang.Boolean",
       "description": "Register the quic binding. Needs ai.badmonkey.agentspaces:agentspaces-transport-quic on the classpath.",
-      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Quic",
       "defaultValue": false
     },
     {
       "name": "agentspaces.transport.quic.bind",
       "type": "java.lang.String",
       "description": "host:port the quic binding listens on and advertises; blank registers it for dialing only.",
-      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener"
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Quic"
     },
     {
       "name": "agentspaces.transport.quic.advertise",
       "type": "java.lang.String",
       "description": "host:port carried in the advertisement in place of bind (a NAT or pod address).",
-      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener"
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Quic"
     },
     {
       "name": "agentspaces.transport.quic.priority",
       "type": "java.lang.Integer",
       "description": "Advertised endpoint priority (spec 5.5), lower dials first; default: after the agentspaces.bind endpoint, in block order.",
-      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Listener"
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Quic"
+    },
+    {
+      "name": "agentspaces.transport.quic.dial-timeout",
+      "type": "java.time.Duration",
+      "description": "The bound on a dial's handshake: a dial to a port nobody serves fails after it, 1 ms to 10 min. Unset: the transport's default (QuicTransport.DEFAULT_DIAL_TIMEOUT).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Quic"
     },
     {
       "name": "agentspaces.transport.dtls.enabled",
@@ -135,6 +148,12 @@
       "description": "Silence after which an association fails, 10s to 10m; keepalive at a quarter of it.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls",
       "defaultValue": "60s"
+    },
+    {
+      "name": "agentspaces.transport.dtls.dial-timeout",
+      "type": "java.time.Duration",
+      "description": "The bound on a dial's handshake (DTLS) or HELLO exchange (bare UDP, which takes this block's datagram settings): a dial to a peer that never answers fails after it, 1 ms to 10 min. Unset: the transport's default (DtlsTransport.DEFAULT_DIAL_TIMEOUT).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Transport$Dtls"
     },
     {
       "name": "agentspaces.transport.dtls.max-half-open",
@@ -754,6 +773,32 @@
       "description": "The largest parts document a stub card's resolution fetches from the content swarm (SPEC §6.1a.5, v0.1.32), in bytes; a larger one fails at once and counts spillsOverLimit.",
       "defaultValue": 16777216,
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Discovery$Spill"
+    },
+    {
+      "name": "agentspaces.watchdog.escalation",
+      "type": "java.lang.String",
+      "description": "What the node does when the watchdog escalates its loop (three re-initialisations within 10 minutes, or a participant fenced for 2 minutes; srad/agentspaces-event-loop.md decision 4): report (an ERROR log, the loop's health DOWN, liveness BROKEN) or exit (as report, then the node closes within 2 s and the process exits with status 70, for hosts with no liveness probe). The watchdog's period and bounds are per process: the system properties agentspaces.watchdog.period-millis, grace-millis, slow-millis, wedge-millis, escalate-after, escalate-window-millis and fence-limit-millis. So are the elastic loop pool's and the stretch's (decision 2, EL-O-10): agentspaces.loop.pool-max (0, the default, means min(8, max(2, cores / 2))), pool-idle-millis (60000), grow-lateness-millis (20), stretch-lateness-millis (100) and stretch-cap (4).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog",
+      "defaultValue": "report"
+    },
+    {
+      "name": "agentspaces.watchdog.hold-limit",
+      "type": "java.time.Duration",
+      "description": "The hold limit of an @OrderedTake handler (srad/agentspaces-event-loop.md §10.16): once a handler has held its entry this long it is taken as hung, its take lease is no longer renewed and the entry lapses to another member at the lease's end; the handler itself is left running. Unset (the default): no limit, a handler keeps its entry while it runs. Either way the watchdog names a handler that has held its entry past a minute (agent, method, entry, held for), again each time the hold doubles; the system property agentspaces.watchdog.held-report-millis sets that bound.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.ttl.strict",
+      "type": "java.lang.Boolean",
+      "description": "Whether a configured TTL, lease or expiry under 60 s with no expert override refuses to start (srad/agentspaces-event-loop.md EL-E-03, decision 18, principle 8). Off by default: such a value logs a WARN naming the key, the value and the principle. A value equal to its registered default always passes.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Ttl",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.ttl.expert-overrides",
+      "type": "java.util.Map<java.lang.String,java.lang.String>",
+      "description": "Expert overrides of the TTL floor, key to reason (EL-E-04): a key named here passes whatever its value, and the node logs the reason once at start. Keys are the property names (agentspaces.relay.path-ttl) or the binder's (binder.<AgentClass>.<method>.<member>); write a dotted key in brackets, agentspaces.ttl.expert-overrides[agentspaces.relay.path-ttl]=<reason>.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Ttl"
     }
   ],
   "hints": [

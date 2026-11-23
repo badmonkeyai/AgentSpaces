@@ -55,7 +55,11 @@ public final class EmbabelRemoteActionsDeployer implements AutoCloseable {
     private final AtomicInteger generationsRetained = new AtomicInteger();
     private volatile Object platform;
     private volatile String deployedSignature = "";
-    private volatile Thread watcher;
+    /** The time source the checks run on and judge expiry by (srad/agentspaces-event-loop.md EL-C-06, EL-W-03). */
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource time =
+            ai.badmonkey.agentspaces.common.time.TimeSource.system();
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled watcher;
+    private volatile boolean running;
     private volatile Instant lastDeployAt;
     private volatile long lastGeneration = -1;
     private volatile Instant nextExpiry;
@@ -77,6 +81,18 @@ public final class EmbabelRemoteActionsDeployer implements AutoCloseable {
         if (pollInterval.isNegative() || pollInterval.isZero()) {
             throw new IllegalArgumentException("pollInterval must be positive: " + pollInterval);
         }
+    }
+
+    /**
+     * The time source the watcher runs on and judges expiry by: the node's, so a test's {@code VirtualTime} drives
+     * it. Default: the system's.
+     *
+     * @param time the time source
+     * @return this deployer
+     */
+    public EmbabelRemoteActionsDeployer time(ai.badmonkey.agentspaces.common.time.TimeSource time) {
+        this.time = Objects.requireNonNull(time, "time");
+        return this;
     }
 
     /** How long a vanished action stays deployed; zero removes it at the next check. */
@@ -127,38 +143,59 @@ public final class EmbabelRemoteActionsDeployer implements AutoCloseable {
         return this;
     }
 
-    /** Starts watching the registry. Idempotent. Nothing deploys until a platform is known. */
+    /**
+     * Starts watching the registry. Idempotent. Nothing deploys until a platform is known. Each check is a one-shot
+     * on the time source, re-armed after it runs for the poll interval or the bridge's next expiry, whichever is
+     * sooner (srad/agentspaces-event-loop.md EL-X-03): no thread of its own and no sleep.
+     */
     public synchronized void start() {
-        if (watcher != null) {
+        if (running) {
             return;
         }
-        watcher = Thread.ofVirtual().name("embabel-remote-actions-deployer").start(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    checkNow();
-                } catch (RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, "remote-action deploy check failed", e);
-                }
-                try {
-                    Thread.sleep(pollInterval.toMillis());
-                } catch (InterruptedException e) {
-                    return;
-                }
+        running = true;
+        arm(Duration.ZERO);
+    }
+
+    private synchronized void arm(Duration delay) {
+        if (!running) {
+            return;
+        }
+        watcher = time.schedule(delay, () -> {
+            try {
+                checkNow();
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "remote-action deploy check failed", e);
+            } finally {
+                arm(nextDelay());
             }
         });
     }
 
+    /** The poll interval, or the time to the bridge's next expiry when that comes first (at least 1 ms). */
+    private Duration nextDelay() {
+        Instant expiry = nextExpiry;
+        if (expiry == null) {
+            return pollInterval;
+        }
+        Duration untilExpiry = Duration.between(time.instant(), expiry);
+        if (untilExpiry.compareTo(pollInterval) >= 0) {
+            return pollInterval;
+        }
+        return untilExpiry.compareTo(Duration.ofMillis(1)) < 0 ? Duration.ofMillis(1) : untilExpiry;
+    }
+
     /** Stops watching. Idempotent; the deployed generation stays deployed. */
     public synchronized void stop() {
-        Thread current = watcher;
+        running = false;
+        ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled current = watcher;
         watcher = null;
         if (current != null) {
-            current.interrupt();
+            current.cancel();
         }
     }
 
     public boolean isRunning() {
-        return watcher != null;
+        return running;
     }
 
     /** Returns how many generations have been deployed so far, the vacant one included. */
@@ -183,7 +220,7 @@ public final class EmbabelRemoteActionsDeployer implements AutoCloseable {
         if (target == null) {
             return false;
         }
-        Instant now = Instant.now();
+        Instant now = time.instant();
         long generation = bridge.generation();
         boolean cacheMoved = generation != lastGeneration;
         boolean expired = nextExpiry != null && !now.isBefore(nextExpiry);

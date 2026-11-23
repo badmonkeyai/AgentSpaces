@@ -82,5 +82,11 @@
       <artifactId>agentspaces-test-support</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Measured waits (srad/feature-measurements.md §3.5): test scope only. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-measure</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>

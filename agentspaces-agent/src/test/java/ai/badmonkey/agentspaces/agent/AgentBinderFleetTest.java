@@ -15,6 +15,7 @@
  */
 package ai.badmonkey.agentspaces.agent;
 
+import ai.badmonkey.agentspaces.measure.Measure;
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
 import ai.badmonkey.agentspaces.agent.annotation.BidFunction;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceTake;
@@ -136,10 +137,7 @@ class AgentBinderFleetTest {
         crasherPeer.binder().bind(crasher);
 
         crasherPeer.work().write(new TaskEntry("handoff", 1), Lease.of(Duration.ofMinutes(10)));
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        while (crasher.attempts.get() < 1 && System.nanoTime() < deadline) {
-            Thread.sleep(50);
-        }
+        Measure.await("agent.fleet.cluster-1", Duration.ofSeconds(30), () -> crasher.attempts.get() >= 1);
         assertThat(crasher.attempts.get()).isGreaterThanOrEqualTo(1);
         // The worker "dies" after its crash: its binder stops, so nothing on
         // that peer renews or re-takes, and the TAKE lease simply lapses. A

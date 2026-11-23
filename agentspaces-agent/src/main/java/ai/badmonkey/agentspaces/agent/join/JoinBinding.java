@@ -174,6 +174,12 @@ public final class JoinBinding implements AutoCloseable {
 
     private final List<Subscription> subscriptions = new ArrayList<>();
     private final List<Thread> threads = new ArrayList<>();
+    /** The source the housekeeping and the waits use (EL-W-02, EL-W-03): the binder's, or the system's. */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource waits;
+    /** Moves when any part's space changes, so a firing waits for its parts on a change, not a 20 ms poll. */
+    private final ai.badmonkey.agentspaces.common.time.ChangeSignal partsChanged;
+    /** The part spaces' change listeners and the housekeeping task, closed with the binding. */
+    private final List<AutoCloseable> closeables = new java.util.concurrent.CopyOnWriteArrayList<>();
     private volatile boolean running = true;
     private volatile boolean started;
 
@@ -189,6 +195,8 @@ public final class JoinBinding implements AutoCloseable {
         this.action = Objects.requireNonNull(action, "action");
         this.dispatch = Objects.requireNonNull(dispatch, "dispatch");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        this.partsChanged = new ai.badmonkey.agentspaces.common.time.ChangeSignal(waits);
         for (PartSpec part : config.parts()) {
             if (!part.keyedByTag()) {
                 accessors.put(part.type(), PartSpec.accessor(part.type(), part.keyField()));
@@ -241,10 +249,14 @@ public final class JoinBinding implements AutoCloseable {
                 trigger(key);
             }
         }
+        java.util.Set<Space> partSpaces = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         for (PartSpec part : config.parts()) {
             subscriptions.add(subscribe(part));
+            if (partSpaces.add(part.space())) {
+                closeables.add(part.space().onChangeSignal(partsChanged)); // only a wake (Space.onChangeSignal)
+            }
         }
-        threads.add(Thread.ofVirtual().name("space-join-keep-" + config.name()).start(this::keep));
+        closeables.add(keep());
         if (config.mode() != SpaceJoin.Mode.LOCAL) {
             threads.add(Thread.ofVirtual().name("space-join-tickets-" + config.name())
                     .start(this::serveTickets));
@@ -261,6 +273,14 @@ public final class JoinBinding implements AutoCloseable {
         running = false;
         threads.forEach(Thread::interrupt);
         subscriptions.forEach(Subscription::close);
+        for (AutoCloseable closeable : closeables) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                LOG.log(System.Logger.Level.DEBUG, config.name() + ": close failed", e);
+            }
+        }
+        partsChanged.run(); // a firing waiting for its parts looks at running and stops
         tickets.close();
     }
 
@@ -440,16 +460,19 @@ public final class JoinBinding implements AutoCloseable {
      */
     private boolean fireWhenPartsReadable(String key) {
         long wait = Math.min(config.takeLease().duration().toNanos() / 2, Duration.ofSeconds(5).toNanos());
-        long deadline = System.nanoTime() + wait;
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, Duration.ofNanos(wait));
         while (true) {
+            long seen = partsChanged.seen(); // read before the look, so a part landing meanwhile is not missed
             if (fire(key)) {
                 return true;
             }
-            if (System.nanoTime() >= deadline || !running) {
+            if (waits.monoNanos() - deadline >= 0 || !running) {
                 return false;
             }
             try {
-                Thread.sleep(20);
+                // A part replicating here moves its space's change signal (EL-W-03; was a 20 ms poll); a part space
+                // that keeps no signal is looked at again when the deadline passes.
+                partsChanged.await(seen, deadline);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return false;
@@ -574,42 +597,44 @@ public final class JoinBinding implements AutoCloseable {
 
     // ------------------------------------------------------------------ housekeeping
 
-    private void keep() {
+    /**
+     * The housekeeping as a task on the binder's time source (srad/agentspaces-event-loop.md EL-W-02): every step it
+     * forgets stale keys, releases settled ones, and renews the subscriptions at half their lease, the renewal cadence
+     * judged on the same source that runs it (a virtual one releases it on an advance).
+     */
+    private AutoCloseable keep() {
         long halfLease = Math.max(1L, config.subscriptionLease().duration().toMillis() / 2);
         long sweep = Math.max(1L, Math.min(config.within().toMillis() / 4, Duration.ofSeconds(30).toMillis()));
         long step = Math.min(halfLease, sweep);
         if (settling()) {
             step = Math.max(1L, Math.min(step, config.settle().toMillis() / 2));
         }
-        long lastRenew = System.currentTimeMillis();
-        while (running) {
-            try {
-                Thread.sleep(step);
-            } catch (InterruptedException e) {
-                return;
-            }
-            if (!running) {
-                return;
-            }
-            forgetStale();
-            if (settling()) {
-                for (String key : settledKeys()) {
-                    trigger(key);
-                }
-            }
-            if (System.currentTimeMillis() - lastRenew >= halfLease) {
-                lastRenew = System.currentTimeMillis();
-                for (Subscription subscription : subscriptions) {
-                    try {
-                        subscription.renew(config.subscriptionLease().duration());
-                    } catch (RuntimeException e) {
-                        LOG.log(System.Logger.Level.WARNING, config.name()
-                                + ": subscription renewal failed; the join stops", e);
-                        return;
+        long[] lastRenew = {waits.monoMillis()};
+        return ai.badmonkey.agentspaces.common.time.Periodic.every(waits, Duration.ofMillis(step),
+                "space-join-keep-" + config.name(), () -> {
+                    if (!running) {
+                        return false;
                     }
-                }
-            }
-        }
+                    forgetStale();
+                    if (settling()) {
+                        for (String key : settledKeys()) {
+                            trigger(key);
+                        }
+                    }
+                    if (waits.monoMillis() - lastRenew[0] >= halfLease) {
+                        lastRenew[0] = waits.monoMillis();
+                        for (Subscription subscription : subscriptions) {
+                            try {
+                                subscription.renew(config.subscriptionLease().duration());
+                            } catch (RuntimeException e) {
+                                LOG.log(System.Logger.Level.WARNING, config.name()
+                                        + ": subscription renewal failed; the join stops", e);
+                                return false;
+                            }
+                        }
+                    }
+                    return running;
+                });
     }
 
     /** Settle mode: complete keys no part has touched for {@code settle}, each handed out once. */

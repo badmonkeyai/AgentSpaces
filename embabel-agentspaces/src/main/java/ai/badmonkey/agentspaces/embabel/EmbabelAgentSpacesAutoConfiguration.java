@@ -199,9 +199,18 @@ public class EmbabelAgentSpacesAutoConfiguration {
     @ConditionalOnProperty(prefix = "agentspaces.embabel", name = "auto-deploy",
             havingValue = "true", matchIfMissing = true)
     public static EmbabelRemoteActionsDeployerLifecycle embabelRemoteActionsDeployer(
-            ObjectProvider<AgentSpacesProperties> properties, ObjectProvider<EmbabelRemoteActions> bridges) {
-        return new EmbabelRemoteActionsDeployerLifecycle(() -> deployers(properties.getObject(),
-                bridges.orderedStream().filter(Objects::nonNull).toList()));
+            ObjectProvider<AgentSpacesProperties> properties, ObjectProvider<EmbabelRemoteActions> bridges,
+            ObjectProvider<java.time.InstantSource> clock) {
+        return new EmbabelRemoteActionsDeployerLifecycle(() -> {
+            List<EmbabelRemoteActionsDeployer> deployers = deployers(properties.getObject(),
+                    bridges.orderedStream().filter(Objects::nonNull).toList());
+            // the context's one time source, the node's (EL-C-06), when it is one
+            List<java.time.InstantSource> clocks = clock.orderedStream().toList();
+            if (clocks.size() == 1 && clocks.get(0) instanceof ai.badmonkey.agentspaces.common.time.TimeSource time) {
+                deployers.forEach(deployer -> deployer.time(time));
+            }
+            return deployers;
+        });
     }
 
     /**

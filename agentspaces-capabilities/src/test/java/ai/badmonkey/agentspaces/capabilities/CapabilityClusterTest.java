@@ -452,14 +452,19 @@ class CapabilityClusterTest {
         }
     }
 
-    /** A deterministic ScheduledExecutorService: records fixed-rate tasks and runs them only when told. */
+    /**
+     * A deterministic ScheduledExecutorService: records one-shot tasks and runs them only when told.
+     * The refresh is a one-shot re-armed from completion (srad/agentspaces-event-loop.md EL-T-13), so
+     * a fixed rate is refused here.
+     */
     private static final class ManualScheduler extends AbstractExecutorService
             implements ScheduledExecutorService {
-        record Scheduled(Runnable task, long periodMillis, ManualFuture future) {
+        record Scheduled(Runnable task, long delayMillis, ManualFuture future) {
         }
 
         static final class ManualFuture implements ScheduledFuture<Object> {
             volatile boolean cancelled;
+            volatile boolean fired;
 
             @Override
             public long getDelay(TimeUnit unit) {
@@ -484,7 +489,7 @@ class CapabilityClusterTest {
 
             @Override
             public boolean isDone() {
-                return cancelled;
+                return cancelled || fired;
             }
 
             @Override
@@ -500,26 +505,32 @@ class CapabilityClusterTest {
 
         final List<Scheduled> scheduled = new ArrayList<>();
 
-        /** Fires every live fixed-rate task once. */
+        /** Fires every live one-shot task that has not fired yet, once; a task it re-arms waits for the next call. */
         void runPending() {
             for (Scheduled s : List.copyOf(scheduled)) {
-                if (!s.future().cancelled) {
+                if (!s.future().cancelled && !s.future().fired) {
+                    s.future().fired = true;
                     s.task().run();
                 }
             }
         }
 
+        /** The tasks armed and not yet fired or cancelled. */
+        List<Scheduled> live() {
+            return scheduled.stream().filter(s -> !s.future().cancelled && !s.future().fired).toList();
+        }
+
         @Override
         public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay,
                                                       long period, TimeUnit unit) {
-            ManualFuture future = new ManualFuture();
-            scheduled.add(new Scheduled(command, unit.toMillis(period), future));
-            return future;
+            throw new UnsupportedOperationException("no fixed rate (EL-T-13)");
         }
 
         @Override
         public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
-            throw new UnsupportedOperationException();
+            ManualFuture future = new ManualFuture();
+            scheduled.add(new Scheduled(command, unit.toMillis(delay), future));
+            return future;
         }
 
         @Override
@@ -572,8 +583,8 @@ class CapabilityClusterTest {
         ManualScheduler scheduler = new ManualScheduler();
         a.capabilities().autoRefresh(Duration.ofMinutes(5), scheduler);
         assertThat(a.capabilities().isAutoRefreshing()).isTrue();
-        assertThat(scheduler.scheduled).singleElement()
-                .satisfies(s -> assertThat(s.periodMillis()).isEqualTo(Duration.ofMinutes(5).toMillis()));
+        assertThat(scheduler.live()).singleElement()
+                .satisfies(s -> assertThat(s.delayMillis()).isEqualTo(Duration.ofMinutes(5).toMillis()));
 
         a.capabilities().register(a.aggregate());
         java.time.Instant registeredAt = clock.instant();
@@ -585,6 +596,9 @@ class CapabilityClusterTest {
             assertThat(b.capabilities().providersOf(PushSumAggregate.TYPE))
                     .as("alive after refresh " + i).singleElement()
                     .satisfies(ad -> assertThat(ad.issued()).isEqualTo(clock.instant()));
+            // Re-armed from completion: exactly one one-shot is waiting, a period out.
+            assertThat(scheduler.live()).as("re-armed after refresh " + i).singleElement()
+                    .satisfies(s -> assertThat(s.delayMillis()).isEqualTo(Duration.ofMinutes(5).toMillis()));
         }
         assertThat(clock.instant()).isEqualTo(registeredAt.plus(Duration.ofMinutes(20)));
 
@@ -592,7 +606,8 @@ class CapabilityClusterTest {
         // and the offer lapses on its own.
         a.capabilities().close();
         assertThat(a.capabilities().isAutoRefreshing()).isFalse();
-        assertThat(scheduler.scheduled.get(0).future().isCancelled()).isTrue();
+        assertThat(scheduler.scheduled.get(scheduler.scheduled.size() - 1).future().isCancelled()).isTrue();
+        assertThat(scheduler.live()).isEmpty();
         clock.advance(Duration.ofMinutes(16));
         scheduler.runPending();
         assertThat(b.capabilities().providersOf(PushSumAggregate.TYPE)).isEmpty();

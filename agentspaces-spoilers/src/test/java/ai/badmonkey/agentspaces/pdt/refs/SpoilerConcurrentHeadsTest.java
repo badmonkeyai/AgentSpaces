@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>On the barrier alone the fork at the end is shallow (every round's tick spreads the round's heads, so the next
  * round merges them), where the busy-waiting writers of the original test left heads up to sixteen versions apart.
- * The scenario therefore shapes the fork with a script first: for the last {@value #ISOLATED} rounds the spoiler's
+ * The scenario therefore shapes the fork with a script first: for the last {@link #ISOLATED} rounds (six) the spoiler's
  * frames on the ref stream are held both ways, so its line runs that many versions without the others and theirs
  * without it, and every version on both lines stays live (PD-R-06). Then each hypothesis for the late joiner's
  * conflict count (33 against the readers' 29 in R2's {@code T-F3}) runs once, with no load:
@@ -103,8 +103,19 @@ class SpoilerConcurrentHeadsTest {
     private static final Duration JOINER_LOAD = Duration.ofSeconds(5);
     private static final String SPOILER = "w2";
     private static final String REF_STREAM = "space:" + RefFleet.REF_SPACE;
-    /** The rounds the spoiler's line runs apart from the others' at the end of the writes. */
-    private static final int ISOLATED = 8;
+    /**
+     * The rounds the spoiler's line runs apart from the others' at the end of the writes. It must release the spoiler's
+     * line before the version it forked from can be cancelled, or the lines share no live base (PD-R-06 keeps a fork's
+     * versions live only once a writer holds both lines; a base cancelled before the lagging line reached its writer is
+     * the documented exception that {@code Refs} fetches by root). That version is superseded, at the earliest, by the
+     * first isolated round, so its writer cancels it {@link Refs#CANCEL_GRACE_MILLIS} of fleet clock (8 ticks) after
+     * that round's tick; the release lands in the tick after the last isolated round. Eight rounds released in the same
+     * tick that cancelled the base whenever one writer saw another's version inside the first isolated round (the
+     * phase-2 gate of srad/agentspaces-event-loop.md, §10.15), so six leave two ticks to spare. {@code spoiler.isolated}
+     * overrides it for an exploratory run.
+     */
+    private static final int ISOLATED = Integer.getInteger("spoiler.isolated",
+            (int) (Refs.CANCEL_GRACE_MILLIS / RefFleet.PERIOD_MILLIS) - 2);
 
     enum Hypothesis { CONTROL, BASE_ENTRY }
 

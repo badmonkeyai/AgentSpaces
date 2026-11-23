@@ -27,8 +27,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -41,7 +39,8 @@ import java.util.function.Consumer;
  * <p>Threads: a drain thread is BouncyCastle's single reader (records in, PDUs
  * to {@link Recovery}); a delivery thread hands completed frames to the
  * receiver, so a slow receiver never stalls acknowledgements; the transport's
- * timer runs the sublayer's deadlines; {@link #send} runs on the caller's
+ * time source runs the sublayer's deadlines (one-shots on its monotonic base, srad/agentspaces-event-loop.md
+ * EL-T-12); {@link #send} runs on the caller's
  * thread. The {@link Recovery} instance's monitor serializes the sublayer.
  */
 final class DtlsAssociation implements TransportConnection {
@@ -53,7 +52,7 @@ final class DtlsAssociation implements TransportConnection {
     private final PeerDatagramTransport path;
     private final Optional<PeerId> attested;
     private final X509Certificate[] chain;
-    private final ScheduledExecutorService timers;
+    private final ai.badmonkey.agentspaces.common.time.TimeSource time;
     private final DtlsCounters counters;
     private final Runnable onRelease;
     private final Recovery recovery;
@@ -61,7 +60,7 @@ final class DtlsAssociation implements TransportConnection {
     private final AtomicBoolean finished = new AtomicBoolean();
     private final AtomicBoolean closeNotified = new AtomicBoolean();
     private final Object timerLock = new Object();
-    private ScheduledFuture<?> timer;
+    private ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled timer;
     private long armedAt = Long.MAX_VALUE;
     private volatile Consumer<byte[]> receiver;
     private volatile boolean deliveryStarted;
@@ -69,18 +68,18 @@ final class DtlsAssociation implements TransportConnection {
     };
 
     DtlsAssociation(RecordLayer dtls, PeerDatagramTransport path, Optional<PeerId> attested,
-                    X509Certificate[] chain, DtlsOptions options, ScheduledExecutorService timers,
+                    X509Certificate[] chain, DtlsOptions options, ai.badmonkey.agentspaces.common.time.TimeSource time,
                     DtlsCounters counters, Runnable onRelease) throws IOException {
         this.dtls = dtls;
         this.path = path;
         this.attested = attested;
         this.chain = chain.clone();
-        this.timers = timers;
+        this.time = time;
         this.counters = counters;
         this.onRelease = onRelease;
         int fragment = dtls.sendLimit() - Pdu.DATA_HEADER;
         this.recovery = new Recovery(this::transmit, fragment, options.window(),
-                options.idleTimeout().toNanos(), System::nanoTime, counters);
+                options.idleTimeout().toNanos(), time::monoNanos, counters);
     }
 
     /** Starts the drain thread and the timers; called once, after construction. */
@@ -283,19 +282,15 @@ final class DtlsAssociation implements TransportConnection {
                 return;
             }
             if (timer != null) {
-                timer.cancel(false);
+                timer.cancel();
                 timer = null;
             }
             armedAt = deadline;
             if (deadline == Long.MAX_VALUE) {
                 return;
             }
-            try {
-                timer = timers.schedule(this::onTimer, Math.max(0, deadline - System.nanoTime()),
-                        TimeUnit.NANOSECONDS);
-            } catch (java.util.concurrent.RejectedExecutionException e) {
-                // The transport is closing; it closes this association too.
-            }
+            // The recovery's deadlines are on the time source's monotonic base, so no conversion.
+            timer = time.scheduleAt(deadline, this::onTimer);
         }
     }
 
@@ -317,7 +312,8 @@ final class DtlsAssociation implements TransportConnection {
         }
         synchronized (timerLock) {
             if (timer != null) {
-                timer.cancel(false);
+                timer.cancel();
+                timer = null;
             }
         }
         try {

@@ -15,6 +15,8 @@
  */
 package ai.badmonkey.agentspaces.agent;
 
+import ai.badmonkey.agentspaces.measure.Wait;
+import ai.badmonkey.agentspaces.measure.Measure;
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
 import ai.badmonkey.agentspaces.agent.annotation.OrderedTake;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceNotify;
@@ -315,11 +317,10 @@ class AgentBinderLayer4ClusterTest {
 
         b.space().write(new Reading("backlog", 40.0), Lease.of(Duration.ofMinutes(5)));
         aggB.start("backlog", 20.0);
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        while (System.nanoTime() < deadline && aggA.estimate("backlog").isEmpty()) {
+        Measure.await("agent.layer4.cluster-1", Duration.ofSeconds(30), () -> {
             tickAll(1);
-            Thread.sleep(10);
-        }
+            return !(aggA.estimate("backlog").isEmpty());
+        }, Wait.with().poll(Duration.ofMillis(10)));
         for (int i = 0; i < 40; i++) {
             tickAll(1);
         }

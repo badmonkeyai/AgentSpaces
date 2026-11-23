@@ -42,9 +42,8 @@ class QuicListenerTest {
     }
 
     private static int freePort() throws Exception {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private static void acceptsThree(QuicTransport server, QuicTransport... clients) throws Exception {

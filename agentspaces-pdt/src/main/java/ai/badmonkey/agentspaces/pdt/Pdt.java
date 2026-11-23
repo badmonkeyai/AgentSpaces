@@ -144,11 +144,20 @@ public final class Pdt implements AutoCloseable {
     private final ai.badmonkey.agentspaces.identity.PeerIdentity identity;
     private volatile boolean started;
     private volatile boolean closed;
+    /**
+     * The last collection look, on {@link #local}'s monotonic base: the collection period is a local period, so a wall
+     * step moves it no more than it moves the loop (srad/agentspaces-event-loop.md EL-C-04, EL-C-05).
+     */
     private long lastCollectMillis = Long.MIN_VALUE;
+    /** The base of the local periods: the clock's time source (a plain test clock's follows its wall time). */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource local;
+    /** Collection looks: each {@code collectEvery} that came round with the collector idle; for tests. */
+    private final java.util.concurrent.atomic.AtomicLong collectLooks = new java.util.concurrent.atomic.AtomicLong();
 
     private Pdt(Builder b) {
         this.refSpace = b.refSpace;
         this.clock = b.clock;
+        this.local = ai.badmonkey.agentspaces.common.time.TimeSources.of(b.clock);
         NodeStore chosen = b.store;
         if (chosen == null && b.content != null) {
             chosen = b.content.treeStore()
@@ -220,7 +229,7 @@ public final class Pdt implements AutoCloseable {
         private GroupKeyRing keyRing;
         private InstantSource clock = InstantSource.system();
         private Duration headLease = Refs.DEFAULT_HEAD_LEASE;
-        private Duration takeLease = Duration.ofSeconds(30);
+        private Duration takeLease = ai.badmonkey.agentspaces.pdt.refs.Refs.DEFAULT_TAKE_LEASE;
         private Duration takeTimeout = Duration.ofSeconds(5);
         private int takeRetries = 3;
         private Duration cancelGrace = Duration.ofMillis(Refs.CANCEL_GRACE_MILLIS);
@@ -475,8 +484,15 @@ public final class Pdt implements AutoCloseable {
             throw new IllegalStateException("attach the content swarm before starting");
         }
         started = true;
-        lastCollectMillis = clock.millis();
+        lastCollectMillis = local.monoMillis();
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration joined = loopRegistration;
+        if (joined != null) {
+            joined.wake(); // a facade that joined its loop before it started read NEVER there (EL-L-03)
+        }
     }
+
+    /** The loop participant, once {@link #joinLoop} ran; null before. */
+    private volatile ai.badmonkey.agentspaces.api.spi.DueWork.Registration loopRegistration;
 
     /** The periodic work: the ref engine's tick and, every {@code collectEvery}, a collection tick (PD-S-04). */
     public void tick() {
@@ -486,13 +502,14 @@ public final class Pdt implements AutoCloseable {
         refs.tick();
         flushMeta();
         if (!collectEvery.isZero()) {
-            long now = clock.millis();
+            long mono = local.monoMillis();
             NodeCollector c = collector;
             NodeCollector.Tick result = null;
             if (c.phase() != NodeCollector.Phase.IDLE) {
                 result = c.tick();
-            } else if (now - lastCollectMillis >= collectEvery.toMillis()) {
-                lastCollectMillis = now;
+            } else if (mono - lastCollectMillis >= collectEvery.toMillis()) {
+                lastCollectMillis = mono;
+                collectLooks.incrementAndGet();
                 if (c.due()) { // idle-loop O3: no cycle when nothing could have become garbage
                     result = c.tick();
                 }
@@ -501,6 +518,105 @@ public final class Pdt implements AutoCloseable {
                 refs.forgetHeld();
             }
         }
+    }
+
+    /** The collector's step while a cycle is in progress: today's cadence (the visits budget stays per step). */
+    static final long COLLECTOR_STEP_MILLIS = 250;
+
+    /**
+     * Joins a group's loop as one participant (srad/agentspaces-event-loop.md EL-T-08, EL-T-09), in place of
+     * {@code runtime.onTick(pdt::tick)}: the ref engine runs only when its next due passed ({@link Refs#nextDueMillis})
+     * or the ref space changed, which wakes the participant; the pins and retained versions are flushed when dirty; the
+     * collector steps every 250 ms while a cycle runs and otherwise at {@code collectEvery}. A direct run
+     * ({@code tick()}) is today's {@link #tick()}.
+     *
+     * @param runtime the group the ref space lives in
+     * @return the registration; closing it leaves the loop
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration joinLoop(
+            ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime) {
+        Objects.requireNonNull(runtime, "runtime");
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration =
+                runtime.onDueWall("pdt", clock, now -> runDue(runtime, now));
+        loopRegistration = registration;
+        AutoCloseable signals = refSpace == null ? () -> { } : refSpace.onChangeSignal(registration::wake);
+        return new ai.badmonkey.agentspaces.api.spi.DueWork.Registration() {
+            @Override
+            public void wake() {
+                registration.wake();
+            }
+
+            @Override
+            public void close() {
+                registration.close();
+                try {
+                    signals.close();
+                } catch (Exception e) {
+                    // a listener list never refuses a removal
+                }
+            }
+        };
+    }
+
+    private long runDue(ai.badmonkey.agentspaces.peering.node.GroupRuntime runtime, long now) {
+        if (closed || !started) {
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        if (runtime.directRun()) {
+            tick();
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        long next = Long.MAX_VALUE;
+        if (refs.nextDueMillis() <= now) {
+            refs.tick();
+            dueTicks.incrementAndGet();
+        }
+        long refsDue = refs.nextDueMillis();
+        // a deadline the tick just served that is still past (a write the space deferred) waits one step, never spins
+        next = Math.min(next, refsDue <= now ? now + Refs.IN_FLIGHT_STEP_MILLIS : refsDue);
+        flushMeta();
+        if (!collectEvery.isZero()) {
+            long mono = local.monoMillis();
+            NodeCollector c = collector;
+            NodeCollector.Tick result = null;
+            if (c.phase() != NodeCollector.Phase.IDLE) {
+                result = c.tick();
+            } else if (mono - lastCollectMillis >= collectEvery.toMillis()) {
+                lastCollectMillis = mono;
+                collectLooks.incrementAndGet();
+                if (c.due()) { // idle-loop O3: no cycle when nothing could have become garbage
+                    result = c.tick();
+                }
+            }
+            if (result != null && result.cycleComplete() && result.removed() > 0) {
+                refs.forgetHeld();
+            }
+            // the local deadline, stated on the wall clock the registration converts from (onDueWall)
+            next = Math.min(next, c.phase() != NodeCollector.Phase.IDLE ? now + COLLECTOR_STEP_MILLIS
+                    : now + Math.max(0, lastCollectMillis + collectEvery.toMillis() - mono));
+        }
+        return next;
+    }
+
+    /**
+     * Collection looks: each {@code collectEvery} of local time that came round with the collector idle; for tests.
+     *
+     * @return the count
+     */
+    long collectLooks() {
+        return collectLooks.get();
+    }
+
+    /** Runs of the participant in which the ref engine ticked; for tests. */
+    private final java.util.concurrent.atomic.AtomicLong dueTicks = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How many runs of the participant ticked the ref engine (EL-T-08); for tests.
+     *
+     * @return the count
+     */
+    public long dueTicks() {
+        return dueTicks.get();
     }
 
     @Override

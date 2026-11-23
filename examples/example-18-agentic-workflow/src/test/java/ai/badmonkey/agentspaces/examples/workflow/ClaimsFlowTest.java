@@ -19,10 +19,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
+import ai.badmonkey.agentspaces.agent.annotation.OnEstimate;
 import ai.badmonkey.agentspaces.agent.annotation.SpaceNotify;
 import ai.badmonkey.agentspaces.agent.join.JoinTicket;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.Template;
+import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.capabilities.vote.VoteCapability;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.examples.workflow.Claims.Claim;
@@ -54,6 +56,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -67,15 +70,36 @@ class ClaimsFlowTest {
     private Params mode = Params.none();
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     @Test
     @Timeout(180)
     void fourClaimsFlowThroughEveryStageAndCloseOnce() throws Exception {
-        runTheFlow(false);
+        runTheFlow(false, false);
+    }
+
+    /**
+     * The demo's supervisor, bound from the start with its forty settled rounds, outlasts the plateau between the
+     * denials and the paid claim and reports the full average once. It waits those forty seconds out in real time, so
+     * it runs in the soak profile ({@code -Psoak}, at phase gates); the default build binds a short-settle supervisor
+     * once the estimate has converged and pins the forty rounds in {@link #theDemoSupervisorKeepsItsFortyRoundSettle}.
+     */
+    @Test
+    @Tag("soak")
+    @Timeout(180)
+    void theDemoSupervisorBoundFromTheStartReportsTheFullAverageOnce() throws Exception {
+        runTheFlow(false, true);
+    }
+
+    /** The demo's pacing stays forty rounds of about a second: what the soak run above relies on. */
+    @Test
+    void theDemoSupervisorKeepsItsFortyRoundSettle() throws Exception {
+        OnEstimate on = Settlement.Supervisor.class.getMethod("report", PushSumAggregate.Estimate.class)
+                .getAnnotation(OnEstimate.class);
+        assertThat(on.settle()).isEqualTo("PT40S");
+        assertThat(on.tolerance()).isEqualTo(0.01);
     }
 
     /**
@@ -85,10 +109,15 @@ class ClaimsFlowTest {
     @Test
     @Timeout(180)
     void twoOrderedJoinersStillAssembleEachClaimOnce() throws Exception {
-        runTheFlow(true);
+        runTheFlow(true, false);
     }
 
-    private void runTheFlow(boolean orderedJoin) throws Exception {
+    /**
+     * @param demoSupervisor bind the demo's supervisor (forty settled rounds) with the staff; otherwise bind
+     *                       {@link QuickSupervisor} once stage 8's estimate has converged, so the report follows a
+     *                       few rounds later instead of forty
+     */
+    private void runTheFlow(boolean orderedJoin, boolean demoSupervisor) throws Exception {
         mode = Params.of("join", orderedJoin ? "ordered" : "leased");
         List<PeerIdentity> ids = List.of(PeerIdentity.generate(), PeerIdentity.generate(),
                 PeerIdentity.generate());
@@ -108,8 +137,9 @@ class ClaimsFlowTest {
                 throw new IllegalStateException("simulated crash in " + worker);
             }
         };
-        List<AutoCloseable> staff = new java.util.ArrayList<>(orderedJoin
-                ? ClaimsFlow.staffWithOrderedJoin(a, b, c, counted) : ClaimsFlow.staff(a, b, c, counted));
+        List<AutoCloseable> staff = new java.util.ArrayList<>(!demoSupervisor
+                ? ClaimsFlow.staffWithoutSupervisor(a, b, c, counted, orderedJoin)
+                : orderedJoin ? ClaimsFlow.staffWithOrderedJoin(a, b, c, counted) : ClaimsFlow.staff(a, b, c, counted));
         // One witness per peer, beside each peer's reserve sensor and reached the same way, so a
         // stage 8 failure says which replica's reaction never saw which priced claim.
         Map<String, ReserveWitness> witnesses = new java.util.LinkedHashMap<>();
@@ -276,17 +306,24 @@ class ClaimsFlowTest {
             assertThat(sensed.getAsDouble()).as(() -> reserveReport(fleet, witnesses))
                     .isCloseTo(expected, within(expected * 0.02));
             // ...and the supervisor reported it exactly once, when it settled.
-            // The supervisor waits for forty settled rounds, paced to the gossip period (one a
+            // The demo's supervisor waits for forty settled rounds, paced to the gossip period (one a
             // second), so the report comes about forty seconds after the last priced claim moved
             // the estimate: measured at 38 to 43 s after this point over 40 runs. The wait is that
             // deliberate span plus room for its variable part (convergence, under 3 s measured) and
             // for a late claim (an ordered take that lapses holds one for its 30 s lease), so 120 s
             // means clearly broken; the time it took is printed.
+            // Otherwise the quick supervisor is bound now, every priced claim in the estimate: three
+            // settled rounds (about 3 s) after this point, so 30 s means clearly broken.
+            if (!demoSupervisor) {
+                staff.add(c.group().bind(new QuickSupervisor()));
+            }
             long reporting = System.nanoTime();
-            List<ReserveReport> reports = await("workflow.settle.report", () -> {
-                List<ReserveReport> all = c.ledger().readAll(Template.of(ReserveReport.class), 10);
-                return all.isEmpty() ? Optional.<List<ReserveReport>>empty() : Optional.of(all);
-            }, Duration.ofSeconds(120), () -> reserveReport(fleet, witnesses)).orElseThrow();
+            List<ReserveReport> reports = await(demoSupervisor ? "workflow.settle.report" : "workflow.settle.report-bound-late",
+                    () -> {
+                        List<ReserveReport> all = c.ledger().readAll(Template.of(ReserveReport.class), 10);
+                        return all.isEmpty() ? Optional.<List<ReserveReport>>empty() : Optional.of(all);
+                    }, Duration.ofSeconds(demoSupervisor ? 120 : 30), () -> reserveReport(fleet, witnesses))
+                    .orElseThrow();
             System.out.println("stage 8: the supervisor reported after "
                     + Duration.ofNanos(System.nanoTime() - reporting).toMillis() + " ms: " + reports);
             // Reported once: the supervisor's estimate rule calls back once per epoch, and its one binding is on c.
@@ -347,6 +384,20 @@ class ClaimsFlowTest {
                 s.close();
             }
             fleet.forEach(Peer::close);
+        }
+    }
+
+    /**
+     * The supervisor with a test's settle: three rounds of about a second. It is bound once stage 8's estimate holds
+     * every priced claim, so the plateau the demo's forty rounds outlast is already behind it.
+     */
+    @AgentSpec(name = "quick-supervisor", description = "Reports the fleet's average reserve once it settles",
+            goals = {"report reserves"})
+    public static final class QuickSupervisor {
+        @OnEstimate(prefix = "reserve:", settle = "PT3S", tolerance = 0.01, resultSpace = Settlement.LEDGER,
+                resultLease = "24h")
+        public ReserveReport report(PushSumAggregate.Estimate reserve) {
+            return new ReserveReport(reserve.epochId(), reserve.value(), "quick-supervisor");
         }
     }
 

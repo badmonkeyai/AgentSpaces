@@ -143,12 +143,12 @@ class CapabilityClockTest {
         Peer a = newPeer("a", 1);
 
         assertThat(a.capabilities().isDrivenByPeerTick()).isTrue();
-        assertThat(a.runtime().tickWorkCount()).isEqualTo(1);
+        assertThat(a.runtime().registrationCount()).isEqualTo(1);
 
         a.capabilities().close();
 
         assertThat(a.capabilities().isDrivenByPeerTick()).isFalse();
-        assertThat(a.runtime().tickWorkCount()).isZero();
+        assertThat(a.runtime().registrationCount()).isZero();
     }
 
     /** QA3 A3-1: a detached runtime is driven only by its host, which is what a deterministic test wants. */
@@ -161,7 +161,7 @@ class CapabilityClockTest {
         a.capabilities().detachFromPeerTick().register(a.aggregate());
         b.capabilities().detachFromPeerTick().register(b.aggregate());
         assertThat(a.capabilities().isDrivenByPeerTick()).isFalse();
-        assertThat(a.runtime().tickWorkCount()).isZero();
+        assertThat(a.runtime().registrationCount()).isZero();
 
         a.aggregate().start("v", 10.0);
         b.aggregate().start("v", 20.0);
@@ -197,7 +197,7 @@ class CapabilityClockTest {
         tickPeersOnly(5);
 
         assertThat(goodTicks.get()).as("the well-behaved sibling kept ticking").isGreaterThanOrEqualTo(5);
-        assertThat(a.runtime().tickWorkCount()).as("the registration survived").isEqualTo(1);
+        assertThat(a.runtime().registrationCount()).as("the registration survived").isEqualTo(1);
         assertThat(a.runtime().membership().allMembers()).hasSizeGreaterThanOrEqualTo((int) membershipBefore);
     }
 
@@ -208,7 +208,7 @@ class CapabilityClockTest {
         AtomicInteger runs = new AtomicInteger();
 
         AutoCloseable registration = a.runtime().onTick(runs::incrementAndGet);
-        assertThat(a.runtime().tickWorkCount()).isEqualTo(2); // ours plus the capability runtime
+        assertThat(a.runtime().registrationCount()).isEqualTo(2); // ours plus the capability runtime
         tickPeersOnly(3);
         assertThat(runs.get()).isEqualTo(3);
 
@@ -287,9 +287,14 @@ class CapabilityClockTest {
         assertThat(a.capabilities().cadence()).isEmpty();
     }
 
-    /** QA3 A3-4: once the node drives its own clock, the real cadence reaches every provider. */
+    /**
+     * QA3 A3-4, owner decision 2 (2026-11-23): once the node drives its own loop, a provider is told the period it is
+     * really stepped at. A legacy provider (it overrides {@code tick()} or {@code requiresTick()}) is stepped every
+     * 250 ms on a started loop whatever {@code tick-millis} says, so it is told 250 ms, not the 120 ms tick; the
+     * runtime itself still reports the node's tick period.
+     */
     @Test
-    void startTickingPropagatesTheRealCadenceToProviders() throws Exception {
+    void startTickingTellsALegacyProviderThePeriodItIsSteppedAt() throws Exception {
         Peer a = newPeer("a", 1);
         RecordingProvider provider = new RecordingProvider(a.identity());
         a.capabilities().register(provider);
@@ -298,12 +303,14 @@ class CapabilityClockTest {
         a.node().startTicking(Duration.ofMillis(120));
         assertThat(a.node().tickPeriod()).hasValue(Duration.ofMillis(120));
 
-        // The node's own scheduler will tick; give it room, then assert.
-        for (int i = 0; i < 100 && provider.cadence == null; i++) {
-            Thread.sleep(10);
-        }
-        assertThat(provider.cadence).isEqualTo(Duration.ofMillis(120));
+        a.node().tick(); // one run on the caller's thread: the capability participant reads the new cadence
+        assertThat(provider.cadence).as("the legacy step's own period").isEqualTo(Duration.ofMillis(250));
         assertThat(a.capabilities().cadence()).hasValue(Duration.ofMillis(120));
+
+        RecordingProvider late = new RecordingProvider(a.identity(), "late");
+        a.capabilities().register(late);
+        assertThat(late.cadence).as("a provider registered on a started loop is told the same").isEqualTo(
+                Duration.ofMillis(250));
     }
 
     /** QA3 A3-4: a host that drives the protocol itself declares its own cadence, and providers are told. */
@@ -433,15 +440,21 @@ class CapabilityClockTest {
     /** A provider that records the cadence it was told about. */
     private static final class RecordingProvider implements CapabilityProvider {
         private final PeerIdentity identity;
+        private final String name;
         private volatile Duration cadence;
 
         RecordingProvider(PeerIdentity identity) {
+            this(identity, "recording");
+        }
+
+        RecordingProvider(PeerIdentity identity, String name) {
             this.identity = identity;
+            this.name = name;
         }
 
         @Override
         public String capabilityType() {
-            return "aspace:cap/recording";
+            return "aspace:cap/" + name;
         }
 
         @Override
@@ -456,7 +469,7 @@ class CapabilityClockTest {
 
         @Override
         public CapabilityAdvertisement describe(GroupId group) {
-            return new CapabilityAdvertisement("aspace://" + group.value() + "/cap/recording",
+            return new CapabilityAdvertisement("aspace://" + group.value() + "/cap/" + name,
                     identity.peerId(), group, java.time.Instant.EPOCH, Duration.ofMinutes(15),
                     capabilityType(), "0.1", "pipe", java.util.Map.of(), java.util.Map.of());
         }

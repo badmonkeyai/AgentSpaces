@@ -147,8 +147,9 @@ class SecondSwapTest {
             int i = round;
             last = onW.swap(m -> m.assoc("today", text(i, 6)).assoc("next-week", text(i, 4))
                     .assoc("past-week", text(i, 3)).assoc("past-month", text(i, 3))).root();
-            // a gossip minute of fleet time, the reader polling as the report's reader did
-            fleet.runUntil(Duration.ofSeconds(60), () -> {
+            // a gossip minute of fleet time (240 ticks of the fleet clock, not of the wall), the reader polling on
+            // every tick as the report's reader did
+            fleet.runFor(Duration.ofSeconds(60), () -> {
                 poll.run();
                 return false;
             });

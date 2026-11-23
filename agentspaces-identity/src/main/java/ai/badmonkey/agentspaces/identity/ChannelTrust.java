@@ -120,7 +120,7 @@ public final class ChannelTrust {
         if (strictOnline) {
             return attestOnline(chain);
         }
-        return status(chain, java.time.Instant.now()) instanceof TrustStatus.Good good
+        return status(chain, ai.badmonkey.agentspaces.common.time.TimeSource.system().instant()) instanceof TrustStatus.Good good
                 ? Optional.of(good.peer()) : Optional.empty();
     }
 

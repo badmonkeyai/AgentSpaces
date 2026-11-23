@@ -270,6 +270,53 @@ class ConnectorClusterTest {
     }
 
     /** TODO-EFG §4 / TODO item 6: a ConnectorRuntime given an Authorizer advertises only the assets its own peer is permitted CONNECTOR_SERVE for, and picks them up once permitted. */
+    /**
+     * The same-millisecond audit (srad/agentspaces-event-loop.md §10.16): a card refreshed in the millisecond of the
+     * one before it, with a changed description, must still reach the group. The gossip item is named by the card's
+     * id and issue millisecond, and a cache keeps the card it holds on an equal instant, so before the fix the second
+     * card reached nobody until a refresh in a later millisecond. The clock here never moves.
+     */
+    @Test
+    @Timeout(60)
+    void aCardChangedInTheMillisecondOfTheLastOneStillReachesTheGroup() throws Exception {
+        Wired connectorPeer = newPeer("conn", 1);
+        Wired agent = newPeer("agent", 2, "conn");
+        tickAll(4);
+        TableAssetProvider table = ordersProvider(Duration.ofMinutes(5));
+        AtomicReference<String> description = new AtomicReference<>("first description");
+        AssetProvider changing = new AssetProvider() {
+            @Override
+            public List<AssetCard> describeAssets(GroupId group, PeerId issuer, Instant now) {
+                return table.describeAssets(group, issuer, now).stream()
+                        .map(c -> new AssetCard(c.id(), c.issuer(), c.group(), c.issued(), c.ttl(), c.asset(),
+                                c.uri(), description.get(), c.shape(), c.freshness(), c.costHints(), c.access()))
+                        .toList();
+            }
+
+            @Override
+            public QueryResult query(String asset, Map<String, String> parameters) {
+                return table.query(asset, parameters);
+            }
+        };
+        connector = new ConnectorRuntime(connectorPeer.data(), connectorPeer.discovery(),
+                connectorPeer.identity(), "pg-connector", changing, groupId, clock, Duration.ofMinutes(1));
+        connector.start();
+        tickAll(4);
+        assertThat(agent.discovery().find(AssetCard.class, card -> true))
+                .extracting(AssetCard::description).containsExactly("first description");
+        Instant first = agent.discovery().find(AssetCard.class, card -> true).get(0).issued();
+
+        description.set("second description");
+        connector.refreshCards(); // the clock has not moved: the same millisecond as the first card
+        tickAll(4);
+
+        List<AssetCard> seen = agent.discovery().find(AssetCard.class, card -> true);
+        assertThat(seen).extracting(AssetCard::description).containsExactly("second description");
+        assertThat(seen.get(0).issued().toEpochMilli()).isEqualTo(first.toEpochMilli() + 1);
+        assertThat(connectorPeer.discovery().find(AssetCard.class, card -> true))
+                .extracting(AssetCard::description).containsExactly("second description");
+    }
+
     @Test
     @Timeout(60)
     void aConnectorRefusesToAdvertiseAssetsItMayNotServe() throws Exception {

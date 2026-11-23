@@ -200,9 +200,9 @@ class SwarmRetriesTest {
         }
         assertThat(b.pdt().refs().headsLate().failedFetch()).as("the first fetch failed").isEqualTo(1);
         fleet.settle(7);
-        long started = System.nanoTime();
-        PMap<String, String> read = onB.deref();
-        long millis = (System.nanoTime() - started) / 1_000_000;
+        var timed = fleet.call(Duration.ofSeconds(30), onB::deref); // a read on the fleet's time (EL-Q-TST-03)
+        PMap<String, String> read = timed.value();
+        long millis = timed.took().toMillis();
         assertThat(read.root()).as("the late head is left out of the read").isEqualTo(v1.root());
         assertThat(millis).as("the read returns without waiting for the retry").isLessThan(loadTimeout.toMillis() / 2);
     }
@@ -307,16 +307,16 @@ class SwarmRetriesTest {
         assertThat(j.pdt().refs().version(NAME, v1)).isEmpty();
         fleet.network.hold("a", "j"); // nobody serves j a chain node now
         fleet.network.hold("b", "j");
-        long started = System.nanoTime();
-        PMap<String, String> first = onJ.deref();
-        long firstMillis = (System.nanoTime() - started) / 1_000_000;
+        var firstRead = fleet.call(Duration.ofSeconds(30), onJ::deref); // reads on the fleet's time (EL-Q-TST-03)
+        PMap<String, String> first = firstRead.value();
+        long firstMillis = firstRead.took().toMillis();
         assertThat(firstMillis).as("the merge asked for the chain and waited one load timeout")
                 .isBetween(loadTimeout.toMillis() / 2, loadTimeout.toMillis() * 2);
         long missed = j.pdt().refs().chainNodesMissed();
         assertThat(missed).as("the walk counted the links it left out").isPositive();
-        started = System.nanoTime();
-        PMap<String, String> second = onJ.deref();
-        long secondMillis = (System.nanoTime() - started) / 1_000_000;
+        var secondRead = fleet.call(Duration.ofSeconds(30), onJ::deref);
+        PMap<String, String> second = secondRead.value();
+        long secondMillis = secondRead.took().toMillis();
         assertThat(secondMillis).as("the next merge waits out the nodes' backoff and asks for nothing")
                 .isLessThan(loadTimeout.toMillis() / 2);
         assertThat(second.root()).isEqualTo(first.root());

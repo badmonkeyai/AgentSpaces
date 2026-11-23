@@ -103,6 +103,12 @@ final class GraftRepairSimulation {
     private final Map<PeerId, Integer> index = new HashMap<>();
     private final List<GossipBus> buses = new ArrayList<>();
     private final long[] uplinkFree;
+    /**
+     * Eager copies on their way, per sender and receiver: the simulated fabric's outbox (srad/agentspaces-event-loop.md
+     * EL-T-15). A probe's piggyback leaves out an item whose eager copy to that member may still be on its way, as
+     * the node's coalescing outbox does; before the event loop the bus left out the items of its current tick.
+     */
+    private final int[][] rumorsInFlight;
     private final long[] cpuFree;
     private final long[][] baseLatency;
     private final PriorityQueue<Event> events = new PriorityQueue<>((a, b) -> a.at != b.at
@@ -132,6 +138,7 @@ final class GraftRepairSimulation {
         this.scenario = scenario;
         this.flooder = scenario.floodEveryMillis() > 0 ? peers - 1 : -1;
         this.uplinkFree = new long[peers];
+        this.rumorsInFlight = new int[peers][peers];
         this.cpuFree = new long[peers];
         this.heardOther = new boolean[peers];
         this.heardAny = new boolean[peers];
@@ -161,6 +168,7 @@ final class GraftRepairSimulation {
             GossipBus bus = new GossipBus(sampler, sender(self), CborCodec.defaultCodec(), 3, GossipBus.DEFAULT_HOPS,
                     () -> now, new Random(random.nextLong()));
             bus.lazyPush(peer -> true);
+            bus.outbox(peer -> rumorsInFlight[self][index.get(peer)] > 0);
             buses.add(bus);
         }
         for (int i = 0; i < peers; i++) {
@@ -381,7 +389,13 @@ final class GraftRepairSimulation {
                     }
                 }
                 int target = index.get(to);
-                transmit(self, target, rumor.payload().length + 120, () -> buses.get(target).onRumor(ids.get(self), rumor));
+                if (rumorsInFlight[self][target]++ == 0) {
+                    buses.get(self).outboxTaking(to); // the pipe was empty: everything stamped before now has arrived
+                }
+                transmit(self, target, rumor.payload().length + 120, () -> {
+                    rumorsInFlight[self][target]--;
+                    buses.get(target).onRumor(ids.get(self), rumor);
+                });
             }
 
             @Override

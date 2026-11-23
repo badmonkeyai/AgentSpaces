@@ -113,7 +113,12 @@ class RobustnessFanoutTest {
                 }
             }
         }
-        assertThat(fleet.settle(10)).as("anti-entropy completes what push missed").isTrue();
+        // The inventory moves by anti-entropy alone, between random partners, while most members' rounds have
+        // stretched in the quiet before the publish, so the rounds it takes are a random tail. Ten rounds missed it
+        // in 10 of 600 runs on HEAD and 5 of 600 on the event loop (srad/agentspaces-event-loop.md §10.8), at most 13
+        // rounds in all; the budget is one fully stretched period (32 rounds), the longest a quiet member's own
+        // round waits.
+        assertThat(fleet.settle(32)).as("anti-entropy completes what push missed").isTrue();
         Result result = new Result(plain, sentPerItem, copiesPerPlainPerItem, pushed, missing, servedByPush);
         System.out.println(result);
         return result;

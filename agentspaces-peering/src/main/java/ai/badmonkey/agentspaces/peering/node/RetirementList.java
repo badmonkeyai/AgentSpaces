@@ -154,6 +154,7 @@ final class RetirementList {
             }
             group.dirty = true;
         }
+        dirtied(groupId, true);
     }
 
     /** Takes a member off the list: a fresh card from it, or its revocation. */
@@ -162,11 +163,13 @@ final class RetirementList {
         if (group == null) {
             return false;
         }
+        boolean removed;
         synchronized (group) {
-            boolean removed = group.retired.remove(peer) != null;
+            removed = group.retired.remove(peer) != null;
             group.dirty |= removed;
-            return removed;
         }
+        dirtied(groupId, removed);
+        return removed;
     }
 
     Optional<Retired> get(GroupId groupId, PeerId peer) {
@@ -185,17 +188,55 @@ final class RetirementList {
         if (group == null) {
             return List.of();
         }
+        boolean dropped;
+        List<Retired> out;
         synchronized (group) {
-            group.dirty |= group.retired.values().removeIf(r -> nowMillis - r.lastSeenMillis() > HORIZON_MILLIS);
-            List<Retired> out = new ArrayList<>(group.retired.values());
-            out.sort(Comparator.comparingLong(Retired::lastSeenMillis).reversed());
-            return out;
+            dropped = group.retired.values().removeIf(r -> nowMillis - r.lastSeenMillis() > HORIZON_MILLIS);
+            group.dirty |= dropped;
+            out = new ArrayList<>(group.retired.values());
         }
+        dirtied(groupId, dropped);
+        out.sort(Comparator.comparingLong(Retired::lastSeenMillis).reversed());
+        return out;
     }
 
     /** Forgets a group in memory (the node left it); its file stays for a later join. */
     void forget(GroupId groupId) {
         groups.remove(groupId);
+    }
+
+    /** Told, with the group, when a group's retirement list turns dirty (srad/agentspaces-event-loop.md EL-L-03). */
+    private volatile java.util.function.Consumer<GroupId> onDirty = g -> { };
+
+    void onDirty(java.util.function.Consumer<GroupId> listener) {
+        this.onDirty = java.util.Objects.requireNonNull(listener, "listener");
+    }
+
+    private void dirtied(GroupId groupId, boolean dirtied) {
+        if (dirtied) {
+            onDirty.accept(groupId);
+        }
+    }
+
+    /**
+     * When {@link #flushIfDue} next writes a group, on the node's clock: never while it is clean or nothing persists,
+     * else a period after its last write (at once before any write).
+     *
+     * @param groupId      the group
+     * @param periodMillis the group's gossip period
+     * @return the time in the clock's milliseconds, or {@link Long#MAX_VALUE}
+     */
+    long nextFlushDueMillis(GroupId groupId, long periodMillis) {
+        Group group = groups.get(groupId);
+        if (group == null || directory == null) {
+            return Long.MAX_VALUE;
+        }
+        synchronized (group) {
+            if (!group.dirty) {
+                return Long.MAX_VALUE;
+            }
+            return group.lastWriteMillis == null ? Long.MIN_VALUE : group.lastWriteMillis + periodMillis;
+        }
     }
 
     void flushIfDue(GroupId groupId, long nowMillis, long periodMillis) {
@@ -204,7 +245,11 @@ final class RetirementList {
             return;
         }
         synchronized (group) {
-            if (!group.dirty || (group.lastWriteMillis != null && nowMillis - group.lastWriteMillis < periodMillis)) {
+            // The cadence is a local period (srad/agentspaces-event-loop.md EL-C-04, §10.18): a wall step back puts the
+            // last write in the future, which counts as due, so a back step never holds a dirty group unwritten until
+            // the wall clock passes the last write again (2 hours after EL-SP-13's correction).
+            if (!group.dirty || (group.lastWriteMillis != null && nowMillis - group.lastWriteMillis >= 0
+                    && nowMillis - group.lastWriteMillis < periodMillis)) {
                 return;
             }
         }

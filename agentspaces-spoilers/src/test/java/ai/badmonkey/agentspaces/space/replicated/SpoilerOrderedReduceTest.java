@@ -60,19 +60,22 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   log's commit order decides, so every payment folds once fleet-wide.</li>
  *   <li>SC-B4, the duplicate ticket: under ORDERED the second ticket is kept and completed, not withdrawn, so no
  *   committed claim waits on a ticket that is neither live nor completed. The stall it caused waited out
- *   {@code KeyTickets.PENDING_CLAIM_MAX_AGE} (30 s of wall time, 4 of 10 runs); here the drain is measured, and it
- *   must end before that age could have passed once (a c-wall bound: "drained, not timed out"; no counter exists).</li>
+ *   {@code KeyTickets.PENDING_CLAIM_MAX_AGE} (30 s of wall time, 4 of 10 runs); here the drain must end in fewer
+ *   ticks than that age spans on the fleet's time, a hard bound ("drained, not timed out").</li>
  *   <li>The negative control: the same fleet and workload with an empty script.</li>
  * </ul>
  *
- * <p>The reducers' takes run on their binders' threads and the log's attempt window is a wall-clock wait (§3.4.4), so
- * the order is asserted and the durations measured.
+ * <p>The reducers' takes run on their binders' threads, and every wait they make (the log's attempt window, the
+ * tickets' waits, the pending claims' age) is on the fleet's virtual time (srad/agentspaces-event-loop.md decision 12),
+ * so the drain's bound is hard, in ticks.
  */
 class SpoilerOrderedReduceTest {
 
     /** {@code KeyTickets.PENDING_CLAIM_MAX_AGE}, private there: a stalled key waited this long on the wall clock. */
     private static final Duration PENDING_CLAIM_MAX_AGE = Duration.ofSeconds(30);
     private static final int PAYMENTS = 6;
+    /** {@link #PENDING_CLAIM_MAX_AGE} in ticks of {@link SpaceFleet#PERIOD}. */
+    private static final int STALL_TICKS = (int) PENDING_CLAIM_MAX_AGE.dividedBy(SpaceFleet.PERIOD);
 
     public record Payment(String account, long cents) {
     }
@@ -170,14 +173,15 @@ class SpoilerOrderedReduceTest {
                 cents += i;
             }
             long total = cents;
-            // A wall ceiling at the stall's own length: a key stalled behind an unresolvable claim drains only after
-            // PENDING_CLAIM_MAX_AGE, so a drain inside it is a drain without the stall (fm: (c-wall), kept hard
-            // because no counter of dropped claims exists).
-            Measurement drain = SimWait.mixed("spoiler.ordered-reduce.drain", Integer.MAX_VALUE, PENDING_CLAIM_MAX_AGE,
+            // A hard bound in virtual time (decision 12, srad/agentspaces-event-loop.md §10.17): the tickets' waits and
+            // the pending claims' age run on the fleet's time now, so a key stalled behind an unresolvable claim drains
+            // only once PENDING_CLAIM_MAX_AGE of fleet time has passed; a drain in fewer ticks than that is a drain
+            // without the stall. The binders' threads run between ticks.
+            Measurement drain = SimWait.ticks("spoiler.ordered-reduce.drain", STALL_TICKS - 1,
                     () -> {
                         fleet.tickAll();
                         sleep(20);
-                    }, fleet.clock::millis, () -> settled(fleet, total),
+                    }, () -> settled(fleet, total),
                     Wait.with().params(Params.of("script", spoil ? "second-reducer" : "honest"))
                             .diagnostics(() -> state(fleet)));
             ScriptRunner.Report report = runner.finish();

@@ -179,9 +179,9 @@ class MergeFunctionTest {
         fleet.settle(4);
         List<PConflict> conflicts = new CopyOnWriteArrayList<>();
         onA.onConflict(conflicts::add);
-        long started = System.nanoTime();
-        PMap<String, String> seen = onA.deref();
-        long waited = (System.nanoTime() - started) / 1_000_000;
+        var read = fleet.call(Duration.ofSeconds(30), onA::deref); // a read on the fleet's time (EL-Q-TST-03)
+        PMap<String, String> seen = read.value();
+        long waited = read.took().toMillis();
         assertThat(seen.root()).as("the later head wins whole").isEqualTo(stray.root());
         assertThat(seen.get("k0")).contains("stray");
         assertThat(conflicts).extracting(PConflict::reason).containsExactly(PConflict.NO_COMMON_BASE);

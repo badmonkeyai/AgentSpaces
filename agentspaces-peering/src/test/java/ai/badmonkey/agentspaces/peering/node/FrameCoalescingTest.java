@@ -24,6 +24,7 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.wire.Envelope;
 import ai.badmonkey.agentspaces.test.SimNetwork;
 import ai.badmonkey.agentspaces.test.TestClock;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -115,5 +116,58 @@ class FrameCoalescingTest {
         assertThat(batches).as("B's twenty rumors went as a few BATCH frames").isBetween(1L, 10L);
         assertThat(rumors).as("C's twenty rumors went as single frames (plus any B got alone)").isBetween(20L, 30L);
         assertThat(atB).as("the batching peer received every item once").hasSize(20).doesNotHaveDuplicates();
+    }
+
+    /**
+     * The flush timer on a node (srad/agentspaces-event-loop.md EL-B-01, EL-B-06, FT-1): an idle coalescing node arms
+     * no flush timer however long it idles, and a burst arms one, which delivers the burst as BATCH frames one window
+     * after the first enqueue. No peer-flush thread exists.
+     */
+    @Test
+    @Timeout(60)
+    void anIdleNodeArmsNoFlushTimerAndABurstFlushesOneWindowAfterItsFirstFrame() throws Exception {
+        VirtualTime time = VirtualTime.create();
+        Duration window = Duration.ofMillis(20);
+        PeerNode a = PeerNode.builder(PeerIdentity.generate()).clock(time).time(time).randomSeed(11)
+                .coalesce(window).build();
+        a.listen(network.register("va"), "va");
+        nodes.add(a);
+        PeerNode b = PeerNode.builder(PeerIdentity.generate()).clock(time).time(time).randomSeed(12)
+                .coalesce(window).build();
+        b.listen(network.register("vb"), "vb");
+        nodes.add(b);
+        GroupRuntime ra = a.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
+        GroupRuntime rb = b.joinGroup(groupAd, GroupMembership.Config.defaults(),
+                List.of(new PeerAdvertisement.Endpoint("mem", "va", 0)));
+        for (int i = 0; i < 4; i++) {
+            a.tick();
+            b.tick();
+            time.advance(Duration.ofSeconds(1));
+        }
+        assertThat(ra.membership().allMembers()).hasSize(1);
+        assertThat(Thread.getAllStackTraces().keySet().stream().map(Thread::getName))
+                .as("EL-B-06: no peer-flush thread").noneMatch(n -> n.startsWith("peer-flush-"));
+        List<String> atB = items(rb);
+
+        long flushRuns = a.loopStats().flushRuns() + b.loopStats().flushRuns();
+        long tasks = time.tasksRun();
+        time.advance(Duration.ofMinutes(1)); // idle, untouched: no tick, no traffic
+        assertThat(a.loopStats().flushRuns() + b.loopStats().flushRuns())
+                .as("FT-1: an idle node arms no flush timer").isEqualTo(flushRuns);
+        assertThat(time.tasksRun()).as("nothing ran in an idle minute").isEqualTo(tasks);
+
+        PeerNode.Traffic before = a.traffic();
+        for (int i = 0; i < 20; i++) {
+            ra.gossip().publish("news", "item-" + i, ("n" + i).getBytes(StandardCharsets.UTF_8));
+        }
+        assertThat(atB).as("held in the outbox until the window passes").isEmpty();
+        time.advance(window.minusMillis(1));
+        assertThat(atB).isEmpty();
+        time.advance(Duration.ofMillis(1));
+        assertThat(atB).as("delivered one window after the first frame").hasSize(20).doesNotHaveDuplicates();
+        long batches = a.traffic().sentByKind().getOrDefault(Envelope.Kind.BATCH, 0L)
+                - before.sentByKind().getOrDefault(Envelope.Kind.BATCH, 0L);
+        assertThat(batches).as("twenty rumors in one BATCH").isEqualTo(1);
+        assertThat(a.loopStats().flushWaitMaxNanos()).as("FT-2").isLessThanOrEqualTo(window.toNanos());
     }
 }

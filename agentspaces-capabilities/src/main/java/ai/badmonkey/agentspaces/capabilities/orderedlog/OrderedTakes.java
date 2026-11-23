@@ -363,12 +363,17 @@ public final class OrderedTakes {
                                             Duration timeout) {
         Objects.requireNonNull(template, "template");
         Objects.requireNonNull(takeLease, "takeLease");
-        long deadline = System.nanoTime() + timeout.toNanos();
+        // Every wait on the space's time source (EL-W-01, decision 12): the deadline, the attempt window and the
+        // wait between scans, so a virtual source releases them on its advance and the scenarios get hard bounds.
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, timeout);
         while (true) {
             if (Thread.currentThread().isInterrupted()) {
                 return Optional.empty(); // the caller is stopping: submit nothing new
             }
+            long seen = space.changeSignals();
             long now = clock.instant().toEpochMilli();
+            boolean attempted = false;
             List<T> candidates = space.readAll(template, 16);
             for (T candidate : candidates) {
                 Optional<EntryId> entryId = space.entryIdOf(candidate);
@@ -385,6 +390,8 @@ public final class OrderedTakes {
                         now + takeLease.duration().toMillis());
                 byte[] claimBytes = codec.toBytes(claim);
                 byte[] command = codec.toBytes(signedCommand(entryId.get(), claim, claimBytes));
+                attempted = true;
+                long attemptSeen = space.changeSignals();
                 raft.submit(command);
                 // Wait for the log to decide this generation, but only for a
                 // bounded attempt window: a command lost to a leader election is
@@ -392,12 +399,13 @@ public final class OrderedTakes {
                 // window holds even past the caller's timeout: a claim the log
                 // commits after the caller gave up would hold the entry for its whole
                 // lease with nobody to adopt it (the 0.6.0 regression, 2026-11-10).
-                // An interrupt does not cut the window short (see the method's comment): the wait sleeps through
-                // it and sets the status again on the way out.
-                long attemptDeadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+                // An interrupt does not cut the window short (see the method's comment): the wait goes on through
+                // it and sets the status again on the way out. The decision lands in the space as a claim, which
+                // moves its change signal, so the window waits on that signal, not on a 20 ms poll.
+                long attemptDeadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, ATTEMPT_WINDOW);
                 boolean interrupted = false;
                 try {
-                    while (System.nanoTime() < attemptDeadline) {
+                    while (waits.monoNanos() - attemptDeadline < 0) {
                         Optional<TakeClaim> decided = space.currentClaim(entryId.get());
                         if (decided.isPresent() && decided.get().epoch() >= epoch) {
                             if (decided.get().holder().equals(issuer)
@@ -411,7 +419,8 @@ public final class OrderedTakes {
                             }
                             break; // someone else won this generation; try another entry
                         }
-                        interrupted |= sleepThrough(Duration.ofMillis(20));
+                        interrupted |= awaitThrough(attemptSeen, attemptDeadline, waits);
+                        attemptSeen = space.changeSignals();
                     }
                 } finally {
                     if (interrupted) {
@@ -420,8 +429,64 @@ public final class OrderedTakes {
                 }
                 break; // re-scan candidates (and resubmit when still undecided), unless interrupted
             }
-            if (System.nanoTime() >= deadline || !pause(Duration.ofMillis(20))) {
+            if (waits.monoNanos() - deadline >= 0) {
                 return Optional.empty();
+            }
+            // Nothing claimable: wait for a change (a write, a lapse the sweep signals, a cancel) or the deadline,
+            // under the one take-wait rule. After an attempt, scan again at once: a command lost to an election is
+            // resubmitted, and a generation someone else won leaves the next scan to find nothing and wait.
+            if (!attempted && !awaitChange(seen, deadline, waits)) {
+                return Optional.empty();
+            }
+            if (Thread.currentThread().isInterrupted()) {
+                return Optional.empty();
+            }
+        }
+    }
+
+    /** How long a submitted claim is waited on for the log's decision before the take scans again. */
+    static final Duration ATTEMPT_WINDOW = Duration.ofSeconds(3);
+
+    /**
+     * Waits for the space's next change after {@code seen}, the deadline, or the look's slice (the one take-wait rule,
+     * srad/agentspaces-event-loop.md EL-W-07: a plain clock a test moves by hand looks again each second).
+     *
+     * @return false when interrupted, with the status set again for the caller
+     */
+    private boolean awaitChange(long seen, long deadline, ai.badmonkey.agentspaces.common.time.TimeSource waits) {
+        long slice = (ai.badmonkey.agentspaces.common.time.Waits.movedByHand(clock)
+                ? ai.badmonkey.agentspaces.common.time.Waits.HAND_CLOCK_LOOK
+                : ai.badmonkey.agentspaces.common.time.Waits.BACKSTOP).toNanos();
+        long left = Math.min(deadline - waits.monoNanos(), slice);
+        if (left <= 0) {
+            return true;
+        }
+        try {
+            space.awaitChange(seen, Duration.ofNanos(left));
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /**
+     * Waits for the space's next change after {@code seen} or the attempt's deadline, whatever interrupts arrive, and
+     * answers whether one did; the status is left clear for the caller to set again. Waiting on a claim already out
+     * uses it, so the wait neither stops early nor spins on a kept status (every wait would throw at once).
+     */
+    private boolean awaitThrough(long seen, long attemptDeadline, ai.badmonkey.agentspaces.common.time.TimeSource waits) {
+        boolean interrupted = false;
+        while (true) {
+            long left = attemptDeadline - waits.monoNanos();
+            if (left <= 0 || space.changeSignals() != seen) {
+                return interrupted;
+            }
+            try {
+                space.awaitChange(seen, Duration.ofNanos(left));
+                return interrupted;
+            } catch (InterruptedException e) {
+                interrupted = true;
             }
         }
     }
@@ -440,39 +505,5 @@ public final class OrderedTakes {
                                 + " holds no certificate covering " + signingTime));
         return new ClaimCommand(entryId, claim, identity.rawPublicKey(),
                 holderIdentity.sign(claimBytes), certificate);
-    }
-
-    /**
-     * Sleeps the whole duration whatever interrupts arrive, and answers whether one did; the status is left clear
-     * for the caller to set again. Waiting on a claim already out uses it, so the wait neither stops early nor
-     * spins on a kept status (every sleep would throw at once).
-     */
-    private static boolean sleepThrough(Duration duration) {
-        long deadline = System.nanoTime() + duration.toNanos();
-        boolean interrupted = false;
-        for (long left = duration.toNanos(); left > 0; left = deadline - System.nanoTime()) {
-            try {
-                java.util.concurrent.TimeUnit.NANOSECONDS.sleep(left);
-            } catch (InterruptedException e) {
-                interrupted = true;
-            }
-        }
-        return interrupted;
-    }
-
-    /**
-     * Sleeps, and answers false when interrupted, with the interrupt status set again for the caller. The old sleep
-     * kept the status but not the stop: every later sleep of the take then threw at once, so an interrupted take
-     * spun through its timeout, submitting claims on whatever it found, and could adopt and return an entry written
-     * after its binding closed.
-     */
-    private static boolean pause(Duration duration) {
-        try {
-            Thread.sleep(duration.toMillis());
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
     }
 }

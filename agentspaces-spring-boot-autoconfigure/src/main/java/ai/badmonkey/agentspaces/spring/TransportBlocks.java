@@ -187,7 +187,7 @@ final class TransportBlocks {
         AgentSpacesProperties.Transport transport = properties.getTransport();
         if (transport.getQuic().isEnabled()) {
             Transport bean = provided.remove("quic");
-            blocks.add(new Block("quic", bean != null ? bean : QuicBlocks.build(identity, serving, trust),
+            blocks.add(new Block("quic", bean != null ? bean : QuicBlocks.build(identity, transport.getQuic(), serving, trust),
                     transport.getQuic(), bean == null));
         }
         if (transport.getDtls().isEnabled()) {

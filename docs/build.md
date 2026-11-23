@@ -4,12 +4,13 @@ Written for: contributors who build and test the core.
 
 JDK 21+ and Maven are the only prerequisites. `BUILD.md` at the workspace root is the full runbook.
 
-Build and test everything (the release gate, roughly 3 minutes):
+Build and test everything (the release gate):
 
 ```
-mvn -T 1C -Pspring-it clean verify -Dgolden.required=true
+mvn -T 2 -Pspring-it clean verify -Dgolden.required=true
 ```
 
+- `-T 2` builds two modules at once, each with three test JVMs; "Build time" below explains why not more. Add `-Psoak` at a phase gate to run the long soak tests too.
 - `-Pspring-it` adds the real Spring Boot integration test, the starter's release gate. CI activates it.
 - `-Dgolden.required=true` makes the cross-language golden-vector tests fail instead of silently skipping when golden.json is missing.
 - Always `clean`. An IDE compiling alongside Maven can leave error-stub classes in `target/`.
@@ -101,3 +102,34 @@ Build success should look like:
 [INFO] ------------------------------------------------------------------------
 [INFO] BUILD SUCCESS
 ```
+
+## Build time
+
+The full core reactor (`mvn -o -fae clean install -Dgolden.required=true -T 2`) runs in about 8 minutes on a 10-core laptop. It took about 29 minutes before 2026-11-22. Three settings do it:
+
+- **Three test JVMs per module.** The root pom sets surefire's `forkCount` to 3 with `reuseForks=true`, so a module's test classes share out over three JVMs. `-Dsurefire.forkCount=1` runs them one after another in one JVM, as before.
+- **`-T 2`.** Two modules build at once, so at most six test JVMs run beside Maven's own. Do not use `-T 1C` with the forks: ten threads times three forks is thirty JVMs on ten cores, and the timing-sensitive tests then measure the machine, not the code.
+- **The soak tag.** Long simulations are tagged `@Tag("soak")`, and the default build leaves them out (`surefire.excludedGroups=soak`). Phase gates run them with the soak profile:
+
+```
+# every test, the soak tests included (a phase gate)
+mvn -o -fae clean install -Dgolden.required=true -T 2 -Psoak
+
+# the soak tests alone, in the modules that have them (about 8 minutes)
+mvn -o test -Psoak -Dgroups=soak -Dsurefire.failIfNoSpecifiedTests=false \
+  -pl agentspaces-spoilers,examples/example-18-agentic-workflow
+```
+
+The soak tests today:
+
+- `TargetedRelaySpoilerTest` at 12 and 16 members. The 10-member run stays in every build.
+- `ClockSpoilerTest`'s two-hour forward step, corrected. Its slow rejoin is FUTURE row EL-F-08.
+- `RaftLeaseSpoilerTest`'s ten-minute idle.
+- `ClaimsFlowTest` with example 18's own supervisor, which waits out its forty settled rounds. Every build pins that setting without the wait.
+- `LoopPoolSpoilerTest`'s EL-SP-27 (two minutes of overrun past the loop pool's max, then the stretch clearing) and EL-SP-28 (a 20 s burst, then the pool back at its min after 60 s idle), at the default bounds. Every build runs their rules on a test clock (`LoopPoolTest`, `NodeLoopPoolTest`).
+
+Rules for tests that run in parallel:
+
+- A test that must name its port before it binds takes it from `Ports.free()` in `agentspaces-test-support`. Never bind port 0, close it, and reuse the number: that port comes from the ephemeral range that every other process draws from, and a parallel JVM can take it first. `Ports` hands out ports below that range.
+- A bound that depends on load is a measurement, or it is relative to the configured value. For example, a dial to a silent port sets a short dial timeout (`DtlsTransport.dialTimeout`, `UdpTransport.dialTimeout`, `QuicTransport.dialTimeout`) and asserts against that timeout.
+- Waits that span minutes of protocol time run on `VirtualTime` or the fleet clock, never on the wall.

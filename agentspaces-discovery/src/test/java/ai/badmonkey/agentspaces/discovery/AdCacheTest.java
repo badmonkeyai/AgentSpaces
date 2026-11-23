@@ -83,6 +83,32 @@ class AdCacheTest {
         assertThat(receiver.size()).isEqualTo(1);
     }
 
+    /**
+     * srad/agentspaces-event-loop.md DW-2: every move of the generation tells the change listeners once, so due work
+     * that reads the cache wakes from it (an ad carried by gossip wakes no loop participant by itself); a refused or
+     * repeated ad tells nobody, and a closed handle stops the calls.
+     */
+    @Test
+    void everyGenerationMoveTellsTheChangeListenersOnce() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger told = new java.util.concurrent.atomic.AtomicInteger();
+        AutoCloseable handle = cache.onChange(told::incrementAndGet);
+        long start = cache.generation();
+        AgentCard first = card("x", clock.instant(), Duration.ofMinutes(15));
+        assertThat(cache.accept(stored(first, issuer))).isPresent();
+        cache.accept(stored(first, issuer)); // the same ad again: no move
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(cache.accept(stored(card("x", clock.instant(), Duration.ofMinutes(15)), issuer))).isPresent();
+        assertThat(cache.accept(stored(card("stale", clock.instant().minus(Duration.ofMinutes(16)),
+                Duration.ofMinutes(15)), issuer))).isEmpty();
+        assertThat(told.get()).isEqualTo(2).isEqualTo((int) (cache.generation() - start));
+        clock.advance(Duration.ofMinutes(20));
+        cache.size(); // reads sweep the expired ad out
+        assertThat(told.get()).isEqualTo((int) (cache.generation() - start));
+        handle.close();
+        cache.accept(stored(card("y", clock.instant(), Duration.ofMinutes(15)), issuer));
+        assertThat(told.get()).as("a closed handle hears nothing").isEqualTo((int) (cache.generation() - start) - 1);
+    }
+
     /** SPEC §6.2: an ad that is already past issued + ttl is refused on arrival. */
     @Test
     void anAlreadyExpiredAdIsRefusedOnArrival() {

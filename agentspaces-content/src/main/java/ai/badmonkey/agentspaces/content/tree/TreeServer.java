@@ -154,7 +154,7 @@ public final class TreeServer {
 
         /** The time, for the prune cache. */
         default long nowMillis() {
-            return System.currentTimeMillis();
+            return ai.badmonkey.agentspaces.common.time.TimeSource.system().monoMillis(); // a local cache age
         }
 
         /** Whether this holder advertises the PDT feature level 2, so it reads the level-2 forms (P2-F-05). */

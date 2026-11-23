@@ -60,10 +60,8 @@ class DtlsCaModeFabricTest {
 
 
     private static int freePort() throws Exception {
-        // A free TCP port is a good guess for a free UDP port on loopback.
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private static void await(String what, BooleanSupplier condition) throws InterruptedException {

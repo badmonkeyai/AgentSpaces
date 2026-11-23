@@ -197,7 +197,7 @@ public final class CollectionAssetProvider implements AssetProvider {
         String prefix = params.get(PARAM_NAME_PREFIX);
         String origin = params.get(PARAM_ORIGIN);
         String after = params.get(PARAM_AFTER);
-        long now = System.currentTimeMillis();
+        long now = content.clock().millis(); // compared with manifest stamps, which are wall instants
         // A page reads only the manifests it needs (LB-Q-PRF-08): the roots are ordered and the
         // cursor applied by name alone, and manifests load one by one until the page is full, so a
         // page of 100 over 40,000 roots touches about 100 manifests rather than all of them.

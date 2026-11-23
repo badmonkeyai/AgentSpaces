@@ -16,6 +16,7 @@
 package ai.badmonkey.agentspaces.space.replicated;
 
 import ai.badmonkey.agentspaces.api.error.LeaseExpiredException;
+import ai.badmonkey.agentspaces.api.entry.EntryId;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.space.TakenEntry;
@@ -23,7 +24,6 @@ import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.measure.Direction;
 import ai.badmonkey.agentspaces.measure.Measure;
 import ai.badmonkey.agentspaces.measure.Measurement;
-import ai.badmonkey.agentspaces.measure.Params;
 import ai.badmonkey.agentspaces.measure.Rec;
 import ai.badmonkey.agentspaces.measure.SimWait;
 import ai.badmonkey.agentspaces.measure.Unit;
@@ -37,6 +37,7 @@ import ai.badmonkey.agentspaces.spoilers.Script;
 import ai.badmonkey.agentspaces.spoilers.ScriptRunner;
 import ai.badmonkey.agentspaces.spoilers.Trigger;
 import ai.badmonkey.agentspaces.test.FleetInvariants;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
 import org.junit.jupiter.api.Test;
@@ -69,8 +70,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *   <li>The negative control: the same workload with an empty script, one winner inside the window.</li>
  * </ul>
  *
- * <p>Takes settle on the wall clock (§3.4.4), so the order is asserted and the durations measured; the repair after
- * the release is a protocol bound on the fleet clock, asserted on ticks.
+ * <p>Takes settle on the fleet's virtual time (srad/agentspaces-event-loop.md decision 12, EL-W-01, §10.17): each
+ * take runs as a task of that time, so its settle window is a hard bound in virtual time (REPAIRED within exactly the
+ * window), no longer a wall duration to measure; the repair after the release is a protocol bound on the fleet clock,
+ * asserted on ticks.
  */
 class SpoilerLateClaimTest {
 
@@ -83,6 +86,24 @@ class SpoilerLateClaimTest {
      * the settle already behind every take). Checked against the code: the default repair window is 3 s, ten ticks.
      */
     private static final int REPAIR_TICKS = 20;
+    /**
+     * The bound, in ticks, on the winner's first anti-entropy pull from the one replica that holds a displaced
+     * completion, in the scenarios where every rumor of that completion into the winner is lost. The writer cannot hold
+     * it: it merged the winner's claim first, so it drops the completion (SPEC §11a.4), and the loser is its only
+     * source. Anti-entropy pulls (the opener is the one repaired), so the completion reaches the winner on its first
+     * periodic round whose random partner is the loser: one draw in two per round, a round every 1 s period, which
+     * lands on every fourth 300 ms tick. Twenty ticks are four rounds, missed one run in sixteen on a fair draw (and
+     * in 2 of 8 to 4 of 6 runs of the seeded fleet, whose few reachable draw sequences include four misses in a
+     * row). Sixteen rounds: a miss on a fair draw is 2^-16.
+     */
+    private static final int HOLDER_PULL_TICKS = 16 * 4;
+    /**
+     * The bound on the same pull when the winner heard the displaced claim before the completion (owner decision 4,
+     * 2026-11-23): the winner opens targeted rounds toward each displaced holder while its take is open, at once and
+     * then after 1, 2, 4 ... s, so the pull lands on the first targeted round after the completion, within about one
+     * period (four ticks); eight ticks leave a round of slack. Its random rounds may come first.
+     */
+    private static final int TARGETED_PULL_TICKS = 8;
 
     private static Template<TaskEntry> task() {
         return Template.of(TaskEntry.class);
@@ -145,18 +166,20 @@ class SpoilerLateClaimTest {
                     .build());
 
             // b claims first: its stamp is the lower, so its claim wins the lattice everywhere it is heard
-            CompletableFuture<Optional<TakenEntry<TaskEntry>>> atB = CompletableFuture.supplyAsync(
+            CompletableFuture<VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>>> atB = fleet.clock.start(
                     () -> b.space().take(task(), MINUTES_10, Duration.ZERO));
+            fleet.clock.runDue(); // b claims, sends its claim, and settles on the fleet's time
             awaitFired(runner, "hold-claim", "spoiler.late-claim.held");
             fleet.clock.advance(Duration.ofMillis(10));
-            long judging = System.nanoTime();
-            Optional<TakenEntry<TaskEntry>> displaced = a.space().take(task(), MINUTES_10, Duration.ZERO);
-            Measure.record("spoiler.late-claim.take", Unit.MS, Direction.LOWER, (System.nanoTime() - judging) / 1e6,
-                    Rec.with().params(Params.of("strategy", "lease-race")));
+            VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>> judged = fleet.call(
+                    () -> a.space().take(task(), MINUTES_10, Duration.ZERO));
+            Optional<TakenEntry<TaskEntry>> displaced = judged.value();
             assertThat(displaced).as("a never heard of b's claim inside its window, so it judged itself the winner")
                     .isPresent();
-            Optional<TakenEntry<TaskEntry>> winning = Measure.awaitValue("spoiler.late-claim.lattice-winner",
-                    Duration.ofSeconds(30), () -> atB.isDone() ? Optional.of(atB.join()) : Optional.empty(), Wait.with());
+            assertThat(judged.took()).as("a's take ended exactly at its settle window (decision 12)").isEqualTo(SETTLE);
+            assertThat(atB).as("b's window ended inside a's: b started 10 ms earlier").isDone();
+            Optional<TakenEntry<TaskEntry>> winning = atB.join().value();
+            assertThat(atB.join().took()).isEqualTo(SETTLE);
             assertThat(winning).as("b heard a's later claim and kept the entry: it holds the lattice's winning claim")
                     .isPresent();
 
@@ -183,6 +206,129 @@ class SpoilerLateClaimTest {
                     .singleElement().satisfies(r -> assertThat(r.cause()).startsWith("on "));
             oracle.assertHolds(report.expectedDrops(), true);
         }
+    }
+
+    /**
+     * The store race of 2026-11-22 (StorePeerTest, 2 of 2 forked reactors; srad/agentspaces-event-loop.md §10.20), at
+     * the space: the loser's completion reaches the lattice winner only by anti-entropy, from replicas that have
+     * merged the winner's claim, so it travels under that claim, which does not authenticate it. The rumor that carries
+     * the completion with the loser's own claim is lost, with every repair of it (rule {@code drop-completion-rumors}:
+     * in the store race the gossip views had dropped the stores). Both scenarios failed before the fix: the winner
+     * never noted the completion and wrote a second result.
+     *
+     * @param claimHeard whether the loser's claim reached the winner before the loser adopted the winner's claim. When
+     *                   it did, the winner keeps the claim its own displaced and judges the later completion with it.
+     *                   When it did not, no replica holds the loser's claim any more: the loser offers it again, and
+     *                   its first offers are lost too (rule {@code drop-loser-claims}, eight periods), so the one that
+     *                   arrives is a retry on the evidence of a replica that still offers the entry present.
+     */
+    private void lateCompletionByAntiEntropy(String name, long seed, boolean claimHeard) throws Exception {
+        try (SpaceFleet fleet = fleet(name)) {
+            SpaceFleet.Member a = fleet.get("a");
+            SpaceFleet.Member b = fleet.get("b");
+            FleetInvariants oracle = FleetInvariants.baseline(fleet.probe(Set.of(), Template.of(FindingEntry.class)));
+            Script.RuleBuilder rules = Script.of("b").seed(seed)
+                    .rule("hold-claim")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR, Envelope.Kind.PULL_RESP, Envelope.Kind.BATCH).to("a")
+                            .item(ItemKind.CLAIM).attr("holderPeer", b.id().toString()))
+                    .act(Action.hold()).always()
+                    .until(Trigger.frame().from("a").item(ItemKind.COMPLETION))
+                    .ceiling(Ceiling.periods(40))
+                    .rule("drop-completion-rumors")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR).to("b").item(ItemKind.COMPLETION))
+                    .act(Action.drop()).always()
+                    .rule("completion-into-b")
+                    .when(Trigger.frame(Envelope.Kind.PULL_RESP).to("b").item(ItemKind.COMPLETION)
+                            .attr("issuerPeer", fleet.get("w").id().toString()))
+                    .act(Action.count());
+            if (!claimHeard) {
+                rules = rules.rule("drop-loser-claims")
+                        .when(Trigger.frame(Envelope.Kind.RUMOR, Envelope.Kind.PULL_RESP, Envelope.Kind.BATCH).to("b")
+                                .item(ItemKind.CLAIM).attr("holderPeer", a.id().toString()))
+                        .act(Action.drop()).always()
+                        .until(Trigger.afterPeriods(8));
+            }
+            ScriptRunner runner = arm(fleet, rules.build());
+
+            // b claims first: its claim wins the lattice; a never hears of it inside its window
+            CompletableFuture<VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>>> atB = fleet.clock.start(
+                    () -> b.space().take(task(), MINUTES_10, Duration.ZERO));
+            fleet.clock.runDue();
+            awaitFired(runner, "hold-claim", "spoiler.late-completion.held");
+            fleet.clock.advance(Duration.ofMillis(10));
+            Optional<TakenEntry<TaskEntry>> displaced = fleet.call(
+                    () -> a.space().take(task(), MINUTES_10, Duration.ZERO)).value();
+            assertThat(displaced).as("a judged itself the winner").isPresent();
+            Optional<TakenEntry<TaskEntry>> winning = atB.join().value();
+            assertThat(winning).as("b holds the lattice's winning claim").isPresent();
+            EntryId entryId = winning.get().entryId();
+
+            if (claimHeard) {
+                // §10.33 (seam C11): with three members a random round of b's or a's lands on the other within the
+                // targeted bound about three times in four, so the bound alone proved nothing (the cut of the targeted
+                // round passed). Every member's periodic round is pushed out to 60 s (a raise applies at once), so
+                // within TARGETED_PULL_TICKS only the winner's targeted round toward the displaced holder can pull.
+                for (SpaceFleet.Member m : fleet.members.values()) {
+                    m.runtime().gossip().antiEntropyPeriod(Duration.ofSeconds(60));
+                }
+            }
+            // a completes; the frame carrying its completion releases b's claim into a, which adopts it at once
+            a.space().complete(displaced.get(), new FindingEntry("contested", "done by a"), MINUTES_30);
+            // a is the completion's one source, and anti-entropy pulls: it reaches b on b's first round with a
+            // (HOLDER_PULL_TICKS), a random draw, measured on its own so the bound below is the product's alone
+            Measurement pulled = SimWait.ticks("spoiler.late-completion.pulled-from-holder",
+                    claimHeard ? TARGETED_PULL_TICKS : HOLDER_PULL_TICKS,
+                    fleet::tickSlowly, () -> runner.report().fired("completion-into-b") > 0,
+                    Wait.with().diagnostics(() -> "firings " + runner.report().signatures()));
+            // from that answer, b pairs the completion with a's displaced claim: at once when the claim was heard
+            // first, else when a's offer of it lands (REPAIR_TICKS covers the backoff past drop-loser-claims)
+            Measurement learned = SimWait.ticks("spoiler.late-completion.winner-learns-after-pull", REPAIR_TICKS,
+                    fleet::tickSlowly, () -> b.space().knowsDisplacedCompletion(entryId),
+                    Wait.with().diagnostics(() -> "firings " + runner.report().signatures() + "; a offered its claim "
+                            + a.space().displacedReoffers() + " times"));
+            if (claimHeard) {
+                assertThat(learned.value()).as("the claim was heard first, so the pull itself pairs it, within a tick")
+                        .isLessThanOrEqualTo(1);
+                assertThat(b.space().displacedPullRounds()).as("owner decision 4: the winner opened targeted rounds"
+                        + " toward the displaced holder").isPositive();
+            }
+            assertThat(a.space().currentClaim(entryId).map(TakeClaim::holder)).as("a adopted b's claim")
+                    .isEqualTo(b.space().currentClaim(entryId).map(TakeClaim::holder));
+            // rule 2: the winner that learned of the displaced holder's completion before its own stands down
+            assertThatThrownBy(() -> b.space().complete(winning.get(), new FindingEntry("contested", "done by b"),
+                    MINUTES_30)).isInstanceOf(LeaseExpiredException.class).hasMessageContaining("completed first");
+            assertThat(b.space().outbidAcknowledged()).isEqualTo(1);
+            if (!claimHeard) {
+                assertThat(runner.report().fired("drop-loser-claims")).as("a's first offers were lost").isPositive();
+                assertThat(a.space().displacedReoffers()).as("so a offered its claim again").isGreaterThan(1);
+            }
+
+            converge(fleet, "spoiler.late-completion.repair", List.of(new FindingEntry("contested", "done by a")));
+            for (SpaceFleet.Member m : fleet.members.values()) {
+                assertThat(m.space().duplicateCompletions()).as("nothing done twice at " + m.name()).isZero();
+            }
+            long offers = a.space().displacedReoffers();
+            fleet.tickAll(10);
+            assertThat(a.space().displacedReoffers()).as("no replica offers the entry present any more, so a stops")
+                    .isEqualTo(offers);
+            ScriptRunner.Report report = runner.finish();
+            System.out.printf("store race at the space (%s): b pulled from a after %.0f ticks and learned %.0f ticks"
+                    + " later; a offered its claim %d times; firing sequence %s%n", name, pulled.value(), learned.value(),
+                    offers, report.signatures());
+            oracle.assertHolds(report.expectedDrops(), true);
+        }
+    }
+
+    @Test
+    @Timeout(120)
+    void aDisplacedClaimAndItsCompletionInDifferentFramesStillMakeTheWinnerAcknowledge() throws Exception {
+        lateCompletionByAntiEntropy("LateCompletionPaired", 4713, true);
+    }
+
+    @Test
+    @Timeout(120)
+    void aDisplacedHolderOffersItsClaimAgainUntilTheWinnerCanAcknowledge() throws Exception {
+        lateCompletionByAntiEntropy("LateCompletionReoffered", 4714, false);
     }
 
     @Test
@@ -214,11 +360,17 @@ class SpoilerLateClaimTest {
                     .ceiling(Ceiling.periods(40))
                     .build());
 
-            Optional<TakenEntry<TaskEntry>> atA = a.space().take(task(), MINUTES_10, Duration.ZERO);
+            VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>> takeA = fleet.call(
+                    () -> a.space().take(task(), MINUTES_10, Duration.ZERO));
             fleet.clock.advance(Duration.ofMillis(10));
-            Optional<TakenEntry<TaskEntry>> atB = b.space().take(task(), MINUTES_10, Duration.ZERO);
+            VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>> takeB = fleet.call(
+                    () -> b.space().take(task(), MINUTES_10, Duration.ZERO));
+            Optional<TakenEntry<TaskEntry>> atA = takeA.value();
+            Optional<TakenEntry<TaskEntry>> atB = takeB.value();
             assertThat(atA).as("a judged alone").isPresent();
             assertThat(atB).as("b judged alone: two holders past the window").isPresent();
+            assertThat(List.of(takeA.took(), takeB.took())).as("each judged at exactly its window (decision 12)")
+                    .containsOnly(SETTLE);
             a.space().complete(atA.get(), new FindingEntry("contested", "done by a"), MINUTES_30);
             b.space().complete(atB.get(), new FindingEntry("contested", "done by b"), MINUTES_30);
 
@@ -246,10 +398,14 @@ class SpoilerLateClaimTest {
             SpaceFleet.Member b = fleet.get("b");
             FleetInvariants oracle = FleetInvariants.baseline(fleet.probe(Set.of(), Template.of(FindingEntry.class)));
             ScriptRunner runner = arm(fleet, Script.honest("b"));
-            Optional<TakenEntry<TaskEntry>> atB = b.space().take(task(), MINUTES_10, Duration.ZERO);
+            VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>> takeB = fleet.call(
+                    () -> b.space().take(task(), MINUTES_10, Duration.ZERO));
+            Optional<TakenEntry<TaskEntry>> atB = takeB.value();
             fleet.clock.advance(Duration.ofMillis(10));
             assertThat(atB).isPresent();
-            assertThat(a.space().take(task(), MINUTES_10, Duration.ZERO)).as("the claim arrived in time").isEmpty();
+            assertThat(takeB.took()).isEqualTo(SETTLE);
+            assertThat(fleet.call(() -> a.space().take(task(), MINUTES_10, Duration.ZERO)).value())
+                    .as("the claim arrived in time").isEmpty();
             b.space().complete(atB.get(), new FindingEntry("contested", "done by b"), MINUTES_30);
             converge(fleet, "spoiler.late-claim.control", List.of(new FindingEntry("contested", "done by b")));
             for (SpaceFleet.Member m : fleet.members.values()) {

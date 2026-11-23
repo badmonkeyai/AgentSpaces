@@ -59,9 +59,6 @@ import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -183,13 +180,12 @@ public final class StoreGraphFleet {
         private final PackNodeStore pack;
         private final Pdt pdt;
         private final ContentStore contentStore;
-        private final ScheduledExecutorService ticker;
         private final List<AutoCloseable> transports;
         private volatile boolean closed;
 
         private Peer(String name, PeerIdentity identity, PeerNode node, GroupRuntime runtime, DiscoveryService discovery,
                      ReplicatedSpace contentSpace, ReplicatedSpace refSpace, CapabilityRuntime capabilities, Content content,
-                     PackNodeStore pack, Pdt pdt, ContentStore contentStore, ScheduledExecutorService ticker,
+                     PackNodeStore pack, Pdt pdt, ContentStore contentStore,
                      List<AutoCloseable> transports) {
             this.name = name;
             this.identity = identity;
@@ -203,7 +199,6 @@ public final class StoreGraphFleet {
             this.pack = pack;
             this.pdt = pdt;
             this.contentStore = contentStore;
-            this.ticker = ticker;
             this.transports = transports;
         }
 
@@ -264,7 +259,6 @@ public final class StoreGraphFleet {
                 return;
             }
             closed = true;
-            ticker.shutdownNow();
             if (contentStore != null) {
                 quietly(contentStore::close);
             }
@@ -363,29 +357,19 @@ public final class StoreGraphFleet {
                 .pdtLevel(Content.PDT_LEVEL).build();
         capabilities.register(content);
         pdt.attach(content).start();
-        runtime.onTick(pdt::tick);
+        pdt.joinLoop(runtime); // its own deadlines on the node's loop (srad/agentspaces-event-loop.md EL-T-08)
         ContentStore contentStore = null;
         if (spec.store() != null) {
             contentStore = ContentStore.builder(pdt, discovery, identity).name(spec.storeName()).policy(spec.store())
                     .holdingInterval(HOLDING_INTERVAL).fetchTimeout(LOAD_TIMEOUT).build();
-            runtime.onTick(contentStore::tick);
+            contentStore.joinLoop(runtime); // srad/agentspaces-event-loop.md EL-T-09
             contentStore.start();
         }
-        ScheduledExecutorService ticker = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "tick-" + name);
-            t.setDaemon(true);
-            return t;
-        });
-        ticker.scheduleAtFixedRate(() -> {
-            try {
-                node.tick();
-            } catch (RuntimeException e) {
-                System.err.println(name + " tick failed: " + e.getMessage());
-            }
-        }, 0, 100, TimeUnit.MILLISECONDS);
-        capabilities.autoRefresh(Duration.ofSeconds(30), ticker);
+        // the node's own loop runs each participant at its own deadline (srad/agentspaces-event-loop.md EL-X-07)
+        node.startTicking(Duration.ofMillis(250));
+        capabilities.autoRefresh(Duration.ofSeconds(30)); // on the node's time source (EL-T-12)
         return new Peer(name, identity, node, runtime, discovery, contentSpace, refSpace, capabilities, content, pack, pdt,
-                contentStore, ticker, transports);
+                contentStore, transports);
     }
 
     /** The transport for a scheme; a binding with its own channel certificate is made for the peer's identity. */

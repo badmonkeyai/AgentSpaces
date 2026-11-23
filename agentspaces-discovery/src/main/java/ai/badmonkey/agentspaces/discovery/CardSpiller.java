@@ -131,9 +131,34 @@ public final class CardSpiller {
                 return card;
             }
             holds.merge(root, card.expiresAt(), (held, now) -> now.isAfter(held) ? now : held);
+            Runnable listener = onHold;
+            if (listener != null) {
+                listener.run(); // the sweep's next due may have moved earlier (DW-2)
+            }
             cardsSpilled.incrementAndGet();
             return Spills.stub(card, new CardSpill(root, document.length, parts));
         });
+    }
+
+    /** Run after a hold is taken or extended; the discovery service wakes its participant from it. */
+    private volatile Runnable onHold;
+
+    void onHold(Runnable listener) {
+        this.onHold = listener;
+    }
+
+    /**
+     * The earliest instant a hold lapses, in epoch millis on this spiller's clock, so the sweep runs only then
+     * (srad/agentspaces-event-loop.md EL-T-09); {@code Long.MAX_VALUE} with no hold.
+     *
+     * @return the next expiry
+     */
+    public long nextExpiryMillis() {
+        long next = Long.MAX_VALUE;
+        for (Instant at : holds.values()) {
+            next = Math.min(next, at.toEpochMilli());
+        }
+        return next;
     }
 
     /** Releases every root whose last naming card has expired. */

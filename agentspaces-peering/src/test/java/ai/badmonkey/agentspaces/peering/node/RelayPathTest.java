@@ -185,6 +185,18 @@ class RelayPathTest {
         assertThat(f.hq().relayBytesByKind(groupId)).containsKey("PIPE_DATA");
         assertThat(f.hq().relayBytesByKind(groupId).get("PIPE_DATA")).isGreaterThan(0L);
         assertThat(f.a1().relayedWithInLastMinute(groupId, f.b1().peerId())).isGreaterThanOrEqualTo(10);
+        // W09c (phase-6 gate, EL-L-03): the first pin gave the pins participant a deadline where it had none, so it
+        // signalled the participant; frames on a pinned path signal nothing more.
+        String pins = groupId.value() + "/pins";
+        long pinWakes = f.a1().loopStats().wakeCalls().getOrDefault(pins, 0L);
+        assertThat(pinWakes).as("the first pin signals the pins participant").isPositive();
+        for (int i = 0; i < 10; i++) {
+            f.a1Runtime().send(f.b1().peerId(), Envelope.Kind.PIPE_DATA, ("again " + i).getBytes(StandardCharsets.UTF_8));
+        }
+        tickAll(2);
+        assertThat(atB1).hasSize(20);
+        assertThat(f.a1().loopStats().wakeCalls().getOrDefault(pins, 0L)).as("no wake per frame on a held pin")
+                .isEqualTo(pinWakes);
     }
 
     @Test

@@ -184,6 +184,35 @@ class JoinByIdRetryTest {
         assertThat(guest.group(wanted)).isEmpty();
     }
 
+    /**
+     * srad/agentspaces-event-loop.md group W, EL-C-08 carried: the join waits on its node's time source. On a virtual
+     * one a 60 s join that nobody answers times out after 60 s of virtual time and no real wait, its slices (1, 2, 4,
+     * then 5 s) and their locates on the same base; it used to wait out its slices in real time.
+     */
+    @Test
+    void aJoinWaitsOnTheNodesTimeSource() throws Exception {
+        ai.badmonkey.agentspaces.test.VirtualTime time =
+                ai.badmonkey.agentspaces.test.VirtualTime.startingAt(java.time.Instant.parse("2026-11-23T00:00:00Z"));
+        PeerNode guest = PeerNode.builder(PeerIdentity.generate()).clock(time).time(time).randomSeed(2).build();
+        guest.listen(network.register("vg"), "vg");
+        nodes.add(guest);
+        GroupId wanted = GroupId.of("zNobodyOnVirtualTime");
+        Scripted locator = new Scripted(n -> BeaconHint.none());
+        long started = System.nanoTime();
+        long virtualStart = time.monoNanos();
+        assertThatThrownBy(() -> time.run(Duration.ofMillis(500), Duration.ofMinutes(2),
+                () -> guest.joinGroup(wanted, GroupMembership.Config.defaults(), locator, Duration.ofSeconds(60))))
+                .hasCauseInstanceOf(FoundingTimeoutException.class);
+        long realMillis = (System.nanoTime() - started) / 1_000_000;
+        long virtualMillis = (time.monoNanos() - virtualStart) / 1_000_000;
+        System.out.printf("[join] a 60 s join timed out after %d ms of virtual time, %d ms real, %d locates%n",
+                virtualMillis, realMillis, locator.asked.get());
+        assertThat(virtualMillis).as("the timeout, on the node's source, within one advance").isBetween(60_000L,
+                60_500L);
+        // the re-asks run on threads of their own, which an advance does not wait for: at least one is asked
+        assertThat(locator.asked.get()).as("asked again inside the timeout").isGreaterThanOrEqualTo(2);
+    }
+
     /** FR-6: a reached seed that holds no signed founding is reported as connected and silent. */
     @Test
     void aConnectedSeedThatSendsNothingIsReportedAsSuch() throws Exception {

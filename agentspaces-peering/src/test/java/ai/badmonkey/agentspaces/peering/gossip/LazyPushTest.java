@@ -850,23 +850,34 @@ class LazyPushTest {
                 .isLessThanOrEqualTo(GossipBus.MISSING_CAPACITY * perItem);
     }
 
+    /**
+     * The young tree's announcements and the probe piggyback (srad/agentspaces-event-loop.md EL-T-15). Rewritten for
+     * the node's loop (EL-L-04): the windows are time from the change, so the clock moves with the ticks; before, the
+     * clock stood still and the windows counted ticks. The sequence is the same: every 250 ms for 2 s, then once a
+     * second until 8 s. A probe carries an item from the 250 ms window after the one it was forwarded in, as it did
+     * from the tick after.
+     */
     @Test
     void announcementsStopOnceTheTreeHasSettledAndTheProbeCarriesTheRecentItems() {
         enable();
-        bus.onPrune(p2, new Bodies.Prune("news", Digests.sha256(bytes("x")))); // a topology change at tick 0
+        bus.onPrune(p2, new Bodies.Prune("news", Digests.sha256(bytes("x")))); // a topology change at time 0
         int haves = 0;
         List<Integer> haveTicks = new ArrayList<>();
         for (int i = 1; i <= 40; i++) {
+            clock[0] = i * 250L;
             bus.publish("news", "i" + i, bytes("item-" + i));
-            bus.tick(i * 250L);
+            bus.tick(clock[0]);
             int now = sentTo("HAVE").size();
             if (now > haves) {
                 haveTicks.add(i);
                 haves = now;
             }
         }
-        assertThat(haveTicks).as("every tick while young, every fourth while settling, none once settled")
+        assertThat(haveTicks).as("every 250 ms while young, once a second while settling, none once settled")
                 .containsExactly(1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28);
+        assertThat(bus.piggyback(p1)).as("the item of the current window is left out")
+                .noneMatch(item -> java.util.Arrays.equals(item.hash(), Digests.sha256(bytes("item-40"))));
+        clock[0] += 250; // the next window
         List<Bodies.HaveItem> carried = bus.piggyback(p1);
         assertThat(carried).hasSize(GossipBus.PIGGYBACK_ITEMS);
         assertThat(carried.get(carried.size() - 1).hash()).isEqualTo(Digests.sha256(bytes("item-40")));
@@ -874,20 +885,118 @@ class LazyPushTest {
         sent.clear();
         bus.onGraft(p3, new Bodies.Graft("news", Digests.sha256(bytes("item-40")))); // p3 was never lazy: no change
         bus.publish("news", "after", bytes("after"));
-        bus.tick(41 * 250L);
+        bus.tick(clock[0]);
         assertThat(sentTo("HAVE")).as("a graft from an eager member is not a topology change").isEmpty();
         bus.onPrune(p4, new Bodies.Prune("news", Digests.sha256(bytes("after"))));
+        clock[0] += 250;
         bus.publish("news", "young-again", bytes("young-again"));
-        bus.tick(42 * 250L);
+        bus.tick(clock[0]);
         assertThat(sentTo("HAVE")).as("a prune makes the tree young again: p2 and p4 hear").hasSize(2);
         // A member admitted after an item was forwarded is not told of it: that is history, and
         // its anti-entropy brings it in registration order.
         bus.memberAdmitted(p3);
+        clock[0] += 250;
         assertThat(bus.piggyback(p3)).as("nothing forwarded since p3 joined").isNull();
         bus.publish("news", "since", bytes("since"));
-        bus.tick(43 * 250L);
+        clock[0] += 250;
+        bus.tick(clock[0]);
         assertThat(bus.piggyback(p3)).hasSize(1);
         assertThat(bus.piggyback(p1)).hasSize(GossipBus.PIGGYBACK_ITEMS);
+    }
+
+    /**
+     * EL-T-15's wake and outbox rule: a topology change with announcements queued, and an announcement queued while
+     * the tree is young, ask the bus's participant, whose next due is the next HAVE round; a probe leaves out an item
+     * while the outbox toward the member holds frames taken after it was stamped.
+     */
+    @Test
+    void theBusAsksItsParticipantForAnnouncementsAndTheProbeWaitsForTheOutbox() {
+        enable();
+        int[] asked = {0};
+        bus.loopHooks(new GossipBus.LoopHooks() {
+            @Override
+            public void gossipDue() {
+                asked[0]++;
+            }
+        });
+        assertThat(bus.nextDueMillis(clock[0])).as("nothing queued, nothing missing").isEqualTo(Long.MAX_VALUE);
+        bus.onPrune(p2, new Bodies.Prune("news", Digests.sha256(bytes("x")))); // young from now
+        bus.publish("news", "a", bytes("a"));
+        assertThat(asked[0]).as("an announcement queued while the tree is young asks the bus").isEqualTo(1);
+        assertThat(bus.nextDueMillis(clock[0])).as("due at once").isEqualTo(clock[0]);
+        bus.tick(clock[0]);
+        assertThat(sentTo("HAVE")).containsExactly(p2);
+        bus.publish("news", "b", bytes("b"));
+        assertThat(bus.nextDueMillis(clock[0])).as("the next round, 250 ms after the last")
+                .isEqualTo(clock[0] + GossipBus.HAVE_EVERY_MILLIS);
+        clock[0] += 3_000;
+        assertThat(bus.nextDueMillis(clock[0])).as("settling: once a second, at once in a new second")
+                .isEqualTo(clock[0]);
+        bus.tick(clock[0]);
+        assertThat(bus.nextDueMillis(clock[0])).as("sent: nothing queued").isEqualTo(Long.MAX_VALUE);
+
+        boolean[] holds = {true};
+        bus.outbox(peer -> holds[0]);
+        bus.outboxTaking(p1); // the outbox toward p1 is taken here
+        clock[0] += 250;
+        bus.publish("news", "c", bytes("c")); // forwarded after the take: may sit in the outbox
+        clock[0] += 250;
+        assertThat(bus.piggyback(p1)).as("its eager copy may still sit in the outbox toward p1")
+                .noneMatch(item -> java.util.Arrays.equals(item.hash(), Digests.sha256(bytes("c"))));
+        holds[0] = false;
+        assertThat(bus.piggyback(p1)).as("the outbox flushed").anyMatch(item ->
+                java.util.Arrays.equals(item.hash(), Digests.sha256(bytes("c"))));
+    }
+
+    /**
+     * W05a (phase-6 gate, EL-T-15): a frame-driven topology change in a settled tree with announcements queued asks
+     * the bus's participant, whose next due is then at once; a cut left the queued HAVEs to the loop's backstop.
+     */
+    @Test
+    void aPruneInASettledTreeWithAnnouncementsQueuedAsksTheBus() {
+        enable();
+        int[] asked = {0};
+        bus.loopHooks(new GossipBus.LoopHooks() {
+            @Override
+            public void gossipDue() {
+                asked[0]++;
+            }
+        });
+        bus.onPrune(p2, new Bodies.Prune("news", Digests.sha256(bytes("x")))); // the tree changes at 0
+        clock[0] = GossipBus.SETTLING_MILLIS + 1_000;
+        bus.publish("news", "a", bytes("a"));
+        assertThat(asked[0]).as("settled: a queued announcement waits for a probe, nothing asked").isZero();
+        bus.onPrune(p3, new Bodies.Prune("news", Digests.sha256(bytes("a")))); // a frame-driven change
+        assertThat(asked[0]).as("the change with announcements queued asks the bus once").isEqualTo(1);
+        assertThat(bus.nextDueMillis(clock[0])).as("young again: the next HAVE round is due at once")
+                .isEqualTo(clock[0]);
+        sent.clear();
+        bus.tick(clock[0]);
+        assertThat(sentTo("HAVE")).as("the asked run announces to both lazy members").containsExactlyInAnyOrder(p2, p3);
+    }
+
+    /**
+     * W04t (phase-6 gate, EL-L-13): the traffic edge armed by a quiet membership run fires on the first traffic, here
+     * a rumor on a stream this node does not hold (traffic, not activity), once; the activity edge alone does not.
+     */
+    @Test
+    void theTrafficEdgeAsksOnceOnTheFirstTrafficThatIsNotActivity() {
+        enable();
+        int[] activity = {0};
+        bus.loopHooks(new GossipBus.LoopHooks() {
+            @Override
+            public void activity() {
+                activity[0]++;
+            }
+        });
+        bus.armActivityEdge(bus.activityGeneration());
+        bus.onRumor(p1, new Bodies.Rumor("elsewhere", "o1", 6, bytes("o1")));
+        assertThat(activity[0]).as("a rumor on a stream not held is no activity").isZero();
+        bus.armTrafficEdge(bus.trafficGeneration());
+        bus.onRumor(p1, new Bodies.Rumor("elsewhere", "o2", 6, bytes("o2")));
+        assertThat(activity[0]).as("but it is traffic: the armed traffic edge asks at once").isEqualTo(1);
+        bus.onRumor(p1, new Bodies.Rumor("elsewhere", "o3", 6, bytes("o3")));
+        assertThat(activity[0]).as("an edge fires once until it is armed again").isEqualTo(1);
     }
 
     @Test

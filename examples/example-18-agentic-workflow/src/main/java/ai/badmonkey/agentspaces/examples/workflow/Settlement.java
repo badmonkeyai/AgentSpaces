@@ -162,7 +162,7 @@ public final class Settlement {
         // Forty rounds (one a second since the rounds were paced to the gossip period): the paid
         // claim's reserve follows the ordered log, which can take longer than twenty seconds after
         // the denials settle, and a shorter settle reported the plateau in between.
-        @OnEstimate(prefix = "reserve:", settleTicks = 40, tolerance = 0.01, resultSpace = LEDGER,
+        @OnEstimate(prefix = "reserve:", settle = "PT40S", tolerance = 0.01, resultSpace = LEDGER,
                 resultLease = "24h")
         public ReserveReport report(PushSumAggregate.Estimate reserve) {
             return new ReserveReport(reserve.epochId(), reserve.value(), name);

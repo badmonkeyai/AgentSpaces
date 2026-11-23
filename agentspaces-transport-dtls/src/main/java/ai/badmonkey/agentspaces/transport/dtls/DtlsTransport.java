@@ -45,6 +45,7 @@ import java.security.Provider;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
@@ -53,8 +54,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -86,6 +85,9 @@ public final class DtlsTransport implements Transport, AutoCloseable {
 
     static final int DIAL_TIMEOUT_MILLIS = 10_000;
 
+    /** The default bound on a dial (the DTLS handshake, or the UDP binding's HELLO): 10 s (SRAD DT-Q-REL-02). */
+    public static final Duration DEFAULT_DIAL_TIMEOUT = Duration.ofMillis(DIAL_TIMEOUT_MILLIS);
+
     private final ServingCredential credential;
     private final Supplier<ChannelTrust> trust;
     private final boolean attesting;
@@ -96,7 +98,8 @@ public final class DtlsTransport implements Transport, AutoCloseable {
     private volatile Provider provider;
     private JcaTlsCrypto crypto;
     private Certificate bcCertificate;
-    private ScheduledThreadPoolExecutor timers;
+    private volatile ai.badmonkey.agentspaces.common.time.TimeSource time = ai.badmonkey.agentspaces.common.time.TimeSource.system();
+    private volatile Duration dialTimeout = DEFAULT_DIAL_TIMEOUT;
     private volatile boolean used;
     private volatile boolean closed;
 
@@ -180,7 +183,7 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         KeyPair pair = generator.generateKeyPair();
         byte[] serial = new byte[9];
         new SecureRandom().nextBytes(serial);
-        Instant now = Instant.now().minus(1, ChronoUnit.HOURS);
+        Instant now = ai.badmonkey.agentspaces.common.time.TimeSource.system().instant().minus(1, ChronoUnit.HOURS);
         X500Name name = new X500Name("CN=agentspaces-dtls-unattested");
         try {
             X509Certificate certificate = new JcaX509CertificateConverter().getCertificate(
@@ -221,6 +224,48 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         requireUnused();
         this.provider = Objects.requireNonNull(provider, "provider");
         return this;
+    }
+
+    /**
+     * Sets the time source the associations' retransmit, acknowledgement and idle deadlines run on (one-shots on its
+     * monotonic base, srad/agentspaces-event-loop.md EL-T-12); valid only before first use. The default is the
+     * process's {@code TimeSource.system()}, so no transport keeps a timer thread of its own.
+     *
+     * @param time the time source
+     * @return this transport
+     * @throws IllegalStateException after first use
+     */
+    public DtlsTransport time(ai.badmonkey.agentspaces.common.time.TimeSource time) {
+        requireUnused();
+        this.time = Objects.requireNonNull(time, "time");
+        return this;
+    }
+
+    /**
+     * Sets the bound on a dial's handshake (default {@link #DEFAULT_DIAL_TIMEOUT}): a dial to a peer that never
+     * answers fails after it. Valid only before first use. A test that dials a silent port sets it short.
+     *
+     * @param timeout the bound, 1 ms to 10 min
+     * @return this transport
+     * @throws IllegalStateException after first use
+     */
+    public DtlsTransport dialTimeout(Duration timeout) {
+        requireUnused();
+        this.dialTimeout = checkDialTimeout(timeout);
+        return this;
+    }
+
+    /** @return the bound on a dial's handshake */
+    public Duration dialTimeout() {
+        return dialTimeout;
+    }
+
+    static Duration checkDialTimeout(Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.compareTo(Duration.ofMillis(1)) < 0 || timeout.compareTo(Duration.ofMinutes(10)) > 0) {
+            throw new IllegalArgumentException("dialTimeout must be 1ms to 10m, not " + timeout);
+        }
+        return timeout;
     }
 
     /** @return the options in force */
@@ -267,7 +312,8 @@ public final class DtlsTransport implements Transport, AutoCloseable {
                 opts.mtu(), remote, socket::close);
         socket.start(path, counters, "dtls-dial-" + remote);
         AspaceDtlsClient client = new AspaceDtlsClient(crypto, credential, bcCertificate,
-                BcSupport.versions(opts.protocols()), opts.connectionId(), DIAL_TIMEOUT_MILLIS);
+                BcSupport.versions(opts.protocols()), opts.connectionId(),
+                (int) dialTimeout.toMillis());
         DTLSTransport dtls;
         try {
             dtls = new DTLSClientProtocol().connect(client, path);
@@ -282,7 +328,7 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         socket.established();
         X509Certificate[] chain = BcSupport.x509(client.presented());
         DtlsAssociation[] self = new DtlsAssociation[1];
-        DtlsAssociation association = new DtlsAssociation(RecordLayer.dtls(dtls), path, attest(chain), chain, opts, timers,
+        DtlsAssociation association = new DtlsAssociation(RecordLayer.dtls(dtls), path, attest(chain), chain, opts, time,
                 counters, () -> untrack(self[0]));
         self[0] = association;
         counters.associationsOpened.increment();
@@ -340,11 +386,6 @@ public final class DtlsTransport implements Transport, AutoCloseable {
             }
         }
         listeners.clear();
-        synchronized (this) {
-            if (timers != null) {
-                timers.shutdownNow();
-            }
-        }
     }
 
     // ---------------------------------------------------------- internals
@@ -364,12 +405,6 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         crypto = factory.create(new SecureRandom());
         bcCertificate = BcSupport.certificate(crypto, credential.chain());
         BcSupport.suitesFor(crypto, credential.key()); // fail now when the provider supports no suite
-        timers = new ScheduledThreadPoolExecutor(1, runnable -> {
-            Thread thread = new Thread(runnable, "dtls-timer");
-            thread.setDaemon(true);
-            return thread;
-        });
-        timers.setRemoveOnCancelPolicy(true);
     }
 
     JcaTlsCrypto crypto() {
@@ -384,8 +419,8 @@ public final class DtlsTransport implements Transport, AutoCloseable {
         return bcCertificate;
     }
 
-    ScheduledExecutorService timers() {
-        return timers;
+    ai.badmonkey.agentspaces.common.time.TimeSource time() {
+        return time;
     }
 
     Optional<PeerId> attest(X509Certificate[] chain) {

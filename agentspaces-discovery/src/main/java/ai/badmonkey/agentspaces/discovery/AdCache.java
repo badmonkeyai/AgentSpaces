@@ -320,11 +320,11 @@ public final class AdCache {
         if (existing == null) {
             byId.put(id, candidate);
             bytes += length;
-            generation.incrementAndGet();
+            moved();
         } else if (candidate.advertisement().issued().isAfter(existing.advertisement().issued())) {
             byId.put(id, candidate);
             bytes += length - existing.stored().adBytes().length;
-            generation.incrementAndGet();
+            moved();
         }
         return true;
     }
@@ -453,7 +453,7 @@ public final class AdCache {
             }
         }
         if (removed > 0) {
-            generation.incrementAndGet();
+            moved();
         }
         return removed;
     }
@@ -466,6 +466,36 @@ public final class AdCache {
      */
     public long generation() {
         return generation.get();
+    }
+
+    /** The generation moved: tell the listeners (they only wake; they may run under this cache's monitor). */
+    private void moved() {
+        generation.incrementAndGet();
+        for (Runnable listener : changeListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                System.getLogger(AdCache.class.getName()).log(System.Logger.Level.WARNING,
+                        "an advertisement cache change listener threw", e);
+            }
+        }
+    }
+
+    private final java.util.List<Runnable> changeListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /**
+     * Registers a listener run whenever {@link #generation()} moves (srad/agentspaces-event-loop.md DW-2): due work
+     * that reads the cache wakes its participant from it, because an advertisement carried by gossip wakes no loop
+     * participant on its own. The listener may run under this cache's monitor, so it must only wake: it must not
+     * block and must not call back into the cache.
+     *
+     * @param listener the listener
+     * @return a handle that removes it
+     */
+    public AutoCloseable onChange(Runnable listener) {
+        java.util.Objects.requireNonNull(listener, "listener");
+        changeListeners.add(listener);
+        return () -> changeListeners.remove(listener);
     }
 
     /**

@@ -42,6 +42,17 @@
     <maven.javadoc.skip>true</maven.javadoc.skip>
   </properties>
 
+  <!-- Test-only helpers for every example's tests (Ports: a free port outside the ephemeral range, so parallel
+       test JVMs never take one another's; docs/build.md, "Build time"). -->
+  <dependencies>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-support</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
   <modules>
     <module>example-01-hello-space</module>
     <module>example-02-research-fleet</module>

@@ -277,8 +277,8 @@ class ConcurrentHeadsTest {
         assertThat(failures).isEmpty();
         long swapMillis = (System.nanoTime() - t0) / 1_000_000;
         long swapTicks = fleet.ticks.get();
-        long writerTickMillis = writers.stream().mapToLong(p -> fleet.nodeTickNanos.get(p.name()).get()).sum() / 1_000_000;
-        long readerTickMillis = readers.stream().mapToLong(p -> fleet.nodeTickNanos.get(p.name()).get()).sum() / 1_000_000;
+        long writerTickMillis = writers.stream().mapToLong(p -> RefFleet.loopBusyNanos(p)).sum() / 1_000_000;
+        long readerTickMillis = readers.stream().mapToLong(p -> RefFleet.loopBusyNanos(p)).sum() / 1_000_000;
         int writerConflicts = 0;
         // concurrent heads (srad/agentspaces-pdt2.md §10.20): the writers are done, but the cancels of superseded heads
         // still travel by lazy repair, and a member that hears one cancel before another reads an older entry as a head

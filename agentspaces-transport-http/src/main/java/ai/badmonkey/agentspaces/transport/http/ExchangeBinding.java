@@ -104,25 +104,39 @@ abstract class ExchangeBinding extends HttpBinding {
         private final Consumer<TransportConnection> onAccept;
         private final Map<String, ExchangeSession> sessions = new ConcurrentHashMap<>();
         private final Map<String, long[]> opens = new ConcurrentHashMap<>();
-        private final ScheduledFuture<?> sweeper;
+        /** The next sweep, re-armed after each one (srad/agentspaces-event-loop.md EL-T-13: no fixed rate). */
+        private volatile ScheduledFuture<?> sweeper;
+        private volatile boolean stopped;
 
         ExchangeRoute(String base, HttpOptions options, Consumer<TransportConnection> onAccept) {
             this.base = base;
             this.options = options;
             this.onAccept = onAccept;
+            armSweep();
+        }
+
+        private void armSweep() {
+            if (stopped) {
+                return;
+            }
             long idle = options.idleTimeout().toNanos();
-            this.sweeper = NettyLoops.group().next().scheduleAtFixedRate(() -> {
-                long now = System.nanoTime();
-                for (ExchangeSession session : sessions.values()) {
-                    if (now - session.lastRequestNanos > idle) {
-                        session.close();
+            sweeper = NettyLoops.group().next().schedule(() -> {
+                try {
+                    long now = System.nanoTime();
+                    for (ExchangeSession session : sessions.values()) {
+                        if (now - session.lastRequestNanos > idle) {
+                            session.close();
+                        }
                     }
+                    opens.entrySet().removeIf(e -> now - e.getValue()[0] > TimeUnit.SECONDS.toNanos(5));
+                } finally {
+                    armSweep();
                 }
-                opens.entrySet().removeIf(e -> now - e.getValue()[0] > TimeUnit.SECONDS.toNanos(5));
-            }, 5, 5, TimeUnit.SECONDS);
+            }, 5, TimeUnit.SECONDS);
         }
 
         void stop() {
+            stopped = true;
             sweeper.cancel(false);
             for (ExchangeSession session : sessions.values()) {
                 session.close();

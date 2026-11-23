@@ -25,7 +25,7 @@ import java.nio.channels.SeekableByteChannel;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * The card spill over a group's content swarm (SPEC §6.1a.5, v0.1.32; ISSUE-AppCardOriginFormats §9.8; AppCard origin
@@ -101,7 +101,13 @@ public final class ContentSpillStore implements SpillStore {
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
-        out.orTimeout(fetchTimeout.toMillis(), TimeUnit.MILLISECONDS).whenComplete((bytes, failure) -> {
+        // The bound runs on the node's time source, not CompletableFuture.orTimeout, which starts the JDK's own
+        // platform timer thread and follows no virtual clock (srad/agentspaces-event-loop.md §10.23, R4).
+        ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled bound = content.timeSource().schedule(fetchTimeout,
+                () -> out.completeExceptionally(new TimeoutException("the fetch of " + root + " took longer than "
+                        + fetchTimeout)));
+        out.whenComplete((bytes, failure) -> {
+            bound.cancel();
             if (failure != null) {
                 fetch.cancel();
             }

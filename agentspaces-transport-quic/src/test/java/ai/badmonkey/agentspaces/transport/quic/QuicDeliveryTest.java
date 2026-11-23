@@ -61,10 +61,7 @@ class QuicDeliveryTest {
     @Test
     @Timeout(120)
     void aReceiverThatAnswersEveryFrameKeepsUpWhenBothDirectionsAreLoaded() throws Exception {
-        int port;
-        try (DatagramSocket socket = new DatagramSocket(0)) {
-            port = socket.getLocalPort();
-        }
+        int port = ai.badmonkey.agentspaces.test.Ports.free(); // below the ephemeral range (parallel forks)
         List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger echoed = new AtomicInteger();
         AutoCloseable listener = server.listen("127.0.0.1:" + port, connection -> connection.onReceive(frame -> {

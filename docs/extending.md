@@ -96,14 +96,20 @@ A capability is any protocol beyond the core that a peer offers its group. The p
        CapabilityAdvertisement describe(GroupId group);  // type, version, binding, parameters, cost hints, TTL
        default void start() {}
        default void stop() {}
-       default void tick() {}                            // one protocol step, driven by the peer's clock
-       default boolean requiresTick() { return false; }  // true when the protocol has rounds to run
-       default void driverCadence(Duration period) {}    // told the real cadence, so advertised leases are truthful
+       default void tick() {}                            // one protocol step, the older 250 ms form
+       @Deprecated default boolean requiresTick() { return false; }
+       @Deprecated default void driverCadence(Duration period) {}
+   }
+
+   public interface DueCapabilityProvider extends CapabilityProvider, DueWork {
+       long run(long nowNanos);                          // do what is due; return the next deadline or NEVER
+       void attach(DueWork.Driver driver);               // wake(), describeChanged(), monoNanos(), timed(), time()
    }
    ```
 
    - `describe` returns the advertisement the runtime signs and publishes. The runtime refreshes it on its schedule, so a provider that stops refreshing simply ages out of every cache. Everything is leased.
-   - A provider with rounds to run declares `requiresTick()` and does one step in `tick()`. The `CapabilityRuntime` registers itself on the peer's one clock and drives every provider from it, so a capability never brings a scheduler of its own.
+   - A provider with rounds to run implements `DueCapabilityProvider`. The `CapabilityRuntime` registers itself on the peer's loop and runs the provider when its deadline falls due or when it calls `driver.wake()`, so a capability never brings a scheduler of its own. It calls `driver.describeChanged()` when its advertisement changes, and the card is republished in the next run.
+   - A provider that overrides `tick()` or `requiresTick()` (the form before 0.7.0) still works: it is stepped every 250 ms. A provider that overrides neither runs only on the advertisement refresh.
 3. **Choose a binding.**
    - **Space-mediated** is the canonical style: requests and responses flow as leased entries in an agreed space, which gives retries, observability, and choreography with other capabilities at no extra cost. `vote`'s QUORUM mode and the connector SDK's `data-query` work this way.
    - **Direct pipe** suits high-rate protocols: `CapabilityPipes.onCapability(type, handler)` receives frames addressed to your type and `send(peer, type, payload)` answers them over the `PIPE_DATA` kind. `aggregate`, `gossip-learn`, `semantic-discovery`, and `key-wrap` work this way.
@@ -114,4 +120,4 @@ A capability is any protocol beyond the core that a peer offers its group. The p
    - For a typed client: implement `CapabilityClientFactory<C>` (`clientType()`, `create(groupContext)`) and register it through `ServiceLoader`. `spaces.group("fleet").capability(NegotiateClient.class)` then resolves it, as `VoteClient`, `AggregateClient`, and `SemanticClient` do today, and an agent can receive it by field with `@CapabilityRef`.
    - A capability with a behaviour agents exhibit (cast, react, take) earns an annotation of the `@SpaceNotify` shape. `LAYER4-ANNOTATIONS.md` is the review that produced `@Ballot`, `@OnDecision`, and `@OrderedTake`, and the bar a new one must clear.
 
-Test a capability the way the shipped ones are tested: a `SimNetwork` cluster with a `TestClock`, providers registered on two or more peers, and assertions on convergence after deterministic ticks (`CapabilityClusterTest` is the template). Consider the security posture as you design: an unauthenticated average can be poisoned by any participant (the specification accepts this for `aggregate` and says so), whereas signed entries in a space are attributable. Say which one your mini-spec offers.
+Test a capability the way the shipped ones are tested: a `SimNetwork` cluster whose nodes run their loops on one `VirtualTime`, providers registered on two or more peers, and assertions on convergence after `advance(...)` (`CapabilityDueTest` and `RaftDueTest` are the templates; `CapabilityClusterTest` drives nodes by hand on a `TestClock`). Consider the security posture as you design: an unauthenticated average can be poisoned by any participant (the specification accepts this for `aggregate` and says so), whereas signed entries in a space are attributable. Say which one your mini-spec offers.

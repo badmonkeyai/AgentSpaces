@@ -103,10 +103,27 @@ class QuicTransportTest {
         } finally {
             listener.close();
         }
-        // Dialing a port nobody serves fails with an IOException, not a hang.
+        // Dialing a port nobody serves fails with an IOException, not a hang: at the dial timeout, set short here
+        // (the 10 s default is pinned below without waiting it out) and judged relative to it.
         int deadPort = freeUdpPort();
+        java.time.Duration timeout = java.time.Duration.ofSeconds(1);
+        transport.dialTimeout(timeout);
+        long start = System.nanoTime();
         assertThatThrownBy(() -> transport.dial("127.0.0.1:" + deadPort))
                 .isInstanceOf(IOException.class);
+        assertThat(java.time.Duration.ofNanos(System.nanoTime() - start)).isLessThan(timeout.plusSeconds(5));
+    }
+
+    @Test
+    void theDialTimeoutDefaultsToTenSeconds() {
+        try (QuicTransport fresh = new QuicTransport()) {
+            assertThat(fresh.dialTimeout()).isEqualTo(QuicTransport.DEFAULT_DIAL_TIMEOUT)
+                    .isEqualTo(java.time.Duration.ofSeconds(10));
+            assertThat(fresh.dialTimeout(java.time.Duration.ofMillis(1_500)).dialTimeout())
+                    .isEqualTo(java.time.Duration.ofMillis(1_500));
+            assertThatThrownBy(() -> fresh.dialTimeout(java.time.Duration.ZERO))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
     }
 
     /**
@@ -164,8 +181,7 @@ class QuicTransportTest {
     }
 
     private static int freeUdpPort() throws IOException {
-        try (DatagramSocket socket = new DatagramSocket(0)) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 }

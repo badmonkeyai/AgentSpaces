@@ -15,6 +15,8 @@
  */
 package ai.badmonkey.agentspaces.space.replicated;
 
+import ai.badmonkey.agentspaces.measure.Wait;
+import ai.badmonkey.agentspaces.measure.Measure;
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
@@ -119,11 +121,10 @@ class LargePayloadTest {
         byte[] data = new byte[150_000];
         new Random(12).nextBytes(data);
         a.space().write(new BigEntry("scan", data), Lease.of(Duration.ofMinutes(30)));
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (seen.isEmpty() && System.nanoTime() < deadline) {
+        Measure.await("space.large-payload.wait-1", Duration.ofSeconds(30), () -> {
             nodes.forEach(PeerNode::tick);   // no read anywhere: only the fabric moves
-            Thread.sleep(20);
-        }
+            return !seen.isEmpty();
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(seen).as("the subscriber learned of the large entry with no read").containsExactly("scan");
         assertThat(b.blocks().size()).isEqualTo(1);
     }
@@ -214,10 +215,7 @@ class LargePayloadTest {
 
         network.partition("a", "b");
         assertThat(b.space().read(Template.of(BigEntry.class))).isEmpty(); // starts attempt 0
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (b.space().pendingBlockRetries() == 0 && System.nanoTime() < deadline) {
-            Thread.sleep(20);
-        }
+        Measure.await("space.large-payload.wait-2", Duration.ofSeconds(30), () -> b.space().pendingBlockRetries() != 0);
         assertThat(b.space().pendingBlockRetries()).as("attempt 0 failed and queued a retry").isEqualTo(1);
 
         network.heal();
@@ -227,10 +225,7 @@ class LargePayloadTest {
         nodes.forEach(PeerNode::tick); // the retry runs here, from the tick
         assertThat(b.space().read(Template.of(BigEntry.class), Duration.ofSeconds(5)))
                 .hasValueSatisfying(entry -> assertThat(entry.data()).isEqualTo(data));
-        deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (b.space().pendingBlockRetries() != 0 && System.nanoTime() < deadline) {
-            Thread.sleep(20);
-        }
+        Measure.await("space.large-payload.wait-3", Duration.ofSeconds(30), () -> b.space().pendingBlockRetries() == 0);
         assertThat(b.space().pendingBlockRetries()).isZero();
     }
 
@@ -311,22 +306,20 @@ class LargePayloadTest {
 
         var taken = a.space().take(Template.of(BigEntry.class), Lease.of(Duration.ofMinutes(5)), Duration.ZERO).orElseThrow();
         a.space().complete(taken);
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (!b.space().recordOf(written.entryId(), false).isEmpty() && System.nanoTime() < deadline) {
+        Measure.await("space.large-payload.wait-4", Duration.ofSeconds(30), () -> {
             nodes.forEach(PeerNode::tick); // the completion reaches B through C
-            Thread.sleep(20);
-        }
+            return !(!b.space().recordOf(written.entryId(), false).isEmpty());
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(b.space().recordOf(written.entryId(), true)).as("B holds the entry completed").isPresent();
         assertThat(b.space().recordOf(written.entryId(), false)).isEmpty();
         assertThat(heard).as("nothing yet: B cannot decode the value").isEmpty();
 
         network.heal();
         clock.advance(Duration.ofMillis(2_100));
-        deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (heard.isEmpty() && System.nanoTime() < deadline) {
+        Measure.await("space.large-payload.wait-5", Duration.ofSeconds(30), () -> {
             nodes.forEach(PeerNode::tick); // the retry runs from the tick and the block lands
-            Thread.sleep(20);
-        }
+            return !heard.isEmpty();
+        }, Wait.with().poll(Duration.ofMillis(20)));
         Thread.sleep(200); // room for a stray second event to show
         assertThat(heard).containsExactly("COMPLETED:brief");
     }
@@ -352,37 +345,31 @@ class LargePayloadTest {
         awaitRecordAndFailedFetch(b, c, written.entryId());
 
         written.cancel();
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (b.space().recordOf(written.entryId(), false).isPresent() && System.nanoTime() < deadline) {
+        Measure.await("space.large-payload.wait-6", Duration.ofSeconds(30), () -> {
             nodes.forEach(PeerNode::tick);
-            Thread.sleep(20);
-        }
+            return !(b.space().recordOf(written.entryId(), false).isPresent());
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(b.space().recordOf(written.entryId(), false)).as("withdrawn at B").isEmpty();
 
         network.heal();
         clock.advance(Duration.ofMillis(2_100));
         for (int i = 0; i < 10; i++) {
             nodes.forEach(PeerNode::tick);
-            Thread.sleep(20);
         }
-        Thread.sleep(200);
+        Thread.sleep(400); // room for the retry's fetch and a stray event to show
         assertThat(heard).isEmpty();
     }
 
     /** Ticks until B holds the entry's record (by way of C) and B's first fetch of the block has failed. */
     private void awaitRecordAndFailedFetch(Peer b, Peer c, ai.badmonkey.agentspaces.api.entry.EntryId entryId)
             throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (b.space().recordOf(entryId, true).isEmpty() && System.nanoTime() < deadline) {
+        Measure.await("space.large-payload.wait-7", Duration.ofSeconds(30), () -> {
             nodes.forEach(PeerNode::tick);
-            Thread.sleep(20);
-        }
+            return !(b.space().recordOf(entryId, true).isEmpty());
+        }, Wait.with().poll(Duration.ofMillis(20)));
         assertThat(c.space().recordOf(entryId, true)).as("C relayed the record").isPresent();
         assertThat(b.space().recordOf(entryId, false)).as("B holds the record, present").isPresent();
-        deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (b.space().pendingBlockRetries() == 0 && System.nanoTime() < deadline) {
-            Thread.sleep(20);
-        }
+        Measure.await("space.large-payload.wait-8", Duration.ofSeconds(30), () -> b.space().pendingBlockRetries() != 0);
         assertThat(b.space().pendingBlockRetries()).as("B's first fetch failed and waits for its retry").isEqualTo(1);
     }
 }

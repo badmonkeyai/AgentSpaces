@@ -88,6 +88,10 @@ public final class ConstraintGate implements AutoCloseable {
     private final ArrayDeque<Event> pending = new ArrayDeque<>();
     private volatile long lastWarn;
     private volatile boolean closed;
+    /** The {@link #onChange} listeners: a gated take waits on these and its space, not on a timer (EL-W-07). */
+    private final List<Runnable> changeListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** How many claim judgements this gate made ({@link #claimJudgements()}). */
+    private final java.util.concurrent.atomic.AtomicLong claimJudgements = new java.util.concurrent.atomic.AtomicLong();
 
     private ConstraintGate(Space constraints, Authorizer authorizer, String scope, InstantSource clock, String by, int cacheKeys) {
         this.constraints = constraints;
@@ -130,6 +134,7 @@ public final class ConstraintGate implements AutoCloseable {
         } catch (RuntimeException e) {
             warn("lane " + name + " cannot be watched: " + e);
         }
+        signalChange(); // a lane's past can enable a claim a take was refused
     }
 
     /** Records the entries a lane holds now (the events of the types nothing names are dropped by {@link #record}). */
@@ -209,6 +214,7 @@ public final class ConstraintGate implements AutoCloseable {
             e = new Event(e.type(), e.wireType(), e.entryId(), now, e.fields(), e.tags(), kind);
         }
         record(e, ev.entryId().value());
+        signalChange(); // a lane's event can enable a claim a take was refused (EL-W-07)
     }
 
     /** A watcher's interest beyond the constraints (a rule agent's reactions and goals): a type and its key spec. */
@@ -311,6 +317,9 @@ public final class ConstraintGate implements AutoCloseable {
         } catch (RuntimeException e) {
             warn("cannot read constraints: " + e);
         }
+        // every reload follows a change to the constraints space: a version, and also a jury decision, which the
+        // judgement reads there and which leaves the versions as they were (EL-W-07)
+        signalChange();
     }
 
     private boolean permitted(AgentId issuer) {
@@ -335,6 +344,57 @@ public final class ConstraintGate implements AutoCloseable {
      */
     public void onReload(Runnable listener) {
         reloadListeners.add(java.util.Objects.requireNonNull(listener, "listener"));
+    }
+
+    /**
+     * Registers a listener run after every change that can move a claim judgement (srad/agentspaces-event-loop.md
+     * EL-W-07): an event of a watched lane, a lane watched, and a reload (a version, or a jury decision written to the
+     * constraints space). A gated take waits on this and on its own space's changes, up to {@link #nextClaimDue()},
+     * instead of looking on a timer. The listener runs on the thread that made the change, possibly under this gate's
+     * lock, so it must only wake (a {@code ChangeSignal}): it must not block and must not call back into the gate.
+     *
+     * @param listener the listener
+     * @return a handle that removes it
+     */
+    public AutoCloseable onChange(Runnable listener) {
+        Runnable l = Objects.requireNonNull(listener, "listener");
+        changeListeners.add(l);
+        return () -> changeListeners.remove(l);
+    }
+
+    private void signalChange() {
+        for (Runnable l : changeListeners) {
+            try {
+                l.run();
+            } catch (RuntimeException e) {
+                warn("a change listener failed: " + e);
+            }
+        }
+    }
+
+    /**
+     * When a claim judgement can next change with no event at all, or empty for never (srad/agentspaces-event-loop.md
+     * EL-W-07: a gated take waits for a change or this, under the one backstop). No claim judgement moves with time
+     * alone today: a precedence, a not-coexistence and a cardinality read only the key's events, a response refuses
+     * nothing (it reports an absence), a jury decision arrives as a write to the constraints space, and the
+     * vocabulary's conditions ({@code older than}, {@code within}) are reported in the marking, not enforced at a
+     * claim. Each of those inputs signals {@link #onChange}. A template whose refusal moved with time would report its
+     * next flip here.
+     *
+     * @return the next instant a claim judgement changes by itself, or empty
+     */
+    public java.util.Optional<Instant> nextClaimDue() {
+        return java.util.Optional.empty();
+    }
+
+    /**
+     * How many claim judgements ({@link #beforeClaim}) this gate made: a gated take that waits on changes makes one
+     * per look, so an idle one makes a few a minute, not one a second.
+     *
+     * @return the count
+     */
+    public long claimJudgements() {
+        return claimJudgements.get();
     }
 
     public Collection<Version> loaded() {
@@ -408,6 +468,7 @@ public final class ConstraintGate implements AutoCloseable {
 
     /** May this entry be claimed (FR-8)? */
     public Decision beforeClaim(Space.Entry<?> candidate) {
+        claimJudgements.incrementAndGet();
         if (candidate == null || versions.isEmpty()) {
             return Decision.ADMIT;
         }

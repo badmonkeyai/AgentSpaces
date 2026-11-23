@@ -152,7 +152,7 @@ public class AgentSpacesAutoConfiguration {
      */
     public Authorizers agentSpacesAuthorizers(AgentSpacesProperties properties,
                                               PeerIdentity identity) {
-        return agentSpacesAuthorizers(properties, identity, InstantSource.system());
+        return agentSpacesAuthorizers(properties, identity, ai.badmonkey.agentspaces.common.time.TimeSource.system());
     }
 
     /**
@@ -171,17 +171,30 @@ public class AgentSpacesAutoConfiguration {
     }
 
     /**
-     * The fabric's clock (review M-8 of TODO-9-10-11): one {@link InstantSource}
-     * that the facade, its agents, the authorizers, and the A2A task binding
-     * share, so an application or test can substitute its own. The peer node
-     * keeps the system clock for its protocol rounds.
+     * The fabric's one time source (review M-8 of TODO-9-10-11; srad/agentspaces-event-loop.md EL-C-06): a
+     * {@link ai.badmonkey.agentspaces.common.time.TimeSource}, which is an {@link InstantSource}, that the peer node,
+     * the facade, its agents, the authorizers and the A2A task binding share, so an application or test can substitute
+     * its own. An application {@link InstantSource} bean replaces it: a time source becomes the node's too, and a
+     * plain clock (a test's) is the facade's while the node keeps the system's time source for its protocol rounds.
      *
-     * @return the clock
+     * @return the time source
      */
     @Bean
-    @ConditionalOnMissingBean
-    public InstantSource agentSpacesClock() {
-        return InstantSource.system();
+    @ConditionalOnMissingBean(InstantSource.class)
+    public ai.badmonkey.agentspaces.common.time.TimeSource agentSpacesClock() {
+        return ai.badmonkey.agentspaces.common.time.TimeSource.system();
+    }
+
+    /**
+     * The node's time source for the context's clock (EL-C-06): the clock itself when it is a time source, the
+     * system's for the system clock or a plain test clock (which the node never ran on), or the system's for none.
+     *
+     * @param clock the context's clock, or null
+     * @return the node's time source
+     */
+    static ai.badmonkey.agentspaces.common.time.TimeSource nodeTime(InstantSource clock) {
+        return clock instanceof ai.badmonkey.agentspaces.common.time.TimeSource source
+                ? source : ai.badmonkey.agentspaces.common.time.TimeSource.system();
     }
 
     /**
@@ -221,10 +234,11 @@ public class AgentSpacesAutoConfiguration {
                                     ObjectProvider<Transport> transports,
                                     ObjectProvider<PeerNodeCustomizer> customizers,
                                     ObjectProvider<PeerNodeConfigurer> configurers,
-                                    ObjectProvider<ai.badmonkey.agentspaces.peering.node.RelayPolicy> relayPolicy) {
+                                    ObjectProvider<ai.badmonkey.agentspaces.peering.node.RelayPolicy> relayPolicy,
+                                    ObjectProvider<InstantSource> clock) {
         return buildNode(properties, identity, transports.orderedStream().toList(),
                 customizers.orderedStream().toList(), configurers.orderedStream().toList(),
-                relayPolicy.getIfAvailable());
+                relayPolicy.getIfAvailable(), clock.getIfAvailable());
     }
 
     /**
@@ -274,6 +288,69 @@ public class AgentSpacesAutoConfiguration {
         return buildNode(properties, identity, transports, customizers, configurers, relayPolicy);
     }
 
+    /** One TTL floor per bound properties object, so an override is logged and a key warned once per context. */
+    private static final Map<AgentSpacesProperties, ai.badmonkey.agentspaces.common.time.TtlFloor> TTL_FLOORS =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    /**
+     * The TTL floor of these properties ({@code agentspaces.ttl.*}, srad/agentspaces-event-loop.md EL-E-03, EL-E-04).
+     *
+     * @param properties the properties
+     * @return the check, the same for the same properties
+     */
+    public static ai.badmonkey.agentspaces.common.time.TtlFloor ttlFloor(AgentSpacesProperties properties) {
+        return TTL_FLOORS.computeIfAbsent(properties, p -> {
+            try {
+                return ai.badmonkey.agentspaces.common.time.TtlFloor.of(p.getTtl().isStrict(),
+                        p.getTtl().getExpertOverrides() == null ? Map.of() : p.getTtl().getExpertOverrides());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("agentspaces.ttl.expert-overrides: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    /**
+     * Checks the configured TTLs, leases and expiries against the floor (EL-E-03): each against its own default, which
+     * the TTL register lists with its reason, so a default passes silently and a configured value under 60 s warns, or
+     * refuses to start under {@code agentspaces.ttl.strict=true}, unless an expert override names its key.
+     *
+     * @param properties the properties
+     * @throws IllegalStateException under a strict floor, naming the key
+     */
+    public static void checkTtls(AgentSpacesProperties properties) {
+        ai.badmonkey.agentspaces.common.time.TtlFloor floor = ttlFloor(properties);
+        AgentSpacesProperties defaults = new AgentSpacesProperties();
+        floor.check("agentspaces.membership.member-ttl", GroupMembership.Config.defaults().memberTtl(),
+                GroupMembership.MEMBER_TTL_FLOOR);
+        floor.check("agentspaces.peer-ad-ttl", PeerNode.DEFAULT_PEER_AD_TTL, PeerNode.DEFAULT_PEER_AD_TTL);
+        floor.check("agentspaces.content.holding-lease", properties.getContent().getHoldingLease(),
+                defaults.getContent().getHoldingLease());
+        floor.check("agentspaces.relay.path-ttl", properties.getRelay().getPathTtl(), defaults.getRelay().getPathTtl());
+        floor.check("agentspaces.store.lease-default", properties.getStore().getLeaseDefault(),
+                defaults.getStore().getLeaseDefault());
+        floor.check("agentspaces.store.lease-max", properties.getStore().getLeaseMax(),
+                defaults.getStore().getLeaseMax());
+        floor.check("agentspaces.identity.agent-certificate-ttl", properties.getIdentity().getAgentCertificateTtl(),
+                defaults.getIdentity().getAgentCertificateTtl());
+        String actionLease = properties.getEmbabel().getActionLease();
+        if (actionLease != null && !actionLease.isBlank()) {
+            java.time.Duration parsed;
+            try {
+                parsed = ai.badmonkey.agentspaces.common.time.Durations.parse(actionLease, false);
+            } catch (IllegalArgumentException e) {
+                parsed = null; // the Embabel wiring refuses it, naming the key
+            }
+            floor.check("agentspaces.embabel.action-lease", parsed,
+                    ai.badmonkey.agentspaces.common.time.Durations.parse(defaults.getEmbabel().getActionLease(), false));
+        }
+        floor.check("agentspaces.a2a.task-lease-millis",
+                java.time.Duration.ofMillis(properties.getA2a().getTaskLeaseMillis()),
+                java.time.Duration.ofMillis(defaults.getA2a().getTaskLeaseMillis()));
+        floor.check("agentspaces.a2a.result-lease-millis",
+                java.time.Duration.ofMillis(properties.getA2a().getResultLeaseMillis()),
+                java.time.Duration.ofMillis(defaults.getA2a().getResultLeaseMillis()));
+    }
+
     /**
      * Builds the node from the application's beans (SRAD DB-C-04 to DB-C-06):
      * the starter's settings on the builder, then every
@@ -299,6 +376,29 @@ public class AgentSpacesAutoConfiguration {
                               List<PeerNodeCustomizer> customizers,
                               List<PeerNodeConfigurer> configurers,
                               ai.badmonkey.agentspaces.peering.node.RelayPolicy relayPolicy) {
+        return buildNode(properties, identity, transports, customizers, configurers, relayPolicy, null);
+    }
+
+    /**
+     * As the six-argument form, on the context's clock (srad/agentspaces-event-loop.md EL-C-06): a
+     * {@link ai.badmonkey.agentspaces.common.time.TimeSource} is the node's one time source; a plain clock or none
+     * leaves the node on the system's.
+     *
+     * @param properties  the properties
+     * @param identity    the peer identity
+     * @param transports  application transports, in order
+     * @param customizers builder hooks, in order
+     * @param configurers node hooks, in order
+     * @param relayPolicy the application's relay policy, or null
+     * @param clock       the context's clock, or null
+     * @return the node
+     */
+    public PeerNode buildNode(AgentSpacesProperties properties, PeerIdentity identity,
+                              List<Transport> transports,
+                              List<PeerNodeCustomizer> customizers,
+                              List<PeerNodeConfigurer> configurers,
+                              ai.badmonkey.agentspaces.peering.node.RelayPolicy relayPolicy,
+                              InstantSource clock) {
         // RE-Q-MNT-04: a misspelt gossip pace or space setting stops the start, naming the key, before anything runs.
         properties.refuseUnknownKeys();
         Set<PeerAdvertisement.PeerRole> roles = rolesOf(properties);
@@ -336,6 +436,7 @@ public class AgentSpacesAutoConfiguration {
                     + " or listen on agentspaces.transport.dtls.bind instead");
         }
         PeerNode.Builder builder = PeerNode.builder(identity)
+                .time(nodeTime(clock))
                 .roles(roles)
                 .peerAdInterval(java.time.Duration.ofMillis(properties.getPeerAdIntervalMillis()))
                 .lazyPush(properties.isLazyPush())
@@ -352,6 +453,12 @@ public class AgentSpacesAutoConfiguration {
                 // reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md: retirement on, post-retirement opt-in
                 .retirement(properties.getRetirement().isEnabled())
                 .postRetirement(properties.getPostRetirement().isEnabled());
+        try {
+            builder.watchdogEscalation(PeerNode.Escalation.parse(properties.getWatchdog().getEscalation()));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException(e.getMessage(), e);
+        }
+        checkTtls(properties); // EL-E-03: a TTL under 60 s warns, or refuses to start under agentspaces.ttl.strict
         if (properties.getRetirement().getAfter() != null) {
             try {
                 builder.retireAfter(properties.getRetirement().getAfter());
@@ -523,7 +630,7 @@ public class AgentSpacesAutoConfiguration {
             }
             return new ai.badmonkey.agentspaces.identity.ReloadingChannelTrust(authorities, crlFiles,
                     tls.getCrlRefresh() == null ? Duration.ofMinutes(5) : tls.getCrlRefresh(),
-                    tls.isRevocationStrict(), InstantSource.system());
+                    tls.isRevocationStrict(), ai.badmonkey.agentspaces.common.time.TimeSource.system());
         } catch (java.security.GeneralSecurityException e) {
             throw new IllegalStateException("cannot load the TLS trust store or CRLs", e);
         }
@@ -640,7 +747,7 @@ public class AgentSpacesAutoConfiguration {
      */
     static java.util.function.Function<String, ai.badmonkey.agentspaces.api.spi.AgentIdentity> agentIdentities(
             AgentSpacesProperties properties, PeerIdentity identity) {
-        return agentIdentities(properties, identity, InstantSource.system());
+        return agentIdentities(properties, identity, ai.badmonkey.agentspaces.common.time.TimeSource.system());
     }
 
     /**
@@ -717,7 +824,7 @@ public class AgentSpacesAutoConfiguration {
      */
     public AgentSpaces agentSpaces(AgentSpacesProperties properties, PeerNode node,
                                    PeerIdentity identity, Authorizers authorizers, Embedder embedder) {
-        return agentSpaces(properties, node, identity, authorizers, embedder, InstantSource.system());
+        return agentSpaces(properties, node, identity, authorizers, embedder, ai.badmonkey.agentspaces.common.time.TimeSource.system());
     }
 
     /**
@@ -935,6 +1042,8 @@ public class AgentSpacesAutoConfiguration {
                     identity.peerId(), clock, roles);
             AgentSpaces.GroupContext context = spaces.register(
                     groupConfig.getName(), runtime.id(), runtime, discovery);
+            context.binder().ttlFloor(ttlFloor(properties)); // EL-E-03 for the verb annotations' leases
+            context.binder().holdLimit(properties.getWatchdog().getHoldLimit()); // §10.16; unset: no limit
             BlockExchange blocks = buildBlocks(properties.getBlocks(), runtime, codec, clock, groupConfig.getName());
             GroupKey contentKey = contentKeyOf(groupConfig);
             if (properties.getMulticast().isSeal() && contentKey != null) {
@@ -1171,6 +1280,18 @@ public class AgentSpacesAutoConfiguration {
     public MembershipReadiness agentSpacesMembershipReadiness(PeerNode node,
                                                               org.springframework.context.ApplicationEventPublisher events) {
         return new MembershipReadiness(node, events);
+    }
+
+    /**
+     * Liveness follows the node loop (srad/agentspaces-event-loop.md decision 4 (i), EL-H-08): BROKEN when the
+     * watchdog escalates this node's own loop, so the supervisor restarts the process. Membership and isolation never
+     * touch liveness ({@link MembershipReadiness}).
+     */
+    @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
+    public LoopLiveness agentSpacesLoopLiveness(PeerNode node,
+                                                org.springframework.context.ApplicationEventPublisher events) {
+        return new LoopLiveness(node, events);
     }
 
     /**

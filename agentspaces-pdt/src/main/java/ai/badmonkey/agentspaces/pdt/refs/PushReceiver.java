@@ -444,6 +444,26 @@ public final class PushReceiver {
         }
     }
 
+    /**
+     * When {@link #expire} next drops a bundle, on the same clock, or {@link Long#MAX_VALUE} with none held
+     * (srad/agentspaces-event-loop.md EL-T-08).
+     */
+    long nextExpiryMillis() {
+        long floor = config.grace().toMillis() * ORPHAN_GRACES;
+        long next = Long.MAX_VALUE;
+        for (Stream s : streams.values()) {
+            synchronized (s) {
+                for (Assembly a : s.assemblies.values()) {
+                    boolean anchored = a.anchoredMillis >= 0;
+                    long since = anchored ? a.anchoredMillis : a.createdMillis;
+                    long limit = anchored ? a.graceMillis * ORPHAN_GRACES : floor;
+                    next = Math.min(next, since + limit + 1);
+                }
+            }
+        }
+        return next;
+    }
+
     long bundlesReceived() {
         return bundlesReceived.get();
     }

@@ -182,8 +182,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** The bus registrations this handle owns; closed by {@link #close()} (QA4 A4-9). */
     private final AutoCloseable streamRegistration;
     private final AutoCloseable reconcileRegistration;
-    /** Runs the expiry sweep from the group tick when something is due (see {@link #sweepIfDue()}). */
-    private final AutoCloseable sweepTick;
+    /**
+     * The space's one participant on the node's loop (srad/agentspaces-event-loop.md EL-T-09): the expiry sweep, the
+     * block and bulk retries and the horizon's rounds, each at its own deadline (see {@link #runDue(long)}).
+     */
+    private final ai.badmonkey.agentspaces.api.spi.DueWork.Registration dueRegistration;
     /**
      * Whether only this replica's writer reads the space ({@link Builder#local()}): it neither gossips its writes
      * nor joins anti-entropy, so the group pays nothing for it (reviews/IDLE-WORK-2026-11-13.md item 15, 5a(f)).
@@ -279,25 +282,37 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** Threads waiting on {@link #lock} for a change; a change notifies only when there are any. Under {@link #lock}. */
     private int waiters;
     /**
-     * The longest a waiting take or read sleeps without a signal. Most of what lets a take succeed signals (a write, a
-     * merge, a renewal, a cancel, a claim, a sweep that lapses a claim, a block or artifact landing here); this bounds
-     * the wait on what cannot (a key that arrives for a sealed payload, a block stored by another path, a test clock
-     * moved by hand). The poll it replaces ran every 20 ms.
+     * The one take-wait rule (srad/agentspaces-event-loop.md EL-W-07, {@link ai.badmonkey.agentspaces.common.time.Waits}):
+     * a waiting take or read waits for this space's change signal or the next time the expiry index says a claim or a
+     * lease lapses, and never longer than the backstop between looks. What lets a take succeed signals: a write, a
+     * merge, a renewal, a cancel, a claim, a sweep that lapses a claim or collects, a block or artifact landing (the
+     * fetch and its retries signal), and a group key installed for a sealed payload (EL-W-07 added it). The space's
+     * former 1 s and 30 s slices are this one rule.
+     *
+     * <p>A compatibility rule (as phase 3's for local periods, §10.16): a space on a plain clock that a test moves by
+     * hand looks again every {@link ai.badmonkey.agentspaces.common.time.Waits#HAND_CLOCK_LOOK}, because moving that
+     * clock signals nobody, so a lease the test lapses by hand would otherwise wait for the backstop.
      */
-    static final long WAIT_SLICE_MILLIS = 1_000;
-    /**
-     * The slice when nothing this space holds can become readable without a signal (idle-loop O9): no payload or block
-     * awaited, no retry pending, no recordless state, no sealing (a key arriving does not signal), and the system
-     * clock (a test clock moved by hand does not signal either). A waiting take then sleeps on changes alone.
-     */
-    static final long IDLE_WAIT_SLICE_MILLIS = 30_000;
-
-    /** The longest a waiter sleeps between looks right now; see {@link #IDLE_WAIT_SLICE_MILLIS}. Under {@link #lock}. */
-    private long waitSliceLocked() {
-        boolean nothingUnsignalled = keyRing == null && InstantSource.system().equals(clock) && awaitingPayload.isEmpty()
-                && blockRetries.isEmpty() && bulkRetries.isEmpty() && pendingStates.isEmpty();
-        return nothingUnsignalled ? IDLE_WAIT_SLICE_MILLIS : WAIT_SLICE_MILLIS;
+    private long lookSliceNanos() {
+        return (handClock ? ai.badmonkey.agentspaces.common.time.Waits.HAND_CLOCK_LOOK
+                : ai.badmonkey.agentspaces.common.time.Waits.BACKSTOP).toNanos();
     }
+
+    /** Whether only a test's hand moves this space's clock (see {@link #lookSliceNanos}). */
+    private final boolean handClock;
+
+    /**
+     * The source every wait of this space is reckoned and parked on (EL-C-10, EL-W-01): the space's clock when it is a
+     * time source (the system's, or a virtual one a test advances), else the system's.
+     */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource waits;
+
+    /** The base of this replica's local leases, its subscriptions' (EL-C-04, §10.18): see {@link #localMillis()}. */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource localTime;
+
+    /** Unregisters the key ring's install listener on close. */
+    private final AutoCloseable keyInstalls;
+
     /** How many times a blocking read or take has tried, for the test that a waiting take does not poll. */
     private final AtomicLong waitingPolls = new AtomicLong();
     /**
@@ -390,6 +405,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private final AtomicLong outbidAcknowledged = new AtomicLong();
     /** Entries completed here, with work, whose displaced rival's own completion arrived afterwards (SPEC §7.4). */
     private final AtomicLong duplicateCompletions = new AtomicLong();
+    /** Displaced claims of this peer's own completions offered again (SPEC §7.4, rule two; see displacedOwn). */
+    private final AtomicLong reoffersSent = new AtomicLong();
     /** Distinct states and claims refused for a logical counter above LOGICAL_LIMIT. */
     private final AtomicLong stampsLogicalRefused = new AtomicLong();
     /** Space deltas, by rumor or by anti-entropy, that did not decode (HLC canonical stamps, 2026-11-08). */
@@ -506,6 +523,104 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return size() > OUTBID_COMPLETIONS_CAP;
         }
     };
+    /**
+     * The claims that a claim held by one of this peer's agents displaced in the lattice, per entry, kept as
+     * evidence for rule two of the settle guarantee (SPEC §7.4; the store race, 2026-11-22). The lattice keeps one
+     * claim per entry, so a replica that has merged the better claim offers a displaced holder's completion, by
+     * anti-entropy, under the better claim alone, which does not authenticate it; and the displaced holder's own
+     * completion delta, the one frame that carries its claim with it, can be lost or come after this peer's take
+     * completed. A displaced claim and that holder's completion that reach this replica in different frames, in
+     * either order, are judged together ({@link #judgeDisplaced}). Verified claims only, at most
+     * {@link #DISPLACED_PER_ENTRY} per entry; bounded like {@link #outbidCompletions}. Under {@link #lock}.
+     */
+    private final Map<EntryId, List<SpaceWire.SignedClaim>> displacedClaims = boundedLines();
+    /**
+     * Completions dropped here, per entry, while a claim held by one of this peer's agents held it: each failed to
+     * authenticate against that claim, and may be a displaced holder's whose claim reaches this replica in another
+     * frame ({@link #displacedClaims}). At most {@link #DISPLACED_PER_ENTRY} per entry. Under {@link #lock}.
+     */
+    private final Map<EntryId, List<SpaceWire.EntryStateDto>> unprovenCompletions = boundedLines();
+    /** At most this many displaced claims, or unproven completions, are kept per entry; past it the oldest goes. */
+    private static final int DISPLACED_PER_ENTRY = 4;
+
+    /** One of this peer's completions whose claim a better claim displaced, and its offers so far. */
+    private static final class Reoffer {
+        final SpaceWire.SignedClaim claim;
+        int offers;
+        long nextMillis;
+
+        Reoffer(SpaceWire.SignedClaim claim, long nextMillis) {
+            this.claim = claim;
+            this.nextMillis = nextMillis;
+        }
+    }
+
+    /**
+     * The entries one of this peer's agents completed with its own work under a claim that a better claim, merged
+     * here afterwards, displaced: the losing side of rule two (SPEC §7.4). This replica now holds the better claim,
+     * so its anti-entropy offers the completion under that claim only, and the holder of the better claim cannot
+     * authenticate it. The displaced claim is offered again, as the claim delta it first travelled in, when the
+     * better claim arrives and then whenever a replica still offers the entry present (it has not heard of the
+     * completion), with a doubling backoff, at most {@link #REOFFER_MAX} times, while the claim is live and well
+     * inside the drift ceiling. The holder of the better claim judges it with the completion, which reaches it by
+     * anti-entropy (owner direction 2026-11-09: no guarantees in P2P; what is missing is offered again, not given up
+     * on). Bounded like {@link #outbidCompletions}. Under {@link #lock}.
+     */
+    private final Map<EntryId, Reoffer> displacedOwn = boundedLines();
+    /** Set under {@link #lock} when a {@link #displacedOwn} offer is due; {@link #offerDisplaced} sends it after the lock. */
+    private volatile boolean reofferDue;
+    /** Whether {@link #displacedOwn} may hold a line: read without the lock on every state received, so almost always false. */
+    private volatile boolean anyDisplacedOwn;
+    /** At most this many offers of one displaced claim. */
+    static final int REOFFER_MAX = 6;
+    /** The first backoff between offers of a displaced claim; it doubles after each. */
+    static final long REOFFER_BACKOFF_MILLIS = 1_000;
+
+    /**
+     * The targeted anti-entropy rounds a winner runs toward each holder its claim displaced, while its own take of the
+     * entry is open (srad/agentspaces-event-loop.md phase 6, owner decision 4 of 2026-11-23). A displaced holder's
+     * completion may have only one source, the holder itself (the writer drops it, SPEC §11a.4), and anti-entropy
+     * repairs only a round's opener, so the winner opens rounds with each displaced holder rather than wait for its
+     * random partner to be one: at once, then after 1, 2, 4, 8 and 16 s, at most {@link #DISPLACED_PULL_MAX} rounds,
+     * ending when it learns the completion, completes the entry itself, or no longer holds the claim. No wire change:
+     * a round is the usual digest. Bounded like {@link #displacedClaims}. Under {@link #lock}.
+     */
+    private final Map<EntryId, DisplacedPull> displacedPulls = boundedLines();
+    /** The earliest {@link #displacedPulls} round due, on the space's clock; {@link Long#MAX_VALUE} for none. */
+    private final java.util.concurrent.atomic.AtomicLong pullDue = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
+    /**
+     * When this replica re-publishes its advertisement, on the space's clock: two thirds of the advertisement TTL
+     * after the last one was issued (the TTL rule's 1.5 margin, §3.11), so the advertisement never lapses while the
+     * space lives; {@link Long#MAX_VALUE} while it does not advertise (srad/agentspaces-event-loop.md §10.33).
+     */
+    private final java.util.concurrent.atomic.AtomicLong adDue = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
+    /** Advertisement renewals the participant ran; package-private, for tests. */
+    private final java.util.concurrent.atomic.AtomicLong adRenewals = new java.util.concurrent.atomic.AtomicLong();
+    /** Targeted rounds opened toward displaced holders; package-private, for tests. */
+    private final java.util.concurrent.atomic.AtomicLong displacedPullRounds = new java.util.concurrent.atomic.AtomicLong();
+    /** At most this many targeted rounds per entry. */
+    static final int DISPLACED_PULL_MAX = 6;
+
+    /** The displaced holders of one entry this peer's claim won, and the targeted rounds so far. */
+    private static final class DisplacedPull {
+        final java.util.Set<PeerId> holders = new java.util.LinkedHashSet<>();
+        int rounds;
+        long nextMillis;
+
+        DisplacedPull(long nextMillis) {
+            this.nextMillis = nextMillis;
+        }
+    }
+
+    /** A map in insertion order that keeps at most {@link #OUTBID_COMPLETIONS_CAP} lines, the oldest going first. */
+    private static <K, V> Map<K, V> boundedLines() {
+        return new java.util.LinkedHashMap<>(16, 0.75f, false) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                return size() > OUTBID_COMPLETIONS_CAP;
+            }
+        };
+    }
     /** Keys of remote claims, and of states refused for their stamps, already rejected
      * here, so a lagging honest replica re-offering the same contested claim or state is
      * not struck once per round. Each key covers signed content alone (HLC round four,
@@ -549,9 +664,21 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      */
     private final Map<EntryId, Boolean> awaitingPayload = new ConcurrentHashMap<>();
 
-    /** Deregisters the block-retry tick work on close. */
-    private final AutoCloseable blockRetryTick;
-    private final AutoCloseable bulkRetryTick;
+    /**
+     * The earliest wall deadline the participant was told of since its last run, per kind, each lowered by whoever
+     * moves a deadline earlier, which then wakes the participant (DW-2): the sweep's (under {@link #lock}), the
+     * retries' (on fetch threads) and the horizon's rounds. A value that is too early costs one look, never a miss.
+     */
+    private final java.util.concurrent.atomic.AtomicLong sweepDue = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
+    private final java.util.concurrent.atomic.AtomicLong retryDue = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
+    private final java.util.concurrent.atomic.AtomicLong horizonDue = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
+    /** The view epoch the participant last swept at (DW-5: its own copy). */
+    private long dueEpoch = Long.MIN_VALUE;
+    /**
+     * Runs of the participant that took the space's lock, for tests (EL-T-09: an idle space looks only at its
+     * deadlines; the loop's backstop asks it every second, and such a run reads three volatile deadlines and returns).
+     */
+    private final AtomicLong dueLooks = new AtomicLong();
 
     private record BlockRetry(EntryRecord record, int attempts, long nextAtMillis, Runnable onArrival) {
     }
@@ -592,6 +719,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // The same canonical codec the space signs and verifies everything with.
         this.certificates = new AgentCertificates(CborCodec.defaultCodec());
         this.clock = builder.clock;
+        this.handClock = ai.badmonkey.agentspaces.common.time.Waits.movedByHand(clock);
+        this.waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        this.localTime = ai.badmonkey.agentspaces.common.time.TimeSources.of(clock);
         this.codec = CborCodec.defaultCodec();
         this.schemas = builder.schemas;
         this.settleWindow = builder.settleWindow;
@@ -606,6 +736,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         this.recordless = builder.recordless;
         this.maxPayload = builder.maxPayload;
         this.keyRing = builder.keyRing;
+        // A key installed for a sealed payload makes an entry readable without any other change (EL-W-07).
+        this.keyInstalls = keyRing == null ? () -> { } : keyRing.onInstall(held -> signalArrival());
         this.tagShard = builder.tagShard;
         this.maxLeaseOverride = builder.maxLease;
         this.publisher = builder.publisher;
@@ -621,8 +753,6 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         this.hlc = new HybridLogicalClock(builder.clock, issuer.encoded());
         this.id = SpaceId.local(runtime.id().value() + "/" + builder.name);
         this.streamId = "space:" + builder.name;
-        this.blockRetryTick = blocks == null ? () -> { } : runtime.onTick(this::retryBlockFetches);
-        this.bulkRetryTick = bulk == null ? () -> { } : runtime.onTick(this::retryBulkFetches);
         for (Class<?> hint : builder.schemaHints) {
             registerSchema(hint);
         }
@@ -740,9 +870,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 }
             });
         }
-        // Lease lapses and collections fire from the tick as well as from the digest, so they keep time without
-        // gossip traffic: an O(1) look at the earliest due time when nothing is due (IDLE-WORK item 4).
-        this.sweepTick = runtime.onTick(this::sweepIfDue);
+        // Lease lapses and collections fire from the space's own participant as well as from the digest, so they keep
+        // time without gossip traffic; the participant wakes only at the earliest deadline (EL-T-09).
+        this.dueRegistration = runtime.onDueWall("space:" + builder.name, clock, this::runDue);
         // Spec §7.5: a member creates a space by publishing its advertisement. A writer-local space publishes none
         // (see refreshAdvertisement).
         refreshAdvertisement();
@@ -769,7 +899,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         private final PeerIdentity identity;
         private final String agentName;
         private AgentIdentity writer;
-        private InstantSource clock = InstantSource.system();
+        /** The space's clock; null for the node's own time source (EL-C-06), resolved by {@link #build()}. */
+        private InstantSource clock;
         private SchemaRegistry schemas = new SimpleSchemaRegistry();
         private Duration settleWindow = Duration.ofMillis(200);
         private ai.badmonkey.agentspaces.api.space.ConflictStrategyType strategy =
@@ -1176,6 +1307,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         /** Builds and attaches the space. A bid function may also arrive later
          * via {@link ReplicatedSpace#bidFunction}, e.g. from an agent binder. */
         public ReplicatedSpace build() {
+            if (clock == null) {
+                // A node passes its own time source down (EL-C-06); a node on a plain test clock keeps the system's.
+                clock = runtime == null ? InstantSource.system() : runtime.defaultClock();
+            }
             return new ReplicatedSpace(this);
         }
     }
@@ -1235,6 +1370,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         @Override
         public void awaitChange(long seen, Duration max) throws InterruptedException {
             ReplicatedSpace.this.awaitChange(seen, max);
+        }
+
+        @Override
+        public AutoCloseable onChangeSignal(Runnable listener) {
+            return ReplicatedSpace.this.onChangeSignal(listener);
         }
 
         @Override
@@ -1389,6 +1529,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         SignedAdvertisement<SpaceAdvertisement> signed = adSigner.sign(ad, identity);
         advertisement = signed;
         publisher.publish(signed);
+        // §10.33: the space's own participant renews it before it lapses; until 0.7.0 nothing did, and a space left
+        // every discovery cache (semantic discovery, the console) 15 minutes after it was built
+        adDue.set(Long.MAX_VALUE);
+        lowerDue(adDue, ad.issued().toEpochMilli() + Math.max(1, advertisementTtl.toMillis() * 2 / 3));
         return Optional.of(signed);
     }
 
@@ -1712,8 +1856,175 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     horizonRefile = true; // tombstones are due earlier now than the index filed them
                 }
             }
+            lowerDue(horizonDue, horizonDeadlineLocked(mode));
             return mode == HorizonMode.PER_ENTRY ? SpaceStateCrdt.Horizon.PER_ENTRY : SpaceStateCrdt.Horizon.LEGACY;
         }
+    }
+
+    /**
+     * When the horizon next moves by time alone: the next counted round while WAITING, the end of the settle while
+     * SETTLING, otherwise never (a view change wakes the participant). Callers hold {@link #horizonLock}.
+     */
+    private long horizonDeadlineLocked(HorizonMode mode) {
+        if (mode == HorizonMode.WAITING && horizonCountedAtMillis != Long.MIN_VALUE) {
+            return horizonCountedAtMillis + Math.max(1, runtime.advertisement().gossip().period().toMillis());
+        }
+        if (mode == HorizonMode.SETTLING) {
+            return horizonEngagedAtMillis + Math.max(0, maxLeaseMillis()) + SpaceStateCrdt.LAPSED_GRACE_MILLIS;
+        }
+        return Long.MAX_VALUE;
+    }
+
+    /** Lowers one of the participant's deadlines, and wakes it when that moved the deadline earlier (DW-2). */
+    private void lowerDue(java.util.concurrent.atomic.AtomicLong due, long atMillis) {
+        if (atMillis == Long.MAX_VALUE) {
+            return;
+        }
+        long before = due.getAndAccumulate(atMillis, Math::min);
+        if (atMillis < before && dueRunner != Thread.currentThread()) { // the participant reads it as it returns
+            ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration = dueRegistration;
+            if (registration != null) {
+                registration.wake(); // never blocks, so a caller under the space's lock may call it
+            }
+        }
+    }
+
+    /**
+     * The space's participant (srad/agentspaces-event-loop.md EL-T-09, EL-L-03). A direct run ({@code tick()})
+     * sweeps and retries as the tick adapters did. On the running loop it takes the space's lock only when something
+     * is due: the sweep's deadline passed, the view's epoch moved (the horizon and writer stays read it), or the
+     * horizon's round or settle came due; the retries run only when one is due. It returns the earliest of the three
+     * deadlines on the space's clock.
+     */
+    private long runDue(long nowMillis) {
+        dueRunner = Thread.currentThread();
+        try {
+            return runDueOnce(nowMillis);
+        } finally {
+            dueRunner = null;
+        }
+    }
+
+    /** The thread running the participant now, whose own deadline moves need no wake; null between runs. */
+    private volatile Thread dueRunner;
+
+    private long runDueOnce(long nowMillis) {
+        long epoch = runtime.viewEpoch();
+        boolean direct = runtime.directRun();
+        if (direct || nowMillis >= sweepDue.get() || nowMillis >= horizonDue.get() || epoch != dueEpoch) {
+            dueEpoch = epoch;
+            dueLooks.incrementAndGet();
+            horizonDue.set(Long.MAX_VALUE); // horizon(now), inside the sweep, files the next round afresh
+            synchronized (lock) {
+                sweepDue.set(Long.MAX_VALUE);
+                sweepIfDue();
+                sweepDue.accumulateAndGet(nextDueLocked(), Math::min);
+            }
+            synchronized (horizonLock) {
+                horizonDue.accumulateAndGet(horizonDeadlineLocked(horizonMode), Math::min);
+            }
+        }
+        if (direct || nowMillis >= retryDue.get()) {
+            retryDue.set(Long.MAX_VALUE); // a retry filed after this lowers it again and wakes the participant
+            if (blocks != null) {
+                retryBlockFetches();
+            }
+            if (bulk != null) {
+                retryBulkFetches();
+            }
+            long next = Long.MAX_VALUE;
+            for (BlockRetry retry : blockRetries.values()) {
+                next = Math.min(next, retry.nextAtMillis());
+            }
+            for (BlockRetry retry : bulkRetries.values()) {
+                next = Math.min(next, retry.nextAtMillis());
+            }
+            retryDue.accumulateAndGet(next, Math::min);
+        }
+        if (direct || nowMillis >= pullDue.get()) {
+            pullDue.set(Long.MAX_VALUE); // a holder displaced after this lowers it again and wakes the participant
+            pullDue.accumulateAndGet(pullDisplacedHolders(nowMillis), Math::min);
+        }
+        if (nowMillis >= adDue.get()) {
+            adDue.set(Long.MAX_VALUE); // a no-op refresh (read-only, closed to advertising) lets it lapse, as designed
+            adRenewals.incrementAndGet();
+            refreshAdvertisement();
+        }
+        return Math.min(Math.min(Math.min(sweepDue.get(), retryDue.get()), Math.min(horizonDue.get(), pullDue.get())),
+                adDue.get());
+    }
+
+    /**
+     * Opens the targeted rounds of {@link #displacedPulls} that are due (owner decision 4) and drops the lines whose
+     * take is no longer open here: this peer's agent no longer holds the claim, the entry is no longer present, the
+     * displaced completion is already noted, or the rounds are spent. The rounds are opened after the lock.
+     *
+     * @return the next round's deadline on the space's clock, or {@link Long#MAX_VALUE}
+     */
+    private long pullDisplacedHolders(long nowMillis) {
+        java.util.Set<PeerId> partners = new java.util.LinkedHashSet<>();
+        long next = Long.MAX_VALUE;
+        synchronized (lock) {
+            if (displacedPulls.isEmpty()) {
+                return Long.MAX_VALUE;
+            }
+            PeerId self = identity.peerId();
+            Iterator<Map.Entry<EntryId, DisplacedPull>> lines = displacedPulls.entrySet().iterator();
+            while (lines.hasNext()) {
+                Map.Entry<EntryId, DisplacedPull> line = lines.next();
+                EntryId entryId = line.getKey();
+                DisplacedPull pull = line.getValue();
+                TakeClaim held = claimOf(entryId);
+                EntryState state = crdt.state(entryId).orElse(null);
+                boolean open = held != null && held.holder().peer().equals(self) && state != null && state.present()
+                        && !held.expired(nowMillis)
+                        && !Long.valueOf(held.epoch()).equals(outbidCompletions.get(entryId));
+                if (!open || pull.rounds >= DISPLACED_PULL_MAX) {
+                    lines.remove();
+                    continue;
+                }
+                if (nowMillis >= pull.nextMillis) {
+                    partners.addAll(pull.holders);
+                    pull.nextMillis = nowMillis + (REOFFER_BACKOFF_MILLIS << pull.rounds);
+                    pull.rounds++;
+                }
+                next = Math.min(next, pull.nextMillis);
+            }
+        }
+        for (PeerId partner : partners) {
+            displacedPullRounds.incrementAndGet();
+            try {
+                runtime.gossip().antiEntropyWith(partner);
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.DEBUG, "a targeted round toward displaced holder " + partner.display()
+                        + " failed; the next one is due on its backoff", e);
+            }
+        }
+        return next;
+    }
+
+    /**
+     * Advertisement renewals the space's participant ran (§10.33); package-private, for tests.
+     *
+     * @return the count
+     */
+    long adRenewals() {
+        return adRenewals.get();
+    }
+
+    /**
+     * Targeted anti-entropy rounds this replica opened toward holders its claim displaced (owner decision 4);
+     * package-private, for tests.
+     *
+     * @return the count
+     */
+    long displacedPullRounds() {
+        return displacedPullRounds.get();
+    }
+
+    /** How many runs of the space's participant took its lock; for tests. */
+    long dueLooks() { // package-private for tests
+        return dueLooks.get();
     }
 
     /** An unhinted member appeared, or this node went legacy: back to the legacy rule at once, streak reset. */
@@ -2460,7 +2771,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // A subscription declares interest in a type: register it so replicated
         // deltas of that type decode into events on this replica.
         registerSchema(template.type());
-        Sub sub = new Sub(template, listener, nowMillis() + lease.duration().toMillis());
+        Sub sub = new Sub(template, listener, localMillis() + lease.duration().toMillis());
         subscriptions.add(sub);
         return sub;
     }
@@ -2473,9 +2784,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         try {
             streamRegistration.close();
             reconcileRegistration.close();
-            sweepTick.close();
-            blockRetryTick.close();
-            bulkRetryTick.close();
+            dueRegistration.close();
+            keyInstalls.close();
         } catch (Exception e) {
             throw new IllegalStateException("failed deregistering space '" + name + "'", e);
         }
@@ -2920,12 +3230,157 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             mergeClaim(delta.claimEntry(), delta.claim());
             noteReplicated(delta.claimEntry()); // a remote took the entry, so it holds the record (PD-L-01)
         }
+        EntryId judged = claimVerified ? delta.claimEntry() : null;
         if (delta.state() != null) {
             boolean merged = mergeState(delta.state());
             if (!merged && claimVerified) {
                 noteOutbidCompletion(delta.claimEntry(), delta.claim(), delta.state());
             }
+            if (!merged && delta.state().completed() && rememberUnproven(delta.state())) {
+                judged = delta.state().entryIdOf();
+            }
+            staleOffered(delta.state());
         }
+        if (judged != null) {
+            judgeDisplaced(judged);
+        }
+        offerDisplaced();
+    }
+
+    /**
+     * Keeps a completion this replica dropped while one of this peer's agents holds its entry's claim
+     * ({@link #unprovenCompletions}): it may be a displaced holder's, whose claim reaches this replica in another frame.
+     *
+     * @return whether a displaced claim is known for the entry, so the pair is worth judging now
+     */
+    private boolean rememberUnproven(SpaceWire.EntryStateDto dto) {
+        EntryId entryId = dto.entryIdOf();
+        if (entryId == null || dto.stateSig() == null) {
+            return false;
+        }
+        synchronized (lock) {
+            TakeClaim held = claimOf(entryId);
+            if (held == null || !held.holder().peer().equals(identity.peerId())
+                    || held.holder().encoded().equals(dto.signer())) {
+                return false; // not this peer's claim, or the held claim's own completion coming back
+            }
+            List<SpaceWire.EntryStateDto> lines = unprovenCompletions.computeIfAbsent(entryId, k -> new ArrayList<>(2));
+            if (lines.stream().noneMatch(d -> Arrays.equals(d.stateSig(), dto.stateSig()))) {
+                if (lines.size() >= DISPLACED_PER_ENTRY) {
+                    lines.remove(0);
+                }
+                lines.add(dto);
+            }
+            return displacedClaims.containsKey(entryId);
+        }
+    }
+
+    /**
+     * Judges each completion dropped here for an entry against each claim that this peer's claim displaced for it
+     * (rule two of SPEC §7.4, the store race of 2026-11-22): the pair authenticates a displaced holder's completion
+     * as the delta that first carried both would have, whichever frames brought them. {@link #noteOutbidCompletion}
+     * makes every check it makes for that delta.
+     */
+    private void judgeDisplaced(EntryId entryId) {
+        List<SpaceWire.SignedClaim> claims;
+        List<SpaceWire.EntryStateDto> states;
+        synchronized (lock) {
+            List<SpaceWire.SignedClaim> c = displacedClaims.get(entryId);
+            List<SpaceWire.EntryStateDto> d = unprovenCompletions.get(entryId);
+            if (c == null || d == null) {
+                return;
+            }
+            claims = List.copyOf(c);
+            states = List.copyOf(d);
+        }
+        for (SpaceWire.EntryStateDto dto : states) {
+            for (SpaceWire.SignedClaim claim : claims) {
+                if (dto.signer() == null || claim.claim().holder().encoded().equals(dto.signer())) {
+                    noteOutbidCompletion(entryId, claim, dto);
+                }
+            }
+        }
+    }
+
+    /**
+     * A state that shows the entry present, received while one of this peer's completions of it waits in
+     * {@link #displacedOwn}: the replica it came from, or one before it, has not heard of the completion, so the
+     * displaced claim is due again once its backoff has passed.
+     */
+    private void staleOffered(SpaceWire.EntryStateDto dto) {
+        if (dto == null || dto.completed() || !anyDisplacedOwn) {
+            return;
+        }
+        EntryId entryId = dto.entryIdOf();
+        if (entryId == null) {
+            return;
+        }
+        synchronized (lock) {
+            Reoffer reoffer = displacedOwn.get(entryId);
+            if (reoffer != null && nowMillis() >= reoffer.nextMillis) {
+                reofferDue = true;
+            }
+        }
+    }
+
+    /**
+     * Offers again each displaced claim of {@link #displacedOwn} that is due, as the claim delta it first travelled
+     * in, and moves its next offer back; drops a line whose offers are spent, whose claim lapsed, or whose stamp
+     * nears the drift ceiling, past which a replica holding the better claim would refuse the claim as a far-past
+     * contest (§7.4, §11), or whose epoch the ordered log decided. Called after the lock.
+     */
+    private void offerDisplaced() {
+        if (!reofferDue) {
+            return;
+        }
+        List<Map.Entry<EntryId, SpaceWire.SignedClaim>> due = new ArrayList<>();
+        synchronized (lock) {
+            reofferDue = false;
+            long now = nowMillis();
+            Iterator<Map.Entry<EntryId, Reoffer>> lines = displacedOwn.entrySet().iterator();
+            while (lines.hasNext()) {
+                Map.Entry<EntryId, Reoffer> line = lines.next();
+                Reoffer reoffer = line.getValue();
+                TakeClaim claim = reoffer.claim.claim();
+                Long decided = logDecidedEpochs.get(line.getKey());
+                if (reoffer.offers >= REOFFER_MAX || claim.expired(now)
+                        || now - claim.stamp().physical() > HybridLogicalClock.MAX_DRIFT_MILLIS / 2
+                        || crdt.state(line.getKey()).isEmpty()
+                        || (decided != null && claim.epoch() <= decided)) { // the ordered log alone names the holder
+                    lines.remove();
+                } else if (now >= reoffer.nextMillis) {
+                    reoffer.nextMillis = now + (REOFFER_BACKOFF_MILLIS << reoffer.offers);
+                    reoffer.offers++;
+                    due.add(Map.entry(line.getKey(), reoffer.claim));
+                }
+            }
+            anyDisplacedOwn = !displacedOwn.isEmpty();
+        }
+        for (Map.Entry<EntryId, SpaceWire.SignedClaim> line : due) {
+            reoffersSent.incrementAndGet();
+            publishDelta(new SpaceWire.Delta(null, line.getKey(), line.getValue()),
+                    "c:" + line.getKey() + ":" + line.getValue().claim().stamp().encoded());
+        }
+    }
+
+    /**
+     * Whether one of this peer's takes of the entry is to acknowledge a displaced holder's authentic completion
+     * rather than do the work again (rule two of SPEC §7.4): its take comes back empty, or its {@code complete}
+     * writes no result. For an operator, and for a test that makes the order of a race.
+     *
+     * @param entryId the entry
+     * @return whether such a completion is noted for the claim this replica holds
+     */
+    public boolean knowsDisplacedCompletion(EntryId entryId) {
+        synchronized (lock) {
+            TakeClaim held = claimOf(entryId);
+            return held != null && Long.valueOf(held.epoch()).equals(outbidCompletions.get(entryId));
+        }
+    }
+
+    /** Offers of a displaced claim this replica made again ({@link #displacedOwn}); package-private, for tests. */
+    long displacedReoffers() {
+        return reoffersSent.get();
     }
 
     /**
@@ -3681,6 +4136,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         long now = nowMillis();
         pendingStates.put(entryId, new PendingState(dto, now));
         pendingDueMillis = Math.min(pendingDueMillis, now + PENDING_STATE_TTL_MILLIS + 1); // the sweep's next look
+        lowerDue(sweepDue, pendingDueMillis);
         recordlessHeld.incrementAndGet();
     }
 
@@ -4215,7 +4671,47 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (merged != held) {
             crdt = crdt.withClaim(entryId, merged, claimHash(merged.claim()));
         }
+        if (held != null) {
+            noteDisplaced(entryId, merged, merged == held ? claim : held);
+        }
         return merged;
+    }
+
+    /**
+     * Keeps what rule two of the settle guarantee (SPEC §7.4) needs once the lattice has kept one claim of two: the
+     * displaced claim, when one of this peer's agents holds the kept one ({@link #displacedClaims}), and this peer's
+     * own completion, when the displaced claim is the one an agent here completed under ({@link #displacedOwn}).
+     * Every claim reaching here was verified or signed here. Callers hold {@link #lock}.
+     */
+    private void noteDisplaced(EntryId entryId, SpaceWire.SignedClaim kept, SpaceWire.SignedClaim lost) {
+        if (kept == lost || kept.claim().holder().equals(lost.claim().holder())) {
+            return; // the same holder's renewal or attestation upgrade displaces nobody
+        }
+        PeerId self = identity.peerId();
+        if (kept.claim().holder().peer().equals(self)) {
+            List<SpaceWire.SignedClaim> lines = displacedClaims.computeIfAbsent(entryId, k -> new ArrayList<>(2));
+            if (lines.stream().noneMatch(c -> c.claim().equals(lost.claim()))) {
+                if (lines.size() >= DISPLACED_PER_ENTRY) {
+                    lines.remove(0);
+                }
+                lines.add(lost);
+            }
+            PeerId displacedPeer = lost.claim().holder().peer();
+            if (!displacedPeer.equals(self)) {
+                long now = nowMillis();
+                DisplacedPull pull = displacedPulls.computeIfAbsent(entryId, k -> new DisplacedPull(now));
+                if (pull.holders.add(displacedPeer) && pull.rounds > 0) {
+                    pull.nextMillis = Math.min(pull.nextMillis, now); // a newly displaced holder is asked at once
+                }
+                lowerDue(pullDue, pull.nextMillis);
+            }
+        } else if (lost.claim().holder().peer().equals(self)
+                && Long.valueOf(lost.claim().epoch()).equals(completedHere.get(entryId))
+                && !displacedOwn.containsKey(entryId)) {
+            displacedOwn.put(entryId, new Reoffer(lost, nowMillis()));
+            anyDisplacedOwn = true;
+            reofferDue = true;
+        }
     }
 
     /**
@@ -4259,6 +4755,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             boolean added = acknowledge(entryId, line);
             collectedAcks.remove(line);
             collectedAcks.put(line, nowMillis() + COLLECTED_ACK_HOLD_MILLIS);
+            lowerDue(sweepDue, collectedAcks.values().iterator().next());
             if (added) {
                 collectedReoffersAcknowledged.incrementAndGet();
                 bump();
@@ -4280,6 +4777,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         unscheduleRefused(line);
         refusedForgetAt.put(line, at);
         refusedForgetBy.computeIfAbsent(at, k -> new java.util.LinkedHashSet<>()).add(line);
+        lowerDue(sweepDue, at);
     }
 
     /** Drops a door acknowledgement's schedule. Callers hold {@link #lock}. */
@@ -5116,6 +5614,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         // Completions the merge dropped while the delta carried a verified claim for their entry: an outbid
         // holder's completion may be among them (see outbidCompletions), judged after the lock.
         List<Integer> droppedCompletions = new ArrayList<>();
+        // Entries for which a claim this delta carried was displaced by one of this peer's while a completion dropped
+        // here earlier waits for it (see displacedClaims), judged after the lock.
+        Set<EntryId> displacedPairs = new HashSet<>();
         try {
             synchronized (lock) {
                 batch = running;
@@ -5123,13 +5624,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 try {
                     for (int i = 0; i < claimList.size(); i++) {
                         if (claimVerified[i]) {
-                            changed |= mergeClaim(EntryId.of(claimList.get(i).getKey()), claimList.get(i).getValue());
+                            EntryId claimed = EntryId.of(claimList.get(i).getKey());
+                            changed |= mergeClaim(claimed, claimList.get(i).getValue());
+                            if (!unprovenCompletions.isEmpty() && unprovenCompletions.containsKey(claimed)
+                                    && displacedClaims.containsKey(claimed)) {
+                                displacedPairs.add(claimed);
+                            }
                         }
                     }
                     for (int i = 0; i < stateList.size(); i++) {
                         boolean merged = mergeState(stateList.get(i), checked[i]);
                         changed |= merged;
                         SpaceWire.EntryStateDto dto = stateList.get(i);
+                        staleOffered(dto);
                         // Under either strategy (SPEC §7.4, the settle guarantee): a claim later than the window
                         // displaces a holder that already judged itself the winner, under LEASE_RACE as under AUCTION.
                         if (!merged && dto != null && dto.completed()) {
@@ -5176,7 +5683,16 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             if (proof != null) {
                 noteOutbidCompletion(entryId, proof, dto);
             }
+            // An answer from a replica that has merged the better claim carries a displaced holder's completion under
+            // that claim, or under none: the displaced claim may have come in another frame (store race, 2026-11-22).
+            if (rememberUnproven(dto)) {
+                displacedPairs.add(entryId);
+            }
         }
+        for (EntryId entryId : displacedPairs) {
+            judgeDisplaced(entryId);
+        }
+        offerDisplaced();
         return changed;
     }
 
@@ -5192,13 +5708,21 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private static final class VerifyPool {
         static final int THREADS = Math.max(1, Math.min(16, Runtime.getRuntime().availableProcessors() - 1));
         static final String PREFIX = "space-verify-";
+        /**
+         * Set on the pool's own threads: a slice that applies a nested batch checks it inline, judged by this mark,
+         * never by the thread's name (srad/agentspaces-event-loop.md EL-X-04, phase 4's "thread-name check gone").
+         */
+        static final ThreadLocal<Boolean> ON_POOL = ThreadLocal.withInitial(() -> Boolean.FALSE);
         static final java.util.concurrent.ThreadPoolExecutor EXECUTOR;
 
         static {
             java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger();
             EXECUTOR = new java.util.concurrent.ThreadPoolExecutor(THREADS, THREADS, 30,
                     java.util.concurrent.TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>(), r -> {
-                        Thread thread = new Thread(r, PREFIX + count.incrementAndGet());
+                        Thread thread = new Thread(() -> {
+                            ON_POOL.set(Boolean.TRUE);
+                            r.run();
+                        }, PREFIX + count.incrementAndGet());
                         thread.setDaemon(true);
                         return thread;
                     });
@@ -5216,7 +5740,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      */
     private static void inParallel(int n, java.util.function.IntConsumer work) {
         int threads = VerifyPool.THREADS;
-        if (n < PARALLEL_FROM || threads < 2 || Thread.currentThread().getName().startsWith(VerifyPool.PREFIX)) {
+        if (n < PARALLEL_FROM || threads < 2 || VerifyPool.ON_POOL.get()) {
             for (int i = 0; i < n; i++) {
                 work.accept(i);
             }
@@ -5661,7 +6185,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }, () -> {
                 fetching.remove(ref);
                 long delay = BLOCK_RETRY_DELAYS_MILLIS[Math.min(attempt, BLOCK_RETRY_DELAYS_MILLIS.length - 1)];
-                bulkRetries.put(ref, new BlockRetry(record, attempt + 1, nowMillis() + delay, onArrival));
+                long at = nowMillis() + delay;
+                bulkRetries.put(ref, new BlockRetry(record, attempt + 1, at, onArrival));
+                lowerDue(retryDue, at);
             });
         } catch (RuntimeException e) {
             fetching.remove(ref);
@@ -5737,7 +6263,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         candidates.add(record.issuer().peer());
         candidates.addAll(runtime.sampler().randomMembers(2));
         long timeout = BLOCK_FETCH_TIMEOUTS_MILLIS[Math.min(attempt, BLOCK_FETCH_TIMEOUTS_MILLIS.length - 1)];
-        Thread.ofVirtual().name("space-block-fetch-" + name).start(() -> {
+        // A task of the node's time source, which runs it on a virtual thread (TS-2): the fetch waits on that source
+        // (group W), so on a virtual one the advance that passes its deadline settles it before time moves on, and its
+        // retry is filed at the virtual instant it failed (phase 6, with BlockExchange's wait).
+        runtime.time().schedule(java.time.Duration.ZERO, () -> {
             boolean landed = false;
             try {
                 landed = blocks.fetch(cid, candidates, timeout).isPresent();
@@ -5752,7 +6281,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 onArrival.run();
             } else {
                 long delay = BLOCK_RETRY_DELAYS_MILLIS[Math.min(attempt, BLOCK_RETRY_DELAYS_MILLIS.length - 1)];
-                blockRetries.put(cid, new BlockRetry(record, attempt + 1, nowMillis() + delay, onArrival));
+                long at = nowMillis() + delay;
+                blockRetries.put(cid, new BlockRetry(record, attempt + 1, at, onArrival));
+                lowerDue(retryDue, at);
             }
         });
     }
@@ -5951,6 +6482,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 takenEpochs.remove(entryId);
                 outbidCompletions.remove(entryId);
                 completedHere.remove(entryId);
+                displacedClaims.remove(entryId);
+                unprovenCompletions.remove(entryId);
+                displacedOwn.remove(entryId);
+                displacedPulls.remove(entryId);
             }
         }
         for (EntryId entryId : due) {
@@ -5958,8 +6493,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 reindex(entryId, now); // its next due time, if it has one
             }
         }
-        if (!reappeared.isEmpty() || !orphans.isEmpty() || !collected.isEmpty()) {
-            signal(); // a lapsed claim makes its entry takeable, and a waiting take hears of it now
+        if (!expired.isEmpty() || !reappeared.isEmpty() || !orphans.isEmpty() || !collected.isEmpty()) {
+            // a lapsed claim makes its entry takeable, and a waiting take hears of it now; a lapsed entry moves the
+            // change signal too, so a participant that keeps something alive in this space (the content swarm's
+            // manifest repair, owner answer 5) hears of the lapse at the lapse (srad/agentspaces-event-loop.md §10.14)
+            signal();
         }
         lastSweep = new SweepActions(expired, reappeared, orphans, collected);
         return events;
@@ -6028,6 +6566,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (due != Long.MAX_VALUE) {
             dueOf.put(entryId, due);
             dueByTime.computeIfAbsent(due, t -> new HashSet<>()).add(entryId);
+            lowerDue(sweepDue, due); // DW-2: an entry merged by gossip wakes no participant by itself
         }
         if (now > indexedAtMillis) {
             indexedAtMillis = now;
@@ -6186,6 +6725,23 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         if (waiters > 0) {
             lock.notifyAll();
         }
+        for (Runnable listener : changeListeners) {
+            try {
+                listener.run(); // a wake only (Space.onChangeSignal): never blocks, never re-enters the space
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "space " + name + ": a change listener threw", e);
+            }
+        }
+    }
+
+    /** The {@link #onChangeSignal} listeners (srad/agentspaces-event-loop.md DW-2). */
+    private final java.util.List<Runnable> changeListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    @Override
+    public AutoCloseable onChangeSignal(Runnable listener) {
+        Objects.requireNonNull(listener, "listener");
+        changeListeners.add(listener);
+        return () -> changeListeners.remove(listener);
     }
 
     /**
@@ -6204,18 +6760,18 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     @Override
     public void awaitChange(long seen, Duration max) throws InterruptedException {
         Objects.requireNonNull(max, "max");
-        long deadline = System.nanoTime() + max.toNanos();
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, max); // one base (EL-C-10)
         synchronized (lock) {
             while (signals == seen) {
-                long leftMillis = (deadline - System.nanoTime() + 999_999) / 1_000_000;
-                if (leftMillis <= 0) {
-                    return;
-                }
                 waiters++;
+                boolean early;
                 try {
-                    lock.wait(leftMillis);
+                    early = waits.waitOn(lock, deadline);
                 } finally {
                     waiters--;
+                }
+                if (!early) {
+                    return;
                 }
             }
         }
@@ -6639,8 +7195,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     @SuppressWarnings({"unchecked", "rawtypes"})
     private void fire(SpaceEvent.Kind kind, EntryId entryId, Object value, AgentId writer,
                       AgentId actor, EntryRecord record) {
-        long now = nowMillis();
-        subscriptions.removeIf(sub -> sub.expiryMillis <= now || sub.closed);
+        long local = localMillis();
+        subscriptions.removeIf(sub -> sub.expiryMillis <= local || sub.closed);
         if (value == null) {
             return;
         }
@@ -6710,22 +7266,35 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     /**
+     * This replica's local now, for the leases nobody else reads (srad/agentspaces-event-loop.md EL-C-04, §10.18): a
+     * subscription lives in this process only, and its renewer is a task on the monotonic base (EL-W-02), so its lease
+     * is judged on that base too. On wall time a 2-hour laptop sleep or a forward NTP step past half the lease lapsed
+     * every subscription at the next event, the renewal then threw, and the agent stopped reacting for good. A plain
+     * clock a test moves by hand keeps its subscriptions on that clock
+     * ({@link ai.badmonkey.agentspaces.common.time.TimeSources#of}).
+     */
+    private long localMillis() {
+        return localTime.monoMillis();
+    }
+
+    /**
      * Waits out the whole settle window, even when interrupted, and keeps the interrupt for the caller. The race is
      * judged when the window ends; a take whose wait an interrupt cut short judged a claim the others had not had
      * time to answer and could win next to a rival, which is the duplicate the window is there to prevent. A closing
      * binding interrupts its take, so this is the path a take in flight at close goes through. The window is short
      * and bounded, so waiting it out keeps the stop prompt.
      */
-    private static void settle(Duration window) {
+    private void settle(Duration window) {
         if (window.isZero()) {
             return;
         }
-        long deadline = System.nanoTime() + window.toNanos();
+        // On the space's time source (EL-W-01, decision 12): a virtual one releases the window on an advance.
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, window);
         boolean interrupted = false;
         try {
-            for (long left = window.toNanos(); left > 0; left = deadline - System.nanoTime()) {
+            for (long left = window.toNanos(); left > 0; left = deadline - waits.monoNanos()) {
                 try {
-                    java.util.concurrent.TimeUnit.NANOSECONDS.sleep(left);
+                    waits.sleep(Duration.ofNanos(left));
                 } catch (InterruptedException e) {
                     interrupted = true;
                 }
@@ -6742,11 +7311,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * waits on the space's change signal ({@link #signal()}): a write, a merge, a renewal, a cancel, a claim, a sweep
      * that lapses a claim or collects, a block or an artifact landing. Every waiter wakes on a change and tries
      * again, as every poller used to try every 20 ms, so the order in which waiters win is what it was. A wait also
-     * ends when a claim lapses by the clock (the expiry index knows when) and after {@link #WAIT_SLICE_MILLIS} at
+     * ends when a claim lapses by the clock (the expiry index knows when) and after {@link #lookSliceNanos} at
      * most, for what does not signal.
      */
     private <V> Optional<V> awaiting(Duration timeout, java.util.function.Supplier<Optional<V>> poll) {
-        long deadline = System.nanoTime() + timeout.toNanos();
+        // The deadline and every wait on one base, the space's time source (EL-C-10, EL-W-01).
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, timeout);
         while (true) {
             long seen;
             synchronized (lock) {
@@ -6757,7 +7327,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // An interrupt ends the wait after the poll in hand, with the status kept, as on a LocalSpace: a closing
             // binding interrupts its take, and a take that waited on through its timeout could still claim and
             // return an entry written after the binding closed.
-            if (result.isPresent() || System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) {
+            if (result.isPresent() || waits.monoNanos() - deadline >= 0 || Thread.currentThread().isInterrupted()) {
                 return result;
             }
             awaitSignal(seen, deadline);
@@ -6765,9 +7335,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     }
 
     /**
-     * Waits until a change is signalled after {@code seen}, the deadline passes, the next due time of the expiry
-     * index comes, or a slice ends. An interrupt ends the wait and is kept for the caller, which then returns after
-     * one more poll ({@link #awaiting}) rather than spinning on the kept status.
+     * Waits until a change is signalled after {@code seen}, the deadline passes, the next due time of the expiry index
+     * comes, or the look's slice ends (the one take-wait rule, {@link #lookSliceNanos}). An interrupt ends the wait and
+     * is kept for the caller, which then returns after one more poll ({@link #awaiting}) rather than spinning on the
+     * kept status. The deadline and the wait are on one base, the space's time source (EL-C-10); the expiry index's
+     * next due is wall time, converted to a span at the moment of the wait.
      */
     private void awaitSignal(long seen, long deadlineNanos) {
         boolean interrupted = Thread.interrupted();
@@ -6776,18 +7348,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 if (signals != seen) {
                     return;
                 }
-                long leftMillis = (deadlineNanos - System.nanoTime() + 999_999) / 1_000_000;
-                if (leftMillis <= 0) {
+                long now = waits.monoNanos();
+                long until = deadlineNanos - now;
+                if (until <= 0) {
                     return;
                 }
-                long wait = Math.min(leftMillis, waitSliceLocked());
-                long untilDue = nextDueLocked() - nowMillis();
-                if (untilDue > 0 && untilDue < wait) {
-                    wait = untilDue; // a claim lapsing by the clock makes its entry takeable without a signal
+                until = Math.min(until, lookSliceNanos());
+                long untilDueMillis = nextDueLocked() - nowMillis();
+                if (untilDueMillis > 0 && untilDueMillis < until / 1_000_000L) {
+                    until = untilDueMillis * 1_000_000L; // a claim lapsing by the clock makes its entry takeable unsignalled
                 }
                 waiters++;
                 try {
-                    lock.wait(wait);
+                    waits.waitOn(lock, now + until);
                 } finally {
                     waiters--;
                 }
@@ -6962,7 +7535,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             // Synchronized so that two renewals at once cannot both read the old expiry and the shorter one write
             // last: the max rule promises the lease never shortens, and the read and the write must be one step.
             Objects.requireNonNull(extension, "extension");
-            long now = nowMillis();
+            long now = localMillis();
             if (closed || expiryMillis <= now) {
                 throw new LeaseExpiredException("subscription lease already lapsed");
             }

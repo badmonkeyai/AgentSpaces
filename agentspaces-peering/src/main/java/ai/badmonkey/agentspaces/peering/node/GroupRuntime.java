@@ -56,11 +56,13 @@ public final class GroupRuntime implements AutoCloseable {
     private final Map<Envelope.Kind, BiConsumer<PeerId, byte[]>> kindHandlers =
             new ConcurrentHashMap<>();
     /**
-     * Periodic work registered by upper layers, driven once per peer tick.
-     * Copy-on-write so the tick iterates without locking and keeps registration
-     * order; registration and removal are rare.
+     * Periodic work registered by upper layers through the deprecated {@link #onTick}, each run by an adapter on the
+     * node's loop (srad/agentspaces-event-loop.md EL-L-05). Copy-on-write; registration and removal are rare.
      */
     private final java.util.List<Runnable> tickWork =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** Every registration this runtime holds on the node's loop, closed when the group is left. */
+    private final java.util.List<ai.badmonkey.agentspaces.api.spi.DueWork.Registration> registrations =
             new java.util.concurrent.CopyOnWriteArrayList<>();
     /** Node-clock millis of the last anti-entropy round; null before the first. */
     private volatile Long lastAntiEntropyMillis;
@@ -70,20 +72,10 @@ public final class GroupRuntime implements AutoCloseable {
 
     GroupRuntime(GroupId groupId, GroupAdvertisement advertisement,
                  GroupMembership membership, GossipBus gossip,
-                 RevocationRegistry revocations, PeerNode node) {
-        this(groupId, advertisement, membership, gossip, revocations,
-                new ai.badmonkey.agentspaces.peering.membership.CredentialRevocationRegistry(advertisement,
-                        ai.badmonkey.agentspaces.peering.membership.CredentialRevocationRegistry.Validator.defaults(),
-                        ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec(),
-                        java.time.InstantSource.system()),
-                node, null);
-    }
-
-    GroupRuntime(GroupId groupId, GroupAdvertisement advertisement,
-                 GroupMembership membership, GossipBus gossip,
                  RevocationRegistry revocations,
                  ai.badmonkey.agentspaces.peering.membership.CredentialRevocationRegistry credentialRevocations,
                  PeerNode node, SignedGroupAdvertisement founding) {
+        java.util.Objects.requireNonNull(node, "node"); // every runtime belongs to a node (DC-03)
         this.groupId = groupId;
         this.advertisement = advertisement;
         this.membership = membership;
@@ -160,10 +152,7 @@ public final class GroupRuntime implements AutoCloseable {
         if (active) {
             quietRounds = 0;
         }
-        // RE-F-03: the base period and the stretch are runtime paces on the bus; the founding sets the first base.
-        long base = gossip.antiEntropyPeriod().toMillis();
-        long period = base * Math.min(Math.min(MAX_BACKOFF_MULTIPLIER, gossip.antiEntropyStretch()),
-                1L << Math.min(quietRounds, 5));
+        long period = antiEntropyPeriodMillis();
         Long last = lastAntiEntropyMillis;
         if (last != null && nowMillis - last < period) {
             return false;
@@ -173,6 +162,27 @@ public final class GroupRuntime implements AutoCloseable {
             quietRounds = Math.min(quietRounds + 1, 5);
         }
         return true;
+    }
+
+    /** The period the next anti-entropy round waits, the base stretched by the quiet rounds so far. */
+    private long antiEntropyPeriodMillis() {
+        // RE-F-03: the base period and the stretch are runtime paces on the bus; the founding sets the first base.
+        long base = gossip.antiEntropyPeriod().toMillis();
+        return base * Math.min(Math.min(MAX_BACKOFF_MULTIPLIER, gossip.antiEntropyStretch()),
+                1L << Math.min(quietRounds, 5));
+    }
+
+    /**
+     * When the next anti-entropy round is due, on the node's clock (srad/agentspaces-event-loop.md EL-L-01, EL-L-07):
+     * a stretched period after the last round, at once before the first. The first activity after a quiet stretch
+     * asks the round again, which brings the period back to the base (EL-L-13).
+     *
+     * @param nowMillis the clock now
+     * @return the time in the clock's milliseconds
+     */
+    long nextAntiEntropyMillis(long nowMillis) {
+        Long last = lastAntiEntropyMillis;
+        return last == null ? nowMillis : last + antiEntropyPeriodMillis();
     }
 
     /** Returns the group id. */
@@ -195,7 +205,7 @@ public final class GroupRuntime implements AutoCloseable {
      * (RE-H-01, {@code agentspaces.space.renew-shortening-log}); a node setting, on by default.
      */
     public boolean renewShorteningLog() {
-        return node == null || node.renewShorteningLog();
+        return node.renewShorteningLog();
     }
 
     /** Returns the group's gossip bus. */
@@ -232,7 +242,7 @@ public final class GroupRuntime implements AutoCloseable {
      * @return true when the member accepts the recordless form
      */
     public boolean advertisesRecordless(PeerId peer) {
-        return node != null && node.advertisesRecordless(peer);
+        return node.advertisesRecordless(peer);
     }
 
     /**
@@ -263,7 +273,7 @@ public final class GroupRuntime implements AutoCloseable {
      * @return true when the per-entry horizon's precondition holds for this view now
      */
     public boolean viewAdvertisesHorizon() {
-        if (node == null || !node.horizonPerEntry()) {
+        if (!node.horizonPerEntry()) {
             return false;
         }
         // idle-loop O5: every space judges this on every tick; the walk runs only when the view or a hint moved.
@@ -291,13 +301,12 @@ public final class GroupRuntime implements AutoCloseable {
     private volatile HorizonJudgement horizonJudgement;
 
     /**
-     * Brings this group's tick back to the full rate at once (idle-loop O8): a component that starts work the tick
-     * drives calls this, so the work's first step does not wait out an idle group's slower tick.
+     * Asks every participant of this group to run again on the node loop's next run (srad/agentspaces-event-loop.md
+     * EL-L-15, DW-2): a component that moved a deadline earlier and cannot name its participant calls this. A
+     * participant that can be named is asked through its own {@link ai.badmonkey.agentspaces.api.spi.DueWork.Registration#wake()}.
      */
     public void wake() {
-        if (node != null) {
-            node.wake(id());
-        }
+        node.wake(id());
     }
 
     /**
@@ -307,7 +316,17 @@ public final class GroupRuntime implements AutoCloseable {
      * @return the view's epoch
      */
     public long viewEpoch() {
-        return membership.viewVersion() + (node == null ? 0 : node.horizonHintsVersion());
+        return membership.viewVersion() + node.horizonHintsVersion();
+    }
+
+    /**
+     * A counter that moves whenever a member's AppCard level moves (srad/agentspaces-event-loop.md EL-T-07): a
+     * registrant that judges the AppCard gate re-judges only when it or {@link #viewEpoch()} moved.
+     *
+     * @return the version; only its equality between reads means anything
+     */
+    public long appCardVersion() {
+        return node.appCardVersion();
     }
 
     /**
@@ -317,7 +336,7 @@ public final class GroupRuntime implements AutoCloseable {
      * @return true when it does
      */
     public boolean advertisesHorizon(PeerId peer) {
-        return node != null && node.advertisesHorizon(peer);
+        return node.advertisesHorizon(peer);
     }
 
     /**
@@ -333,7 +352,7 @@ public final class GroupRuntime implements AutoCloseable {
      * @return milliseconds the writer has been in view and hinted, {@link Long#MAX_VALUE} for this node, or -1
      */
     public long hintedWriterInViewMillis(PeerId peer) {
-        if (node == null || peer == null) {
+        if (peer == null) {
             return -1;
         }
         if (peer.equals(node.identity().peerId())) {
@@ -351,7 +370,7 @@ public final class GroupRuntime implements AutoCloseable {
      * @return true when the whole view reads them
      */
     public boolean viewAtAppCardLevel(int level) {
-        if (node == null || node.appCardLevel() < level) {
+        if (node.appCardLevel() < level) {
             return false;
         }
         for (GroupMembership.Member member : membership.allMembers()) {
@@ -523,45 +542,224 @@ public final class GroupRuntime implements AutoCloseable {
     }
 
     /**
-     * Registers periodic work to be driven by the peer's tick, and returns the
-     * handle that deregisters it (QA3 A3-1). This is the clock seam for layers
-     * above peering: a replicated space already joins the same clock by handing
-     * the gossip bus a {@code ReconcilableState}, and a capability runtime joins
-     * it here, so anything built on a joined group advances for the same reason
-     * membership and anti-entropy do, with no scheduler of its own.
+     * Registers due work on the node's loop (srad/agentspaces-event-loop.md §3.2, EL-L-05): the work runs when the
+     * deadline it last returned falls due, when its registration or this group is woken, on the loop's backstop, and
+     * on every {@link PeerNode#tick()}. It runs on the node's loop, serially with every other participant of the node
+     * and after the protocol participants of every group (NL-2, NL-8); it must not block (DW-3). A participant that
+     * throws is logged with its name, counted and re-armed at the backstop (NL-4).
      *
-     * <p>Work runs on the peer's single tick thread, in registration order,
-     * after membership probing and anti-entropy for this group. It must return
-     * promptly and must not block on the network. Work that throws is caught
-     * and logged by the node: one misbehaving registrant can neither stop the
-     * others nor kill the tick.
+     * @param name the participant's stable name, as {@link PeerNode#loopStats()} reports it (DW-4)
+     * @param work the work
+     * @return the registration: {@code wake()} asks the work again, {@code close()} removes it
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration onDue(String name,
+                                                                     ai.badmonkey.agentspaces.api.spi.DueWork work) {
+        return onDue(name, work, NodeLoop.Timing.FIXED);
+    }
+
+    /**
+     * Registers due work with a timing for the loop's stretch (srad/agentspaces-event-loop.md §3.10, EL-O-04 to
+     * EL-O-07): {@link NodeLoop.Timing#local} for a period no peer judges, which may stretch under sustained overrun up
+     * to its cap; {@link NodeLoop.Timing#wireVisible} for a cadence a peer judges (a lease's renewal, an
+     * advertisement's re-issue), whose refresh action the loop runs with the stretched period before the stretch
+     * applies, so that no peer reads a lapse. {@link #onDue(String, ai.badmonkey.agentspaces.api.spi.DueWork)}
+     * registers {@link NodeLoop.Timing#FIXED}, which never stretches.
+     *
+     * @param name   the participant's stable name (DW-4)
+     * @param work   the work
+     * @param timing how its period may stretch
+     * @return the registration
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration onDue(String name,
+                                                                     ai.badmonkey.agentspaces.api.spi.DueWork work,
+                                                                     NodeLoop.Timing timing) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(work, "work");
+        Objects.requireNonNull(timing, "timing");
+        if (closed) {
+            return NO_REGISTRATION; // a left group runs nothing
+        }
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration = node.registerDue(groupId, name, work,
+                timing);
+        registrations.add(registration);
+        return new ai.badmonkey.agentspaces.api.spi.DueWork.Registration() {
+            @Override
+            public void wake() {
+                registration.wake();
+            }
+
+            @Override
+            public void close() {
+                registration.close();
+                registrations.remove(registration);
+            }
+        };
+    }
+
+    /**
+     * Registers due work that keeps its deadlines on its own wall clock (srad/agentspaces-event-loop.md EL-T-09,
+     * §3.6): the work is given its clock's now and returns its next due on that clock, which this method converts to
+     * the loop's monotonic base against both clocks read together, after the run (the fix of §10.8), and caps at an
+     * hour ahead. This is the one converter for registrants whose leases and expiries are wall instants. A wall step
+     * (TS-6) asks every participant of the node again, these among them, so each converts its deadline again on the
+     * stepped clock (EL-C-12).
+     *
+     * @param name  the participant's stable name (DW-4)
+     * @param clock the registrant's wall clock
+     * @param work  the work
+     * @return the registration
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration onDueWall(String name, java.time.InstantSource clock,
+                                                                         ai.badmonkey.agentspaces.api.spi.DueWork.Wall work) {
+        return onDueWall(name, clock, work, NodeLoop.Timing.FIXED);
+    }
+
+    /**
+     * {@link #onDueWall(String, java.time.InstantSource, ai.badmonkey.agentspaces.api.spi.DueWork.Wall)} with a timing
+     * for the loop's stretch and re-initialisation (EL-O-05 to EL-O-07, WD-4): a registrant whose cadence a peer judges
+     * (a card's re-issue, a lease's renewal) registers {@link NodeLoop.Timing#wireVisible} with its refresh action.
+     *
+     * @param name   the participant's stable name (DW-4)
+     * @param clock  the registrant's wall clock
+     * @param work   the work
+     * @param timing how its period may stretch
+     * @return the registration
+     */
+    public ai.badmonkey.agentspaces.api.spi.DueWork.Registration onDueWall(String name, java.time.InstantSource clock,
+                                                                         ai.badmonkey.agentspaces.api.spi.DueWork.Wall work,
+                                                                         NodeLoop.Timing timing) {
+        Objects.requireNonNull(clock, "clock");
+        Objects.requireNonNull(work, "work");
+        if (closed) {
+            return NO_REGISTRATION;
+        }
+        ai.badmonkey.agentspaces.common.time.TimeSource time = node.time();
+        return onDue(name, now -> {
+            long next = work.run(clock.millis());
+            return next == ai.badmonkey.agentspaces.api.spi.DueWork.NEVER
+                    ? ai.badmonkey.agentspaces.api.spi.DueWork.NEVER
+                    : PeerNode.due(time.monoNanos(), clock.millis(), next);
+        }, timing);
+    }
+
+
+    /**
+     * A wall deadline on {@code clock} converted to the loop's monotonic base, both clocks read now together, for a
+     * registrant that reports through {@link #onDue} and keeps some deadlines on a wall clock.
+     *
+     * @param clock      the registrant's wall clock
+     * @param wallMillis the wall deadline, or NEVER
+     * @return the deadline on the loop's monotonic base
+     */
+    public long dueAt(java.time.InstantSource clock, long wallMillis) {
+        if (wallMillis == ai.badmonkey.agentspaces.api.spi.DueWork.NEVER) {
+            return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
+        }
+        ai.badmonkey.agentspaces.common.time.TimeSource time = time();
+        return PeerNode.due(time.monoNanos(), clock.millis(), wallMillis);
+    }
+
+    /**
+     * Whether the calling thread is inside a run that {@link PeerNode#tick()} started, which calls every participant
+     * whether due or not: a registrant keeps its legacy one-step behaviour there (owner answer 4, 2026-11-22).
+     *
+     * @return whether the current run is a direct one
+     */
+    public boolean directRun() {
+        return node.directRun();
+    }
+
+    /**
+     * Whether the node's loop is running on its own ({@code startTicking}), as against driven by hand.
+     *
+     * @return whether the loop runs
+     */
+    public boolean loopRunning() {
+        return node.tickPeriod().isPresent();
+    }
+
+    /**
+     * The node's monotonic now, the base due work reports on.
+     *
+     * @return the monotonic now in nanoseconds
+     */
+    public long monoNanos() {
+        return time().monoNanos();
+    }
+
+    /**
+     * The node's time source.
+     *
+     * @return the time source; the system's for a runtime with no node
+     */
+    public ai.badmonkey.agentspaces.common.time.TimeSource time() {
+        return node.time();
+    }
+
+    /**
+     * The clock a layer built on this group defaults to when it is given none (srad/agentspaces-event-loop.md
+     * EL-C-06): the node's time source, so a space, a content swarm or a store judges its leases on the same time as
+     * the node; for a node built on a plain test clock, the system's, as before phase 3, since such a clock moves only
+     * by a test's hand.
+     *
+     * @return the clock
+     */
+    public ai.badmonkey.agentspaces.common.time.TimeSource defaultClock() {
+        ai.badmonkey.agentspaces.common.time.TimeSource t = time();
+        return ai.badmonkey.agentspaces.common.time.TimeSources.followsWall(t)
+                ? ai.badmonkey.agentspaces.common.time.TimeSource.system() : t;
+    }
+
+    /**
+     * How many registrations this group holds on the node's loop: {@link #onDue}, {@link #onDueWall} and
+     * {@link #onTick} work; for tests and diagnostics.
+     *
+     * @return the count
+     */
+    public int registrationCount() {
+        return registrations.size();
+    }
+
+    private static final ai.badmonkey.agentspaces.api.spi.DueWork.Registration NO_REGISTRATION =
+            new ai.badmonkey.agentspaces.api.spi.DueWork.Registration() {
+                @Override
+                public void wake() {
+                }
+
+                @Override
+                public void close() {
+                }
+            };
+
+    /**
+     * Registers periodic work to be driven by the peer's tick, and returns the handle that deregisters it (QA3 A3-1).
+     *
+     * <p>Deprecated since the node's loop (srad/agentspaces-event-loop.md decision 7, EL-L-05): register
+     * {@link #onDue} work that reports its own next due time instead. The adapter behind this method keeps the old
+     * behaviour: the work runs every {@link #tickPeriod()} while the node's loop runs ({@code tick-millis}), and on
+     * every {@link PeerNode#tick()} a host drives by hand; it runs on the node's loop after the protocol participants,
+     * must return promptly and must not block on the network. Work that throws is caught and logged; one misbehaving
+     * registrant can neither stop the others nor kill the loop. The first registration from each class logs the
+     * deprecation once.
      *
      * @param work the work to run once per tick
      * @return a handle that removes the work when closed; closing twice is safe
+     * @deprecated register {@link #onDue} work that returns its next due time
      */
+    @Deprecated(since = "0.7.0")
     public AutoCloseable onTick(Runnable work) {
         Objects.requireNonNull(work, "work");
         if (closed) {
             return () -> { }; // a left group ticks nothing
         }
         tickWork.add(work);
-        return () -> tickWork.remove(work);
-    }
-
-    /**
-     * Runs every registered periodic task once. Called by {@link PeerNode#tick()};
-     * a task that throws is reported and skipped so the rest still run.
-     *
-     * @param onError invoked with any task failure, for the node to log
-     */
-    void runTickWork(java.util.function.Consumer<RuntimeException> onError) {
-        for (Runnable work : tickWork) {
-            try {
-                work.run();
-            } catch (RuntimeException e) {
-                onError.accept(e);
-            }
-        }
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration = node.registerTickAdapter(groupId, work);
+        registrations.add(registration);
+        return () -> {
+            tickWork.remove(work);
+            registration.close();
+            registrations.remove(registration);
+        };
     }
 
     /** Returns how many periodic tasks are registered; for tests and diagnostics. */
@@ -574,7 +772,10 @@ public final class GroupRuntime implements AutoCloseable {
      * while the host drives {@link PeerNode#tick()} by hand (QA3 A3-4).
      *
      * @return the peer's tick period, or empty when hand-driven
+     * @deprecated due work keeps its own deadlines in time (srad/agentspaces-event-loop.md decision 6); use
+     *     {@link #loopRunning()} to tell a running loop from a hand-driven node
      */
+    @Deprecated(since = "0.7.0")
     public Optional<java.time.Duration> tickPeriod() {
         return node.tickPeriod();
     }
@@ -666,6 +867,10 @@ public final class GroupRuntime implements AutoCloseable {
         }
         closed = true;
         tickWork.clear();
+        for (ai.badmonkey.agentspaces.api.spi.DueWork.Registration registration : registrations) {
+            registration.close();
+        }
+        registrations.clear();
         kindHandlers.clear();
         for (Runnable listener : closeListeners) {
             try {

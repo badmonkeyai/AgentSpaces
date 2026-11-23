@@ -35,6 +35,7 @@ import ai.badmonkey.agentspaces.spoilers.Script;
 import ai.badmonkey.agentspaces.spoilers.ScriptRunner;
 import ai.badmonkey.agentspaces.spoilers.Trigger;
 import ai.badmonkey.agentspaces.test.FleetInvariants;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 import ai.badmonkey.agentspaces.test.Fixtures.FindingEntry;
 import ai.badmonkey.agentspaces.test.Fixtures.TaskEntry;
 import org.junit.jupiter.api.Test;
@@ -56,13 +57,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * space's gossip delivers the committed claim to that follower; the hold is released when the follower raises TAKEN for
  * the entry. REPAIR: the follower's own log then applies the claim, its commit index moves past zero, and its committed
  * listener hears the same claim the leader committed. The bound after the release is one append retry plus an
- * anti-entropy round on the fleet clock, asserted on ticks. Before, the order came from the wall-clock wait of the app's
+ * anti-entropy round on the fleet clock, asserted on ticks; the leader's take runs as a task of the fleet's virtual time,
+ * so its commit is a hard bound too (srad/agentspaces-event-loop.md decision 12, §10.17). Before, the order came from the wall-clock wait of the app's
  * desk log (Superfriends {@code DeskLog}, 10 s); the app form follows after 0.7.0.
  */
 class SpoilerLaggingFollowerTest {
 
     /** One append retry plus a round, in ticks of {@link SpaceFleet#PERIOD}, with room: checked against the runs. */
     private static final int APPEND_REPAIR_TICKS = 20;
+    /** The ordered log's attempt window (3 s) in ticks of {@link SpaceFleet#PERIOD}: the take's hard bound. */
+    private static final int ATTEMPT_TICKS = 10;
 
     @Test
     @Timeout(120)
@@ -119,15 +123,15 @@ class SpoilerLaggingFollowerTest {
                     PeerNode.ChannelAuth.SIGNED, script).watch(follower, atFollower.space(), Template.of(TaskEntry.class));
             fleet.afterTick.add(runner::tick);
 
-            // the leader takes through the log; its take waits for the commit on its own thread
-            CompletableFuture<Optional<TakenEntry<TaskEntry>>> take = CompletableFuture.supplyAsync(() -> logs.get(leader)
-                    .take(Template.of(TaskEntry.class), Lease.of(Duration.ofMinutes(5)), Duration.ofSeconds(10)));
-            Optional<TakenEntry<TaskEntry>> taken = Measure.awaitValue("spoiler.lagging-follower.take",
-                    Duration.ofSeconds(30), () -> {
-                        fleet.tickSlowly();
-                        return take.isDone() ? Optional.of(take.join()) : Optional.empty();
-                    }, Wait.with());
+            // the leader takes through the log, as a task of the fleet's time: its attempt window waits on that time
+            // (decision 12), so the commit is a hard bound in ticks: inside one attempt window, the other follower's
+            // appends making the majority while this one's are held
+            VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>> take = fleet.callTicking("spoiler.lagging-follower.take",
+                    ATTEMPT_TICKS, () -> logs.get(leader).take(Template.of(TaskEntry.class),
+                            Lease.of(Duration.ofMinutes(5)), Duration.ofSeconds(10)));
+            Optional<TakenEntry<TaskEntry>> taken = take.value();
             assertThat(taken).as("the leader's take committed").isPresent();
+            assertThat(take.took()).as("within one attempt window").isLessThanOrEqualTo(Duration.ofSeconds(3));
             EntryId entry = taken.get().entryId();
 
             // after the release (or at once, honestly) the follower's log applies the claim and its listener hears it

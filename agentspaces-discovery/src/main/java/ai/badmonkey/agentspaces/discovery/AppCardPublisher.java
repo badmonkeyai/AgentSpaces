@@ -95,8 +95,11 @@ public final class AppCardPublisher implements AutoCloseable {
     private synchronized CompletableFuture<AppCard> issue(AppCard card) {
         AppCard last = signed.get(card.id());
         Instant issued = card.issued();
-        if (last != null && !issued.isAfter(last.issued())) {
-            issued = last.issued().plusMillis(1); // the cache keeps only a strictly newer version
+        // The cache keeps only a strictly newer version, and the gossip item is named by the issue millisecond: a card
+        // later than the last by less than a millisecond shares its item id and reaches nobody (§10.16), so the
+        // comparison is on milliseconds.
+        if (last != null && issued.toEpochMilli() <= last.issued().toEpochMilli()) {
+            issued = Instant.ofEpochMilli(last.issued().toEpochMilli() + 1);
         }
         boolean open = AppCards.gateOpen(runtime);
         AppCard current = AppCards.issuedAt(card, issued);

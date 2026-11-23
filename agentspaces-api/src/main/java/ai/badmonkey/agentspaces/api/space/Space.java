@@ -248,6 +248,20 @@ public interface Space {
     }
 
     /**
+     * Registers a listener run whenever {@link #changeSignals()} moves, right after the change (srad/agentspaces-event-loop.md
+     * DW-2): due work that reads the space wakes its own participant from it, because entries that arrive by gossip
+     * wake no loop participant on their own. The listener may run while the space holds its own lock, so it must only
+     * wake (a {@code DueWork.Registration.wake()} or a flag): it must not block and must not call back into the space.
+     * The default, for a space that keeps no counter, never calls it.
+     *
+     * @param listener the listener
+     * @return a handle that removes the listener
+     */
+    default AutoCloseable onChangeSignal(Runnable listener) {
+        return () -> { };
+    }
+
+    /**
      * The entries {@link #readAllEntries} matches by type and tags but cannot decode (HLC round
      * six, 2026-11-08, ruling R3): live, unclaimed, held here in the clear, and holding no value
      * of the template's type. The reads skip them; a reader that counts the records it refuses,

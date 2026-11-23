@@ -47,7 +47,7 @@ import java.util.function.UnaryOperator;
  * {@link #GossipLearning(GossipLearner)}); the exchange protocol and its
  * mass-conservation argument are documented there.
  */
-public final class GossipLearning implements CapabilityProvider {
+public final class GossipLearning implements ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider {
 
     /** The capability type URI. */
     public static final String TYPE = GossipLearner.TYPE;
@@ -135,6 +135,16 @@ public final class GossipLearning implements CapabilityProvider {
     @Override
     public void tick() {
         learner.tick();
+    }
+
+    @Override
+    public void attach(ai.badmonkey.agentspaces.api.spi.DueWork.Driver driver) {
+        learner.attach(driver);
+    }
+
+    @Override
+    public long run(long nowNanos) {
+        return learner.run(nowNanos);
     }
 
     /**

@@ -30,8 +30,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -75,14 +73,18 @@ public final class RtcSignalCapability {
     private final SecureRandom random = new SecureRandom();
     private final Map<String, WebRtcSession> sessions = new ConcurrentHashMap<>();
     private final Map<PeerId, Deque<Long>> offerTimes = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService sweeper;
+    /**
+     * The next sweep: a one-shot on the time source, armed only while a session or an offer record is held and
+     * re-armed from the end of each sweep (srad/agentspaces-event-loop.md EL-T-12, EL-T-13); null when idle.
+     */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource time = ai.badmonkey.agentspaces.common.time.TimeSource.system();
+    private ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled sweeper;
+    private boolean closed;
     private volatile SignalPipe pipe;
     private volatile Predicate<PeerId> members = peer -> true;
 
     RtcSignalCapability(WebRtcTransport transport) {
         this.transport = Objects.requireNonNull(transport, "transport");
-        this.sweeper = Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().name("webrtc-sweeper").factory());
-        sweeper.scheduleAtFixedRate(this::sweep, 1, 1, TimeUnit.SECONDS);
     }
 
     WebRtcOptions options() {
@@ -238,6 +240,7 @@ public final class RtcSignalCapability {
         }
         WebRtcSession session = new WebRtcSession(this, offer.sid(), from, false);
         sessions.put(session.key(), session);
+        armSweep();
         try {
             session.startAnswer(transport.engine(), offer);
         } catch (IOException e) {
@@ -250,6 +253,7 @@ public final class RtcSignalCapability {
         long now = System.nanoTime();
         long window = TimeUnit.MINUTES.toNanos(1);
         Deque<Long> times = offerTimes.computeIfAbsent(from, p -> new ArrayDeque<>());
+        armSweep();
         synchronized (times) {
             while (!times.isEmpty() && now - times.peekFirst() > window) {
                 times.pollFirst();
@@ -283,6 +287,7 @@ public final class RtcSignalCapability {
         random.nextBytes(sid);
         WebRtcSession session = new WebRtcSession(this, sid, target, true);
         sessions.put(session.key(), session);
+        armSweep();
         session.startOffer(transport.engine());
         return session;
     }
@@ -314,6 +319,25 @@ public final class RtcSignalCapability {
         sessions.remove(session.key(), session);
     }
 
+    /** Arms the next sweep a second from now, unless one is armed or the binding closed. */
+    private synchronized void armSweep() {
+        if (closed || sweeper != null) {
+            return;
+        }
+        sweeper = time.schedule(java.time.Duration.ofSeconds(1), () -> {
+            try {
+                sweep();
+            } finally {
+                synchronized (this) {
+                    sweeper = null;
+                }
+                if (!sessions.isEmpty() || !offerTimes.isEmpty()) {
+                    armSweep(); // still something to expire: the next second
+                }
+            }
+        });
+    }
+
     /** Expires sessions that have not opened within the dial timeout (JS-W-10). */
     void sweep() {
         long now = System.nanoTime();
@@ -330,7 +354,13 @@ public final class RtcSignalCapability {
     }
 
     void close() {
-        sweeper.shutdownNow();
+        synchronized (this) {
+            closed = true;
+            if (sweeper != null) {
+                sweeper.cancel();
+                sweeper = null;
+            }
+        }
         for (WebRtcSession session : sessions.values()) {
             session.end(RtcSignal.END_NORMAL, "binding closed");
         }

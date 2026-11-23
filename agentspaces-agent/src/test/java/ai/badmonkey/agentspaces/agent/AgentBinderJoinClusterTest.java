@@ -15,6 +15,8 @@
  */
 package ai.badmonkey.agentspaces.agent;
 
+import ai.badmonkey.agentspaces.measure.Wait;
+import ai.badmonkey.agentspaces.measure.Measure;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import ai.badmonkey.agentspaces.agent.annotation.AgentSpec;
@@ -245,11 +247,10 @@ class AgentBinderJoinClusterTest {
         closeables.add(late.group().bind(joiner));
         assertThat(late.space().knownEntries()).as("bound before anything arrived").isZero();
 
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (System.nanoTime() < deadline && late.space().readAll(Template.of(Result.class), 10).size() < 3) {
+        Measure.await("agent.join.cluster-1", Duration.ofSeconds(30), () -> {
             tickAll(1);
-            Thread.sleep(20);
-        }
+            return late.space().readAll(Template.of(Result.class), 10).size() >= 3;
+        }, Wait.with().poll(Duration.ofMillis(20)));
         tickAll(10);
         Thread.sleep(200); // a second firing would run on its own virtual thread
 

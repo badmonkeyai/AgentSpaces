@@ -290,7 +290,7 @@ final class DtlsListener implements AutoCloseable {
             DtlsAssociation[] self = new DtlsAssociation[1];
             DtlsAssociation association;
             try {
-                association = new DtlsAssociation(RecordLayer.dtls(dtls), path, attested, chain, options, owner.timers(),
+                association = new DtlsAssociation(RecordLayer.dtls(dtls), path, attested, chain, options, owner.time(),
                         counters, () -> {
                             release.run();
                             accepted.remove(self[0]);

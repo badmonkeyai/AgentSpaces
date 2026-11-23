@@ -37,7 +37,16 @@ final class DtlsBlocks {
 
     /** The bare UDP binding, tuned by the DTLS block's datagram settings. */
     static Transport buildUdp(AgentSpacesProperties.Transport.Dtls tuning) {
-        return new ai.badmonkey.agentspaces.transport.dtls.UdpTransport().options(options(tuning));
+        ai.badmonkey.agentspaces.transport.dtls.UdpTransport udp =
+                new ai.badmonkey.agentspaces.transport.dtls.UdpTransport().options(options(tuning));
+        if (tuning.getDialTimeout() != null) {
+            try {
+                udp.dialTimeout(tuning.getDialTimeout());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("agentspaces.transport.dtls.dial-timeout: " + e.getMessage(), e);
+            }
+        }
+        return udp;
     }
 
     private static DtlsOptions options(AgentSpacesProperties.Transport.Dtls block) {
@@ -62,7 +71,15 @@ final class DtlsBlocks {
             } else {
                 transport = DtlsTransport.withRefreshableTrust(identity, serving, trust);
             }
-            return transport.options(options);
+            transport.options(options);
+            if (block.getDialTimeout() != null) {
+                try {
+                    transport.dialTimeout(block.getDialTimeout());
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalStateException("agentspaces.transport.dtls.dial-timeout: " + e.getMessage(), e);
+                }
+            }
+            return transport;
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("cannot create the DTLS channel credential", e);
         }

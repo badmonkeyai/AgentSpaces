@@ -17,6 +17,8 @@ package ai.badmonkey.agentspaces.capabilities.runtime;
 
 import ai.badmonkey.agentspaces.api.ad.CapabilityAdvertisement;
 import ai.badmonkey.agentspaces.api.spi.CapabilityProvider;
+import ai.badmonkey.agentspaces.api.spi.DueCapabilityProvider;
+import ai.badmonkey.agentspaces.api.spi.DueWork;
 import ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.AdvertisementSigner;
@@ -86,9 +88,13 @@ public final class CapabilityRuntime implements AutoCloseable {
      * its own advertisement.
      */
     private final Map<String, CapabilityProvider> providers = new ConcurrentHashMap<>();
-    private volatile ScheduledFuture<?> refresh;
-    /** Deregisters the protocol tick from the peer clock; null once detached. */
-    private volatile AutoCloseable tickRegistration;
+    /** Each provider's place on the participant, by advertisement id (srad/agentspaces-event-loop.md EL-T-05). */
+    private final Map<String, Slot> slots = new ConcurrentHashMap<>();
+    /** Cancels the self-refresh: a one-shot re-armed from completion (EL-T-13); null when none. */
+    private volatile Runnable refresh;
+    private volatile java.util.function.BooleanSupplier refreshLive = () -> false;
+    /** The capability participant on the node's loop; null once detached. */
+    private volatile DueWork.Registration tickRegistration;
     /** Content fingerprint of each provider's last published advertisement, by advertisement id. */
     private final Map<String, String> published = new ConcurrentHashMap<>();
     /**
@@ -113,7 +119,157 @@ public final class CapabilityRuntime implements AutoCloseable {
         this.discovery = Objects.requireNonNull(discovery, "discovery");
         this.identity = Objects.requireNonNull(identity, "identity");
         this.cadence = runtime.tickPeriod().orElse(null);
-        this.tickRegistration = runtime.onTick(this::protocolTick);
+        this.tickRegistration = runtime.onDue("capabilities", this::runDue);
+    }
+
+    /** The legacy cadence of a provider that overrides {@code tick()} or {@code requiresTick()} (owner answer 3). */
+    static final Duration LEGACY_PERIOD = Duration.ofMillis(250);
+
+    /** How the participant drives a provider (srad/agentspaces-event-loop.md EL-T-05, owner answer 3, 2026-11-22). */
+    enum Drive {
+        /** A {@link DueCapabilityProvider}: its own deadlines, its own change signal. */
+        DUE,
+        /** A provider that overrides {@code tick()} or {@code requiresTick()}: every 250 ms with the fingerprint. */
+        LEGACY,
+        /** Neither: never run on a started loop; its card is republished by the refresh. */
+        STATIC
+    }
+
+    /** Whether a provider overrides the legacy {@code tick()} or {@code requiresTick()}, judged once by reflection. */
+    static Drive driveOf(CapabilityProvider provider) {
+        if (provider instanceof DueCapabilityProvider) {
+            return Drive.DUE;
+        }
+        try {
+            Class<?> tick = provider.getClass().getMethod("tick").getDeclaringClass();
+            Class<?> requires = provider.getClass().getMethod("requiresTick").getDeclaringClass();
+            return tick != CapabilityProvider.class || requires != CapabilityProvider.class ? Drive.LEGACY : Drive.STATIC;
+        } catch (NoSuchMethodException e) {
+            return Drive.LEGACY;
+        }
+    }
+
+    /**
+     * The cadence a provider on the node's loop is told (owner decision 2, 2026-11-23): the period it is really
+     * stepped at. A legacy provider is stepped every {@link #LEGACY_PERIOD} on a started loop whatever
+     * {@code tick-millis} says; any other is told the node's tick period, which its own {@code tick()} keeps for the
+     * direct runs that call it.
+     */
+    static Duration cadenceFor(Drive drive, Duration tickPeriod) {
+        return drive == Drive.LEGACY ? LEGACY_PERIOD : tickPeriod;
+    }
+
+    /** One provider's place on the capability participant, and the driver it was given (DW-2, DW-5). */
+    private final class Slot implements DueWork.Driver {
+        final CapabilityProvider provider;
+        final Drive drive;
+        /** Asked to run on the next run (a wake); cleared by the run that reads it. */
+        volatile boolean asked = true;
+        /** Moves on every {@link #describeChanged()}; the run keeps its own copy (DW-5). */
+        final java.util.concurrent.atomic.AtomicLong changes = new java.util.concurrent.atomic.AtomicLong();
+        long seenChanges;
+        /** The provider's next due on the loop's base, as last reported; the legacy step's last run. */
+        long next = DueWork.NEVER;
+        long last = Long.MIN_VALUE;
+
+        Slot(CapabilityProvider provider) {
+            this.provider = provider;
+            this.drive = driveOf(provider);
+        }
+
+        @Override
+        public void wake() {
+            asked = true;
+            DueWork.Registration registration = tickRegistration;
+            if (registration != null) {
+                registration.wake();
+            }
+        }
+
+        @Override
+        public void describeChanged() {
+            changes.incrementAndGet();
+            wake();
+        }
+
+        @Override
+        public long monoNanos() {
+            return runtime.monoNanos();
+        }
+
+        @Override
+        public long dueAt(long wallMillis) {
+            return runtime.dueAt(runtime.time(), wallMillis);
+        }
+
+        @Override
+        public ai.badmonkey.agentspaces.common.time.TimeSource time() {
+            return runtime.time();
+        }
+
+        @Override
+        public boolean timed() {
+            return tickRegistration != null && runtime.loopRunning() && !runtime.directRun();
+        }
+    }
+
+    /**
+     * The capability participant (srad/agentspaces-event-loop.md EL-T-05): on a started loop each provider runs at its
+     * own deadline. A {@link DueCapabilityProvider} runs when it is due or asked, and its card is republished only
+     * when it said {@code describeChanged()}; a provider that overrides the legacy {@code tick()} keeps its 250 ms
+     * step with the fingerprint; any other provider never runs and its card lives on the refresh. A direct run
+     * ({@code tick()}) and a hand-driven node step every provider once, as the tick did (QA3 A3-1, A3-4).
+     */
+    private long runDue(long now) {
+        Duration period = runtime.tickPeriod().orElse(null);
+        boolean cadenceChanged = period != null && !period.equals(cadence);
+        if (cadenceChanged) {
+            cadence = period;
+        }
+        boolean timed = runtime.loopRunning() && !runtime.directRun();
+        long next = DueWork.NEVER;
+        for (Slot slot : slots.values()) {
+            CapabilityProvider provider = slot.provider;
+            try {
+                if (cadenceChanged) {
+                    provider.driverCadence(cadenceFor(slot.drive, period));
+                }
+                if (!timed) {
+                    provider.tick();
+                    republishIfChanged(provider);
+                    if (slot.drive == Drive.LEGACY) {
+                        slot.last = now;
+                        slot.next = runtime.loopRunning() ? now + LEGACY_PERIOD.toNanos() : DueWork.NEVER;
+                    }
+                } else if (slot.drive == Drive.DUE) {
+                    if (slot.asked || now >= slot.next) {
+                        slot.asked = false;
+                        slot.next = ((DueCapabilityProvider) provider).run(now);
+                        long changed = slot.changes.get();
+                        if (changed != slot.seenChanges) {
+                            slot.seenChanges = changed;
+                            republishIfChanged(provider);
+                        }
+                    }
+                } else if (slot.drive == Drive.LEGACY) {
+                    if (slot.last == Long.MIN_VALUE || now - slot.last >= LEGACY_PERIOD.toNanos()) {
+                        slot.last = now;
+                        provider.tick();
+                        republishIfChanged(provider);
+                    }
+                    slot.next = slot.last + LEGACY_PERIOD.toNanos();
+                } else {
+                    slot.next = DueWork.NEVER;
+                }
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "capability run failed: " + provider.capabilityType(), e);
+                if (slot.drive == Drive.LEGACY) {
+                    slot.next = now + LEGACY_PERIOD.toNanos();
+                }
+            }
+            next = Math.min(next, slot.next);
+        }
+        return next;
     }
 
     /**
@@ -140,7 +296,7 @@ public final class CapabilityRuntime implements AutoCloseable {
                 if (cadenceChanged) {
                     provider.driverCadence(now);
                 }
-                provider.tick();
+                provider.tick(); // every provider's legacy step once, for a detached host
                 republishIfChanged(provider);
             } catch (RuntimeException e) {
                 LOG.log(System.Logger.Level.WARNING,
@@ -179,14 +335,10 @@ public final class CapabilityRuntime implements AutoCloseable {
      * @return this runtime
      */
     public CapabilityRuntime detachFromPeerTick() {
-        AutoCloseable current = tickRegistration;
+        DueWork.Registration current = tickRegistration;
         if (current != null) {
             tickRegistration = null;
-            try {
-                current.close();
-            } catch (Exception e) {
-                throw new IllegalStateException("failed detaching from the peer tick", e);
-            }
+            current.close();
         }
         return this;
     }
@@ -243,17 +395,23 @@ public final class CapabilityRuntime implements AutoCloseable {
         // Configuring a provider that then fails validation is harmless -- it is
         // neither registered nor started.
         if (cadence != null) {
-            provider.driverCadence(cadence);
+            provider.driverCadence(tickRegistration != null ? cadenceFor(driveOf(provider), cadence) : cadence);
         }
         CapabilityAdvertisement ad = provider.describe(runtime.id());
         publish(provider, ad);
         providers.put(ad.id(), provider);
+        Slot slot = new Slot(provider);
+        if (provider instanceof DueCapabilityProvider due) {
+            due.attach(slot);
+        }
+        slots.put(ad.id(), slot);
         if (provider instanceof PushSumAggregate aggregate && !aggregate.hasParticipantRule()) {
             // Shares go only to members that advertise the aggregate: a bystander
             // without one would swallow them (2026-10-09, the council and Spring runs).
             aggregate.participants(PushSumAggregate.advertisedIn(discovery));
         }
         provider.start();
+        slot.wake(); // its first run files its deadlines
     }
 
     /** Re-publishes every registered provider's advertisement with a fresh issue time. */
@@ -276,27 +434,102 @@ public final class CapabilityRuntime implements AutoCloseable {
     public CapabilityRuntime autoRefresh(Duration period, ScheduledExecutorService executor) {
         Objects.requireNonNull(period, "period");
         Objects.requireNonNull(executor, "executor");
-        if (period.isZero() || period.isNegative()) {
-            throw new IllegalArgumentException("refresh period must be positive: " + period);
-        }
-        ScheduledFuture<?> previous = refresh;
-        if (previous != null) {
-            previous.cancel(false);
-        }
-        refresh = executor.scheduleAtFixedRate(() -> {
+        checkPeriod(period);
+        // One-shot, re-armed from completion (srad/agentspaces-event-loop.md EL-T-13): a refresh that ran late never
+        // runs twice back to back to catch up, as a fixed rate would.
+        cancelRefresh();
+        java.util.concurrent.atomic.AtomicReference<ScheduledFuture<?>> pending =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable[] task = new Runnable[1];
+        task[0] = () -> {
+            if (cancelled.get()) {
+                return;
+            }
             try {
                 refreshTick();
             } catch (RuntimeException e) {
                 // keep the schedule alive; the next run retries
             }
-        }, period.toMillis(), period.toMillis(), TimeUnit.MILLISECONDS);
+            if (!cancelled.get()) {
+                try {
+                    pending.set(executor.schedule(task[0], period.toMillis(), TimeUnit.MILLISECONDS));
+                } catch (java.util.concurrent.RejectedExecutionException e) {
+                    cancelled.set(true); // the host shut its executor down
+                }
+            }
+        };
+        pending.set(executor.schedule(task[0], period.toMillis(), TimeUnit.MILLISECONDS));
+        refresh = () -> {
+            cancelled.set(true);
+            ScheduledFuture<?> f = pending.get();
+            if (f != null) {
+                f.cancel(false);
+            }
+        };
+        refreshLive = () -> !cancelled.get() && !executor.isShutdown();
         return this;
+    }
+
+    /**
+     * Refreshes every advertisement on the node's own time source, one-shot and re-armed from completion
+     * (srad/agentspaces-event-loop.md EL-T-12, EL-T-13): no thread of the host's. {@link #close()} cancels it.
+     *
+     * @param period how often to refresh; positive
+     * @return this runtime
+     */
+    public CapabilityRuntime autoRefresh(Duration period) {
+        Objects.requireNonNull(period, "period");
+        checkPeriod(period);
+        cancelRefresh();
+        ai.badmonkey.agentspaces.common.time.TimeSource time = runtime.time();
+        java.util.concurrent.atomic.AtomicReference<ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled> pending =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable[] task = new Runnable[1];
+        task[0] = () -> {
+            if (cancelled.get()) {
+                return;
+            }
+            try {
+                refreshTick();
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "capability card refresh failed; the next one retries", e);
+            }
+            if (!cancelled.get()) {
+                pending.set(time.schedule(period, task[0]));
+            }
+        };
+        pending.set(time.schedule(period, task[0]));
+        refresh = () -> {
+            cancelled.set(true);
+            ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled f = pending.get();
+            if (f != null) {
+                f.cancel();
+            }
+        };
+        refreshLive = () -> !cancelled.get();
+        return this;
+    }
+
+    private static void checkPeriod(Duration period) {
+        if (period.isZero() || period.isNegative()) {
+            throw new IllegalArgumentException("refresh period must be positive: " + period);
+        }
+    }
+
+    private void cancelRefresh() {
+        Runnable current = refresh;
+        refresh = null;
+        refreshLive = () -> false;
+        if (current != null) {
+            current.run();
+        }
     }
 
     /** Returns whether a self-refresh schedule is currently active. */
     public boolean isAutoRefreshing() {
-        ScheduledFuture<?> current = refresh;
-        return current != null && !current.isCancelled() && !current.isDone();
+        return refresh != null && refreshLive.getAsBoolean();
     }
 
     /**
@@ -314,13 +547,10 @@ public final class CapabilityRuntime implements AutoCloseable {
     @Override
     public void close() {
         detachFromPeerTick();
-        ScheduledFuture<?> current = refresh;
-        if (current != null) {
-            current.cancel(false);
-            refresh = null;
-        }
+        cancelRefresh();
         providers.values().forEach(CapabilityProvider::stop);
         providers.clear();
+        slots.clear();
         published.clear();
         // No unpublish: the advertisements lapse on their own (spec P2).
     }
@@ -329,12 +559,34 @@ public final class CapabilityRuntime implements AutoCloseable {
         publish(provider, provider.describe(runtime.id()));
     }
 
-    private void publish(CapabilityProvider provider, CapabilityAdvertisement ad) {
-        if (!ad.issuer().equals(identity.peerId())) {
+    private void publish(CapabilityProvider provider, CapabilityAdvertisement described) {
+        if (!described.issuer().equals(identity.peerId())) {
             throw new IllegalArgumentException("provider " + provider.capabilityType()
-                    + " described an advertisement for a different issuer: " + ad.issuer());
+                    + " described an advertisement for a different issuer: " + described.issuer());
         }
+        CapabilityAdvertisement ad = afterLastIssue(described);
         discovery.publish(signer.sign(ad, identity));
         published.put(ad.id(), fingerprint(ad));
+    }
+
+    /** The issue millisecond of each card id last published, so the next one is strictly later (§10.14). */
+    private final Map<String, Long> lastIssuedMillis = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The card with an issue instant at least a millisecond past the last one published under its id
+     * (srad/agentspaces-event-loop.md §10.14, the phase 2 wire adversary). A change-driven republish can follow the
+     * last publication within the same millisecond (two role changes, a change and the refresh). The cache keeps the
+     * version it holds on an equal issue instant, and the gossip item id is the card's id and issue millisecond, which
+     * every peer had already seen, so such a card reached nobody while its fingerprint was recorded as published: the
+     * change was lost until the next refresh. The 250 ms tick hid it for Raft, whose lease moved every tick.
+     */
+    private CapabilityAdvertisement afterLastIssue(CapabilityAdvertisement ad) {
+        long described = ad.issued().toEpochMilli();
+        long issued = lastIssuedMillis.merge(ad.id(), described, (last, now) -> Math.max(now, last + 1));
+        if (issued == described) {
+            return ad;
+        }
+        return new CapabilityAdvertisement(ad.id(), ad.issuer(), ad.group(), java.time.Instant.ofEpochMilli(issued),
+                ad.ttl(), ad.capabilityType(), ad.version(), ad.binding(), ad.parameters(), ad.costHints());
     }
 }

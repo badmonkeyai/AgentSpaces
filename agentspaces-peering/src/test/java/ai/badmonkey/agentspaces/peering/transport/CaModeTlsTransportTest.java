@@ -43,9 +43,8 @@ class CaModeTlsTransportTest {
     private final TestCa ca = TestCa.create();
 
     private static int freePort() throws Exception {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     private TlsTcpTransport caTransport(PeerIdentity identity, ChannelTrust trust)

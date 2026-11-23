@@ -137,7 +137,10 @@ class DtlsTransportTest {
     @Test
     @Timeout(30)
     void anUnreachablePeerFailsTheDialWithinTheDialTimeout() throws Exception {
-        DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate());
+        // A short dial timeout: the bound is the transport's setting, judged relative to it here; the 10 s default
+        // is pinned in aTransportDialsWithTheDefaultTimeoutUntilOneIsSet without waiting it out.
+        Duration timeout = Duration.ofSeconds(1);
+        DtlsTransport dialer = new DtlsTransport(PeerIdentity.generate()).dialTimeout(timeout);
         closeables.add(dialer);
         // A socket that holds the port and never answers: the host sends no port unreachable, so only the
         // handshake's timeout ends the dial, as for a peer behind a firewall that drops the datagrams.
@@ -147,8 +150,34 @@ class DtlsTransportTest {
         assertThatThrownBy(() -> dialer.dial("127.0.0.1:" + silent.getLocalPort()))
                 .isInstanceOf(IOException.class).hasMessageContaining("over DTLS")
                 .hasMessageNotContaining("port unreachable");
-        assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(15));
+        Duration took = Duration.ofNanos(System.nanoTime() - start);
+        System.out.println("a dtls dial to a silent port failed in " + took.toMillis() + " ms (dial timeout "
+                + timeout.toMillis() + " ms)");
+        // the dial runs to its timeout and not far past it (5 s of room for a loaded host)
+        assertThat(took).isGreaterThanOrEqualTo(timeout.minusMillis(50)).isLessThan(timeout.plusSeconds(5));
         assertThat(dialer.counters().handshakesFailed()).isEqualTo(1);
+    }
+
+    /** The dial timeout's default, and that it is fixed once the transport is used; nothing is waited out. */
+    @Test
+    void aTransportDialsWithTheDefaultTimeoutUntilOneIsSet() throws Exception {
+        DtlsTransport dtls = new DtlsTransport(PeerIdentity.generate());
+        closeables.add(dtls);
+        assertThat(DtlsTransport.DEFAULT_DIAL_TIMEOUT).isEqualTo(Duration.ofSeconds(10));
+        assertThat(dtls.dialTimeout()).isEqualTo(DtlsTransport.DEFAULT_DIAL_TIMEOUT);
+        assertThat(dtls.dialTimeout(Duration.ofMillis(1_500)).dialTimeout()).isEqualTo(Duration.ofMillis(1_500));
+        assertThatThrownBy(() -> dtls.dialTimeout(Duration.ZERO)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> dtls.dialTimeout(Duration.ofMinutes(11))).isInstanceOf(IllegalArgumentException.class);
+        UdpTransport udp = new UdpTransport();
+        closeables.add(udp);
+        assertThat(udp.dialTimeout()).isEqualTo(DtlsTransport.DEFAULT_DIAL_TIMEOUT);
+        assertThat(DtlsOptions.defaults().idleTimeout()).isEqualTo(Duration.ofSeconds(60));
+        AutoCloseable listening = dtls.listen("127.0.0.1:0", c -> { });
+        closeables.add(listening);
+        assertThatThrownBy(() -> dtls.dialTimeout(Duration.ofSeconds(1))).isInstanceOf(IllegalStateException.class);
+        AutoCloseable udpListening = udp.listen("127.0.0.1:0", c -> { });
+        closeables.add(udpListening);
+        assertThatThrownBy(() -> udp.dialTimeout(Duration.ofSeconds(1))).isInstanceOf(IllegalStateException.class);
     }
 
     /**

@@ -153,6 +153,21 @@ public final class StoreLedger {
         return out;
     }
 
+    /**
+     * The earliest lease end of any holding, for the store's loop deadline (srad/agentspaces-event-loop.md EL-T-09).
+     *
+     * @return epoch milliseconds, or {@link Long#MAX_VALUE} with no holding
+     */
+    public synchronized long earliestUntilMillis() {
+        long earliest = Long.MAX_VALUE;
+        for (Map<?, Held> m : byRoot.values()) {
+            for (Held h : m.values()) {
+                earliest = Math.min(earliest, h.until());
+            }
+        }
+        return earliest;
+    }
+
     /** The holdings whose lease ended before an instant. */
     public synchronized List<Held> lapsed(long cutoffMillis) {
         return holdingsUnlocked().stream().filter(h -> h.until() < cutoffMillis).toList();

@@ -127,8 +127,12 @@ public final class ReduceBinding implements AutoCloseable {
     private final List<Thread> threads = new ArrayList<>();
     private volatile boolean running = true;
     private volatile boolean started;
+    /** The subscription renewer, a task on the binder's time source (EL-W-02); null before start. */
+    private volatile AutoCloseable keeper;
     /** The drain thread, which {@link #close} does not interrupt while it folds. */
     private volatile Thread drainThread;
+    /** Whether the drain has stopped; guarded by {@link #lock}. */
+    private boolean drainEnded;
     /** Whether the drain is inside a fold whose element it already won; guarded by {@link #lock}. */
     private boolean folding;
 
@@ -169,7 +173,7 @@ public final class ReduceBinding implements AutoCloseable {
         drainThread = Thread.ofVirtual().name("space-reduce-" + config.name()).unstarted(this::drain);
         threads.add(drainThread);
         drainThread.start();
-        threads.add(Thread.ofVirtual().name("space-reduce-keep-" + config.name()).start(this::keep));
+        keeper = keep();
         LOG.log(System.Logger.Level.INFO, config.name() + ": " + config.mode() + " reduce of "
                 + config.elementType().getSimpleName() + " into " + config.accumulatorType().getSimpleName()
                 + " on '" + config.space().name() + "', keyed by "
@@ -201,22 +205,33 @@ public final class ReduceBinding implements AutoCloseable {
             }
             lock.notifyAll();
         }
-        subscriptions.forEach(Subscription::close);
-        long ceiling = System.nanoTime() + config.takeLease().duration().plus(config.pollTimeout())
-                .plus(CLOSE_MARGIN).toNanos();
-        for (Thread thread : threads) {
-            if (thread == Thread.currentThread()) {
-                continue;
-            }
-            long left = ceiling - System.nanoTime();
+        AutoCloseable k = keeper;
+        if (k != null) {
             try {
-                if (left <= 0 || !thread.join(Duration.ofNanos(left))) {
-                    LOG.log(System.Logger.Level.WARNING, config.name() + ": " + thread.getName()
-                            + " still running when close gave up waiting");
+                k.close();
+            } catch (Exception e) {
+                LOG.log(System.Logger.Level.DEBUG, config.name() + ": closing the renewer failed", e);
+            }
+        }
+        subscriptions.forEach(Subscription::close);
+        // Wait for the drain to stop on the binder's time source (EL-W-01): the take it interrupts finishes its settle
+        // or the log's attempt window on that source, so a virtual one releases both on one advance.
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
+        long ceiling = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits,
+                config.takeLease().duration().plus(config.pollTimeout()).plus(CLOSE_MARGIN));
+        if (drainThread != null && drainThread != Thread.currentThread()) {
+            synchronized (lock) {
+                try {
+                    while (!drainEnded) {
+                        if (!waits.waitOn(lock, ceiling) && !drainEnded) {
+                            LOG.log(System.Logger.Level.WARNING, config.name() + ": " + drainThread.getName()
+                                    + " still running when close gave up waiting");
+                            break;
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt(); // the closer was interrupted: stop waiting, keep the status
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt(); // the closer was interrupted: stop waiting, keep the status
-                break;
             }
         }
         tickets.close(); // after the drain: an ORDERED drain reads the committed claims until it stops
@@ -333,12 +348,26 @@ public final class ReduceBinding implements AutoCloseable {
     // ------------------------------------------------------------------ the drain
 
     private void drain() {
+        try {
+            drainLoop();
+        } finally {
+            synchronized (lock) {
+                drainEnded = true;
+                lock.notifyAll(); // a close waiting for the drain to stop
+            }
+        }
+    }
+
+    private void drainLoop() {
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(clock);
         while (running) {
             String key;
             synchronized (lock) {
                 while (running && pending.isEmpty()) {
                     try {
-                        lock.wait(config.pollTimeout().toMillis());
+                        // idle: wait for an element's event, and sweep once per poll timeout for one it missed
+                        waits.waitOn(lock, ai.badmonkey.agentspaces.common.time.Waits.deadline(waits,
+                                config.pollTimeout()));
                     } catch (InterruptedException e) {
                         return;
                     }
@@ -591,27 +620,28 @@ public final class ReduceBinding implements AutoCloseable {
 
     // ------------------------------------------------------------------ housekeeping
 
-    private void keep() {
-        long halfLease = Math.max(1L, config.subscriptionLease().duration().toMillis() / 2);
-        while (running) {
-            try {
-                Thread.sleep(halfLease);
-            } catch (InterruptedException e) {
-                return;
-            }
-            if (!running) {
-                return;
-            }
-            for (Subscription subscription : subscriptions) {
-                try {
-                    subscription.renew(config.subscriptionLease().duration());
-                } catch (RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, config.name()
-                            + ": subscription renewal failed; the reduce stops reacting", e);
-                    return;
-                }
-            }
-        }
+    /**
+     * Renews the subscriptions at half their lease: a task on the binder's time source (srad/agentspaces-event-loop.md
+     * EL-W-02), so the renewal's cadence and the lease it renews are judged on one source; close cancels it.
+     */
+    private AutoCloseable keep() {
+        Duration half = config.subscriptionLease().duration().dividedBy(2);
+        return ai.badmonkey.agentspaces.common.time.Periodic.every(ai.badmonkey.agentspaces.common.time.Waits.base(clock),
+                half, "space-reduce-keep-" + config.name(), () -> {
+                    if (!running) {
+                        return false;
+                    }
+                    for (Subscription subscription : subscriptions) {
+                        try {
+                            subscription.renew(config.subscriptionLease().duration());
+                        } catch (RuntimeException e) {
+                            LOG.log(System.Logger.Level.WARNING, config.name()
+                                    + ": subscription renewal failed; the reduce stops reacting", e);
+                            return false;
+                        }
+                    }
+                    return running;
+                });
     }
 
     /** The pending keys, for tests. */

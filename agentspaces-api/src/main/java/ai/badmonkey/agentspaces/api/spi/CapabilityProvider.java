@@ -83,7 +83,11 @@ public interface CapabilityProvider {
      * without special-casing type URIs.
      *
      * @return {@code true} when this provider needs a clock
+     * @deprecated a provider that keeps deadlines implements {@link DueCapabilityProvider} and reports its next due
+     *     time (srad/agentspaces-event-loop.md decision 6, EL-T-05); a provider that overrides this or {@link #tick()}
+     *     keeps the legacy 250 ms cadence
      */
+    @Deprecated(since = "0.7.0")
     default boolean requiresTick() {
         return false;
     }
@@ -97,7 +101,10 @@ public interface CapabilityProvider {
      * was told matches the one it is driven at (QA3 A3-4).
      *
      * @param period the wall-clock period between {@link #tick()} calls
+     * @deprecated a {@link DueCapabilityProvider} keeps its rules in time (srad/agentspaces-event-loop.md decision 6);
+     *     the cadence is still given to legacy providers, and supplies the base of deprecated tick counts
      */
+    @Deprecated(since = "0.7.0")
     default void driverCadence(Duration period) {
     }
 

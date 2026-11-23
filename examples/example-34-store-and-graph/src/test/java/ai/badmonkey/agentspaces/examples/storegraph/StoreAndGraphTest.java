@@ -43,13 +43,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class StoreAndGraphTest {
 
-    static final IntSupplier FREE_TCP = () -> {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        } catch (IOException e) {
-            throw new java.io.UncheckedIOException(e);
-        }
-    };
+    // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+    static final IntSupplier FREE_TCP = ai.badmonkey.agentspaces.test.Ports::free;
 
     @Test
     @Timeout(600)

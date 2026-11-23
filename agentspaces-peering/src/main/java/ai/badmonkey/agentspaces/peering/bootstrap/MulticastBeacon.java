@@ -22,8 +22,10 @@ import java.net.InetSocketAddress;
 import java.net.MulticastSocket;
 import java.net.NetworkInterface;
 import java.net.SocketException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -49,6 +51,16 @@ import java.util.function.Supplier;
  * <p>The beacon is written against the small {@link Datagrams} carrier so the
  * discovery-to-admission path is testable in memory; {@link #multicast} is the
  * real UDP multicast carrier.
+ *
+ * <p>How often it announces (srad/agentspaces-event-loop.md EL-O-11): the
+ * retry intervals are a fixed sequence, {@link #RETRY_INTERVALS}, read by one
+ * position per beacon. Each retry reads the interval at its position and
+ * advances it; after the last it wraps back to the first. A success (the
+ * node heard a sender it had no live entry for) resets the position to 0.
+ * The beacon takes no part in the node loop's stretch. What the node learns
+ * from datagrams is held for {@link #learnedHold()}, about 1.5 times the
+ * longest interval, so a peer whose beacon has backed off never lets it
+ * lapse.
  */
 public final class MulticastBeacon implements AutoCloseable {
 
@@ -89,8 +101,26 @@ public final class MulticastBeacon implements AutoCloseable {
         void close();
     }
 
+    /**
+     * The retry intervals at their defaults, by position (EL-O-11, the owner's rule of 2026-11-22): 1 min, 2 min,
+     * 10 min, 20 min, then back to 1 min. A configured first interval replaces the first and scales the rest in
+     * proportion (2, 10 and 20 times it).
+     */
+    public static final List<Duration> RETRY_INTERVALS = List.of(Duration.ofMinutes(1), Duration.ofMinutes(2),
+            Duration.ofMinutes(10), Duration.ofMinutes(20));
+
+    /** The default first retry interval: position 0 of {@link #RETRY_INTERVALS}. */
+    public static final Duration FIRST_RETRY = RETRY_INTERVALS.get(0);
+
+    /** The TTL rule's factor (principle 8): a learned hint outlives the longest retry interval by about 1.5 times. */
+    private static final double LEARNED_HOLD_FACTOR = 1.5;
+
     private final Datagrams carrier;
     private final Supplier<List<byte[]>> announcements;
+    /** The configured first retry interval; the later positions keep the table's ratios to it. */
+    private final Duration firstRetry;
+    /** The one position per beacon (EL-O-11): 0 to 3, read and advanced by each retry, reset to 0 by a success. */
+    private final AtomicInteger position = new AtomicInteger();
 
     /**
      * Creates a beacon.
@@ -103,6 +133,25 @@ public final class MulticastBeacon implements AutoCloseable {
      */
     public MulticastBeacon(Datagrams carrier, Supplier<List<byte[]>> announcements,
                            Consumer<byte[]> inbound) {
+        this(carrier, announcements, inbound, FIRST_RETRY);
+    }
+
+    /**
+     * Creates a beacon whose first retry interval is {@code firstRetry} (EL-O-11): the later positions are 2, 10 and
+     * 20 times it, as in {@link #RETRY_INTERVALS}.
+     *
+     * @param carrier       the datagram carrier
+     * @param announcements supplies the datagrams to send each round
+     * @param inbound       receives inbound datagrams
+     * @param firstRetry    the interval at position 0, positive
+     */
+    public MulticastBeacon(Datagrams carrier, Supplier<List<byte[]>> announcements,
+                           Consumer<byte[]> inbound, Duration firstRetry) {
+        Objects.requireNonNull(firstRetry, "firstRetry");
+        if (firstRetry.isZero() || firstRetry.isNegative()) {
+            throw new IllegalArgumentException("the first retry interval must be positive: " + firstRetry);
+        }
+        this.firstRetry = firstRetry;
         this.carrier = Objects.requireNonNull(carrier, "carrier");
         this.announcements = Objects.requireNonNull(announcements, "announcements");
         Objects.requireNonNull(inbound, "inbound");
@@ -129,6 +178,55 @@ public final class MulticastBeacon implements AutoCloseable {
                 // Best effort: multicast is a hint, not a channel.
             }
         }
+    }
+
+    /**
+     * The retry interval at a position (EL-O-11): the table's entry, scaled to this beacon's first interval.
+     *
+     * @param position 0 to {@code RETRY_INTERVALS.size() - 1}
+     * @return the interval
+     */
+    public Duration retryInterval(int position) {
+        long factor = RETRY_INTERVALS.get(position).dividedBy(FIRST_RETRY); // 1, 2, 10, 20
+        return firstRetry.multipliedBy(factor);
+    }
+
+    /**
+     * Takes one retry (EL-O-11): reads the interval at the position and advances it, wrapping after the last.
+     *
+     * @return the interval until the next retry
+     */
+    public Duration nextRetry() {
+        int read = position.getAndUpdate(p -> (p + 1) % RETRY_INTERVALS.size());
+        return retryInterval(read);
+    }
+
+    /**
+     * A success (EL-O-11): the position goes back to 0. The retry already armed keeps its time; it reads position 0,
+     * so the wait after it is the first interval again.
+     */
+    public void succeeded() {
+        position.set(0);
+    }
+
+    /**
+     * The position the next retry reads, 0 to 3.
+     *
+     * @return the position
+     */
+    public int position() {
+        return position.get();
+    }
+
+    /**
+     * How long a hint learned from a datagram is held (EL-O-11, the TTL rule): about 1.5 times the longest retry
+     * interval, so it outlives whatever interval the sender's beacon is at (30 min at the defaults).
+     *
+     * @return the hold
+     */
+    public Duration learnedHold() {
+        Duration longest = retryInterval(RETRY_INTERVALS.size() - 1);
+        return Duration.ofMillis((long) (longest.toMillis() * LEARNED_HOLD_FACTOR));
     }
 
     @Override

@@ -191,15 +191,15 @@ final class WebRtcSession implements DataChannelEngine.Events {
     }
 
     void onEnd(int code) {
-        counters.failed(opened.isDone() ? "closed" : code == RtcSignal.END_REFUSED ? "refused"
-                : code == RtcSignal.END_TIMEOUT ? "timeout" : "failed");
-        finish(code, "remote END(" + code + ")", false);
+        finish(code, "remote END(" + code + ")", false, opened.isDone() ? "closed" : code == RtcSignal.END_REFUSED
+                ? "refused" : code == RtcSignal.END_TIMEOUT ? "timeout" : "failed");
     }
 
     /** The dial timeout passed without a channel: {@code END(2)} to the remote (JS-W-09). */
     void expire() {
-        counters.failed("timeout");
-        finish(RtcSignal.END_TIMEOUT, "no channel within " + options.dialTimeout(), true);
+        // Counted only by the caller that ends the session: the dial's own timeout and the sweep can both reach
+        // an expired session at the same instant (the sweep is armed one second after the dial starts).
+        finish(RtcSignal.END_TIMEOUT, "no channel within " + options.dialTimeout(), true, "timeout");
     }
 
     /** Ends from this side with a code, telling the remote. */
@@ -278,18 +278,12 @@ final class WebRtcSession implements DataChannelEngine.Events {
 
     @Override
     public void closed(String reason) {
-        if (!isEnded()) {
-            counters.failed(opened.isDone() ? "closed" : "failed");
-        }
-        finish(RtcSignal.END_FAILED, reason, false);
+        finish(RtcSignal.END_FAILED, reason, false, opened.isDone() ? "closed" : "failed");
     }
 
     @Override
     public void failed(String reason) {
-        if (!isEnded()) {
-            counters.failed("failed");
-        }
-        finish(RtcSignal.END_FAILED, reason, !opened.isDone());
+        finish(RtcSignal.END_FAILED, reason, !opened.isDone(), "failed");
     }
 
     /**
@@ -298,6 +292,15 @@ final class WebRtcSession implements DataChannelEngine.Events {
      * forgets the session.
      */
     private void finish(int code, String reason, boolean signal) {
+        finish(code, reason, signal, null);
+    }
+
+    /**
+     * {@link #finish(int, String, boolean)}, counting {@code failure} (when not null) only when this call is the one
+     * that ends the session, and before the waiting dial is failed, so a session ended from two threads at once is
+     * counted once.
+     */
+    private void finish(int code, String reason, boolean signal, String failure) {
         DataChannelEngine.Session toClose;
         synchronized (lock) {
             if (ended) {
@@ -305,6 +308,9 @@ final class WebRtcSession implements DataChannelEngine.Events {
             }
             ended = true;
             toClose = engine;
+        }
+        if (failure != null) {
+            counters.failed(failure);
         }
         LOG.log(System.Logger.Level.DEBUG, "webrtc session " + key.substring(0, 8) + " with " + remote.display()
                 + " ended: " + reason + " (END " + code + ")");

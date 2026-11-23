@@ -16,6 +16,7 @@
 
 package ai.badmonkey.agentspaces.transport.webrtc;
 
+import ai.badmonkey.agentspaces.common.time.SerialExecutor;
 import tel.schich.libdatachannel.DataChannel;
 import tel.schich.libdatachannel.DataChannelCallback;
 import tel.schich.libdatachannel.DataChannelInitSettings;
@@ -39,8 +40,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -139,7 +138,7 @@ final class LibDataChannelEngine implements DataChannelEngine {
         private final Events events;
         private final PeerConnection peer;
         private final DataChannel channel;
-        private final ExecutorService callbacks;
+        private final SerialExecutor callbacks;
         private final AtomicBoolean closed = new AtomicBoolean();
         private final AtomicBoolean opened = new AtomicBoolean();
         /** Local candidates gathered, {@code ip:port} to type, to name the selected one after open. */
@@ -151,10 +150,12 @@ final class LibDataChannelEngine implements DataChannelEngine {
             // and the binary-message ByteBuffer is a view over native memory valid only during that
             // synchronous callback. So the engine's executor is inline (Runnable::run, the library's
             // own thread): the message bytes are copied there and then, before the native frees them.
-            // Everything past the copy runs on `worker`, one ordered thread per session, so the
-            // binding's signalling, reassembly, and native getters never run on the callback thread
+            // Everything past the copy runs on the session's serial executor, one ordered process per
+            // session drained on a virtual thread (srad/agentspaces-event-loop.md §3.5, EL-X-06), so
+            // the binding's signalling, reassembly, and native getters never run on the callback thread
             // (which could deadlock the library) and the channel's frames stay in order.
-            this.callbacks = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("webrtc-session-", 0).factory());
+            Thread.Builder drains = Thread.ofVirtual().name("webrtc-session-", 0);
+            this.callbacks = new SerialExecutor("webrtc-session", drains::start);
             PeerConnectionConfiguration config = PeerConnectionConfiguration.DEFAULT
                     .withDisableAutoNegotiation(true)
                     .withCertificateType(PeerConnectionConfiguration.CertificateType.RTC_CERTIFICATE_ECDSA)
@@ -215,11 +216,7 @@ final class LibDataChannelEngine implements DataChannelEngine {
             if (closed.get()) {
                 return;
             }
-            try {
-                callbacks.execute(action);
-            } catch (java.util.concurrent.RejectedExecutionException e) {
-                // the session closed between the check and the submit; the event is moot
-            }
+            callbacks.execute(action); // after close nothing more is deferred; what is queued runs, as before
         }
 
         private void rememberCandidate(String candidate) {
@@ -314,7 +311,6 @@ final class LibDataChannelEngine implements DataChannelEngine {
             } catch (RuntimeException e) {
                 LOG.log(System.Logger.Level.DEBUG, "closing a peer connection: " + e);
             }
-            callbacks.shutdown();
         }
 
         private interface Native {

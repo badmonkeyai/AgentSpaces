@@ -195,6 +195,45 @@ class WebRtcTransportTest {
     }
 
     @Test
+    void aSessionEndedFromTwoPathsAtOnceIsCountedOnce() throws Exception {
+        // The sweep is a one-shot armed a second after a dial starts (srad/agentspaces-event-loop.md EL-T-13), so
+        // with a 1 s dial timeout the dial's own timeout and the sweep reach the same session together, and the
+        // remote's END(2) can arrive for it too. Each used to count a failure: WebRtcFallbackTest read
+        // {timeout=2}. Only the path that ends the session counts.
+        engine.neverOpen = true;
+        Side alice = side(WebRtcOptions.defaults().withDialTimeout(Duration.ofSeconds(30)), false);
+        Side bob = side(WebRtcOptions.defaults().withDialTimeout(Duration.ofSeconds(30)), true);
+        fabric.dropAll = true; // Bob never answers or refuses: only the calls below end Alice's sessions
+        WebRtcSession session = alice.transport().signalling().dial(bob.id());
+        session.expire();
+        session.expire();
+        session.onEnd(RtcSignal.END_TIMEOUT);
+        session.failed("late engine failure");
+        session.closed("late engine close");
+        assertThat(alice.transport().counters().failed()).containsExactly(java.util.Map.entry("timeout", 1L));
+
+        // And from two threads at the same instant, many times over.
+        for (int i = 0; i < 50; i++) {
+            WebRtcSession racing = alice.transport().signalling().dial(bob.id());
+            java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+            Thread a = Thread.ofVirtual().start(() -> { awaitLatch(go); racing.expire(); });
+            Thread b = Thread.ofVirtual().start(() -> { awaitLatch(go); racing.expire(); });
+            go.countDown();
+            a.join();
+            b.join();
+        }
+        assertThat(alice.transport().counters().failed()).containsExactly(java.util.Map.entry("timeout", 51L));
+    }
+
+    private static void awaitLatch(java.util.concurrent.CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    @Test
     void aTimedOutDialWhoseEndSignalRoutesBackIntoTheBindingDoesNotNestAnotherDial() throws Exception {
         // The node sends a signal to a member it has no connection to by dialing that member's
         // endpoints, the webrtc one first (WebRtcFleetTest found this: a timed-out dial's END
@@ -290,7 +329,9 @@ class WebRtcTransportTest {
     void anOfferFromANonMemberIsIgnoredAndOneWithoutAnAcceptorIsRefused() throws Exception {
         Side alice = side(WebRtcOptions.defaults(), true);
         Side bob = side(WebRtcOptions.defaults(), false);
-        Side stranger = side(WebRtcOptions.defaults(), false);
+        // The stranger's offer is dropped, so its dial ends at its own dial timeout: a short one, since the default
+        // (15 s) is pinned in WebRtcFallbackTest and waiting it out here proved nothing more.
+        Side stranger = side(WebRtcOptions.defaults().withDialTimeout(Duration.ofSeconds(1)), false);
         alice.transport().signalling().members(peer -> !peer.equals(stranger.id()));
         assertThatThrownBy(() -> stranger.transport().dial(WebRtcTransport.SIG, alice.id())).isInstanceOf(IOException.class);
         assertThat(alice.transport().counters().signalsDropped()).containsEntry("non-member", 1L);

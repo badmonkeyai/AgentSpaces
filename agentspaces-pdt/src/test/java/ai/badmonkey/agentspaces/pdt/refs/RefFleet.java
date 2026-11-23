@@ -42,8 +42,10 @@ import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
+import ai.badmonkey.agentspaces.test.OutsideWaitDriver;
 import ai.badmonkey.agentspaces.test.SimNetwork;
-import ai.badmonkey.agentspaces.test.TestClock;
+import ai.badmonkey.agentspaces.test.VirtualThreadsIdle;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -63,7 +65,10 @@ import java.util.function.Consumer;
  * {@code runUntil} helper of {@code PdtSwarmTest}, with a second replicated
  * space per peer for the refs and a {@link Pdt} facade built before the content
  * swarm (so the swarm takes {@code pdt.treeStore()}) and attached after. Frames
- * travel inline, ticks run on the test thread, and leases run on the test clock.
+ * travel inline. Every node runs its own loop on one {@link VirtualTime} (srad/agentspaces-event-loop.md EL-Q-TST-03):
+ * a tick moves the time one period, each node runs what falls due in it as a task of that time, and the tick then
+ * waits for the work that is no task of it (the swarm's frame handlers) to settle, so no tick sleeps and no wait
+ * outruns a fetch.
  * Every node runs in {@code ChannelAuth.SESSION} (SESSION test fleets, ROBUSTNESS.md §10.10; ShareTest's
  * bridge test joined them, ROBUSTNESS.md §10.11).
  */
@@ -73,7 +78,7 @@ class RefFleet {
     static final Duration DEADLINE = Duration.ofSeconds(30);
     static final String REF_SPACE = "refs";
 
-    final TestClock clock = TestClock.create();
+    final VirtualTime clock = VirtualTime.create();
     // the fabric's delays and spoiler holds run on the fleet clock (srad/spoiler-peers.md SP-N-02)
     final SimNetwork network = new SimNetwork().clock(clock);
     /** Work run after each {@link #tickAll} on the test thread, such as a spoiler script's time triggers. */
@@ -88,8 +93,26 @@ class RefFleet {
             GroupAdvertisement.GossipParameters.defaults());
     final Map<PeerId, CapabilityAdvertisement> ads = new ConcurrentHashMap<>();
     final Set<String> dead = new HashSet<>();
-    final Map<String, java.util.concurrent.atomic.AtomicLong> nodeTickNanos = new ConcurrentHashMap<>();
     final java.util.concurrent.atomic.AtomicLong ticks = new java.util.concurrent.atomic.AtomicLong();
+    /** The fleet time past which a {@link #call} fails; no call open, none. */
+    private volatile long callLimitNanos = Long.MAX_VALUE;
+
+    /** Moves the fleet's time while the test's thread waits on it in a blocking call (a linear swap, a loading read). */
+    private final OutsideWaitDriver driver = OutsideWaitDriver.forCurrentThread(clock, () -> {
+        settleHandlers();
+        if (ownerWaiting()) {
+            if (clock.monoNanos() >= callLimitNanos) {
+                throw new AssertionError("a call waited past its limit of fleet time");
+            }
+            clock.advance(CALL_STEP);
+            network.pump();
+        }
+    });
+
+    private boolean ownerWaiting() {
+        return driver.ownerWaiting();
+    }
+
     record Peer(String name, PeerIdentity identity, PeerNode node, GroupRuntime runtime, ReplicatedSpace contentSpace,
                 ReplicatedSpace refSpace, Content content, NodeStore store, Pdt pdt, java.util.concurrent.atomic.AtomicLong pdtTickNanos,
                 java.util.concurrent.atomic.AtomicLong contentTickNanos) {
@@ -126,6 +149,7 @@ class RefFleet {
     }
 
     void close() {
+        driver.close();
         peers.forEach(p -> {
             if (!dead.contains(p.name())) {
                 p.pdt().close();
@@ -159,6 +183,7 @@ class RefFleet {
         // nobody, so no frame travels bare (RefFleetSessionTest)
         PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).channelAuth(PeerNode.ChannelAuth.SESSION)
                 .audit(audit).build();
+        node.startTicking(Duration.ofMillis(PERIOD_MILLIS)); // its own loop on the fleet's virtual time
         node.listen(network.register(address), address);
         List<PeerAdvertisement.Endpoint> seeds = new ArrayList<>();
         for (String s : seedAddresses) {
@@ -209,20 +234,61 @@ class RefFleet {
         peer.node().close();
     }
 
+    /**
+     * One period of fleet time: every live node's loop runs what falls due in it (the onTick work of the swarm and the
+     * facade once per period), then the frames a link delayed are delivered, then the work outside the time's tasks
+     * settles (the swarm handles each frame on its own virtual thread).
+     */
     void tickAll() {
-        for (Peer p : peers) {
-            if (!dead.contains(p.name())) {
-                long t = System.nanoTime();
-                p.node().tick();
-                nodeTickNanos.computeIfAbsent(p.name(), k -> new java.util.concurrent.atomic.AtomicLong()).addAndGet(System.nanoTime() - t);
-            }
-        }
+        driver.rethrow();
         ticks.incrementAndGet();
         clock.advance(Duration.ofMillis(PERIOD_MILLIS));
         network.pump(); // frames a link delays are due on the fleet clock, never on the wall
+        settleHandlers();
         for (Runnable r : afterTick) {
             r.run();
         }
+    }
+
+    /** The real-time bound of one settle: a handler that runs past it is left running, never failed here. */
+    static final Duration SETTLE_BOUND = Duration.ofSeconds(2);
+
+    /** Waits for the virtual threads outside the fleet time's tasks (frame handlers, fetch waiters) to settle. */
+    void settleHandlers() {
+        VirtualThreadsIdle.await(SETTLE_BOUND);
+    }
+
+    /** The step of the time the driver moves while the test's thread waits in a blocking call. */
+    static final Duration CALL_STEP = Duration.ofMillis(10);
+
+    /**
+     * Runs a call that may wait on the fleet's time (a read that waits for a load, which ends at the load timeout) on
+     * the test's thread, as the test called it before, and returns its value with the fleet time it took: while it
+     * waits, the driver moves the time in {@link #CALL_STEP} steps and every node's loop runs what falls due on the way.
+     *
+     * @param limit the most fleet time the call may take before it is interrupted and fails
+     * @param call  the call
+     * @param <T>   its value
+     * @return its value and the fleet time it took
+     */
+    <T> VirtualTime.Outcome<T> call(Duration limit, java.util.concurrent.Callable<T> call) {
+        driver.rethrow();
+        long started = clock.monoNanos();
+        callLimitNanos = started + limit.toNanos();
+        try {
+            T value = call.call();
+            return new VirtualTime.Outcome<>(value, Duration.ofNanos(clock.monoNanos() - started));
+        } catch (Exception e) {
+            driver.rethrow();
+            throw new AssertionError("the call threw", e);
+        } finally {
+            callLimitNanos = Long.MAX_VALUE;
+        }
+    }
+
+    /** A node's loop time in this fleet: the work its runs did ({@code LoopStats.busyNanos}). */
+    static long loopBusyNanos(Peer peer) {
+        return peer.node().loopStats().busyNanos();
     }
 
     /** One fleet tick's span of fleet clock: the gossip period a spoiler's ceilings count in. */
@@ -282,6 +348,10 @@ class RefFleet {
         }
     }
 
+    /**
+     * Ticks until the condition holds. Each tick settles before the next, so nothing sleeps; {@code max} stays the
+     * real-time ceiling of a condition that never comes.
+     */
     boolean runUntil(Duration max, BooleanSupplier until) throws InterruptedException {
         long deadline = System.nanoTime() + max.toNanos();
         while (!until.getAsBoolean()) {
@@ -289,26 +359,17 @@ class RefFleet {
                 return false;
             }
             tickAll();
-            Thread.sleep(2);
         }
         return true;
     }
 
     /**
-     * {@link #runUntil(Duration, BooleanSupplier)} as a measured wait (srad/feature-measurements.md §3.5): the clock is
-     * fake while fetches run on their own threads, so it keeps the wall ceiling and records the ticks, the fake
-     * milliseconds and the tick rate beside it. The tick ceiling is left open (FM-H-14).
+     * {@link #runUntil(Duration, BooleanSupplier)} as a measured wait (srad/feature-measurements.md §3.5): it keeps the
+     * wall ceiling and records the ticks, the fleet milliseconds and the tick rate beside it. The tick ceiling is left
+     * open (FM-H-14).
      */
     boolean runUntil(String metric, Duration max, BooleanSupplier until) {
-        SimWait.mixed(metric, Integer.MAX_VALUE, max, () -> {
-            tickAll();
-            try {
-                Thread.sleep(2);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("interrupted while ticking the fleet", e);
-            }
-        }, clock::millis, until, Wait.with());
+        SimWait.mixed(metric, Integer.MAX_VALUE, max, this::tickAll, clock::millis, until, Wait.with());
         return true;
     }
 
@@ -323,7 +384,6 @@ class RefFleet {
                 return false;
             }
             tickAll();
-            Thread.sleep(2);
         }
         return true;
     }

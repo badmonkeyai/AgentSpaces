@@ -50,7 +50,9 @@ import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
 import ai.badmonkey.agentspaces.peering.node.PeerNode;
 import ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace;
 import ai.badmonkey.agentspaces.test.SimNetwork;
-import ai.badmonkey.agentspaces.test.TestClock;
+import ai.badmonkey.agentspaces.test.OutsideWaitDriver;
+import ai.badmonkey.agentspaces.test.VirtualThreadsIdle;
+import ai.badmonkey.agentspaces.test.VirtualTime;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -68,23 +70,32 @@ import java.util.function.UnaryOperator;
 /**
  * The sim fleet of the store tests (PDT 2 phase 3): peers on a {@link SimNetwork} with a content space, a ref
  * space, discovery, a {@link Pdt} facade built before its swarm, and, for a store, a {@link ContentStore} over
- * them, ticked with the group. Frames travel inline, ticks run on the test thread, and leases run on the test
- * clock; the stores' take loops run on their own threads, as in a host.
+ * them, ticked with the group. Frames travel inline. Every node runs its own loop on one {@link VirtualTime}
+ * (srad/agentspaces-event-loop.md EL-Q-TST-03): a tick moves the time one period, each node runs what falls due in
+ * it, and the tick then waits for the work that is no task of that time (the stores' take loops, which run on their
+ * own threads as in a host and pause between scans on the same time, and the swarm's frame handlers) to settle. No
+ * tick sleeps; a blocking call from the test's thread has the time moved for it ({@link OutsideWaitDriver}).
  */
 final class StoreFleet implements AutoCloseable {
 
     static final Codec<String> STR = Codec.of(String.class);
     static final Duration HOLDING = Duration.ofSeconds(2);
     /*
-     * The product default. Each tick moves the test clock 250 ms while the stores' fetches run on their own
-     * threads, so on a loaded machine the clock outruns them: a 60 s timeout was 240 ticks, under a second of
-     * real time, and a starved fetch was abandoned though nothing was wrong (the winner of a pin race then
-     * held its take with nothing fetched). Ten minutes still abandons a truly stuck fetch inside a test's
-     * real-time wait; tests that probe the timeout set their own (PinProgressTest).
+     * Ten minutes, not the product's minute: on the hand-moved clock the fleet once ran on, the clock outran the
+     * stores' fetches on a loaded machine and a starved fetch was abandoned though nothing was wrong. The fleet's
+     * ticks now settle the fetches before the next, and the value is kept so each scenario stays as it was; tests
+     * that probe the timeout set their own (PinProgressTest).
      */
     static final Duration FETCH_TIMEOUT = Duration.ofMinutes(10);
 
-    final TestClock clock = TestClock.create();
+    /** One tick of fleet time. */
+    static final Duration PERIOD = Duration.ofMillis(250);
+    /** The step of the time the driver moves while the test's thread waits in a blocking call. */
+    static final Duration WAIT_STEP = Duration.ofMillis(10);
+    /** The real-time bound of one settle: work that runs past it is left running, never failed here. */
+    static final Duration SETTLE_BOUND = Duration.ofSeconds(2);
+
+    final VirtualTime clock = VirtualTime.create();
     final SimNetwork network = new SimNetwork();
     final CborCodec codec = CborCodec.defaultCodec();
     final GroupId groupId = GroupId.of("zStores");
@@ -96,6 +107,17 @@ final class StoreFleet implements AutoCloseable {
     final Map<PeerId, CapabilityAdvertisement> ads = new ConcurrentHashMap<>();
     final List<Peer> peers = new ArrayList<>();
     final Set<String> dead = new HashSet<>();
+    /** Moves the fleet's time while the test's thread waits on it in a blocking call. */
+    private final OutsideWaitDriver driver = OutsideWaitDriver.forCurrentThread(clock, () -> {
+        VirtualThreadsIdle.await(SETTLE_BOUND);
+        if (ownerWaiting()) {
+            clock.advance(WAIT_STEP);
+        }
+    });
+
+    private boolean ownerWaiting() {
+        return driver.ownerWaiting();
+    }
 
     record Peer(String name, PeerIdentity identity, PeerNode node, GroupRuntime runtime, ReplicatedSpace contentSpace,
                 DiscoveryService discovery, Content content, NodeStore store, Pdt pdt, ContentStore contentStore) {
@@ -160,6 +182,7 @@ final class StoreFleet implements AutoCloseable {
     Peer newPeer(String address, long seed, Spec spec, String... seedAddresses) throws IOException {
         PeerIdentity identity = spec.identity() != null ? spec.identity() : PeerIdentity.generate();
         PeerNode node = PeerNode.builder(identity).clock(clock).randomSeed(seed).build();
+        node.startTicking(PERIOD); // its own loop on the fleet's virtual time
         node.listen(network.register(address), address);
         List<PeerAdvertisement.Endpoint> seeds = new ArrayList<>();
         for (String s : seedAddresses) {
@@ -223,13 +246,15 @@ final class StoreFleet implements AutoCloseable {
         return !dead.contains(peer.name() + "@" + System.identityHashCode(peer));
     }
 
+    /**
+     * One period of fleet time: every live node's loop runs what falls due in it (the swarm's, the facade's and the
+     * stores' onTick work once per period), then the work outside the time's tasks settles: the stores' scans, which
+     * the advance released, and the swarm's frame handlers.
+     */
     void tickAll() {
-        for (Peer p : List.copyOf(peers)) {
-            if (alive(p)) {
-                p.node().tick();
-            }
-        }
-        clock.advance(Duration.ofMillis(250));
+        driver.rethrow();
+        clock.advance(PERIOD);
+        VirtualThreadsIdle.await(SETTLE_BOUND);
     }
 
     void settle(int ticks) {
@@ -238,6 +263,10 @@ final class StoreFleet implements AutoCloseable {
         }
     }
 
+    /**
+     * Ticks until the condition holds. Each tick settles before the next, so nothing sleeps; {@code max} stays the
+     * real-time ceiling of a condition that never comes.
+     */
     boolean runUntil(Duration max, BooleanSupplier until) throws InterruptedException {
         long deadline = System.nanoTime() + max.toNanos();
         while (!until.getAsBoolean()) {
@@ -245,16 +274,14 @@ final class StoreFleet implements AutoCloseable {
                 return false;
             }
             tickAll();
-            Thread.sleep(3);
         }
         return true;
     }
 
     /**
-     * A measured wait on this fleet (srad/feature-measurements.md §3.5, FM-L-03): the clock is fake while the stores'
-     * take loops and fetches run on their own threads, so it keeps the wall ceiling the site had and records the
-     * ticks, the fake milliseconds and the tick rate beside the wall time (FM-H-14). The tick ceiling is left open, so
-     * it never binds earlier than the wall ceiling did; tightening it is a change of its own.
+     * A measured wait on this fleet (srad/feature-measurements.md §3.5, FM-L-03): it keeps the wall ceiling the site
+     * had and records the ticks, the fleet milliseconds and the tick rate beside the wall time (FM-H-14). The tick
+     * ceiling is left open, so it never binds earlier than the wall ceiling did; tightening it is a change of its own.
      *
      * @return true; a passed ceiling fails with the diagnostics
      */
@@ -263,21 +290,21 @@ final class StoreFleet implements AutoCloseable {
     }
 
     boolean runUntil(String metric, Duration max, BooleanSupplier until, java.util.function.Supplier<String> diagnostics) {
-        SimWait.mixed(metric, Integer.MAX_VALUE, max, () -> {
-            tickAll();
-            try {
-                Thread.sleep(3); // the stores' own threads run between ticks, as in runUntil below
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("interrupted while ticking the store fleet", e);
-            }
-        }, clock::millis, until, Wait.with().diagnostics(diagnostics));
+        SimWait.mixed(metric, Integer.MAX_VALUE, max, this::tickAll, clock::millis, until,
+                Wait.with().diagnostics(diagnostics));
         return true;
     }
 
-    /** Ticks the fleet for a stretch of real time, so the stores' take loops scan the pins many times. */
-    void runFor(Duration real) throws InterruptedException {
-        runUntil(real, () -> false);
+    /**
+     * Ticks the fleet for a stretch of fleet time, so the stores' take loops scan the pins many times: their scans pause
+     * on the fleet's time, about one scan a tick. On the hand-moved clock the stretch was real time, over which the
+     * scans ran on real pauses of the same length.
+     */
+    void runFor(Duration span) {
+        long end = clock.millis() + span.toMillis();
+        while (clock.millis() < end) {
+            tickAll();
+        }
     }
 
     /** A map value of {@code entries} keys on a peer's facade, swapped into a ref; its root is complete in the peer's store. */
@@ -316,6 +343,7 @@ final class StoreFleet implements AutoCloseable {
 
     @Override
     public void close() {
+        driver.close();
         for (Peer p : peers) {
             if (alive(p)) {
                 kill(p);

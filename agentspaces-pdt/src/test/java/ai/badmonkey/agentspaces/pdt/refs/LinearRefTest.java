@@ -115,7 +115,6 @@ class LinearRefTest {
                 maxHeads.accumulateAndGet(heads, Math::max);
                 assertThat(RefFleet.headEntries(p, NAME).size()).as("live head entries at " + p.name()).isLessThanOrEqualTo(1);
             }
-            Thread.sleep(1);
         }
         assertThat(failures).isEmpty();
         assertThat(maxHeads.get()).as("never two heads").isEqualTo(1);
@@ -150,19 +149,15 @@ class LinearRefTest {
         assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> RefFleet.headEntries(b, NAME).isEmpty())).isTrue();
         Ref<PMap<String, String>> onB = b.pdt().mapRef(NAME, RefFleet.STR, RefFleet.STR);
         List<Throwable> failures = new CopyOnWriteArrayList<>();
-        long started = System.nanoTime();
-        Thread writer = Thread.ofVirtual().start(() -> {
+        // the swap's takes wait on the fleet's time, so it runs as a task of it and its wait is fleet time (EL-Q-TST-03)
+        long waited = fleet.call(Duration.ofSeconds(30), () -> {
             try {
                 onB.swap(m -> m.assoc("second", "b"));
             } catch (Throwable t) {
                 failures.add(t);
             }
-        });
-        while (writer.isAlive()) {
-            fleet.tickAll();
-            Thread.sleep(1);
-        }
-        long waited = (System.nanoTime() - started) / 1_000_000;
+            return null;
+        }).took().toMillis();
         // the space hides a taken entry, so a handle that never saw the ref cannot tell a take from an empty ref: it takes
         // twice before it writes a first head (the residual race of PD-R-04, recorded in the SRAD)
         assertThat(failures).isEmpty();
@@ -230,20 +225,16 @@ class LinearRefTest {
         fleet.kill(a);
 
         List<Throwable> failures = new CopyOnWriteArrayList<>();
-        Thread writer = Thread.ofVirtual().start(() -> {
+        // b's take waits while the claim stands; the lease lapses on the fleet's time and the entry reappears. The swap
+        // runs as a task of that time, bounded in it (EL-Q-TST-03): the claim's 3 s lease, then the take's retries
+        fleet.call(Duration.ofSeconds(30), () -> {
             try {
                 onB.swap(m -> m.assoc("second", "b"));
             } catch (Throwable t) {
                 failures.add(t);
             }
+            return null;
         });
-        // b's take waits while the claim stands; the lease lapses on the test clock and the entry reappears
-        long started = System.nanoTime();
-        while (writer.isAlive()) {
-            fleet.tickAll();
-            Thread.sleep(1);
-            assertThat(System.nanoTime() - started).as("b's swap finished").isLessThan(Duration.ofSeconds(30).toNanos());
-        }
         assertThat(failures).isEmpty();
         PMap<String, String> v2 = onB.deref();
         assertThat(v2.get("first")).contains("a");

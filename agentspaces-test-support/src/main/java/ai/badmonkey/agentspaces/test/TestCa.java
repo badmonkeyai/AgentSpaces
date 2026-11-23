@@ -81,7 +81,7 @@ public final class TestCa {
             KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
             generator.initialize(new ECGenParameterSpec("secp256r1"));
             KeyPair keys = generator.generateKeyPair();
-            Instant now = Instant.now().minus(Duration.ofHours(1));
+            Instant now = ai.badmonkey.agentspaces.common.time.TimeSource.system().instant().minus(Duration.ofHours(1));
             X509v3CertificateBuilder builder = new X509v3CertificateBuilder(
                     caName, BigInteger.valueOf(1),
                     Date.from(now), Date.from(now.plus(Duration.ofDays(30))),
@@ -125,7 +125,7 @@ public final class TestCa {
      * @return the issued credential
      */
     public Issued issue(byte[] identityKeyRaw) {
-        Instant now = Instant.now().minus(Duration.ofHours(1));
+        Instant now = ai.badmonkey.agentspaces.common.time.TimeSource.system().instant().minus(Duration.ofHours(1));
         return issue(identityKeyRaw, now, now.plus(Duration.ofDays(7)));
     }
 
@@ -169,7 +169,7 @@ public final class TestCa {
      * @return the CRL
      */
     public X509CRL crl(X509Certificate... revokedLeaves) {
-        Instant now = Instant.now();
+        Instant now = ai.badmonkey.agentspaces.common.time.TimeSource.system().instant();
         return crl(now, now.plus(Duration.ofDays(7)), CRLReason.KEY_COMPROMISE, revokedLeaves);
     }
 

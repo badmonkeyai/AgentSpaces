@@ -55,5 +55,18 @@
       <groupId>org.bouncycastle</groupId>
       <artifactId>bcprov-jdk18on</artifactId>
     </dependency>
+    <!-- WatchdogTotalsListener (srad/agentspaces-event-loop.md EL-Q-REL-11): the reactor's end-of-build read of the
+         watchdog's counters. Both are on every test classpath that runs it; provided, so nothing ships with them. -->
+    <dependency>
+      <groupId>org.junit.platform</groupId>
+      <artifactId>junit-platform-launcher</artifactId>
+      <version>1.13.4</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-test-measure</artifactId>
+      <scope>provided</scope>
+    </dependency>
   </dependencies>
 </project>

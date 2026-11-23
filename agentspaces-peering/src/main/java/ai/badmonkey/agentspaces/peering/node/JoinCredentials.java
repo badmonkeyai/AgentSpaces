@@ -341,7 +341,8 @@ public final class JoinCredentials {
      * @return {@code true} when the credential admits the candidate
      */
     static boolean verify(String encoded, PeerId candidate, GroupAdvertisement groupAd, CborCodec codec) {
-        return verify(encoded, candidate, groupAd, codec, Instant.now());
+        return verify(encoded, candidate, groupAd, codec,
+                ai.badmonkey.agentspaces.common.time.TimeSource.system().instant());
     }
 
     /**

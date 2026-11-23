@@ -1245,7 +1245,9 @@ class ContentSwarmTest {
                 .isEqualTo(published + Duration.ofDays(90).toMillis());
         assertThat(manifestExpiry(a, brief.root())).as("the 2-day publish is extended to seven days")
                 .isEqualTo(ticked + Duration.ofDays(7).toMillis());
-        assertThat(a.space().renewShortenings()).as("the keepalive asked the 90-day manifest for less, once")
-                .isEqualTo(1);
+        // EL-T-10 (srad/agentspaces-event-loop.md): a kept manifest is renewed only once less than half the 7-day
+        // lease is left, so the 90-day publish is not renewed at all yet; the 30 s keepalive used to ask it for less.
+        assertThat(a.space().renewShortenings()).as("the keepalive never asks the 90-day manifest for less")
+                .isZero();
     }
 }

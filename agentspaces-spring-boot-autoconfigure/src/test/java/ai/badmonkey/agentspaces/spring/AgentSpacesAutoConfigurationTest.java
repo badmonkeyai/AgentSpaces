@@ -94,12 +94,33 @@ class AgentSpacesAutoConfigurationTest {
     }
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        }
+        // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+        return ai.badmonkey.agentspaces.test.Ports.free();
     }
 
     /** ISSUE-Constraints FR-10: the gate is installed in each binder only when the property is on, with the hint. */
+    /**
+     * srad/agentspaces-event-loop.md EL-C-06: the fabric's clock bean is one time source, the system's by default; a
+     * time source the context supplies is the node's too, and a plain clock (a test's) leaves the node on the system's.
+     */
+    @Test
+    void theContextsTimeSourceIsTheNodesAndAPlainClockLeavesTheSystems() throws Exception {
+        assertThat(autoConfig.agentSpacesClock())
+                .isSameAs(ai.badmonkey.agentspaces.common.time.TimeSource.system());
+        ai.badmonkey.agentspaces.test.VirtualTime virtual = ai.badmonkey.agentspaces.test.VirtualTime.create();
+        AgentSpacesProperties properties = fleetProperties(freePort(), 0);
+        PeerNode onVirtual = autoConfig.buildNode(properties, autoConfig.agentSpacesIdentity(properties),
+                List.of(), List.of(), List.of(), null, virtual);
+        closeables.add(onVirtual::close);
+        assertThat(onVirtual.time()).isSameAs(virtual);
+
+        AgentSpacesProperties plain = fleetProperties(freePort(), 0);
+        PeerNode onPlain = autoConfig.buildNode(plain, autoConfig.agentSpacesIdentity(plain),
+                List.of(), List.of(), List.of(), null, ai.badmonkey.agentspaces.test.TestClock.create());
+        closeables.add(onPlain::close);
+        assertThat(onPlain.time()).isSameAs(ai.badmonkey.agentspaces.common.time.TimeSource.system());
+    }
+
     /** reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md: retirement on by default, post-retirement an opt-in. */
     @Test
     void retirementIsOnAndPostRetirementOffUnlessConfigured() throws Exception {

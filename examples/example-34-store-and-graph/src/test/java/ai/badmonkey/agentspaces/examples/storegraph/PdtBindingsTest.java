@@ -33,13 +33,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class PdtBindingsTest {
 
-    private static final IntSupplier FREE_UDP = () -> {
-        try (DatagramSocket socket = new DatagramSocket(0)) {
-            return socket.getLocalPort();
-        } catch (IOException e) {
-            throw new java.io.UncheckedIOException(e);
-        }
-    };
+    // below the ephemeral range, so no other process takes it before the test binds it (parallel forks)
+    private static final IntSupplier FREE_UDP = ai.badmonkey.agentspaces.test.Ports::free;
 
     @Test
     @Timeout(600)

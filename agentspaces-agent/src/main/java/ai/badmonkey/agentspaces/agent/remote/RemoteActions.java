@@ -378,7 +378,7 @@ public final class RemoteActions {
             return known;
         }
         Long failedAt = resolveFailedAt.get(schemaName);
-        if (failedAt != null && System.currentTimeMillis() - failedAt < RESOLVE_FAILURE_TTL_MILLIS) {
+        if (failedAt != null && ai.badmonkey.agentspaces.common.time.TimeSource.system().monoMillis() - failedAt < RESOLVE_FAILURE_TTL_MILLIS) {
             return Optional.empty();
         }
         Optional<Class<?>> answer = resolveUncached(schemaName);
@@ -386,7 +386,7 @@ public final class RemoteActions {
             resolved.put(schemaName, answer);
             resolveFailedAt.remove(schemaName);
         } else {
-            resolveFailedAt.put(schemaName, System.currentTimeMillis());
+            resolveFailedAt.put(schemaName, ai.badmonkey.agentspaces.common.time.TimeSource.system().monoMillis());
         }
         return answer;
     }

@@ -121,4 +121,61 @@ class ProbeForgeryTest {
         }
         assertThat(membership.member(target)).isPresent();
     }
+
+    /**
+     * The targeted relay (srad/agentspaces-event-loop.md §3.12, TR-3): an ACK on a holder round's nonce counts only
+     * from a holder this node asked (or the target itself); a member that was not asked credits nothing, and the
+     * target lapses as if no ACK arrived.
+     */
+    @Test
+    void anAckOnAHolderRoundFromAMemberNotAskedCreditsNothing() {
+        PeerId holder = PeerIdentity.generate().peerId();
+        GroupMembership view = new GroupMembership(self, clock, new Random(11), new GroupMembership.Config(
+                Duration.ofSeconds(45), Duration.ofSeconds(1), 2, Duration.ofSeconds(1), Duration.ofSeconds(30), 1.5));
+        for (PeerId peer : List.of(target, holder, attacker)) {
+            view.onPeerAdvertisement(new PeerAdvertisement(
+                    "aspace://" + group.value() + "/peer/" + peer.value(), peer, group,
+                    clock.instant(), Duration.ofMinutes(10), List.of(), Set.of(), Map.of()));
+        }
+        Map<Long, Set<PeerId>> askedUnder = new java.util.HashMap<>();
+        GroupMembership.Prober prober = new GroupMembership.Prober() {
+            @Override
+            public void ping(PeerId to, long nonce) {
+                if (!to.equals(target)) {
+                    view.onAck(nonce, to); // the holder and the attacker answer their own probes
+                }
+            }
+
+            @Override
+            public void pingReq(PeerId relay, PeerId to, long nonce) {
+                if (to.equals(target)) {
+                    askedUnder.computeIfAbsent(nonce, n -> new java.util.HashSet<>()).add(relay);
+                }
+            }
+
+            @Override
+            public java.util.Collection<PeerId> linkHolders(PeerId to) {
+                return to.equals(target) ? List.of(holder) : List.of();
+            }
+
+            @Override
+            public java.util.Collection<PeerId> declaredHolders(PeerId to) {
+                return linkHolders(to);
+            }
+        };
+        for (int i = 0; i < 120 && view.member(target).isPresent(); i++) {
+            view.tick(prober, true);
+            askedUnder.forEach((nonce, relays) -> {
+                if (!relays.contains(attacker)) {
+                    view.onAck(nonce, attacker); // a member, but not asked under this nonce
+                }
+            });
+            clock.advance(Duration.ofSeconds(1));
+        }
+        assertThat(askedUnder.values()).as("routine rounds asked the holder alone")
+                .anyMatch(relays -> relays.equals(Set.of(holder)));
+        assertThat(view.member(target)).as("the forged vouching kept nobody").isEmpty();
+        assertThat(view.member(holder)).isPresent();
+        assertThat(view.probeStats().dropsAfterHolderRound()).isEqualTo(1);
+    }
 }

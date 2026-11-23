@@ -17,6 +17,7 @@ package ai.badmonkey.agentspaces.peering.node;
 
 import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
+import ai.badmonkey.agentspaces.api.spi.DueWork;
 import ai.badmonkey.agentspaces.api.spi.MembershipValidator;
 import ai.badmonkey.agentspaces.api.spi.BeaconHint;
 import ai.badmonkey.agentspaces.api.spi.BeaconLocator;
@@ -153,7 +154,6 @@ public final class PeerNode implements AutoCloseable {
     private static final Duration REVOCATION_GOSSIP_TTL = Duration.ofDays(30);
 
     private final PeerIdentity identity;
-    private final InstantSource clock;
     private final Random random;
     private final CborCodec codec;
     private final WireCodec wire;
@@ -166,8 +166,14 @@ public final class PeerNode implements AutoCloseable {
     private final Duration coalesceWindow;
     /** Members whose advertisement said they accept BATCH frames. */
     private final Set<PeerId> batchPeers = ConcurrentHashMap.newKeySet();
-    private final Map<PeerId, Outbox> outboxes = new ConcurrentHashMap<>();
-    private final java.util.concurrent.ScheduledExecutorService flusher;
+    /** The outboxes and the one flush timer (srad/agentspaces-event-loop.md §3.4), or null when not coalescing. */
+    private final Coalescer coalescer;
+    /**
+     * The node's one time source (srad/agentspaces-event-loop.md §3.1, §3.6, EL-C-04): wall time ({@code millis()},
+     * {@code instant()}) for everything a peer reads or that outlives a restart, and monotonic milliseconds
+     * ({@link #localMillis()}) for every local period.
+     */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource time;
     /** The hint a node advertises when it accepts BATCH frames. */
     public static final String BATCH_HINT = "wire.batch";
     /** The hint a node advertises when it understands lazy push (HAVE, GRAFT, PRUNE; PERF2 §3.4). */
@@ -228,10 +234,288 @@ public final class PeerNode implements AutoCloseable {
     public static final int APPCARD_LEVEL = 2;
     /** The AppCard level each member's advertisement states, for members above level 1. */
     private final Map<PeerId, Integer> appCardLevels = new ConcurrentHashMap<>();
+    /** Moves whenever {@link #appCardLevels} changes a level (EL-T-07). */
+    private final AtomicLong appCardVersion = new AtomicLong();
     /** The AppCard level this node advertises; 1 advertises no hint. */
     private final int appCardLevel;
     /** Members admitted since the last tick, per group: each gets a targeted anti-entropy round on the next tick. */
     private final Map<GroupId, Set<PeerId>> newlyAdmitted = new ConcurrentHashMap<>();
+    /** When each newly admitted member was admitted, on the node's clock, for the newcomer-round series (EL-M-04). */
+    private final Map<GroupPeer, Long> admittedAtMillis = new ConcurrentHashMap<>();
+
+    /** A member of a group, as a map key. */
+    private record GroupPeer(GroupId group, PeerId peer) {
+    }
+
+    /** The loop's counters (srad/agentspaces-event-loop.md EL-M-02, NL-6). */
+    private final LoopMeter loopMeter = new LoopMeter();
+    /** Interval refreshes of this node's advertisement (the keepalive once the probe cycle outgrows the TTL). */
+    private final AtomicLong selfAdRefreshes = new AtomicLong();
+    /** Frames those refreshes sent, one per member reached directly. */
+    private final AtomicLong selfAdRefreshFrames = new AtomicLong();
+    /** Flooded publishes of this node's advertisement (a changed card, or an unreachable member). */
+    private final AtomicLong selfAdFloods = new AtomicLong();
+    /** Direct introductions to a member this node had not introduced itself to since the last refresh. */
+    private final AtomicLong selfAdIntroductions = new AtomicLong();
+
+    /**
+     * What this node's loop did since it started (srad/agentspaces-event-loop.md NL-6, EL-M-02). Phase 0 read the
+     * old ticker and flusher with the first of these counters; from phase 1 they read the node's loop and its flush
+     * timer, so the series before and after the event loop are the same series.
+     *
+     * @param runs              loop runs: timer, event and direct ({@link #tick()})
+     * @param timerWakes        runs the loop's armed timer started (a deadline or the backstop)
+     * @param eventWakes        runs a wake started (a frame, a change signal, a registration)
+     * @param directRuns        runs of {@link #tick()}
+     * @param backstopRuns      runs that swept every participant because the backstop came due
+     * @param backstopFoundWork sweeps that found a participant reporting a deadline earlier than the one the loop held
+     *                          with no wake (a missed wake, EL-Q-REL-03), over every participant
+     * @param backstopFoundBy   the same, by participant name
+     * @param participantThrows runs of a participant that threw, by participant name (NL-4)
+     * @param flushRuns         runs of the flush timer, armed only by an enqueue into an idle node (EL-B-01)
+     * @param flushesWithFrames flush runs that found at least one frame to send
+     * @param slowRuns          loop runs over {@link #SLOW_RUN_NANOS} of real time
+     * @param failedRuns        participant runs that threw, over every participant
+     * @param overruns          timer fires that found a run pending or running (§3.10)
+     * @param latenessSamples   timer-started runs whose lateness is in the three figures below (the most recent 4,096)
+     * @param latenessP50Nanos  the median of a timer-started run's start minus the deadline it was armed for
+     * @param latenessP99Nanos  the 99th percentile of the same
+     * @param latenessMaxNanos  the largest lateness since the node started
+     * @param busyNanos         the real time loop runs took, summed
+     * @param flushWaitSamples  flushes whose oldest frame's wait is in the two figures below (the most recent 4,096)
+     * @param flushWaitP99Nanos the 99th percentile of the oldest frame's wait from its enqueue to its flush (EL-B-04)
+     * @param flushWaitMaxNanos the largest such wait since the node started
+     * @param generation        the loop's generation, bumped by each watchdog re-initialisation (§3.9)
+     * @param backstopOnlyRuns  backstop runs in which no participant was due or asked; timer and event wakes less
+     *                          these are the runs that had work ({@code core.idle.wakes}, §5.4)
+     * @param dueRuns           per participant, scheduled runs that called it because its deadline came
+     * @param askedRuns         per participant, scheduled runs that called it because a wake asked it
+     * @param wakeCalls         wakes raised, by who raised them: a participant's name, {@code group:<id>[/<kind>]}
+     *                          or {@code all} (the per-participant wake counters, srad/agentspaces-event-loop.md
+     *                          §10.21)
+     * @param stretch           the stretch factor on local periods now, 1 for none (EL-O-04)
+     * @param stretches         steps up of the stretch
+     * @param restores          steps down of the stretch
+     * @param refreshes         refresh actions run before a stretch applied, or before the first run after a
+     *                          re-initialisation that found a wire-visible deadline overdue (EL-O-05, WD-4)
+     * @param stretchUnrefreshed wire-visible deadlines whose stretch would have outrun their refresh, held to it
+     *                          ({@code core.loop.stretch-unrefreshed}, goal 0)
+     * @param poolThreads       the loop pool's threads now, 0 on a source with none ({@code core.loop.pool-threads})
+     * @param poolMax           the loop pool's max, 0 on a source with none
+     * @param wireVisible       the participants whose cadence a peer judges, which carry a refresh action (EL-O-07,
+     *                          EL-F-01)
+     */
+    public record LoopStats(long runs, long timerWakes, long eventWakes, long directRuns, long backstopRuns,
+                            long backstopFoundWork, Map<String, Long> backstopFoundBy,
+                            Map<String, Long> participantThrows, long flushRuns, long flushesWithFrames,
+                            long slowRuns, long failedRuns, long overruns,
+                            long latenessSamples, long latenessP50Nanos, long latenessP99Nanos,
+                            long latenessMaxNanos, long busyNanos, long flushWaitSamples, long flushWaitP99Nanos,
+                            long flushWaitMaxNanos, long generation, long backstopOnlyRuns,
+                            Map<String, Long> dueRuns, Map<String, Long> askedRuns, Map<String, Long> wakeCalls,
+                            int stretch, long stretches, long restores, long refreshes, long stretchUnrefreshed,
+                            int poolThreads, int poolMax, java.util.List<String> wireVisible) {
+    }
+
+    /** A loop run longer than this is counted as slow (srad/agentspaces-event-loop.md EL-X-10). */
+    public static final long SLOW_RUN_NANOS = 100_000_000L;
+
+    /**
+     * Returns the loop's counters (srad/agentspaces-event-loop.md EL-M-02, NL-6).
+     *
+     * @return the counters as of now
+     */
+    public LoopStats loopStats() {
+        NodeLoop.Stats loopNow = loop.stats();
+        ai.badmonkey.agentspaces.common.time.LoopPool pool = time.loopPool();
+        LoopMeter.Figures flush = loopMeter.snapshot();
+        long failed = loopNow.participantThrows().values().stream().mapToLong(Long::longValue).sum();
+        return new LoopStats(loopNow.runs(), loopNow.timerWakes(), loopNow.eventWakes(), loopNow.directRuns(),
+                loopNow.backstopRuns(), loopNow.backstopFoundTotal(), loopNow.backstopFoundWork(),
+                loopNow.participantThrows(), flush.flushRuns(), flush.flushesWithFrames(), loopNow.slowRuns(), failed,
+                loopNow.overruns(), loopNow.latenessSamples(), loopNow.latenessP50Nanos(), loopNow.latenessP99Nanos(),
+                loopNow.latenessMaxNanos(), loopNow.busyNanos(), flush.flushWaitSamples(), flush.flushWaitP99Nanos(),
+                flush.flushWaitMaxNanos(), loopNow.generation(), loopNow.backstopOnlyRuns(), loopNow.dueRuns(),
+                loopNow.askedRuns(), loopNow.wakeCalls(), loopNow.stretch(), loopNow.stretches(), loopNow.restores(),
+                loopNow.refreshes(), loopNow.stretchUnrefreshed(), pool == null ? 0 : pool.threads(),
+                pool == null ? 0 : pool.options().max(), loopNow.wireVisible());
+    }
+
+    /**
+     * The node's loop participants in run order, by name (srad/agentspaces-event-loop.md DW-4), for diagnostics.
+     *
+     * @return their names
+     */
+    public List<String> loopParticipants() {
+        return loop.participants();
+    }
+
+    /** What the node does when its watchdog escalates (decision 4, EL-H-08). */
+    public enum Escalation {
+        /**
+         * (i), the default: an ERROR log, {@link #loopHealth()} DOWN and every {@link #onLoopHealth} listener told
+         * (the Spring starter publishes {@code LivenessState.BROKEN}), so the supervisor restarts the process.
+         */
+        REPORT,
+        /**
+         * (ii), {@code agentspaces.watchdog.escalation=exit}, for hosts with no liveness probe: as REPORT, then the
+         * node closes within 2 s and the process exits with {@link #WATCHDOG_EXIT_STATUS}.
+         */
+        EXIT;
+
+        /**
+         * Reads {@code report} or {@code exit}.
+         *
+         * @param value the text
+         * @return the escalation
+         */
+        public static Escalation parse(String value) {
+            return switch (value.trim().toLowerCase(java.util.Locale.ROOT)) {
+                case "report" -> REPORT;
+                case "exit" -> EXIT;
+                default -> throw new IllegalArgumentException("agentspaces.watchdog.escalation is report or exit: "
+                        + value);
+            };
+        }
+    }
+
+    /** The process's exit status under {@link Escalation#EXIT} (decision 4 ii): distinct for the supervisor. */
+    public static final int WATCHDOG_EXIT_STATUS = 70;
+
+    /**
+     * The node loop's health (srad/agentspaces-event-loop.md EL-H-14): OK; DEGRADED while a participant is backed off
+     * after repeated throws or runs in its own process after repeated slow runs; DOWN once the watchdog escalated.
+     *
+     * @return the health now, with reasons
+     */
+    public NodeLoop.Health loopHealth() {
+        return loop.health();
+    }
+
+    /** The flush timer, or null without coalescing; for the seam and combination tests (§10.33). */
+    Coalescer coalescer() {
+        return coalescer;
+    }
+
+    /** Tests and spoilers only: the node's loop, to script a fault on it (EL-SP-20, EL-SP-21). */
+    NodeLoop loop() {
+        return loop;
+    }
+
+    /**
+     * What this node does when its watchdog escalates (agentspaces.watchdog.escalation): report, or exit the process.
+     *
+     * @return the escalation
+     */
+    public Escalation watchdogEscalation() {
+        return escalation;
+    }
+
+    /**
+     * Tells a listener of each change of {@link #loopHealth()} (EL-H-14). It runs on the loop's or the watchdog's
+     * thread and must be quick.
+     *
+     * @param listener the listener
+     */
+    public void onLoopHealth(Consumer<NodeLoop.Health> listener) {
+        loopHealthListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    /**
+     * The loop's participants that ran over the slow bound (100 ms of real time), with how often (EL-H-11).
+     *
+     * @return counts by participant name
+     */
+    public Map<String, Long> slowParticipants() {
+        return loop.stats().slowParticipants();
+    }
+
+    /**
+     * Inbound frame kinds whose handler ran over the slow bound (100 ms of real time), with how often; keyed
+     * {@code KIND} (EL-H-11). Moving a slow handler off the reader thread waits for EL-F-06, because per-link order
+     * must hold.
+     *
+     * @return counts by frame kind
+     */
+    public Map<String, Long> slowFrameHandlers() {
+        Map<String, Long> out = new java.util.TreeMap<>();
+        slowFrames.forEach((k, v) -> out.put(k.name(), v.get()));
+        return Map.copyOf(out);
+    }
+
+    private final List<Consumer<NodeLoop.Health>> loopHealthListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final Map<Envelope.Kind, AtomicLong> slowFrames = new ConcurrentHashMap<>();
+    private volatile ai.badmonkey.agentspaces.common.time.Watchdog.Registration flushWatch;
+    private final java.util.function.IntConsumer exiter;
+    private final Escalation escalation;
+
+    private void loopHealthChanged(NodeLoop.Health health) {
+        System.Logger.Level level = health.state() == NodeLoop.HealthState.DOWN ? System.Logger.Level.ERROR
+                : health.state() == NodeLoop.HealthState.DEGRADED ? System.Logger.Level.WARNING
+                : System.Logger.Level.INFO;
+        LOG.log(level, "loop health " + health.state() + (health.reasons().isEmpty() ? "" : ": " + health.reasons()));
+        for (Consumer<NodeLoop.Health> listener : loopHealthListeners) {
+            try {
+                listener.accept(health);
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "a loop health listener threw", e);
+            }
+        }
+        if (health.state() == NodeLoop.HealthState.DOWN && escalation == Escalation.EXIT) {
+            // Decision 4 (ii): close within 2 s, then exit with a distinct status, off the watchdog's thread.
+            Thread.ofVirtual().name("agentspaces-watchdog-exit").start(() -> {
+                Thread closer = Thread.ofVirtual().start(this::close);
+                try {
+                    closer.join(Duration.ofSeconds(2));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    LOG.log(System.Logger.Level.ERROR, "watchdog escalation=exit: exiting with status "
+                            + WATCHDOG_EXIT_STATUS);
+                    exiter.accept(WATCHDOG_EXIT_STATUS);
+                }
+            });
+        }
+    }
+
+    private void frameHandled(Envelope.Kind kind, PeerId from, long tookNanos) {
+        long n = slowFrames.computeIfAbsent(kind, k -> new AtomicLong()).incrementAndGet();
+        LOG.log(n == 1 ? System.Logger.Level.WARNING : System.Logger.Level.DEBUG, "a " + kind + " frame from "
+                + (from == null ? "?" : from.display()) + " took " + tookNanos / 1_000_000 + " ms to handle (slow"
+                + " bound " + SLOW_RUN_NANOS / 1_000_000 + " ms, EL-H-11)");
+    }
+
+    /**
+     * How this node kept its advertisement alive (srad/agentspaces-event-loop.md EL-M-03,
+     * {@code core.idle.keepalive-frames}).
+     *
+     * @param refreshes     interval refreshes
+     * @param refreshFrames frames the interval refreshes sent directly, one per member
+     * @param floods        flooded publishes (a new or changed card, or a member unreachable directly)
+     * @param introductions direct copies to members not yet introduced to since the last refresh
+     */
+    public record KeepaliveStats(long refreshes, long refreshFrames, long floods, long introductions) {
+    }
+
+    /**
+     * Returns the advertisement keepalive's counters.
+     *
+     * @return the counters as of now
+     */
+    public KeepaliveStats keepaliveStats() {
+        return new KeepaliveStats(selfAdRefreshes.get(), selfAdRefreshFrames.get(), selfAdFloods.get(),
+                selfAdIntroductions.get());
+    }
+
+    /**
+     * The time from each recent admission to this node's targeted anti-entropy round with the newcomer, on the node's
+     * clock, oldest first (srad/agentspaces-event-loop.md EL-M-04, {@code core.newcomer.targeted-round}).
+     *
+     * @return the most recent 256 figures, in milliseconds
+     */
+    public List<Long> newcomerRoundMillis() {
+        return loopMeter.newcomerRounds();
+    }
     /** The seeds each group was joined with, re-dialed when the view is empty (ROBUSTNESS.md §3.3, §3.6). */
     private final Map<GroupId, List<PeerAdvertisement.Endpoint>> groupSeeds = new ConcurrentHashMap<>();
     /** The locator each group was joined with, re-asked on an empty view once its last hint has aged. */
@@ -383,19 +667,6 @@ public final class PeerNode implements AutoCloseable {
      * this, so a mixed group can be checked (RE-P-03).
      */
     private volatile boolean probeHashesAlways;
-    private static final int BATCH_MAX_FRAMES = 64;
-    private static final int BATCH_MAX_BYTES = 48 * 1024;
-
-    /** Frames waiting for one destination, flushed as one signed BATCH. */
-    private static final class Outbox {
-        final GroupId group;
-        final List<byte[]> frames = new ArrayList<>();
-        int bytes;
-
-        Outbox(GroupId group) {
-            this.group = group;
-        }
-    }
     private final Map<GroupId, Long> lastSelfAdMillis = new ConcurrentHashMap<>();
     private final Map<GroupId, Set<PeerId>> selfAdSentTo = new ConcurrentHashMap<>();
     /** The content the last flooded advertisement carried per group; a change floods at once. */
@@ -568,8 +839,14 @@ public final class PeerNode implements AutoCloseable {
     private final LongSupplier nanos;
     /** Opt-in LAN bootstrap beacon (spec §10.1), or null. */
     private final MulticastBeacon beacon;
-    private final Duration beaconInterval;
-    private volatile Long lastBeaconMillis;
+    /**
+     * The beacon's next retry on the local base (EL-O-11), or {@link Long#MIN_VALUE} while none is armed: no group
+     * to announce yet. The beacon participant alone writes it.
+     */
+    private volatile long nextBeaconMillis = Long.MIN_VALUE;
+    /** A group was joined since the beacon last ran: announce at once, from position 0 (EL-O-11). */
+    private final java.util.concurrent.atomic.AtomicBoolean beaconRestart =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /** Frames the wire codec refused (bad signature, unknown version, garbage). */
     private final AtomicLong framesDropped = new AtomicLong();
     /** Join-by-GroupID fetches awaiting a verified founding advertisement. */
@@ -660,6 +937,10 @@ public final class PeerNode implements AutoCloseable {
      * expires. Long enough for the enterprise revocation path to act, short
      * enough that a misjudged honest peer recovers on its own. */
     static final Duration QUARANTINE = Duration.ofMinutes(10);
+    /** The default time to live of this node's self-advertisement (srad/agentspaces-event-loop.md §3.11). */
+    public static final Duration DEFAULT_PEER_AD_TTL = Duration.ofMinutes(10);
+    /** The default time to live of an unused pinned relay path (§3.11). */
+    public static final Duration DEFAULT_PATH_TTL = Duration.ofMinutes(10);
     /** Bound on tracked strike counters; least-recently-struck evict. */
     private static final int STRIKES_CAPACITY = 1_024;
 
@@ -900,7 +1181,7 @@ public final class PeerNode implements AutoCloseable {
             return 0;
         }
         java.util.ArrayDeque<Long> times = perMember.get(Objects.requireNonNull(member, "member"));
-        return times == null ? 0 : windowCount(times, clock.millis());
+        return times == null ? 0 : windowCount(times, localMillis());
     }
 
     /** Records one frame relayed between this node and {@code member}, stamped by the node's clock. */
@@ -913,10 +1194,18 @@ public final class PeerNode implements AutoCloseable {
                     }
                 }));
         java.util.ArrayDeque<Long> times = perMember.computeIfAbsent(member, m -> new java.util.ArrayDeque<>());
-        long now = clock.millis();
+        long now = localMillis();
+        int count;
         synchronized (times) {
             windowCount(times, now);
             times.addLast(now);
+            count = times.size();
+        }
+        if (count == relayOffload.framesPerMinute() + 1) {
+            GroupParticipants gp = participants.get(groupId);
+            if (gp != null) {
+                gp.offload.wake(); // the frame that takes the member over the threshold (EL-L-03)
+            }
         }
     }
 
@@ -1010,7 +1299,8 @@ public final class PeerNode implements AutoCloseable {
     }
     private final Map<Envelope.Kind, AtomicLong> bytesSentByKind = new ConcurrentHashMap<>();
     private final AtomicLong bareFramesSent = new AtomicLong();
-    private java.util.concurrent.ScheduledExecutorService ticker;
+    /** The node's loop (srad/agentspaces-event-loop.md §3.3): one sequential process that runs due work. */
+    private final NodeLoop loop;
     /** The period {@link #startTicking} was called with; null while hand-driven. */
     private volatile Duration tickPeriod;
 
@@ -1061,11 +1351,11 @@ public final class PeerNode implements AutoCloseable {
 
     private PeerNode(Builder builder) {
         this.identity = builder.identity;
-        this.clock = builder.clock;
+        this.time = builder.resolveTime();
         this.random = builder.random;
         this.codec = CborCodec.defaultCodec();
         this.wire = new WireCodec(codec);
-        this.hlc = new HybridLogicalClock(builder.clock, builder.identity.peerId().value());
+        this.hlc = new HybridLogicalClock(time, builder.identity.peerId().value());
         this.peerAdTtl = builder.peerAdTtl;
         this.peerAdInterval = builder.peerAdInterval.compareTo(builder.peerAdTtl.dividedBy(2)) > 0
                 ? builder.peerAdTtl.dividedBy(2) : builder.peerAdInterval;
@@ -1097,17 +1387,41 @@ public final class PeerNode implements AutoCloseable {
         if (appCardLevel > 1) {
             nodeHints.put(APPCARD_HINT, Integer.toString(appCardLevel));
         }
+        this.loop = new NodeLoop("node:" + builder.identity.peerId().display(), time, NodeLoop.DEFAULT_BACKSTOP);
+        this.escalation = builder.escalation;
+        this.exiter = builder.exiter;
+        loop.onHealth(this::loopHealthChanged);
         if (coalesceWindow != null) {
             nodeHints.put(BATCH_HINT, "1");
-            flusher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "peer-flush-" + builder.identity.peerId().display());
-                t.setDaemon(true);
-                return t;
-            });
-            flusher.scheduleAtFixedRate(this::flushOutboxes, coalesceWindow.toMillis(), coalesceWindow.toMillis(),
-                    java.util.concurrent.TimeUnit.MILLISECONDS);
+            // One flush timer, armed by the first enqueue into an idle node (EL-B-01), in place of the fixed-rate
+            // peer-flush thread (EL-B-06).
+            coalescer = new Coalescer("flush:" + builder.identity.peerId().display(), time, coalesceWindow,
+                    new Coalescer.Sink() {
+                @Override
+                public void single(GroupId group, PeerId to, Envelope.Kind kind, byte[] body) {
+                    sendNow(group, to, kind, body);
+                }
+
+                @Override
+                public void batch(GroupId group, PeerId to, List<byte[]> frames) {
+                    sendNow(group, to, Envelope.Kind.BATCH, new Bodies.Batch(frames));
+                }
+
+                @Override
+                public void taking(GroupId group, PeerId to) {
+                    GroupRuntime runtime = groups.get(group);
+                    if (runtime != null) {
+                        runtime.gossip().outboxTaking(to); // what this flush carries, for the piggyback (EL-T-15)
+                    }
+                }
+            }, loopMeter);
         } else {
-            flusher = null;
+            coalescer = null;
+        }
+        if (coalescer != null) {
+            Coalescer c = coalescer;
+            // Refresh before slowdown (EL-O-05): what the refresh actions sent leaves the outboxes before a stretch.
+            loop.afterRefresh(c::flushAllNow);
         }
         this.channelAuth = builder.channelAuth;
         this.revocationValidator = builder.revocationValidator;
@@ -1116,11 +1430,15 @@ public final class PeerNode implements AutoCloseable {
         this.requireAttestation = builder.requireAttestation;
         this.rateCapacity = builder.rateCapacity;
         this.rateRefillPerSecond = builder.rateRefillPerSecond;
-        this.nanos = builder.nanos;
+        // EL-C-07: the bucket refills on the node's monotonic base; a node on a plain test clock keeps the system's,
+        // since its frozen clock would never refill it.
+        this.nanos = builder.nanos != null ? builder.nanos
+                : ai.badmonkey.agentspaces.common.time.TimeSources.followsWall(time)
+                        ? ai.badmonkey.agentspaces.common.time.TimeSource.system()::monoNanos
+                : time::monoNanos;
         this.bootstrapBucket = new TokenBucket(TokenBucket.DEFAULT_CAPACITY,
                 TokenBucket.DEFAULT_REFILL_PER_SEC, nanos);
         this.roles = Set.copyOf(builder.roles);
-        this.beaconInterval = builder.beaconInterval;
         MulticastBeacon.Datagrams carrier = builder.beaconCarrier;
         if (carrier == null && builder.multicastGroup != null) {
             try {
@@ -1131,9 +1449,10 @@ public final class PeerNode implements AutoCloseable {
             }
         }
         this.beacon = carrier == null ? null
-                : new MulticastBeacon(carrier, this::beaconAnnouncements, this::onBeaconDatagram);
+                : new MulticastBeacon(carrier, this::beaconAnnouncements, this::onBeaconDatagram,
+                        builder.beaconInterval);
         this.credentialHintListeners.addAll(builder.credentialHintListeners);
-        this.admissionMemory = new AdmissionMemory(builder.stateDirectory, builder.admissionMemoryBound, clock);
+        this.admissionMemory = new AdmissionMemory(builder.stateDirectory, builder.admissionMemoryBound, time);
         this.retirement = builder.retirement;
         this.postRetirement = builder.postRetirement;
         this.retireAfterMillis = builder.retireAfter.toMillis();
@@ -1145,6 +1464,94 @@ public final class PeerNode implements AutoCloseable {
         this.unreachableSignal = builder.unreachableSignal;
         this.locateMinMillis = builder.locateMinMillis;
         this.locateMaxMillis = builder.locateMaxMillis;
+        // A group's state turning dirty asks its persistence participant (EL-L-03).
+        admissionMemory.onDirty(this::persistDue);
+        retirementList.onDirty(this::persistDue);
+        registerNodeParticipants();
+        // EL-C-12, EL-C-14: the time source tells this node of a wall step (TS-6); the node asks every participant
+        // again, and after a forward step longer than a group's member TTL re-introduces itself there.
+        this.wallStepRegistration = time.onWallStep(this::onWallStep);
+    }
+
+    // ---- the wall-step signal and the resume probe (srad/agentspaces-event-loop.md §3.6, EL-C-12, EL-C-14)
+
+    private final AutoCloseable wallStepRegistration;
+    private final AtomicLong wallStepsSeen = new AtomicLong();
+    private final AtomicLong resumeRejoins = new AtomicLong();
+    /** The monotonic instant of the last wall step not yet followed by a run of the wall-step marker, or -1. */
+    private volatile long wallStepPendingNanos = -1;
+    private volatile long lastWallStepRerunNanos = -1;
+    private DueWork.Registration wallStepMarker;
+
+    /**
+     * What this node saw of wall steps (TS-6, EL-C-12, EL-C-14).
+     *
+     * @param steps              wall steps the time source raised to this node
+     * @param resumeRejoins      groups re-introduced to after a forward step longer than their member TTL (EL-C-14)
+     * @param lastRerunNanos     monotonic time from the last step to the end of the first run of the loop that asked
+     *                           every participant again ({@code core.wallstep.rerun}), or -1 before the first
+     */
+    public record WallStepStats(long steps, long resumeRejoins, long lastRerunNanos) {
+    }
+
+    /**
+     * What this node saw of wall steps.
+     *
+     * @return the counters
+     */
+    public WallStepStats wallStepStats() {
+        return new WallStepStats(wallStepsSeen.get(), resumeRejoins.get(), lastWallStepRerunNanos);
+    }
+
+    /**
+     * A wall step (TS-6): every participant is asked again at once, so a wall-anchored deadline (a space's lapse, a
+     * lease renewal, a card, credential or retirement expiry, the card refresh) is converted again on the stepped
+     * clock instead of waiting out the deadline converted before it (EL-C-12). A forward step longer than a group's
+     * member TTL may have been an absence (a suspend, a long freeze), and its peers may have dropped this node, so the
+     * node re-introduces itself to the group's seeds and members and probes each member once (EL-C-14). Local periods
+     * are on monotonic time and do not move (EL-C-05).
+     */
+    private void onWallStep(Duration step) {
+        if (loop.closed()) {
+            return;
+        }
+        wallStepsSeen.incrementAndGet();
+        wallStepPendingNanos = time.monoNanos();
+        if (!step.isNegative()) {
+            long stepMillis = step.toMillis();
+            for (GroupRuntime runtime : groups.values()) {
+                if (stepMillis > runtime.membership().memberTtlMillis()) {
+                    resumeProbe(runtime);
+                }
+            }
+        }
+        loop.wakeAll();
+    }
+
+    /** EL-C-14: back from a possible absence, introduce this node again and probe every member once. */
+    private void resumeProbe(GroupRuntime runtime) {
+        GroupId groupId = runtime.id();
+        resumeRejoins.incrementAndGet();
+        Set<PeerId> sentTo = selfAdSentTo.get(groupId);
+        if (sentTo != null) {
+            sentTo.clear(); // the self ad goes to every member directly in the next run
+        }
+        GroupParticipants gp = participants.get(groupId);
+        if (gp != null) {
+            gp.introductionsOwed = true;
+        }
+        List<PeerAdvertisement.Endpoint> seeds = groupSeeds.get(groupId);
+        if (seeds != null && !seeds.isEmpty()) {
+            introduceTo(groupId, seeds); // as a lost view's retry does, without waiting for its back-off
+        }
+        runtime.membership().probeEachOnce(); // after the self ads: the self-ad participant runs first
+    }
+
+    private void persistDue(GroupId groupId) {
+        GroupParticipants gp = participants.get(groupId);
+        if (gp != null) {
+            gp.persist.wake();
+        }
     }
 
     /**
@@ -1160,9 +1567,10 @@ public final class PeerNode implements AutoCloseable {
     /** Builder for {@link PeerNode}. */
     public static final class Builder {
         private final PeerIdentity identity;
-        private InstantSource clock = InstantSource.system();
+        /** The wall clock a caller passed with {@link #clock}, or null. */
+        private InstantSource clock;
         private Random random = new Random();
-        private Duration peerAdTtl = Duration.ofMinutes(10);
+        private Duration peerAdTtl = DEFAULT_PEER_AD_TTL;
         private Duration peerAdInterval = Duration.ofSeconds(30);
         private boolean lazyPush = true;
         private int probeHashStreams = GossipBus.PROBE_DIGEST_STREAMS;
@@ -1174,6 +1582,11 @@ public final class PeerNode implements AutoCloseable {
         private boolean recordless = true;
         private int appCardLevel = APPCARD_LEVEL;
         private Duration coalesceWindow;
+        /** The time source a caller passed with {@link #time}, or null. */
+        private ai.badmonkey.agentspaces.common.time.TimeSource time;
+        private Escalation escalation = Escalation.parse(System.getProperty("agentspaces.watchdog.escalation",
+                "report"));
+        private java.util.function.IntConsumer exiter = System::exit;
         private ChannelAuth channelAuth = ChannelAuth.SIGNED;
         private RevocationRegistry.RevocationValidator revocationValidator =
                 RevocationRegistry.RevocationValidator.founderRooted();
@@ -1185,10 +1598,11 @@ public final class PeerNode implements AutoCloseable {
         private boolean requireAttestation;
         private double rateCapacity = TokenBucket.DEFAULT_CAPACITY;
         private double rateRefillPerSecond = TokenBucket.DEFAULT_REFILL_PER_SEC;
-        private LongSupplier nanos = System::nanoTime;
+        /** The token bucket's source, or null for the node's monotonic base (EL-C-07). */
+        private LongSupplier nanos;
         private java.net.InetSocketAddress multicastGroup;
         private MulticastBeacon.Datagrams beaconCarrier;
-        private Duration beaconInterval = Duration.ofSeconds(5);
+        private Duration beaconInterval = MulticastBeacon.FIRST_RETRY;
         private final List<BiConsumer<PeerId, Map<String, String>>> credentialHintListeners =
                 new ArrayList<>();
         private java.nio.file.Path stateDirectory;
@@ -1199,7 +1613,7 @@ public final class PeerNode implements AutoCloseable {
         private RelayPolicy relayPolicy = RelayPolicy.ALLOW;
         private RelayOffload relayOffload = RelayOffload.defaults();
         private int maxPathHops = 4;
-        private Duration pathTtl = Duration.ofMinutes(10);
+        private Duration pathTtl = DEFAULT_PATH_TTL;
         private boolean unreachableSignal = true;
 
         private Builder(PeerIdentity identity) {
@@ -1367,14 +1781,33 @@ public final class PeerNode implements AutoCloseable {
         }
 
         /**
-         * Injects the time source.
+         * Injects the node's clock. A {@link ai.badmonkey.agentspaces.common.time.TimeSource} is the node's one time
+         * source, as {@link #time} sets it; the system clock is {@link
+         * ai.badmonkey.agentspaces.common.time.TimeSource#system()}; any other plain clock (a test's) is read for wall
+         * time and, as before phase 3, for the node's local periods too, so a hand-driven test that moves it moves
+         * them ({@link ai.badmonkey.agentspaces.common.time.TimeSources#of}).
          *
-         * @param clock the time source
+         * @param clock the clock
          * @return this builder
          */
         public Builder clock(InstantSource clock) {
             this.clock = Objects.requireNonNull(clock, "clock");
             return this;
+        }
+
+        /**
+         * The node's one time source (srad/agentspaces-event-loop.md EL-C-06): {@link #time} when set, with a different
+         * {@link #clock} as its wall time; else the clock's time source; else the system's.
+         */
+        ai.badmonkey.agentspaces.common.time.TimeSource resolveTime() {
+            if (time == null) {
+                return clock == null ? ai.badmonkey.agentspaces.common.time.TimeSource.system()
+                        : ai.badmonkey.agentspaces.common.time.TimeSources.of(clock);
+            }
+            if (clock == null || clock == time) {
+                return time;
+            }
+            return ai.badmonkey.agentspaces.common.time.TimeSources.withWall(clock, time);
         }
 
         /**
@@ -1415,6 +1848,40 @@ public final class PeerNode implements AutoCloseable {
                 throw new IllegalArgumentException("the coalescing window must be positive");
             }
             this.coalesceWindow = window;
+            return this;
+        }
+
+        /**
+         * The node's one time source (srad/agentspaces-event-loop.md §3.1, EL-C-06): wall time for what peers read and
+         * what outlives a restart, monotonic time for every local period, scheduling for the loop and the flush timer,
+         * and the wall-step signal. Tests pass a {@code VirtualTime}; {@link #clock(InstantSource)} need not be set as
+         * well. Default: the clock's, else {@link ai.badmonkey.agentspaces.common.time.TimeSource#system()}.
+         *
+         * @param time the time source
+         * @return this builder
+         */
+        public Builder time(ai.badmonkey.agentspaces.common.time.TimeSource time) {
+            this.time = Objects.requireNonNull(time, "time");
+            return this;
+        }
+
+        /**
+         * What the node does when the watchdog escalates its loop (srad/agentspaces-event-loop.md decision 4,
+         * EL-H-08): {@link Escalation#REPORT} (the default; the system property
+         * {@code agentspaces.watchdog.escalation} sets the default) or {@link Escalation#EXIT} for a host with no
+         * liveness probe.
+         *
+         * @param escalation the escalation
+         * @return this builder
+         */
+        public Builder watchdogEscalation(Escalation escalation) {
+            this.escalation = Objects.requireNonNull(escalation, "escalation");
+            return this;
+        }
+
+        /** Tests only: what {@link Escalation#EXIT} calls in place of {@link System#exit(int)}. */
+        Builder exiter(java.util.function.IntConsumer exiter) {
+            this.exiter = Objects.requireNonNull(exiter, "exiter");
             return this;
         }
 
@@ -1691,17 +2158,20 @@ public final class PeerNode implements AutoCloseable {
 
         /**
          * Enables the LAN multicast bootstrap beacon (spec §10.1
-         * {@code bootstrap: multicast}, roadmap M1; off by default). Every
-         * {@code interval} of the node's clock, {@link #tick()} sends one UDP
-         * datagram per joined group carrying only this node's signed
-         * self-advertisement, and datagrams heard from others are verified and
+         * {@code bootstrap: multicast}, roadmap M1; off by default). On each
+         * retry the node sends one UDP datagram per joined group carrying only
+         * its signed self-advertisement: at once when it joins a group, then
+         * after {@code interval}, 2, 10 and 20 times it, and from the top again
+         * (srad/agentspaces-event-loop.md EL-O-11; 1, 2, 10 and 20 min at the
+         * 1 min default). Datagrams heard from others are verified and
          * admitted exactly like a stranger's bootstrap rumor, after which the
          * node introduces itself to the advertised endpoints as if they were
          * configured seeds. See {@link MulticastBeacon}.
          *
          * @param group    the multicast group address and port, e.g.
          *                 {@code 239.255.42.99:7787}
-         * @param interval how often to announce, on the node's clock
+         * @param interval the first retry interval (EL-O-11), on the node's
+         *                 monotonic clock
          * @return this builder
          */
         public Builder multicast(java.net.InetSocketAddress group, Duration interval) {
@@ -1717,7 +2187,8 @@ public final class PeerNode implements AutoCloseable {
          * verification path as {@link #multicast}.
          *
          * @param carrier  the datagram carrier
-         * @param interval how often to announce, on the node's clock
+         * @param interval the first retry interval (EL-O-11), on the node's
+         *                 monotonic clock
          * @return this builder
          */
         public Builder beacon(MulticastBeacon.Datagrams carrier, Duration interval) {
@@ -1810,6 +2281,7 @@ public final class PeerNode implements AutoCloseable {
      */
     public void credentialHint(String key, String value) {
         nodeHints.put(Objects.requireNonNull(key, "key"), Objects.requireNonNull(value, "value"));
+        selfAdChanged();
     }
 
     /**
@@ -1834,6 +2306,7 @@ public final class PeerNode implements AutoCloseable {
             }
             return Map.copyOf(next);
         });
+        selfAdChanged();
     }
 
     /**
@@ -1844,6 +2317,7 @@ public final class PeerNode implements AutoCloseable {
      */
     public void removeCredentialHint(String key) {
         nodeHints.remove(Objects.requireNonNull(key, "key"));
+        selfAdChanged();
     }
 
     /** Returns the peer's id. */
@@ -2031,8 +2505,13 @@ public final class PeerNode implements AutoCloseable {
         // of it (onClose) and re-dials with a fresh handshake, rather than keeping a session this
         // node no longer holds and sending frames into it that would be dropped here unverified.
         connection.close();
-        // A peer whose channel went away is introduced to again on the next tick (publishSelfAd).
+        // A peer whose channel went away is introduced to again on the self ad's next run, which a link change asks.
         selfAdSentTo.values().forEach(sent -> sent.remove(peer));
+        for (GroupParticipants gp : participants.values()) {
+            gp.introductionsOwed = true;
+            gp.selfAd.wake();
+        }
+        linksChanged();
     }
 
     /**
@@ -2102,6 +2581,7 @@ public final class PeerNode implements AutoCloseable {
         }));
         advertisedEndpoints.add(new PeerAdvertisement.Endpoint(
                 transport.scheme(), advertisedAddress, priority));
+        selfAdChanged();
     }
 
     /** The topology roles this node declares ({@code RENDEZVOUS}, {@code RELAY}). */
@@ -2529,7 +3009,10 @@ public final class PeerNode implements AutoCloseable {
         Objects.requireNonNull(membershipHints, "membershipHints");
         String name = groupName == null || groupName.isBlank() ? groupId.value() : groupName;
         // The timeout bounds the whole join, the first locate included (CR-3).
-        long deadline = System.nanoTime() + timeout.toNanos();
+        // The join waits on futures on the node's time source (group W): a virtual one releases it when an advance
+        // passes a slice's end; a node on a hand-moved clock waits on the system's.
+        ai.badmonkey.agentspaces.common.time.TimeSource waits = ai.badmonkey.agentspaces.common.time.Waits.base(time);
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(waits, timeout);
         BeaconHint hint = locate(groupId, name, locator);
         if (hint.founding().isPresent()) {
             SignedGroupAdvertisement carried = decodeFounding(hint.founding().get());
@@ -2564,23 +3047,27 @@ public final class PeerNode implements AutoCloseable {
         try {
             dialAndAsk(groupId, current, dialed, connected);
             while (true) {
-                long sliceEnd = Math.min(System.nanoTime() + slice * 1_000_000L, deadline);
+                long sliceEnd = Math.min(waits.monoNanos() + slice * 1_000_000L, deadline);
                 while (true) {
-                    long wait = sliceEnd - System.nanoTime();
-                    if (wait <= 0) {
+                    if (sliceEnd - waits.monoNanos() <= 0) {
                         break;
                     }
                     CompletableFuture<?> wake = reask == null ? pending : CompletableFuture.anyOf(pending, reask);
                     try {
-                        wake.get(wait, java.util.concurrent.TimeUnit.NANOSECONDS);
-                    } catch (TimeoutException e) {
-                        break;
+                        if (!ai.badmonkey.agentspaces.common.time.Waits.awaitDone(waits, wake, sliceEnd)) {
+                            break;
+                        }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         throw new TimeoutException("interrupted while fetching the founding advertisement of "
                                 + groupId);
-                    } catch (java.util.concurrent.ExecutionException e) {
-                        throw new IllegalStateException(e.getCause());
+                    }
+                    if (wake.isCompletedExceptionally()) {
+                        try {
+                            wake.join();
+                        } catch (java.util.concurrent.CompletionException | java.util.concurrent.CancellationException e) {
+                            throw new IllegalStateException(e.getCause() == null ? e : e.getCause());
+                        }
                     }
                     if (pending.isDone()) {
                         break;
@@ -2608,7 +3095,7 @@ public final class PeerNode implements AutoCloseable {
                     return join(founding.advertisement(), founding, membershipConfig, locator, current,
                             membershipHints, validator, name);
                 }
-                if (System.nanoTime() >= deadline) {
+                if (waits.monoNanos() - deadline >= 0) {
                     throw joinTimeout(groupId, timeout, locates, dialed.size(), connected.size(), current);
                 }
                 dialAndAsk(groupId, current, dialed, connected);
@@ -2718,7 +3205,7 @@ public final class PeerNode implements AutoCloseable {
      * seed the channel expectations of the beacon it names (DB-N-08).
      */
     private BeaconHint locate(GroupId groupId, String groupName, BeaconLocator locator, boolean joining) {
-        long now = clock.millis();
+        long now = time.millis();
         lastLocateMillis.put(groupId, now);
         BeaconHint hint;
         try {
@@ -2879,7 +3366,7 @@ public final class PeerNode implements AutoCloseable {
         if (learned == null || learned.isEmpty()) {
             return new BeaconLearned(List.of(), 0, Duration.ZERO);
         }
-        long now = clock.millis();
+        long now = time.millis();
         List<PeerAdvertisement.Endpoint> out = new ArrayList<>();
         long shortest = Long.MAX_VALUE;
         int peers = 0;
@@ -2956,7 +3443,7 @@ public final class PeerNode implements AutoCloseable {
             groupValidators.put(groupId, validator);
         }
         GroupMembership membership =
-                new GroupMembership(peerId(), clock, random, membershipConfig);
+                new GroupMembership(peerId(), time, random, membershipConfig);
         GossipBus.FrameSender sender = new GossipBus.FrameSender() {
             @Override
             public void sendRumor(PeerId to, Bodies.Rumor rumor) {
@@ -2995,7 +3482,7 @@ public final class PeerNode implements AutoCloseable {
         };
         // the bus times its asks for announced items by this node's clock (swarm retries, ROBUSTNESS.md §10.2)
         GossipBus gossip = new GossipBus(membership, sender, codec,
-                groupAd.gossip().fanout(), GossipBus.DEFAULT_HOPS, clock::millis, random);
+                groupAd.gossip().fanout(), GossipBus.DEFAULT_HOPS, this::localMillis, random);
         gossip.probeDigestStreams(probeHashStreams);
         if (lazyPush) {
             gossip.lazyPush(treePeers::contains);
@@ -3012,11 +3499,11 @@ public final class PeerNode implements AutoCloseable {
             gossip.auditBudget(auditBudget);
         }
         RevocationRegistry revocations = new RevocationRegistry(groupAd,
-                revocationValidator, codec, clock,
+                revocationValidator, codec, time,
                 ad -> onPeerRevoked(membership, ad));
         ai.badmonkey.agentspaces.peering.membership.CredentialRevocationRegistry credentialRevocations =
                 new ai.badmonkey.agentspaces.peering.membership.CredentialRevocationRegistry(groupAd,
-                        credentialRevocationValidator, codec, clock);
+                        credentialRevocationValidator, codec, time);
         credentialRevocations.addListener(ad -> onCredentialRevoked(groupId, membership, ad));
         GroupRuntime runtime = new GroupRuntime(groupId, groupAd, membership, gossip,
                 revocations, credentialRevocations, this, founding);
@@ -3046,7 +3533,7 @@ public final class PeerNode implements AutoCloseable {
         gossip.forwardFilter(PEER_AD_STREAM, payload -> forwardsPeerAd(revocations, payload));
         // The members admitted under a delegation before a restart, back before the first contact.
         admissionMemory.load(groupId);
-        retirementList.load(groupId, clock.millis());
+        retirementList.load(groupId, time.millis());
         if (groupAd.membershipPolicy() == GroupAdvertisement.MembershipPolicy.INVITE
                 && !admissionMemory.persistent()) {
             LOG.log(System.Logger.Level.INFO, "the admission memory of group " + groupId.value()
@@ -3055,6 +3542,11 @@ public final class PeerNode implements AutoCloseable {
                     + " after it (PeerNode.Builder.stateDirectory; the starter passes agentspaces.keystore)");
         }
         groups.put(groupId, runtime);
+        registerParticipants(runtime);
+        if (beacon != null) { // the new group is announced at once, from the table's top (EL-O-11)
+            beaconRestart.set(true);
+            beaconParticipant.wake();
+        }
 
         // Introduce ourselves to the seeds directly; gossip takes it from there.
         groupSeeds.put(groupId, List.copyOf(seeds));
@@ -3244,7 +3736,7 @@ public final class PeerNode implements AutoCloseable {
         if (runtime == null) {
             return Optional.empty();
         }
-        long now = clock.millis();
+        long now = time.millis();
         MembershipState state = membershipState(runtime, now);
         StateSince known = membershipStates.get(groupId);
         long since = known != null && known.state() == state ? known.sinceMillis() : now;
@@ -3366,6 +3858,10 @@ public final class PeerNode implements AutoCloseable {
     void noteLostForTest(GroupId groupId, PeerId peer, List<PeerAdvertisement.Endpoint> endpoints, long lostAtMillis) {
         lastEndpoints.put(peer, List.copyOf(endpoints));
         lostMembers.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>()).put(peer, lostAtMillis);
+        GroupParticipants gp = participants.get(groupId);
+        if (gp != null) {
+            gp.lost.wake();
+        }
     }
 
     /** Moves a lost member that never answered to the retirement list, with its last endpoints and card time. */
@@ -3507,7 +4003,10 @@ public final class PeerNode implements AutoCloseable {
             held.add(member.id());
         }
         lastViewVersion.remove(groupId);
-        idleGroups.remove(groupId);
+        GroupParticipants leaving = participants.remove(groupId);
+        if (leaving != null) {
+            leaving.close();
+        }
         Set<PeerId> previous = lastView.remove(groupId);
         if (previous != null) {
             held.addAll(previous);
@@ -3530,12 +4029,13 @@ public final class PeerNode implements AutoCloseable {
         everConnected.remove(groupId);
         lastResortSchedule.remove(groupId);
         lastResortCursor.remove(groupId);
-        retirementList.flushAll(clock.millis());
+        retirementList.flushAll(time.millis());
         retirementList.forget(groupId);
         lastLostRetryMillis.remove(groupId);
         lostRetryIntervalMillis.remove(groupId);
         heldAds.remove(groupId);
         newlyAdmitted.remove(groupId);
+        admittedAtMillis.keySet().removeIf(key -> key.group().equals(groupId));
         lastSelfAdMillis.remove(groupId);
         selfAdSentTo.remove(groupId);
         lastSelfAdFingerprint.remove(groupId);
@@ -3547,15 +4047,8 @@ public final class PeerNode implements AutoCloseable {
         offloadAttempted.remove(groupId);
         readmittedLogged.removeIf(key -> key.startsWith(groupId.value() + '|'));
         // Frames coalesced for the group and not yet flushed are discarded, never sent.
-        for (Map.Entry<PeerId, Outbox> entry : List.copyOf(outboxes.entrySet())) {
-            Outbox outbox = entry.getValue();
-            if (groupId.equals(outbox.group)) {
-                synchronized (outbox) {
-                    outbox.frames.clear();
-                    outbox.bytes = 0;
-                }
-                outboxes.remove(entry.getKey(), outbox);
-            }
+        if (coalescer != null) {
+            coalescer.discard(groupId);
         }
         runtime.release();
         admissionMemory.drop(groupId);
@@ -3584,7 +4077,9 @@ public final class PeerNode implements AutoCloseable {
             if (horizonPeers.remove(peer)) {
                 horizonHintsVersion.incrementAndGet();
             }
-            appCardLevels.remove(peer); // FR-6: a member counts at level 2 only on an advertisement held now
+            if (appCardLevels.remove(peer) != null) { // FR-6: a member counts at level 2 only on an ad held now
+                appCardVersion.incrementAndGet();
+            }
         }
         LOG.log(System.Logger.Level.INFO, "left group " + groupId.value() + ": " + held.size()
                 + " member(s) forgotten, " + closed + " connection(s) closed");
@@ -3592,158 +4087,607 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * Runs one protocol round for every joined group: refresh the leased
-     * self-advertisement, probe membership, and — once per gossip period of
-     * the node's clock (spec §5.3, {@code GossipParameters.period}) —
-     * reconcile state with one partner. Rumor forwarding and probes are not
-     * paced by the period. Also announces on the bootstrap beacon, when one
-     * is configured, once per beacon interval.
+     * Runs everything due now, and every participant whether due or not (srad/agentspaces-event-loop.md EL-L-04,
+     * DW-1): for every joined group, refresh the leased self-advertisement, probe membership, handle departures,
+     * retry lost members, run the lazy push, and reconcile with one partner once per (stretched) gossip period; run
+     * every {@code onTick} registrant and every {@link GroupRuntime#onDue} participant; announce on the bootstrap
+     * beacon once per beacon interval. Each participant judges for itself whether its work is due, so an early call
+     * is harmless. The run is serial with the node's loop (NL-2) and returns when it ends; called from inside the
+     * node's own run it runs inline (EL-L-16).
      */
     public void tick() {
-        tick(false, false);
+        loop.tick();
     }
 
-    private void tick(boolean scheduled, boolean afterIdleSleep) {
-        long nowMillis = clock.millis();
-        rejudgeIfTrustChanged();
-        for (GroupRuntime runtime : groups.values()) {
-            if (scheduled && restsThisTick(runtime, afterIdleSleep)) {
-                continue;
-            }
-            GossipBus gossip = runtime.gossip();
-            publishSelfAd(runtime, gossip, nowMillis);
-            boolean active = gossip.consumeActivity();
-            // The membership probe's quiet rule (SPEC §5.2) counts all gossip, held here or not, as it did before the
-            // honest backoff: a member forwarding a busy stream it does not hold keeps the failure detector at the
-            // base period, and only the anti-entropy period (below) reads the honest activity.
-            boolean traffic = gossip.consumeTraffic();
-            // The digest hashes a probe carries (v0.1.17) are taken here, before the membership monitor is held, and
-            // only when they will be read (IDLE-WORK item 7): a receiver reads them only while its own anti-entropy
-            // has backed off, which in a quiet group is when this node's has too. Busy, both run anti-entropy at the
-            // base period, the hashes would differ on every probe anyway, and taking them cost every stream's
-            // digest twice a second.
-            boolean probing = (probeHashesAlways || !active && runtime.antiEntropyStretched())
-                    && runtime.membership().probeDue(nowMillis); // idle-loop O8: only on the tick a probe goes
-            // Two kinds of hashes, taken only when they will be read: a member on wire.ae=2 gets each space's trie
-            // hash and any other member the text digests' hashes, so each compares like with like (annex I.6).
-            // Each kind is taken only when some member in view would receive it: the text form, which rebuilds a
-            // space's sorted digest whenever its generation moved (a lease sweep moves it in a space nobody writes),
-            // only when the view holds a member without wire.ae=2, and the trie form only when it holds one with it.
-            // Taking the text form for an all-hinted view cost the busy spaces' digests every probing tick and was
-            // never sent (a demo console's deployments, 2026-11-18). Both are decided here, outside the membership
-            // monitor the probe callbacks run under, since taking a digest takes its space's lock.
-            boolean textPartner = false;
-            boolean triePartner = false;
-            if (probing) {
-                for (GroupMembership.Member member : runtime.membership().allMembers()) {
-                    if (member.id().equals(peerId())) {
-                        continue;
-                    }
-                    if (gossip.audits(member.id())) {
-                        triePartner = true;
-                    } else {
-                        textPartner = true;
-                    }
-                    if (textPartner && triePartner) {
-                        break;
-                    }
-                }
-            }
-            ProbeDigests probeText = probing && textPartner ? probeDigests(gossip, false) : ProbeDigests.NONE;
-            ProbeDigests probeTrie = probing && triePartner && gossip.auditing() ? probeDigests(gossip, true)
-                    : ProbeDigests.NONE;
-            runtime.membership().tick(new GroupMembership.Prober() {
-                @Override
-                public void ping(PeerId target, long nonce) {
-                    // The probe carries the anti-entropy digests, when taken above, and the recent items (v0.1.17).
-                    ProbeDigests probe = gossip.audits(target) ? probeTrie : probeText;
-                    send(runtime.id(), target, Envelope.Kind.PING, new Bodies.Ping(nonce,
-                            probe.root(), probe.hashes(), gossip.piggyback(target)));
-                }
+    // ---- the node's participants (srad/agentspaces-event-loop.md §3.2, §3.3, EL-L-01, appendix C)
 
-                @Override
-                public void pingReq(PeerId relay, PeerId target, long nonce) {
-                    send(runtime.id(), relay, Envelope.Kind.PING_REQ,
-                            new Bodies.PingReq(target, nonce));
-                }
+    /** The trust participant's deadline until every channel-trust supplier signals its changes (EL-L-14). */
+    static final long TRUST_RECHECK_MILLIS = 1_000;
+    /** How often a relayed member over the offload threshold is looked at again while it stays over (JS-W-11). */
+    static final long OFFLOAD_RECHECK_MILLIS = 1_000;
+    /** The built-in participants of one group (EL-L-01) and what each reads between its runs (DW-5). */
+    private final class GroupParticipants {
+        final GroupRuntime runtime;
+        final List<DueWork.Registration> all = new ArrayList<>();
+        DueWork.Registration selfAd;
+        DueWork.Registration membership;
+        DueWork.Registration view;
+        DueWork.Registration gossip;
+        DueWork.Registration antiEntropy;
+        DueWork.Registration newcomer;
+        DueWork.Registration lost;
+        DueWork.Registration reach;
+        DueWork.Registration mesh;
+        DueWork.Registration pins;
+        DueWork.Registration offload;
+        DueWork.Registration persist;
+        // The generations each reader last read (DW-5): no participant clears a flag another reads.
+        long membershipActivitySeen;
+        long membershipTrafficSeen;
+        long antiEntropyActivitySeen;
+        // The anti-entropy round's partner, and the run it was picked in, for the newcomer round of the same run.
+        PeerId periodicPartner;
+        long periodicPartnerRun = Long.MIN_VALUE;
+        // The self ad's change test (EL-L-09): the card version and view it last judged, and whether a link loss
+        // owes a member a fresh introduction.
+        long selfAdSeenVersion = -1;
+        long selfAdSeenView = -1;
+        volatile boolean introductionsOwed = true;
 
-                @Override
-                public boolean carriesNews(PeerId target, long sinceMillis) {
-                    if (gossip.piggyback(target) != null) {
-                        return true;
-                    }
-                    ProbeDigests probe = gossip.audits(target) ? probeTrie : probeText;
-                    if (probe.root() == null && probe.hashes() == null) {
-                        return false;
-                    }
-                    // The target's own PING with hashes in this period was answered with this node's: both compared.
-                    Long hashedAt = hashedPingFrom.getOrDefault(runtime.id(), Map.of()).get(target);
-                    return hashedAt == null || hashedAt < sinceMillis;
-                }
-            }, !traffic);
-            // A member that left the view since the last tick (the failure detector dropped it, or
-            // an eviction did) is outside the data plane: only its own introduction re-admits it,
-            // and it sends one on the channel it dials next (see connectionTo), so the stale
-            // channel is closed here to make that happen.
-            // The view as of this tick, kept for leaving the group (the members held then); taken only when the view's
-            // version moved (idle-loop O8), since every entry and exit moves it.
-            long viewVersion = runtime.membership().viewVersion();
-            Long taken = lastViewVersion.put(runtime.id(), viewVersion);
-            if (taken == null || taken != viewVersion) {
-                Set<PeerId> view = new java.util.HashSet<>();
-                for (GroupMembership.Member member : runtime.membership().allMembers()) {
-                    view.add(member.id());
-                }
-                lastView.put(runtime.id(), view);
-            }
-            // Every departure is handled, each once, from the membership's own record of it: a member that left and came
-            // back between two ticks (re-admitted from a copy of its card, then dropped again by a probe) left all the
-            // same, and a loss not recorded is a loss never retried. Comparing views from tick to tick missed it, and a
-            // fleet whose other members had stopped retrying stayed split for good (HorizonLaggingCopyTest, 2026-11-18).
-            for (PeerId dropped : runtime.membership().drainDeparted()) {
-                if (runtime.membership().member(dropped).isPresent()) {
-                    continue; // back already: nothing to retry, and its link and state stay
-                }
-                memberLeft(runtime, gossip, dropped, nowMillis);
-            }
-            retryLost(runtime, nowMillis);
-            publishReachHints(runtime);
-            meshRelays(runtime, nowMillis);
-            expirePins(runtime, nowMillis);
-            gossip.tick(nowMillis); // lazy push: grafts and announcements (PERF2 §3.4)
-            PeerId periodicPartner = null;
-            if (runtime.claimAntiEntropyRound(nowMillis, active)) {
-                periodicPartner = gossip.antiEntropyTick().orElse(null);
-            }
-            // A member admitted since the last tick is reconciled with now, after this node's own
-            // introduction went out above, so it holds this node and answers: the newcomer pulls
-            // the cards and space state the fleet already has instead of waiting for the random
-            // periodic partner to be one that holds them. The periodic round's partner is not
-            // asked twice.
-            Set<PeerId> admitted = newlyAdmitted.remove(runtime.id());
-            if (admitted != null) {
-                for (PeerId member : admitted) {
-                    if (!member.equals(periodicPartner) && runtime.membership().member(member).isPresent()) {
-                        gossip.antiEntropyWith(member);
-                    }
-                }
-            }
-            // Layers above peering join this same clock through
-            // GroupRuntime.onTick (QA3 A3-1): capability protocols advance here,
-            // for the same reason membership and anti-entropy just did.
-            offloadRelayed(runtime, nowMillis); // JS-W-11, off this thread for the dial itself
-            runtime.runTickWork(e -> LOG.log(System.Logger.Level.WARNING,
-                    "tick work failed in group " + runtime.id().value(), e));
-            admissionMemory.flushIfDue(runtime.id(), nowMillis,
-                    runtime.advertisement().gossip().period().toMillis());
-            retirementList.flushIfDue(runtime.id(), nowMillis, runtime.advertisement().gossip().period().toMillis());
+        GroupParticipants(GroupRuntime runtime) {
+            this.runtime = runtime;
         }
-        if (beacon != null) {
-            Long last = lastBeaconMillis;
-            if (last == null || nowMillis - last >= beaconInterval.toMillis()) {
-                lastBeaconMillis = nowMillis;
-                beacon.announce();
+
+        DueWork.Registration add(String name, NodeLoop.Kind kind, DueWork work) {
+            return add(name, kind, work, NodeLoop.Timing.FIXED);
+        }
+
+        DueWork.Registration add(String name, NodeLoop.Kind kind, DueWork work, NodeLoop.Timing timing) {
+            DueWork.Registration registration = loop.register(runtime.id().value() + "/" + name, kind,
+                    runtime.id().value(), work, timing);
+            all.add(registration);
+            return registration;
+        }
+
+        void close() {
+            all.forEach(DueWork.Registration::close);
+        }
+    }
+
+    private final Map<GroupId, GroupParticipants> participants = new ConcurrentHashMap<>();
+    /** The node-wide participants: the trust rejudge (EL-L-14) and the bootstrap beacon. */
+    private DueWork.Registration trustParticipant;
+    private DueWork.Registration beaconParticipant;
+    /** Moves whenever an input of this node's card moves (an endpoint, a hint), for the self ad's change test (EL-L-09). */
+    private final AtomicLong selfAdVersion = new AtomicLong();
+    /** One deprecation note per {@code onTick} registrant class (EL-L-05). */
+    private static final Set<String> TICK_ADAPTER_NOTED = ConcurrentHashMap.newKeySet();
+
+    /** A wall deadline on the node's clock as a deadline on the loop's monotonic base, or NEVER. */
+    static long due(long nowNanos, long nowMillis, long deadlineMillis) {
+        return ai.badmonkey.agentspaces.common.time.TimeSources.monoDue(nowNanos, nowMillis, deadlineMillis);
+    }
+
+    /**
+     * A wall deadline as a deadline on the loop's base, converted against both clocks read now, together. A run's own
+     * {@code now} was read when the run began, and a participant reads the wall clock after the participants before
+     * it ran: converting one against the other made a deadline look earlier by however long they took, and the
+     * backstop counted it as a missed wake (6 in 5 minutes over TCP, srad/agentspaces-event-loop.md §10.8).
+     */
+    private long dueFromWall(long deadlineMillis) {
+        return due(time.monoNanos(), time.millis(), deadlineMillis);
+    }
+
+    /** A deadline on this node's local base ({@link #localMillis()}) as a deadline on the loop's base, or NEVER. */
+    private long dueFromLocal(long deadlineMillis) {
+        long nowNanos = time.monoNanos();
+        return due(nowNanos, Math.floorDiv(nowNanos, 1_000_000L), deadlineMillis);
+    }
+
+    /**
+     * This node's local now: the time source's monotonic milliseconds, the base of every local period
+     * (srad/agentspaces-event-loop.md §3.6, EL-C-04): probe turns and timeouts, the gossip bus's windows, the
+     * self-ad and beacon cadences, relay pins, quarantines and log throttles. A wall step moves none of them.
+     */
+    private long localMillis() {
+        return time.monoMillis();
+    }
+
+    /** The earlier of two deadlines on the loop's base. */
+    private static long earlier(long a, long b) {
+        if (a == DueWork.NEVER) {
+            return b;
+        }
+        if (b == DueWork.NEVER) {
+            return a;
+        }
+        return a - b <= 0 ? a : b;
+    }
+
+    /** Registers the node-wide participants; called once, by the constructor. */
+    private void registerNodeParticipants() {
+        // core.wallstep.rerun (EL-C-12): asked by every wall step with every other participant; its run, after every
+        // protocol participant of the run, closes the measure from the step.
+        wallStepMarker = loop.register("wall-step", NodeLoop.Kind.OTHER, "", now -> {
+            long at = wallStepPendingNanos;
+            if (at >= 0) {
+                wallStepPendingNanos = -1;
+                lastWallStepRerunNanos = Math.max(0, time.monoNanos() - at);
             }
+            return DueWork.NEVER;
+        });
+        trustParticipant = loop.register("trust", NodeLoop.Kind.PROTOCOL, "", now -> {
+            rejudgeIfTrustChanged();
+            // one reference compare a second until every supplier signals (EL-L-14, EL-Q-SEC-06)
+            return channelTrust == null ? DueWork.NEVER : now + TRUST_RECHECK_MILLIS * 1_000_000L;
+        }, LOCAL_PERIOD); // a local recheck; a trust change also signals (EL-L-14)
+        // The beacon takes no part in the stretch (EL-O-11): its retries follow their own table, so FIXED.
+        beaconParticipant = loop.register("beacon", NodeLoop.Kind.PROTOCOL, "", now -> runBeacon(),
+                NodeLoop.Timing.FIXED);
+    }
+
+    /**
+     * The beacon participant (srad/agentspaces-event-loop.md EL-O-11): announces at once after a join, from position
+     * 0, and otherwise when its retry falls due; each retry reads the interval at the beacon's position and advances
+     * it ({@link MulticastBeacon#nextRetry()}). With no group joined nothing is announced and no retry is spent; the
+     * next join asks it again.
+     */
+    private long runBeacon() {
+        if (beacon == null) {
+            return DueWork.NEVER;
+        }
+        boolean restart = beaconRestart.getAndSet(false);
+        if (groups.isEmpty()) {
+            nextBeaconMillis = Long.MIN_VALUE;
+            return DueWork.NEVER;
+        }
+        long nowMillis = localMillis();
+        if (restart) {
+            beacon.succeeded(); // a fresh group starts the table from the top
+        }
+        long next = nextBeaconMillis;
+        if (restart || next == Long.MIN_VALUE || nowMillis >= next) {
+            beacon.announce();
+            next = nowMillis + beacon.nextRetry().toMillis();
+            nextBeaconMillis = next;
+        }
+        return dueFromLocal(next);
+    }
+
+    /** The node's beacon, or null when it has none (EL-O-11 tests). */
+    MulticastBeacon beacon() {
+        return beacon;
+    }
+
+    /**
+     * The timing of a local period under the loop's stretch (§3.10, EL-O-04): it stretches with the factor and no
+     * peer judges it. The node's protocol cadences a peer judges (the self ad, the probes, the gossip push) keep
+     * {@link NodeLoop.Timing#FIXED}: they are what this node's keepalive and peers' TTLs rest on (EL-O-06).
+     */
+    private static final NodeLoop.Timing LOCAL_PERIOD = NodeLoop.Timing.local(Duration.ZERO);
+
+    /**
+     * Registers a group's built-in participants (EL-L-01), in today's order within the group, and the change signals
+     * that ask them again (EL-L-03, EL-L-13, EL-T-15).
+     */
+    private void registerParticipants(GroupRuntime runtime) {
+        GroupId groupId = runtime.id();
+        GroupParticipants gp = new GroupParticipants(runtime);
+        // Every built-in participant is the node's own protocol work, so it runs before any registrant (NL-8), and
+        // an inbound working frame, which asks a group's registrants (Kind.OTHER), never asks these.
+        NodeLoop.Kind protocol = NodeLoop.Kind.PROTOCOL;
+        gp.selfAd = gp.add("self-ad", protocol, now -> runSelfAd(gp, now));
+        gp.membership = gp.add("membership", protocol, now -> runMembership(gp, now));
+        gp.view = gp.add("view", protocol, now -> runView(gp));
+        gp.gossip = gp.add("gossip", protocol, now -> {
+            long nowMillis = localMillis();
+            runtime.gossip().tick(nowMillis); // lazy push: grafts and announcements (PERF2 §3.4)
+            long next = runtime.gossip().nextDueMillis(nowMillis);
+            return next <= nowMillis ? now + 1_000_000L : dueFromLocal(next);
+        });
+        // Anti-entropy stretches, never past 32 times the founding period (SPEC §5.3, EL-O-04).
+        gp.antiEntropy = gp.add("anti-entropy", protocol, now -> runAntiEntropy(gp, now), NodeLoop.Timing.local(
+                runtime.advertisement().gossip().period().multipliedBy(GossipBus.ANTI_ENTROPY_STRETCH_CEILING)));
+        gp.newcomer = gp.add("newcomer", protocol, now -> runNewcomer(gp, now));
+        gp.lost = gp.add("lost", protocol, now -> runLost(gp, now), LOCAL_PERIOD);
+        gp.reach = gp.add("reach", protocol, now -> {
+            publishReachHints(runtime);
+            return DueWork.NEVER; // asked again on a link or view change
+        });
+        gp.mesh = gp.add("mesh", protocol, now -> runMesh(gp, now), LOCAL_PERIOD);
+        gp.pins = gp.add("pins", protocol, now -> runPins(gp, now), LOCAL_PERIOD);
+        gp.offload = gp.add("offload", protocol, now -> runOffload(gp, now), LOCAL_PERIOD);
+        gp.persist = gp.add("persist", protocol, now -> {
+            long nowMillis = time.millis();
+            long period = runtime.advertisement().gossip().period().toMillis();
+            admissionMemory.flushIfDue(groupId, nowMillis, period);
+            retirementList.flushIfDue(groupId, nowMillis, period);
+            long next = Math.min(admissionMemory.nextFlushDueMillis(groupId, period),
+                    retirementList.nextFlushDueMillis(groupId, period));
+            return next <= nowMillis ? dueFromWall(nowMillis + period) : dueFromWall(next);
+        }, LOCAL_PERIOD);
+        participants.put(groupId, gp);
+        // The change signals (EL-L-03): a view change or a pace moved asks the whole group; the first activity after
+        // a quiet stretch asks membership and anti-entropy (EL-L-13); the bus's own work asks the bus (EL-T-15).
+        runtime.membership().onChange(() -> loop.wakeGroup(groupId.value()));
+        runtime.gossip().loopHooks(new GossipBus.LoopHooks() {
+            @Override
+            public void activity() {
+                gp.membership.wake();
+                gp.antiEntropy.wake();
+            }
+
+            @Override
+            public void gossipDue() {
+                gp.gossip.wake();
+            }
+
+            @Override
+            public void paceChanged() {
+                loop.wakeGroup(groupId.value());
+            }
+        });
+        if (coalescer != null) {
+            runtime.gossip().outbox(peer -> coalescer.holds(groupId, peer));
+        }
+    }
+
+    /** The self ad (EL-L-09): its work, then its next refresh. */
+    private long runSelfAd(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        long nowMillis = localMillis();
+        publishSelfAd(gp, runtime, runtime.gossip(), nowMillis);
+        Long last = lastSelfAdMillis.get(runtime.id());
+        if (last == null) {
+            return now + 1_000_000L;
+        }
+        return dueFromLocal(last + refreshIntervalMillis(runtime, runtime.membership().size()));
+    }
+
+    /** Membership: the probe digests when a probe goes, then SWIM's round (EL-L-06). */
+    private long runMembership(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        GossipBus gossip = runtime.gossip();
+        long nowMillis = localMillis();
+        long activity = gossip.activityGeneration();
+        boolean active = activity != gp.membershipActivitySeen;
+        gp.membershipActivitySeen = activity;
+        // The membership probe's quiet rule (SPEC §5.2) counts all gossip, held here or not, as it did before the
+        // honest backoff: a member forwarding a busy stream it does not hold keeps the failure detector at the
+        // base period, and only the anti-entropy period reads the honest activity. Each reader keeps its own copy of
+        // the generation (DW-5), so membership and anti-entropy never consume each other's signal.
+        long trafficSeen = gossip.trafficGeneration();
+        boolean traffic = trafficSeen != gp.membershipTrafficSeen;
+        gp.membershipTrafficSeen = trafficSeen;
+        // The digest hashes a probe carries (v0.1.17) are taken here, before the membership monitor is held, and
+        // only when they will be read (IDLE-WORK item 7): a receiver reads them only while its own anti-entropy
+        // has backed off, which in a quiet group is when this node's has too. Busy, both run anti-entropy at the
+        // base period, the hashes would differ on every probe anyway, and taking them cost every stream's
+        // digest twice a second.
+        boolean probing = (probeHashesAlways || !active && runtime.antiEntropyStretched())
+                && runtime.membership().probeDue(nowMillis); // only on the run a probe goes
+        // Two kinds of hashes, taken only when they will be read: a member on wire.ae=2 gets each space's trie
+        // hash and any other member the text digests' hashes, so each compares like with like (annex I.6).
+        // Each kind is taken only when some member in view would receive it: the text form, which rebuilds a
+        // space's sorted digest whenever its generation moved (a lease sweep moves it in a space nobody writes),
+        // only when the view holds a member without wire.ae=2, and the trie form only when it holds one with it.
+        // Taking the text form for an all-hinted view cost the busy spaces' digests every probing tick and was
+        // never sent (a demo console's deployments, 2026-11-18). Both are decided here, outside the membership
+        // monitor the probe callbacks run under, since taking a digest takes its space's lock.
+        boolean textPartner = false;
+        boolean triePartner = false;
+        if (probing) {
+            for (GroupMembership.Member member : runtime.membership().allMembers()) {
+                if (member.id().equals(peerId())) {
+                    continue;
+                }
+                if (gossip.audits(member.id())) {
+                    triePartner = true;
+                } else {
+                    textPartner = true;
+                }
+                if (textPartner && triePartner) {
+                    break;
+                }
+            }
+        }
+        ProbeDigests probeText = probing && textPartner ? probeDigests(gossip, false) : ProbeDigests.NONE;
+        ProbeDigests probeTrie = probing && triePartner && gossip.auditing() ? probeDigests(gossip, true)
+                : ProbeDigests.NONE;
+        runtime.membership().tick(new GroupMembership.Prober() {
+            @Override
+            public void ping(PeerId target, long nonce) {
+                // The probe carries the anti-entropy digests, when taken above, and the recent items (v0.1.17).
+                ProbeDigests probe = gossip.audits(target) ? probeTrie : probeText;
+                send(runtime.id(), target, Envelope.Kind.PING, new Bodies.Ping(nonce,
+                        probe.root(), probe.hashes(), gossip.piggyback(target)));
+            }
+
+            @Override
+            public void pingReq(PeerId relay, PeerId target, long nonce) {
+                send(runtime.id(), relay, Envelope.Kind.PING_REQ,
+                        new Bodies.PingReq(target, nonce));
+            }
+
+            @Override
+            public java.util.Collection<PeerId> linkHolders(PeerId target) {
+                // TR-1: the members the target names in relay.via, when this node holds no link to it, cannot dial
+                // it and has no relay path; a PING would go nowhere (srad/agentspaces-event-loop.md §3.12).
+                Set<PeerId> via = viaOf(runtime.id(), target);
+                if (via.isEmpty() || hopsTo(runtime.id(), target) >= 0) {
+                    return List.of();
+                }
+                return via;
+            }
+
+            @Override
+            public java.util.Collection<PeerId> declaredHolders(PeerId target) {
+                return viaOf(runtime.id(), target); // TR-2: an escalated round asks these first
+            }
+
+            @Override
+            public boolean carriesNews(PeerId target, long sinceMillis) {
+                if (gossip.piggyback(target) != null) {
+                    return true;
+                }
+                ProbeDigests probe = gossip.audits(target) ? probeTrie : probeText;
+                if (probe.root() == null && probe.hashes() == null) {
+                    return false;
+                }
+                // The target's own PING with hashes in this period was answered with this node's: both compared.
+                Long hashedAt = hashedPingFrom.getOrDefault(runtime.id(), Map.of()).get(target);
+                return hashedAt == null || hashedAt < sinceMillis;
+            }
+        }, !traffic);
+        if (!traffic) {
+            gossip.armTrafficEdge(trafficSeen); // quiet: the first traffic from now on asks again (EL-L-13)
+        }
+        long next = runtime.membership().nextDueMillis();
+        return next <= nowMillis ? now + 1_000_000L : dueFromLocal(next);
+    }
+
+    /**
+     * The view as of this run, kept for leaving the group, and every departure, each once (EL-L-01). Asked on a view
+     * change; nothing here has a deadline.
+     */
+    private long runView(GroupParticipants gp) {
+        GroupRuntime runtime = gp.runtime;
+        long nowMillis = time.millis();
+        // A member that left the view since the last run (the failure detector dropped it, or an eviction did) is
+        // outside the data plane: only its own introduction re-admits it, and it sends one on the channel it dials
+        // next (see connectionTo), so the stale channel is closed here to make that happen.
+        // The view as of this run, kept for leaving the group (the members held then); taken only when the view's
+        // version moved (idle-loop O8), since every entry and exit moves it.
+        long viewVersion = runtime.membership().viewVersion();
+        Long taken = lastViewVersion.put(runtime.id(), viewVersion);
+        if (taken == null || taken != viewVersion) {
+            Set<PeerId> view = new java.util.HashSet<>();
+            for (GroupMembership.Member member : runtime.membership().allMembers()) {
+                view.add(member.id());
+            }
+            lastView.put(runtime.id(), view);
+        }
+        // Every departure is handled, each once, from the membership's own record of it: a member that left and came
+        // back between two runs (re-admitted from a copy of its card, then dropped again by a probe) left all the
+        // same, and a loss not recorded is a loss never retried. Comparing views from tick to tick missed it, and a
+        // fleet whose other members had stopped retrying stayed split for good (HorizonLaggingCopyTest, 2026-11-18).
+        boolean departed = false;
+        for (PeerId dropped : runtime.membership().drainDeparted()) {
+            if (runtime.membership().member(dropped).isPresent()) {
+                continue; // back already: nothing to retry, and its link and state stay
+            }
+            memberLeft(runtime, runtime.gossip(), dropped, nowMillis);
+            departed = true;
+        }
+        if (departed) {
+            gp.lost.wake(); // a loss to retry, later in this same run (NL-7)
+        }
+        return DueWork.NEVER;
+    }
+
+    /** The periodic anti-entropy round, its quiet stretch and the snap-back on the first activity (EL-L-07, EL-L-13). */
+    private long runAntiEntropy(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        GossipBus gossip = runtime.gossip();
+        long nowMillis = localMillis();
+        long activity = gossip.activityGeneration();
+        boolean active = activity != gp.antiEntropyActivitySeen;
+        gp.antiEntropyActivitySeen = activity;
+        if (runtime.claimAntiEntropyRound(nowMillis, active)) {
+            gp.periodicPartner = gossip.antiEntropyTick().orElse(null);
+            gp.periodicPartnerRun = now;
+        }
+        if (!active) {
+            gossip.armActivityEdge(activity); // quiet: the first activity from now on asks again (EL-L-13)
+        }
+        long next = runtime.nextAntiEntropyMillis(nowMillis);
+        return next <= nowMillis ? now + 1_000_000L : dueFromLocal(next);
+    }
+
+    /**
+     * A member admitted since the last run is reconciled with now, after this node's own introduction went out (the
+     * self ad runs first), so it holds this node and answers: the newcomer pulls the cards and space state the fleet
+     * already has instead of waiting for the random periodic partner to be one that holds them. The periodic round's
+     * partner of this same run is not asked twice. Asked by the admission (EL-L-07, EL-SP-09).
+     */
+    private long runNewcomer(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        Set<PeerId> admitted = newlyAdmitted.remove(runtime.id());
+        if (admitted == null) {
+            return DueWork.NEVER;
+        }
+        PeerId periodicPartner = gp.periodicPartnerRun == now ? gp.periodicPartner : null;
+        for (PeerId member : admitted) {
+            boolean present = runtime.membership().member(member).isPresent();
+            if (!member.equals(periodicPartner) && present) {
+                runtime.gossip().antiEntropyWith(member);
+            }
+            Long admittedAt = admittedAtMillis.remove(new GroupPeer(runtime.id(), member));
+            if (admittedAt != null && present) {
+                // reconciled now, by the targeted round or the periodic one that picked it (EL-M-04)
+                loopMeter.newcomerRound(Math.max(0, localMillis() - admittedAt));
+            }
+        }
+        return DueWork.NEVER;
+    }
+
+    /** Lost members and the empty view: their retries' next due times (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md). */
+    private long runLost(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        GroupId groupId = runtime.id();
+        long nowMillis = time.millis();
+        retryLost(runtime, nowMillis);
+        long next = Long.MAX_VALUE;
+        Map<PeerId, Long> lost = lostMembers.get(groupId);
+        if (lost != null && !lost.isEmpty()) {
+            long window = retirement ? retireAfterMillis : LOST_RETRY_WINDOW_MILLIS;
+            Map<PeerId, Backoff> schedule = lostSchedule.getOrDefault(groupId, Map.of());
+            for (Map.Entry<PeerId, Long> entry : lost.entrySet()) {
+                next = Math.min(next, entry.getValue() + window + 1);
+                Backoff backoff = schedule.get(entry.getKey());
+                next = Math.min(next, backoff == null ? entry.getValue() + LOST_RETRY_INTERVAL_MILLIS
+                        : backoff.nextDueMillis);
+            }
+        }
+        if (runtime.membership().size() == 0) {
+            Long last = lastLostRetryMillis.get(groupId);
+            long interval = lostRetryIntervalMillis.getOrDefault(groupId, LOST_RETRY_INTERVAL_MILLIS);
+            next = Math.min(next, last == null ? nowMillis : last + interval);
+            Long empty = emptySince.get(groupId);
+            if (empty != null && nowMillis - empty < LAST_RESORT_AFTER_MILLIS) {
+                next = Math.min(next, empty + LAST_RESORT_AFTER_MILLIS);
+            } else if (postRetirement) {
+                Backoff backoff = lastResortSchedule.get(groupId);
+                if (backoff != null && backoff.nextDueMillis > nowMillis) {
+                    next = Math.min(next, backoff.nextDueMillis); // an overdue one found nobody to try
+                }
+            }
+        }
+        // A retry already overdue (the round's budget ran out) goes on the next run a moment later.
+        return next <= nowMillis ? dueFromWall(nowMillis + 100) : dueFromWall(next);
+    }
+
+    /** The relay mesh (relays only): each unlinked relay again a minute after its last dial (LB-R-02). */
+    private long runMesh(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        if (!roles.contains(PeerAdvertisement.PeerRole.RELAY)) {
+            return DueWork.NEVER;
+        }
+        long nowMillis = localMillis();
+        meshRelays(runtime, nowMillis);
+        long next = Long.MAX_VALUE;
+        for (PeerId relay : runtime.membership().withRole(PeerAdvertisement.PeerRole.RELAY)) {
+            Long attempted = meshAttempted.get(relay);
+            if (attempted != null && !relay.equals(peerId()) && !connections.containsKey(relay)) {
+                next = Math.min(next, attempted + MESH_RETRY_MILLIS);
+            }
+        }
+        return next <= nowMillis ? dueFromLocal(nowMillis + MESH_RETRY_MILLIS) : dueFromLocal(next);
+    }
+
+    /** Pinned relay paths: the earliest idle expiry; a hop leaving the view asks again (LB-R-07). */
+    private long runPins(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        long nowMillis = localMillis();
+        expirePins(runtime, nowMillis);
+        Map<PeerId, PinnedPath> pins = pinnedPaths.get(runtime.id());
+        if (pins == null || pins.isEmpty()) {
+            return DueWork.NEVER;
+        }
+        long next = Long.MAX_VALUE;
+        for (PinnedPath pinned : pins.values()) {
+            next = Math.min(next, pinned.lastUsedMillis() + pathTtl.toMillis() + 1);
+        }
+        return dueFromLocal(Math.max(next, nowMillis + 1));
+    }
+
+    /** The relay offload (JS-W-11): looked at again while a relayed member stays over the threshold. */
+    private long runOffload(GroupParticipants gp, long now) {
+        GroupRuntime runtime = gp.runtime;
+        long nowMillis = localMillis();
+        offloadRelayed(runtime, nowMillis); // JS-W-11, off this thread for the dial itself
+        Map<PeerId, java.util.ArrayDeque<Long>> perMember = relayedWith.get(runtime.id());
+        if (perMember == null) {
+            return DueWork.NEVER;
+        }
+        List<java.util.ArrayDeque<Long>> windows;
+        synchronized (perMember) {
+            windows = List.copyOf(perMember.values());
+        }
+        for (java.util.ArrayDeque<Long> times : windows) {
+            if (windowCount(times, nowMillis) > relayOffload.framesPerMinute()) {
+                return dueFromLocal(nowMillis + OFFLOAD_RECHECK_MILLIS);
+            }
+        }
+        return DueWork.NEVER; // the frame that takes a member over the threshold asks again
+    }
+
+    /**
+     * Registers due work of a group on the node's loop (GroupRuntime.onDue): a registrant's participant, run after
+     * the protocol participants of every group (NL-8).
+     */
+    DueWork.Registration registerDue(GroupId groupId, String name, DueWork work, NodeLoop.Timing timing) {
+        return loop.register(groupId.value() + "/" + name, NodeLoop.Kind.OTHER, groupId.value(), work, timing);
+    }
+
+    /**
+     * The deprecated {@code onTick} adapter (decision 7, EL-L-05): the runnable runs every {@code tick-millis} while
+     * the node's loop runs, and on every {@link #tick()}; hand-driven, only on {@link #tick()}.
+     */
+    DueWork.Registration registerTickAdapter(GroupId groupId, Runnable work) {
+        String owner = work.getClass().getName();
+        int lambda = owner.indexOf("$$");
+        if (lambda > 0) {
+            owner = owner.substring(0, lambda);
+        }
+        if (TICK_ADAPTER_NOTED.add(owner)) {
+            // The core's own registrants move to onDue in phase 2 (EL-T-09); an application's hears it once.
+            System.Logger.Level level = owner.startsWith("ai.badmonkey.agentspaces.")
+                    && !owner.startsWith("ai.badmonkey.agentspaces.examples.")
+                    ? System.Logger.Level.DEBUG : System.Logger.Level.INFO;
+            LOG.log(level, "GroupRuntime.onTick is deprecated (registered by " + owner + "); it runs every tick-millis"
+                    + " on the node's loop: register GroupRuntime.onDue work that returns its next due time");
+        }
+        long[] last = {Long.MIN_VALUE};
+        String name = "tick:" + owner.substring(owner.lastIndexOf('.') + 1);
+        return loop.register(groupId.value() + "/" + name, NodeLoop.Kind.OTHER, groupId.value(), now -> {
+            Duration period = tickPeriod;
+            long periodNanos = (period == null ? DEFAULT_TICK_PERIOD : period).toNanos();
+            boolean dueByTime = period != null && (last[0] == Long.MIN_VALUE || now - last[0] >= periodNanos);
+            if (loop.directRun() || dueByTime) {
+                last[0] = now;
+                work.run();
+            }
+            return period == null ? DueWork.NEVER : last[0] + periodNanos;
+        });
+    }
+
+    /** A link opened or closed (EL-L-03): the reach hints, the relay mesh, the offload and owed introductions. */
+    private void linksChanged() {
+        for (GroupParticipants gp : participants.values()) {
+            gp.reach.wake();
+            gp.mesh.wake();
+            gp.offload.wake();
+        }
+    }
+
+    /** An input of this node's card moved (EL-L-09): every group's self ad is asked again. */
+    private void selfAdChanged() {
+        selfAdVersion.incrementAndGet();
+        for (GroupParticipants gp : participants.values()) {
+            gp.selfAd.wake();
+        }
+    }
+
+    /**
+     * Tells the node that the channel-trust supplier's value changed (a CRL refresh, srad/agentspaces-event-loop.md
+     * EL-L-14): every live chained channel is re-judged on the loop's next run, so a revoked channel is cut at once
+     * rather than on the trust participant's next look.
+     */
+    public void trustChanged() {
+        DueWork.Registration trust = trustParticipant;
+        if (trust != null) {
+            trust.wake();
         }
     }
 
@@ -3757,14 +4701,16 @@ public final class PeerNode implements AutoCloseable {
     /**
      * How often this node's advertisement is refreshed to each member of a group. The configured
      * interval, unless the group's probe cycle (one member per period, stretched four times when
-     * quiet, or further while the TTL bound allows: {@link GroupMembership#maxQuietIntervalMillis}) has outgrown the member TTL: a
-     * member is kept by hearing from it, and past that size the probes cannot reach every member
+     * quiet, or further while the TTL bound allows: {@link GroupMembership#maxQuietIntervalMillis}) has outgrown the
+     * keepalive TTL: a member is kept by hearing from it, and past that size the probes cannot reach every member
      * inside the TTL, so the refresh takes over as the keepalive at half the TTL (ROBUSTNESS.md
-     * §6b, scale). Small groups keep their cadence unchanged.
+     * §6b, scale). Small groups keep their cadence unchanged. The rule reads the keepalive TTL (30 s by default), not
+     * the member TTL this node judges others by, so every peer that judges this node at 30 s sees today's cadence
+     * (srad/agentspaces-event-loop.md EL-E-06, EL-E-07).
      */
     long refreshIntervalMillis(GroupRuntime runtime, int members) {
         GroupMembership membership = runtime.membership();
-        long ttl = membership.config().memberTtl().toMillis();
+        long ttl = membership.config().keepaliveTtl().toMillis();
         long legacy = membership.probeIntervalMillis() * (1L << GroupMembership.LEGACY_QUIET_STRETCH);
         if (membership.maxQuietIntervalMillis(members) > legacy) {
             // stretched past four times by the TTL bound, which keeps every member heard twice inside the TTL
@@ -3779,8 +4725,21 @@ public final class PeerNode implements AutoCloseable {
     }
 
 
-    private void publishSelfAd(GroupRuntime runtime, GossipBus gossip, long nowMillis) {
+    private void publishSelfAd(GroupParticipants gp, GroupRuntime runtime, GossipBus gossip, long nowMillis) {
         GroupId groupId = runtime.id();
+        // The change test (srad/agentspaces-event-loop.md EL-L-09): with no input of the card moved, the view as it
+        // was, no introduction owed and the refresh not due, the run allocates nothing. A setter moves the version,
+        // a view change the view's version, a link loss the owed flag; each also asks this participant again.
+        long version = selfAdVersion.get();
+        long viewVersion = runtime.membership().viewVersion();
+        Long lastRun = lastSelfAdMillis.get(groupId);
+        if (lastRun != null && gp.selfAdSeenVersion == version && gp.selfAdSeenView == viewVersion
+                && !gp.introductionsOwed
+                && nowMillis - lastRun < refreshIntervalMillis(runtime, runtime.membership().size())) {
+            return;
+        }
+        gp.introductionsOwed = false; // before the walk: a link lost during it owes again
+        gp.selfAdSeenView = viewVersion;
         Set<PeerId> sentTo = selfAdSentTo.computeIfAbsent(groupId, g -> ConcurrentHashMap.newKeySet());
         List<GroupMembership.Member> members = runtime.membership().allMembers();
         Set<PeerId> current = new java.util.HashSet<>();
@@ -3789,23 +4748,29 @@ public final class PeerNode implements AutoCloseable {
         }
         sentTo.retainAll(current);
         Long last = lastSelfAdMillis.get(groupId);
-        int fingerprint = Objects.hash(List.copyOf(advertisedEndpoints), roles, selfHints(groupId));
-        boolean changed = !Integer.valueOf(fingerprint).equals(lastSelfAdFingerprint.get(groupId));
+        boolean changed = false;
+        if (gp.selfAdSeenVersion != version || last == null) {
+            int fingerprint = Objects.hash(List.copyOf(advertisedEndpoints), roles, selfHints(groupId));
+            changed = !Integer.valueOf(fingerprint).equals(lastSelfAdFingerprint.get(groupId));
+            lastSelfAdFingerprint.put(groupId, fingerprint);
+            gp.selfAdSeenVersion = version;
+        }
         if (last == null || changed) {
             // Flooded: the content is new and has to reach every member, through a third where a
             // direct link is cut. A view change no longer floods (ROBUSTNESS.md §6b, scale): a
             // newcomer gets this node's advertisement directly below, a lost member by the
             // lost-member retry, and at fifty members one expiry made forty-nine floods.
             // Mark before publishing: a member whose send fails is dropped from the set by
-            // dropConnection during the publish, and is introduced to again on the next tick.
+            // dropConnection during the publish, and is introduced to again on the next run.
             sentTo.addAll(current);
             lastSelfAdMillis.put(groupId, nowMillis);
-            lastSelfAdFingerprint.put(groupId, fingerprint);
             Bodies.Rumor selfAd = selfAdRumor(groupId);
             gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload());
+            selfAdFloods.incrementAndGet();
             return;
         }
         if (nowMillis - last >= refreshIntervalMillis(runtime, members.size())) {
+            selfAdRefreshes.incrementAndGet();
             // The interval refresh goes to each member directly and unforwarded (v0.1.17): the
             // flood cost every member several copies when nothing else had pruned the tree, and
             // a refresh has to reach each member exactly once anyway.
@@ -3814,10 +4779,15 @@ public final class PeerNode implements AutoCloseable {
             Bodies.Rumor selfAd = selfAdRumor(groupId);
             Bodies.Rumor refresh = new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload());
             for (PeerId member : current) {
-                if (!member.equals(peerId()) && !send(groupId, member, Envelope.Kind.RUMOR, refresh)) {
+                if (member.equals(peerId())) {
+                    continue;
+                }
+                if (!send(groupId, member, Envelope.Kind.RUMOR, refresh)) {
                     gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload()); // unreachable: flood
+                    selfAdFloods.incrementAndGet();
                     return;
                 }
+                selfAdRefreshFrames.incrementAndGet();
             }
             return;
         }
@@ -3832,12 +4802,14 @@ public final class PeerNode implements AutoCloseable {
             }
             if (send(groupId, member, Envelope.Kind.RUMOR, direct)) {
                 sentTo.add(member);
+                selfAdIntroductions.incrementAndGet();
                 continue;
             }
             // Unreachable directly (a partition, a dial-only peer behind another member): let
             // the group carry the introduction instead, as the per-tick flood used to.
             Bodies.Rumor flooded = selfAdRumor(groupId);
             gossip.publish(flooded.streamId(), flooded.itemId(), flooded.payload());
+            selfAdFloods.incrementAndGet();
             lastSelfAdMillis.put(groupId, nowMillis);
             sentTo.addAll(current);
             return;
@@ -3845,31 +4817,23 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * Starts a background ticker for wall-clock deployments.
+     * Starts the node's loop for wall-clock deployments (srad/agentspaces-event-loop.md §3.3): from now on each
+     * participant runs when it is due or asked, and the node sleeps in between; there is no periodic tick. The period
+     * is {@code tick-millis}: the cadence the deprecated {@code onTick} adapters keep (decision 8) and the one
+     * {@link #tickPeriod()} reports to layers that convert ticks to time. Idempotent.
      *
      * @param period the tick period
      */
     public synchronized void startTicking(Duration period) {
-        if (ticker != null) {
+        if (tickPeriod != null) {
             return;
         }
         this.tickPeriod = Objects.requireNonNull(period, "period");
-        ticker = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "peer-tick-" + peerId().display());
-            t.setDaemon(true);
-            return t;
-        });
-        scheduleNextTick();
+        loop.start(); // registers the loop with its time source's watchdog (EL-H-02)
+        if (coalescer != null) {
+            flushWatch = time.watchdog().register(coalescer); // the flush timer too
+        }
     }
-
-    // ---- the sleeping ticker (idle-loop item 1, reviews/IDLE-LOOP-2026-11-18.md §6)
-
-    private final Object tickSchedule = new Object();
-    /** The next scheduled tick. Under {@link #tickSchedule}. */
-    private java.util.concurrent.ScheduledFuture<?> nextTick;
-    /** Whether the next scheduled tick is a long one, every group idle. Under {@link #tickSchedule}. */
-    private boolean sleepingIdle;
-    private final AtomicLong idleSleeps = new AtomicLong();
 
     /** Introductions this node sent to lost members' last endpoints (the per-member back-off). */
     public long lostIntroductions() {
@@ -3893,7 +4857,7 @@ public final class PeerNode implements AutoCloseable {
      * @return their peer ids
      */
     public List<PeerId> retired(GroupId groupId) {
-        return retirementList.list(groupId, clock.millis()).stream().map(RetirementList.Retired::peer).toList();
+        return retirementList.list(groupId, time.millis()).stream().map(RetirementList.Retired::peer).toList();
     }
 
     /** Whether lost members retire (the retirement setting). */
@@ -3919,164 +4883,54 @@ public final class PeerNode implements AutoCloseable {
         return known != null && known.state() == MembershipState.ISOLATED;
     }
 
-    /** Times the ticker slept a whole idle span because every group was idle (idle-loop item 1). */
-    public long idleSleeps() {
-        return idleSleeps.get();
-    }
-
     /**
-     * Schedules the next tick: one period away, or, while every group is idle, {@link #IDLE_TICK_DIVIDER} periods away,
-     * so an idle node's ticker thread sleeps instead of waking to look. A {@link #wake} cuts a long sleep short.
-     */
-    private void scheduleNextTick() {
-        java.util.concurrent.ScheduledExecutorService executor = ticker;
-        Duration period = tickPeriod;
-        if (executor == null || executor.isShutdown() || period == null) {
-            return;
-        }
-        synchronized (tickSchedule) {
-            boolean idle = everyGroupIdle();
-            sleepingIdle = idle;
-            if (idle) {
-                idleSleeps.incrementAndGet();
-            }
-            try {
-                nextTick = executor.schedule(this::scheduledTick,
-                        idle ? period.toMillis() * IDLE_TICK_DIVIDER : period.toMillis(),
-                        java.util.concurrent.TimeUnit.MILLISECONDS);
-            } catch (java.util.concurrent.RejectedExecutionException closing) {
-                // the node is closing
-            }
-        }
-    }
-
-    private void scheduledTick() {
-        boolean slept;
-        synchronized (tickSchedule) {
-            slept = sleepingIdle;
-            sleepingIdle = false;
-        }
-        try {
-            tick(true, slept);
-        } catch (RuntimeException e) {
-            LOG.log(System.Logger.Level.WARNING, "scheduled tick failed", e);
-        } finally {
-            scheduleNextTick();
-        }
-    }
-
-    /** Cuts a long idle sleep short: the next tick runs now. */
-    private void rouseTicker() {
-        synchronized (tickSchedule) {
-            java.util.concurrent.ScheduledExecutorService executor = ticker;
-            if (!sleepingIdle || executor == null || nextTick == null || !nextTick.cancel(false)) {
-                return;
-            }
-            sleepingIdle = false;
-            try {
-                nextTick = executor.schedule(this::scheduledTick, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
-            } catch (java.util.concurrent.RejectedExecutionException closing) {
-                // the node is closing
-            }
-        }
-    }
-
-    /** Whether every group has been idle long enough, with nothing pending, for the ticker to sleep a whole span. */
-    private boolean everyGroupIdle() {
-        if (groups.isEmpty()) {
-            return false;
-        }
-        for (GroupRuntime runtime : groups.values()) {
-            Idleness idleness = idleGroups.get(runtime.id());
-            GossipBus gossip = runtime.gossip();
-            if (idleness == null || idleness.woken || idleness.quietTicks < IDLE_AFTER_TICKS
-                    || gossip.activityPending() || gossip.trafficPending() || runtime.membership().probesPending()
-                    || runtime.membership().viewVersion() != idleness.view) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // ---- the idle tick (idle-loop O8, reviews/IDLE-LOOP-2026-11-18.md)
-
-    /** A group idle this long, in scheduled ticks, runs one scheduled tick in {@link #IDLE_TICK_DIVIDER}. */
-    static final int IDLE_AFTER_TICKS = 40;
-    /** An idle group's full tick runs on one scheduled tick in this many; the others only look for work. */
-    static final int IDLE_TICK_DIVIDER = 4;
-
-    /** One group's idleness, as the scheduled ticks judge it. */
-    private static final class Idleness {
-        volatile boolean woken = true;
-        int quietTicks;
-        int skipped;
-        long view = -1;
-    }
-
-    private final Map<GroupId, Idleness> idleGroups = new ConcurrentHashMap<>();
-    private final AtomicLong idleTicksSkipped = new AtomicLong();
-
-    /** Group ticks the scheduled ticker skipped because the group was idle (idle-loop O8). */
-    public long idleTicksSkipped() {
-        return idleTicksSkipped.get();
-    }
-
-    /**
-     * Brings a group back to the full tick rate at once: work this node started that the tick drives (a fetch, a
-     * protocol step) calls this, as a frame of such work does on arrival or departure (idle-loop O8).
+     * Asks every participant of a group to run again on the loop's next run (srad/agentspaces-event-loop.md EL-L-15,
+     * DW-2): work this node started whose deadline moved earlier calls this when it cannot name its participant.
      *
      * @param groupId the group
      */
     public void wake(GroupId groupId) {
-        Idleness idleness = idleGroups.get(groupId);
-        if (idleness != null) {
-            idleness.woken = true;
-            rouseTicker();
-        }
-    }
-
-    /** Frames that are liveness or time-paced reconciliation; any other kind is work the tick may be driving. */
-    private static boolean wakes(Envelope.Kind kind) {
-        return switch (kind) {
-            case PING, PING_REQ, ACK, RUMOR, DIGEST, PULL_RESP -> false;
-            default -> true;
-        };
+        loop.wakeGroup(groupId.value());
     }
 
     /**
-     * Whether a scheduled tick may skip a group's full tick: the group showed no work (gossip activity or traffic, a
-     * probe awaiting its answer, a change of view, a working frame either way, a {@link #wake}) for
-     * {@link #IDLE_AFTER_TICKS} scheduled ticks, and this is not its one tick in {@link #IDLE_TICK_DIVIDER}. Every
-     * judgement below the tick is by the clock, so a skipped tick delays it by at most the divider's span; the flags
-     * read here are only peeked, and the full tick consumes them as before. A direct {@link #tick()} never skips.
+     * The node's time source: the loop's monotonic base and scheduler.
+     *
+     * @return the time source
      */
-    private boolean restsThisTick(GroupRuntime runtime, boolean afterIdleSleep) {
-        Idleness idleness = idleGroups.computeIfAbsent(runtime.id(), g -> new Idleness());
-        GossipBus gossip = runtime.gossip();
-        long view = runtime.membership().viewVersion();
-        boolean busy = idleness.woken || gossip.activityPending() || gossip.trafficPending()
-                || runtime.membership().probesPending() || view != idleness.view;
-        if (busy) {
-            idleness.woken = false;
-            idleness.quietTicks = 0;
-            idleness.skipped = 0;
-            idleness.view = view;
-            return false;
-        }
-        if (idleness.quietTicks < IDLE_AFTER_TICKS) {
-            idleness.quietTicks++;
-            return false;
-        }
-        if (afterIdleSleep) {
-            idleness.skipped = 0; // the ticker slept the span: this is the group's one tick in the divider
-            return false;
-        }
-        if (++idleness.skipped < IDLE_TICK_DIVIDER) {
-            idleTicksSkipped.incrementAndGet();
-            return true;
-        }
-        idleness.skipped = 0;
-        return false;
+    public ai.badmonkey.agentspaces.common.time.TimeSource time() {
+        return time;
+    }
+
+    /** Whether the calling thread is inside a run {@link #tick()} started (GroupRuntime.directRun). */
+    boolean directRun() {
+        return loop.directRun();
+    }
+
+    /**
+     * Moves whenever a member's AppCard level moves, so a registrant that judges the AppCard gate re-judges only then
+     * (srad/agentspaces-event-loop.md EL-T-07).
+     *
+     * @return the version
+     */
+    public long appCardVersion() {
+        return appCardVersion.get();
+    }
+
+    /**
+     * Frames that are liveness or time-paced reconciliation, or the gossip bus's own tree upkeep, wake no registrant;
+     * any other kind is work a registrant of the group may be driving, and asks the group's registrants again on
+     * arrival (EL-L-03). HAVE, GRAFT and PRUNE are the lazy push's announcements and repairs: the bus handles them and
+     * wakes its own participant (EL-T-15), and nothing a registrant reads moves. Asking every registrant on each HAVE
+     * was the needless wake behind phase 3's rise at ten members (srad/agentspaces-event-loop.md §10.21: HAVE received
+     * 2.0 to 9.2 a minute, event wakes 6.4 to 14.6). A BATCH's inner frames are each dispatched and judged by their own
+     * kind, so the outer frame asks nothing.
+     */
+    static boolean wakes(Envelope.Kind kind) {
+        return switch (kind) {
+            case PING, PING_REQ, ACK, RUMOR, DIGEST, PULL_RESP, HAVE, GRAFT, PRUNE, BATCH -> false;
+            default -> true;
+        };
     }
 
     /**
@@ -4094,17 +4948,14 @@ public final class PeerNode implements AutoCloseable {
         if (!groups.containsKey(groupId)) {
             return false; // a group this node left sends nothing more, even over a link it still holds (R2-2.2)
         }
-        if (wakes(kind)) {
-            wake(groupId);
-        }
         if (quarantined(to)) {
             return false; // cautious: a sentenced peer is sent nothing, and no link is opened to it
         }
         // Never coalesce an introduction: a peer that has not admitted this node yet discards a
         // BATCH whole, and the peer advertisement inside it is what would have admitted it.
         boolean introduction = body instanceof Bodies.Rumor rumor && PEER_AD_STREAM.equals(rumor.streamId());
-        if (coalesceWindow != null && batchable(kind) && !introduction && batchPeers.contains(to)
-                && !to.equals(peerId())) {
+        if (coalescer != null && !coalescer.stopped() && batchable(kind) && !introduction
+                && batchPeers.contains(to) && !to.equals(peerId())) {
             enqueue(groupId, to, kind, body);
             return true;
         }
@@ -4120,45 +4971,7 @@ public final class PeerNode implements AutoCloseable {
     private void enqueue(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
         byte[] bodyBytes = body instanceof byte[] raw ? raw : codec.toBytes(body);
         byte[] inner = codec.toBytes(new Envelope(WIRE_VERSION, groupId, kind, peerId(), to, hlc.now(), bodyBytes));
-        Outbox full = null;
-        Outbox outbox = outboxes.computeIfAbsent(to, p -> new Outbox(groupId));
-        synchronized (outbox) {
-            outbox.frames.add(inner);
-            outbox.bytes += inner.length;
-            if (outbox.frames.size() >= BATCH_MAX_FRAMES || outbox.bytes >= BATCH_MAX_BYTES) {
-                full = outbox;
-            }
-        }
-        if (full != null) {
-            flush(to, full);
-        }
-    }
-
-    private void flushOutboxes() {
-        for (Map.Entry<PeerId, Outbox> e : outboxes.entrySet()) {
-            flush(e.getKey(), e.getValue());
-        }
-    }
-
-    private void flush(PeerId to, Outbox outbox) {
-        List<byte[]> frames;
-        GroupId group;
-        synchronized (outbox) {
-            if (outbox.frames.isEmpty()) {
-                return;
-            }
-            frames = List.copyOf(outbox.frames);
-            outbox.frames.clear();
-            outbox.bytes = 0;
-            group = outbox.group;
-        }
-        if (frames.size() == 1) {
-            // Nothing to coalesce: forward the inner frame as itself, re-signed as a plain frame.
-            Envelope inner = codec.fromBytes(frames.get(0), Envelope.class); // this node's own outbox
-            sendNow(group, to, inner.kind(), inner.body());
-            return;
-        }
-        sendNow(group, to, Envelope.Kind.BATCH, new Bodies.Batch(frames));
+        coalescer.enqueue(groupId, to, kind, bodyBytes, inner);
     }
 
     private void onBatch(GroupRuntime runtime, Envelope envelope, TransportConnection connection) {
@@ -4248,7 +5061,7 @@ public final class PeerNode implements AutoCloseable {
             PeerId first = path.get(0);
             TransportConnection connection = connectionTo(groupId, first);
             if (connection == null) {
-                firstHopFailedAt.put(first, clock.millis()); // not a start for a while (LB-R-04)
+                firstHopFailedAt.put(first, localMillis()); // not a start for a while (LB-R-04)
             } else {
                 try {
                     Bodies.RelayFrame frame = path.size() == 1
@@ -4289,7 +5102,7 @@ public final class PeerNode implements AutoCloseable {
     /** The pinned path to a target, or a freshly computed and pinned one; null when none exists. */
     private List<PeerId> pathTo(GroupId groupId, GroupRuntime runtime, PeerId to) {
         Map<PeerId, PinnedPath> pins = pinnedPaths.computeIfAbsent(groupId, g -> new ConcurrentHashMap<>());
-        long now = clock.millis();
+        long now = localMillis();
         PinnedPath pinned = pins.get(to);
         if (pinned != null && now - pinned.lastUsedMillis() <= pathTtl.toMillis()
                 && pinned.path().stream().allMatch(hop -> runtime.membership().member(hop).isPresent())) {
@@ -4301,7 +5114,12 @@ public final class PeerNode implements AutoCloseable {
             pins.remove(to);
             return null;
         }
+        boolean first = pins.isEmpty();
         pins.put(to, new PinnedPath(computed, now));
+        GroupParticipants gp = participants.get(groupId);
+        if (first && gp != null) {
+            gp.pins.wake(); // a deadline where there was none (EL-L-03)
+        }
         return computed;
     }
 
@@ -4358,7 +5176,7 @@ public final class PeerNode implements AutoCloseable {
         Set<PeerId> attached = new java.util.HashSet<>(attachedRelays(runtime));
         attached.remove(to);
         Set<PeerId> dialable = new java.util.HashSet<>();
-        long now = clock.millis();
+        long now = localMillis();
         for (PeerId relay : graph.relays()) {
             Long failed = firstHopFailedAt.get(relay);
             if (!relay.equals(peerId()) && !relay.equals(to) && !attached.contains(relay)
@@ -4607,7 +5425,7 @@ public final class PeerNode implements AutoCloseable {
             return;
         }
         String key = runtime.id().value() + "|" + origin.value() + "|" + relayed.target().value();
-        long now = clock.millis();
+        long now = localMillis();
         Long last = signalSentAt.get(key);
         if (last != null && now - last < SIGNAL_INTERVAL_MILLIS) {
             return;
@@ -4640,28 +5458,26 @@ public final class PeerNode implements AutoCloseable {
 
     @Override
     public synchronized void close() {
-        if (flusher != null) {
-            flusher.shutdownNow();
-            try {
-                flushOutboxes();
-            } catch (RuntimeException e) {
-                // closing anyway
-            }
+        if (coalescer != null) {
+            coalescer.close(); // stop flag, timer cancelled, every outbox flushed once (EL-B-03, FT-6)
         }
-        if (ticker != null) {
-            // Let an in-flight tick finish rather than interrupt it: a tick may be
-            // persisting state (a rotated content-key ring), and an interrupted
-            // write leaves a half-written file behind. Bounded, and never awaited
-            // from the tick thread itself.
-            ticker.shutdown();
-            if (!Thread.currentThread().getName().startsWith("peer-tick-")) {
-                try {
-                    ticker.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            ticker.shutdownNow();
+        // No run starts after this (NL-5). Let a run in flight finish rather than interrupt it: a run may be
+        // persisting state (a rotated content-key ring), and an interrupted write leaves a half-written file behind.
+        // Bounded, and never awaited from inside the node's own run, judged by the loop, not a thread name (NL-5).
+        loop.close(); // and leaves the watchdog
+        try {
+            wallStepRegistration.close();
+        } catch (Exception e) {
+            // a registration's close does not fail
+        }
+        ai.badmonkey.agentspaces.common.time.Watchdog.Registration fw = flushWatch;
+        if (fw != null) {
+            fw.close();
+        }
+        try {
+            loop.awaitIdle(Duration.ofSeconds(2));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         for (AutoCloseable listener : listeners) {
             try {
@@ -4671,7 +5487,7 @@ public final class PeerNode implements AutoCloseable {
             }
         }
         admissionMemory.flushAll(); // an admission inside the last gossip period survives the restart
-        retirementList.flushAll(clock.millis());
+        retirementList.flushAll(time.millis());
         connections.values().forEach(TransportConnection::close);
         connections.clear();
         // Every link this node attached, accepted or dialed, not only the one it sends to each peer on: a peer that
@@ -4805,7 +5621,7 @@ public final class PeerNode implements AutoCloseable {
     private void judgeChannel(TransportConnection connection,
                               ai.badmonkey.agentspaces.identity.ChannelTrust trust) {
         java.security.cert.X509Certificate[] chain = connection.remoteChain();
-        if (!(trust.status(chain, clock.instant())
+        if (!(trust.status(chain, time.instant())
                 instanceof ai.badmonkey.agentspaces.identity.TrustStatus.Revoked revoked)
                 || !revoked.authorizesPeerRevocation()) {
             return;
@@ -4823,7 +5639,7 @@ public final class PeerNode implements AutoCloseable {
             ai.badmonkey.agentspaces.api.ad.RevocationAdvertisement ad =
                     new ai.badmonkey.agentspaces.api.ad.RevocationAdvertisement(
                             "aspace://" + runtime.id().value() + "/revocation/" + revoked.peer().value(),
-                            peerId(), runtime.id(), clock.instant(), REVOCATION_GOSSIP_TTL,
+                            peerId(), runtime.id(), time.instant(), REVOCATION_GOSSIP_TTL,
                             revoked.peer(), "ca:" + revoked.reason().name().toLowerCase(), null, evidence);
             byte[] adBytes = codec.toBytes(ad);
             RevocationRegistry.SignedRevocation signed = new RevocationRegistry.SignedRevocation(
@@ -4878,7 +5694,13 @@ public final class PeerNode implements AutoCloseable {
         if (session != null && decoded.get().auth() == WireCodec.Auth.SESSION) {
             session.confirmed = true; // the other end holds the key: key confirmation (spec §5.6)
         }
-        dispatch(decoded.get().envelope(), connection);
+        Envelope envelope = decoded.get().envelope();
+        long handleStart = System.nanoTime();
+        dispatch(envelope, connection);
+        long took = System.nanoTime() - handleStart;
+        if (took > SLOW_RUN_NANOS) {
+            frameHandled(envelope.kind(), envelope.from(), took); // EL-H-11: named by kind and peer
+        }
     }
 
     /**
@@ -4951,7 +5773,9 @@ public final class PeerNode implements AutoCloseable {
         }
         hlc.update(envelope.stamp());
         if (connection != null) {
-            connections.putIfAbsent(envelope.from(), connection);
+            if (connections.putIfAbsent(envelope.from(), connection) == null) {
+                linksChanged(); // a link opened (EL-L-03)
+            }
             // A session opens only after a non-introduction frame from a member: probes, digests
             // and forwards go to members alone, so such a frame proves the peer admitted this
             // node too, and its answer to a hello will not be ignored as a stranger's.
@@ -4971,7 +5795,7 @@ public final class PeerNode implements AutoCloseable {
             runtime.membership().recordHeard(envelope.from());
         }
         if (wakes(envelope.kind())) {
-            wake(runtime.id());
+            loop.wakeGroup(runtime.id().value(), NodeLoop.Kind.OTHER); // a registrant's work (EL-L-03)
         }
         try {
             dispatchKind(runtime, envelope, connection);
@@ -4999,7 +5823,7 @@ public final class PeerNode implements AutoCloseable {
                 boolean asked = ping.root() != null || ping.hashes() != null;
                 if (asked) {
                     hashedPingFrom.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>())
-                            .put(envelope.from(), clock.millis());
+                            .put(envelope.from(), localMillis());
                 }
                 ProbeDigests probe = asked || probeHashesAlways || runtime.antiEntropyStretched()
                         ? probeDigests(gossip, gossip.audits(envelope.from())) : ProbeDigests.NONE;
@@ -5128,6 +5952,7 @@ public final class PeerNode implements AutoCloseable {
             runtime.membership().evict(envelope.from());
             TransportConnection cached = connections.remove(envelope.from());
             if (cached != null) {
+                linksChanged();
                 cached.close();
                 bareAccepted.remove(cached);
                 helloSent.remove(cached);
@@ -5257,7 +6082,9 @@ public final class PeerNode implements AutoCloseable {
             // but only after admission does it deserve fan-out).
             hlc.update(envelope.stamp());
             if (connection != null) {
-                connections.putIfAbsent(envelope.from(), connection);
+                if (connections.putIfAbsent(envelope.from(), connection) == null) {
+                    linksChanged(); // a link opened (EL-L-03)
+                }
                 maybeAnnounceChannel(envelope.group(), connection, null); // the newcomer may not hold us yet
                 // An introduction is answered with an introduction, on the same connection and
                 // before anything else: this node is about to push the newcomer data (the cards
@@ -5292,7 +6119,7 @@ public final class PeerNode implements AutoCloseable {
         ai.badmonkey.agentspaces.api.ad.RevocationAdvertisement ad =
                 new ai.badmonkey.agentspaces.api.ad.RevocationAdvertisement(
                         "aspace://" + runtime.id().value() + "/revocation/" + revoked.value(),
-                        peerId(), runtime.id(), clock.instant(), REVOCATION_GOSSIP_TTL,
+                        peerId(), runtime.id(), time.instant(), REVOCATION_GOSSIP_TTL,
                         revoked, reason, successor);
         byte[] adBytes = codec.toBytes(ad);
         RevocationRegistry.SignedRevocation signed =
@@ -5317,7 +6144,7 @@ public final class PeerNode implements AutoCloseable {
             GroupRuntime runtime, ai.badmonkey.agentspaces.api.ad.CredentialRevocation.Target target,
             String reason, Instant effectiveFrom) {
         Objects.requireNonNull(target, "target");
-        Instant now = clock.instant();
+        Instant now = time.instant();
         if (effectiveFrom != null && effectiveFrom.isAfter(now)) {
             throw new IllegalArgumentException("effectiveFrom " + effectiveFrom
                     + " lies in the future; a revocation takes effect no later than its issue");
@@ -5371,6 +6198,7 @@ public final class PeerNode implements AutoCloseable {
                                     && g.getValue().membership().member(evicted).isPresent());
                     TransportConnection connection = sharedElsewhere ? null : connections.remove(evicted);
                     if (connection != null) {
+                        linksChanged();
                         connection.close();
                     }
                     LOG.log(System.Logger.Level.WARNING, "member " + evicted.display()
@@ -5400,6 +6228,7 @@ public final class PeerNode implements AutoCloseable {
         membership.evict(ad.revoked());
         TransportConnection connection = connections.remove(ad.revoked());
         if (connection != null) {
+            linksChanged();
             connection.close();
         }
         LOG.log(System.Logger.Level.WARNING,
@@ -5432,7 +6261,7 @@ public final class PeerNode implements AutoCloseable {
      * @return true when the frame is refused and the caller must drop it
      */
     private boolean refusesFarFuture(Envelope envelope) {
-        long ceiling = clock.millis() + HybridLogicalClock.MAX_DRIFT_MILLIS;
+        long ceiling = time.millis() + HybridLogicalClock.MAX_DRIFT_MILLIS;
         long physical = envelope.stamp().physical();
         if (physical <= ceiling) {
             return false;
@@ -5481,9 +6310,10 @@ public final class PeerNode implements AutoCloseable {
         int count = strikes.merge(peer, 1, Integer::sum);
         if (count >= STRIKE_THRESHOLD) {
             strikes.remove(peer);
-            quarantinedUntil.put(peer, clock.millis() + QUARANTINE.toMillis());
+            quarantinedUntil.put(peer, localMillis() + QUARANTINE.toMillis());
             TransportConnection connection = connections.remove(peer);
             if (connection != null) {
+                linksChanged();
                 connection.close();
             }
             // The peer may have been a gossip-tree forwarder for this node: ask every other
@@ -5510,7 +6340,7 @@ public final class PeerNode implements AutoCloseable {
         if (until == null) {
             return false;
         }
-        if (clock.millis() >= until) {
+        if (localMillis() >= until) {
             quarantinedUntil.remove(peer);
             return false;
         }
@@ -5528,7 +6358,7 @@ public final class PeerNode implements AutoCloseable {
         // Judge staleness against this node's own clock (the injected
         // InstantSource, so deterministic-clock tests stay consistent), which
         // is also the reference the sender's HLC stamp was merged toward.
-        long ageMillis = clock.millis() - envelope.stamp().physical();
+        long ageMillis = time.millis() - envelope.stamp().physical();
         if (ageMillis > MAX_FRAME_AGE_MILLIS) {
             framesStale.incrementAndGet();
             return true;
@@ -5607,7 +6437,7 @@ public final class PeerNode implements AutoCloseable {
         }
         Session session = sessions.computeIfAbsent(connection, c -> new Session());
         synchronized (session) {
-            long now = clock.millis();
+            long now = localMillis();
             if (session.key != null || session.answered
                     || (session.helloSent && now - session.helloSentAtMillis < SESSION_HELLO_RETRY_MILLIS)) {
                 return;
@@ -5631,7 +6461,7 @@ public final class PeerNode implements AutoCloseable {
         boolean wasAnswered = session.answered;
         long wasAt = session.helloSentAtMillis;
         session.helloSent = true;
-        session.helloSentAtMillis = clock.millis();
+        session.helloSentAtMillis = localMillis();
         session.answered = echo != null;
         try {
             byte[] frame = encodeFrame(groupId, peer, Envelope.Kind.SESSION_HELLO, hello);
@@ -5670,7 +6500,7 @@ public final class PeerNode implements AutoCloseable {
                 || hello.nonce() == null || hello.nonce().length < 16 || hello.nonce().length > 64) {
             return;
         }
-        if (clock.millis() - envelope.stamp().physical() > SESSION_HELLO_MAX_AGE_MILLIS) {
+        if (time.millis() - envelope.stamp().physical() > SESSION_HELLO_MAX_AGE_MILLIS) {
             // A live hello is seconds old; a captured one replayed on a fresh link after the
             // exact-replay cache turned over would otherwise be answered. Ignored, never a strike:
             // its signer sent it once, honestly (ROBUSTNESS.md §5, the hello replay window).
@@ -5823,7 +6653,7 @@ public final class PeerNode implements AutoCloseable {
         if (!mismatch) {
             return;
         }
-        long now = clock.millis();
+        long now = localMillis();
         long period = runtime.advertisement().gossip().period().toMillis();
         Long last = probePulls.get(from);
         if (last != null && now - last < period) {
@@ -5935,7 +6765,7 @@ public final class PeerNode implements AutoCloseable {
 
     /** A relay policy that threw: logged at most once a minute, since it runs once per relayed frame. */
     private void logPolicyFailure(RuntimeException e) {
-        long now = clock.millis();
+        long now = localMillis();
         Long last = lastPolicyFailureLogMillis;
         if (last != null && now - last < 60_000L) {
             return;
@@ -6035,6 +6865,7 @@ public final class PeerNode implements AutoCloseable {
             dialed.close();
             return raced;
         }
+        linksChanged(); // a link opened (EL-L-03)
         maybeAnnounceChannel(groupId, dialed, null); // a session opens once the peer answers
         // Introduce ourselves on the new channel, as to a seed: a peer that forgot
         // this node (its view expired, or it was quarantined) re-admits it from its
@@ -6230,8 +7061,10 @@ public final class PeerNode implements AutoCloseable {
         if (admission && runtime.membership().member(ad.issuer()).isPresent()) {
             lostRetryIntervalMillis.remove(runtime.id()); // somebody answered: retries start fresh
             newlyAdmitted.computeIfAbsent(runtime.id(), g -> ConcurrentHashMap.newKeySet()).add(ad.issuer());
+            admittedAtMillis.putIfAbsent(new GroupPeer(runtime.id(), ad.issuer()), localMillis());
             runtime.gossip().topologyChanged();
             runtime.gossip().memberAdmitted(ad.issuer());
+            wake(runtime.id()); // the newcomer's introduction and its targeted round (EL-L-07, EL-SP-09)
         }
         if ("1".equals(ad.resourceHints().get(BATCH_HINT))) {
             batchPeers.add(ad.issuer());
@@ -6267,20 +7100,28 @@ public final class PeerNode implements AutoCloseable {
         }
         // RE-H-04: the per-entry horizon follows the current card alone, so a card that drops the hint disengages
         // every space whose view holds its member at the next read, and a beacon hint never engages it.
+        boolean hintMoved = false;
         if (HORIZON_LEVEL.equals(ad.resourceHints().get(HORIZON_HINT))) {
             if (horizonPeers.add(ad.issuer())) {
                 horizonHintsVersion.incrementAndGet();
+                hintMoved = true;
             }
         } else {
             if (horizonPeers.remove(ad.issuer())) {
                 horizonHintsVersion.incrementAndGet();
+                hintMoved = true;
             }
         }
         int level = appCardLevelOf(ad.resourceHints().get(APPCARD_HINT));
-        if (level > 1) {
-            appCardLevels.put(ad.issuer(), level);
-        } else {
-            appCardLevels.remove(ad.issuer());
+        Integer before = level > 1 ? appCardLevels.put(ad.issuer(), level) : appCardLevels.remove(ad.issuer());
+        if ((before == null ? 1 : before) != level) {
+            appCardVersion.incrementAndGet();
+            hintMoved = true;
+        }
+        if (hintMoved) {
+            // A card carried by RUMOR wakes nothing (wakes(kind)), so the spaces' horizon judgement and the AppCard
+            // gate hear a moved hint here, not at the backstop (EL-T-07, DW-2).
+            loop.wakeGroup(runtime.id().value(), NodeLoop.Kind.OTHER);
         }
         rememberReach(runtime.id(), ad);
         Map<String, String> hints = ad.resourceHints();
@@ -6298,7 +7139,7 @@ public final class PeerNode implements AutoCloseable {
         for (GroupId groupId : groups.keySet()) {
             byte[] signedAd = selfAdRumor(groupId).payload();
             ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal seal = beaconSeals.get(groupId);
-            announcements.add(seal == null ? signedAd : seal.seal(signedAd, clock.instant()));
+            announcements.add(seal == null ? signedAd : seal.seal(signedAd, time.instant()));
         }
         return announcements;
     }
@@ -6340,7 +7181,7 @@ public final class PeerNode implements AutoCloseable {
             // it unread; the opened bytes take the plain path below, verification and all.
             byte[] opened = null;
             for (ai.badmonkey.agentspaces.peering.bootstrap.BeaconSeal seal : beaconSeals.values()) {
-                opened = seal.open(datagram, clock.instant()).orElse(null);
+                opened = seal.open(datagram, time.instant()).orElse(null);
                 if (opened != null) {
                     break;
                 }
@@ -6359,8 +7200,21 @@ public final class PeerNode implements AutoCloseable {
             return;
         }
         if (!ad.endpoints().isEmpty()) {
-            beaconLearned.computeIfAbsent(ad.group(), g -> new ConcurrentHashMap<>()).put(ad.issuer(),
-                    new LearnedEndpoints(List.copyOf(ad.endpoints()), ad.issued().plus(ad.ttl()).toEpochMilli()));
+            // Held past the ad's own expiry for about 1.5 times the longest retry interval (EL-O-11, the TTL rule), so
+            // a sender whose beacon has backed off to 20 min never lets this hint lapse between its datagrams.
+            // The carrier may deliver before the constructor has assigned the beacon, hence the local read.
+            MulticastBeacon heardOn = beacon;
+            long now = time.millis();
+            List<PeerAdvertisement.Endpoint> endpoints = List.copyOf(ad.endpoints());
+            long hold = heardOn == null ? 0 : heardOn.learnedHold().toMillis();
+            long expires = Math.max(ad.issued().plus(ad.ttl()).toEpochMilli(), now + hold);
+            LearnedEndpoints previous = beaconLearned.computeIfAbsent(ad.group(), g -> new ConcurrentHashMap<>())
+                    .put(ad.issuer(), new LearnedEndpoints(endpoints, expires));
+            boolean news = previous == null || previous.expiresMillis() <= now
+                    || !previous.endpoints().equals(endpoints);
+            if (news && heardOn != null) {
+                heardOn.succeeded(); // a sender it had no live entry for: the beacon's retries start over (EL-O-11)
+            }
         }
         if (!requireAttestation) {
             admitAdvertisement(runtime, ad);
@@ -6377,8 +7231,8 @@ public final class PeerNode implements AutoCloseable {
 
     private Optional<PeerAdvertisement> verifiedPeerAd(byte[] payload) {
         return decodeSignedPeerAd(codec, payload)
-                .filter(ad -> !ad.expired(clock.instant())
-                        && !ad.issued().isAfter(clock.instant().plus(MAX_AD_ISSUED_SKEW)));
+                .filter(ad -> !ad.expired(time.instant())
+                        && !ad.issued().isAfter(time.instant().plus(MAX_AD_ISSUED_SKEW)));
     }
 
     /**
@@ -6449,7 +7303,7 @@ public final class PeerNode implements AutoCloseable {
     private boolean admitsInvite(GroupAdvertisement groupAd, PeerAdvertisement ad) {
         String credential = ad.resourceHints().get(JoinCredentials.HINT_KEY);
         JoinCredentials.Verdict verdict = JoinCredentials.judge(credential, ad.issuer(), groupAd, codec,
-                clock.instant());
+                time.instant());
         if (verdict == JoinCredentials.Verdict.INVALID) {
             return false;
         }
@@ -6509,12 +7363,40 @@ public final class PeerNode implements AutoCloseable {
         return merged;
     }
 
+    /**
+     * Per group, the content fingerprint and issue millisecond of the last self ad built (§10.16, the same-millisecond
+     * audit): a changed self ad never shares its millisecond with the one before it.
+     */
+    private final Map<GroupId, long[]> lastSelfAdIssue = new ConcurrentHashMap<>();
+
+    /**
+     * The issue instant of a self ad (§10.16): now, unless a self ad with different content was already issued in this
+     * millisecond or later. Its gossip item id is the issue millisecond, which every peer had seen, and a receiver keeps
+     * the card it holds on an equal instant, so such a change reached nobody until the next refresh. The same content
+     * in the same millisecond keeps that millisecond: it is the same card.
+     */
+    private Instant selfAdIssue(GroupId groupId, List<PeerAdvertisement.Endpoint> endpoints,
+                                Map<String, String> hints) {
+        Instant now = time.instant();
+        long fingerprint = Objects.hash(endpoints, roles, hints, peerAdTtl);
+        long[] issued = lastSelfAdIssue.compute(groupId, (g, last) -> {
+            long ms = now.toEpochMilli();
+            if (last == null || ms > last[1]) {
+                return new long[] {fingerprint, ms};
+            }
+            return last[0] == fingerprint ? last : new long[] {fingerprint, last[1] + 1};
+        });
+        return issued[1] == now.toEpochMilli() ? now : Instant.ofEpochMilli(issued[1]);
+    }
+
     private Bodies.Rumor selfAdRumor(GroupId groupId) {
+        List<PeerAdvertisement.Endpoint> endpoints = List.copyOf(advertisedEndpoints);
+        Map<String, String> hints = selfHints(groupId);
         PeerAdvertisement ad = new PeerAdvertisement(
                 "aspace://" + groupId.value() + "/peer/" + peerId().value(),
-                peerId(), groupId, clock.instant(), peerAdTtl,
-                List.copyOf(advertisedEndpoints), roles,
-                selfHints(groupId));
+                peerId(), groupId, selfAdIssue(groupId, endpoints, hints), peerAdTtl,
+                endpoints, roles,
+                hints);
         byte[] adBytes = codec.toBytes(ad);
         byte[] payload = codec.toBytes(
                 new SignedPeerAd(adBytes, identity.rawPublicKey(), identity.sign(adBytes)));

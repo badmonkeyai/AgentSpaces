@@ -109,7 +109,7 @@ class AppCardOriginTest {
 
     @Test
     void theKindIsClosedAndNoKindIsTiedToAnOrigin() {
-        assertThat(AppCard.KINDS).containsExactly("peer", "fed", "gateway", "assembled");
+        assertThat(AppCard.KINDS).containsExactly("peer", "fed", "gateway", "assembled", "dynamic");   // v0.1.38 adds dynamic
         RawAppCard raw = CardMirrors.raw(imported());
         refused(raw.withKind("realm"));
         refused(raw.withKind("drafted"));

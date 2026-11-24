@@ -1861,6 +1861,15 @@ public final class GoldenVectors {
                 .withFormats(List.of("text/html", "application/geo+json", "urn:realm:example-realm#"));
         json.append(field("app_card_origin_formats_cbor", hex.formatHex(codec.toBytes(imported))));
 
+        // app_card_dynamic_cbor (v0.1.38): an app whose agent composes its surfaces per person and moment from the
+        // catalogs its ui names (the kind's set grows by one, a flag day shipped with AgentCard.threads in 0.7.0)
+        ai.badmonkey.agentspaces.api.ad.AppCard dynamic = new ai.badmonkey.agentspaces.api.ad.AppCard(
+                "aspace://zApps/app/zPeerA/example-desk", peer, apps, at, Duration.ofMinutes(15), "example-desk", "dynamic", "a2ui",
+                "example", List.of("zApps/orders"), List.of(), "", "", "", "1", List.of(),
+                new ai.badmonkey.agentspaces.api.ad.AppCard.Ui("a2ui", "1.0", List.of("https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"),
+                        "desk", "views", List.of()));
+        json.append(field("app_card_dynamic_cbor", hex.formatHex(codec.toBytes(dynamic))));
+
         // app_card_spill_cbor and app_card_parts_cbor: a fed a2ui stub and its parts document
         ai.badmonkey.agentspaces.api.ad.AppCard board = new ai.badmonkey.agentspaces.api.ad.AppCard(
                 "aspace://zApps/app/zPeerA/example-board", peer, apps, at, Duration.ofMinutes(15), "example-board", "fed", "a2ui",

@@ -94,10 +94,15 @@ public record AppCard(
      * member; {@code fed}, an agent of the group feeds it its entries and views; {@code gateway}, it sits behind the
      * A2A gateway; {@code assembled}, a composition its publisher selected and reviewed before publishing and serves as
      * is (SPEC §6.1a.2, revised in v0.1.38): a static site that reads nothing live, or a page whose components were chosen
-     * once and that binds the live reads its {@code reads} name, such as a chat page over a group's conversations. A reader
+     * once and that binds the live reads its {@code reads} name, such as a chat page over a group's conversations;
+     * {@code dynamic} (v0.1.38), its agent composes the layout per person and per moment from the catalogs its
+     * {@code ui.catalogIds} lists, and every surface is checked against them before it reaches a person. A reader
      * refuses any other value.
      */
-    public static final List<String> KINDS = List.of("peer", "fed", "gateway", "assembled");
+    public static final List<String> KINDS = List.of("peer", "fed", "gateway", "assembled", "dynamic");
+
+    /** The kind of an app whose agent composes its surfaces per person and moment (SPEC v0.1.38, §6.1a.2). */
+    public static final String DYNAMIC = "dynamic";
     public static final List<String> SHAPES = List.of("web", "desktop", "static", "a2ui");
     public static final List<String> TRANSPORTS = List.of("views", "a2a");
     public static final int MAX_TERMS = 64;

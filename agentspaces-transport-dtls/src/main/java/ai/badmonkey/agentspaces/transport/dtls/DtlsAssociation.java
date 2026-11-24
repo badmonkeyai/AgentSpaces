@@ -26,7 +26,6 @@ import java.security.cert.X509Certificate;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -56,7 +55,16 @@ final class DtlsAssociation implements TransportConnection {
     private final DtlsCounters counters;
     private final Runnable onRelease;
     private final Recovery recovery;
-    private final ArrayBlockingQueue<byte[]> deliveries = new ArrayBlockingQueue<>(DELIVERY_QUEUE);
+    /**
+     * Frames complete and not yet delivered, then {@link #END} once the association finished (EL-W-06): the delivery
+     * thread blocks on a take, with no poll, and the sentinel ends it behind every frame queued before it. The queue's
+     * bound is {@link #room}'s, so the sentinel always fits.
+     */
+    private final java.util.concurrent.LinkedBlockingQueue<byte[]> deliveries = new java.util.concurrent.LinkedBlockingQueue<>();
+    /** Room for {@link #DELIVERY_QUEUE} frames: a full queue stops the drain, which is the backpressure. */
+    private final java.util.concurrent.Semaphore room = new java.util.concurrent.Semaphore(DELIVERY_QUEUE);
+    /** Ends the delivery thread (compared by identity). */
+    private static final byte[] END = new byte[0];
     private final AtomicBoolean finished = new AtomicBoolean();
     private final AtomicBoolean closeNotified = new AtomicBoolean();
     private final Object timerLock = new Object();
@@ -64,6 +72,8 @@ final class DtlsAssociation implements TransportConnection {
     private long armedAt = Long.MAX_VALUE;
     private volatile Consumer<byte[]> receiver;
     private volatile boolean deliveryStarted;
+    /** The delivery thread once started, for tests (EL-W-06). */
+    private volatile Thread deliverThread;
     private volatile Runnable closeListener = () -> {
     };
 
@@ -136,8 +146,22 @@ final class DtlsAssociation implements TransportConnection {
         this.receiver = Objects.requireNonNull(receiver, "receiver");
         if (!deliveryStarted) {
             deliveryStarted = true;
-            Thread.ofVirtual().name("dtls-deliver-" + path.remote()).start(this::deliver);
+            deliverThread = Thread.ofVirtual().name("dtls-deliver-" + path.remote()).start(this::deliver);
         }
+    }
+
+    /** The delivery thread, or null before a receiver is set; for tests. */
+    Thread deliverThread() {
+        return deliverThread;
+    }
+
+    /** Bytes of a frame not yet whole (SPEC v0.1.37 §9.4): told for each record that completes no frame. */
+    private volatile Runnable progressListener = () -> {
+    };
+
+    @Override
+    public void onProgress(Runnable listener) {
+        this.progressListener = Objects.requireNonNull(listener, "listener");
     }
 
     @Override
@@ -180,14 +204,18 @@ final class DtlsAssociation implements TransportConnection {
                     }
                 }
                 rearm();
+                if (frames.isEmpty() && n > 0) {
+                    progressListener.run(); // a record that completed no frame: bytes still arriving (§9.4)
+                }
                 for (byte[] frame : frames) {
                     // Backpressure: a full delivery queue stops reading, and the peer's
                     // retransmissions wait until the receiver catches up.
-                    while (!deliveries.offer(frame, 1, TimeUnit.SECONDS)) {
+                    while (!room.tryAcquire(1, TimeUnit.SECONDS)) {
                         if (finished.get()) {
                             return;
                         }
                     }
+                    deliveries.add(frame);
                 }
                 if (finishIfFailed()) {
                     return;
@@ -241,13 +269,11 @@ final class DtlsAssociation implements TransportConnection {
     private void deliver() {
         try {
             while (true) {
-                byte[] frame = deliveries.poll(250, TimeUnit.MILLISECONDS);
-                if (frame == null) {
-                    if (finished.get()) {
-                        return; // frames complete before the end were delivered first (DT-R-12)
-                    }
-                    continue;
+                byte[] frame = deliveries.take();
+                if (frame == END) {
+                    return; // frames complete before the end were delivered first (DT-R-12)
                 }
+                room.release();
                 try {
                     receiver.accept(frame);
                 } catch (RuntimeException e) {
@@ -310,6 +336,7 @@ final class DtlsAssociation implements TransportConnection {
         if (!finished.compareAndSet(false, true)) {
             return;
         }
+        deliveries.add(END); // behind the frames already complete (EL-W-06)
         synchronized (timerLock) {
             if (timer != null) {
                 timer.cancel();

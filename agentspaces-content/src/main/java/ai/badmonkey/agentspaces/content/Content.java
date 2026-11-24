@@ -242,7 +242,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
                     treeMessagesDropped.incrementAndGet();
                     LOG.warning(() -> "tree frame from " + peer.display() + " failed: " + e);
                 }
-                lastUsedMillis = clock.millis();
+                lastUsedMillis = periods.monoMillis();
             }
         }
 
@@ -340,6 +340,12 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
     private final PeerId self;
     private final CborCodec codec;
     private final InstantSource clock;
+    /**
+     * The base of the challenges' deadlines and the tree queues' idle bound (srad/agentspaces-event-loop.md EL-C-04,
+     * §10.35): local periods, on the clock's monotonic time, so a wall step moves neither. On a plain clock a test moves
+     * by hand it follows that clock, as before.
+     */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource periods;
     private final PieceStore store;
     private final ContentPolicy policy;
     private final BlockExchange blocks;
@@ -467,6 +473,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
         this.codec = b.codec == null ? CborCodec.defaultCodec() : b.codec;
         // EL-C-06: the node's own time source unless one is given (the system's for a node on a plain test clock).
         this.clock = b.clock == null ? this.runtime.defaultClock() : b.clock;
+        this.periods = ai.badmonkey.agentspaces.common.time.TimeSources.of(this.clock);
         this.store = b.store == null ? new MemoryPieceStore(this.clock, 0) : b.store;
         this.policy = b.policy == null ? ContentPolicy.DEFAULT : b.policy;
         this.blocks = b.blocks;
@@ -497,7 +504,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
                         queue = treeQueues.computeIfAbsent(from, TreeQueue::new);
                         wakeDue(); // its idle deadline joins the participant's (EL-L-03)
                     }
-                    if (!queue.offer(payload, clock.millis())) {
+                    if (!queue.offer(payload, periods.monoMillis())) {
                         treeMessagesDropped.incrementAndGet();
                     }
                 } else {
@@ -853,8 +860,9 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
                 finishTree(pending);
             }
         }
-        treeQueues.values().removeIf(q -> q.idle(now));
-        expireChallenges(now);
+        long period = periods.monoMillis(); // EL-C-04: the challenges' and tree queues' base
+        treeQueues.values().removeIf(q -> q.idle(period));
+        expireChallenges(period);
         for (ai.badmonkey.agentspaces.content.tree.sync.SketchSession session : List.copyOf(sketchSessions.values())) {
             session.tick(now);
             if (session.outcome().isDone()) {
@@ -1028,6 +1036,8 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
         }
         long now = clock.millis();
         long local = localMillis(); // EL-C-04: the local periods' base
+        long period = periods.monoMillis(); // the challenges' and tree queues' base (§10.35)
+        long nextPeriod = Long.MAX_VALUE; // the next deadline on that base
         long next = Long.MAX_VALUE; // the next wall deadline (a lease's or an expiry's)
         long nextLocal = Long.MAX_VALUE; // the next local one
         boolean worked = false;
@@ -1052,15 +1062,15 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
             }
         }
         if (!treeQueues.isEmpty()) {
-            treeQueues.values().removeIf(q -> q.idle(now));
+            treeQueues.values().removeIf(q -> q.idle(period));
             for (TreeQueue q : treeQueues.values()) {
-                next = Math.min(next, q.idleAt());
+                nextPeriod = Math.min(nextPeriod, q.idleAt());
             }
         }
         if (!challenges.isEmpty()) {
-            expireChallenges(now);
+            expireChallenges(period);
             for (PendingChallenge c : challenges.values()) {
-                next = Math.min(next, c.deadlineMillis + 1);
+                nextPeriod = Math.min(nextPeriod, c.deadlineMillis + 1);
             }
         }
         if (groupSealsLookup != null) {
@@ -1114,7 +1124,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
             dueWork.incrementAndGet();
         }
         ai.badmonkey.agentspaces.api.spi.DueWork.Driver d = driver;
-        if (d == null || next == Long.MAX_VALUE && nextLocal == Long.MAX_VALUE) {
+        if (d == null || next == Long.MAX_VALUE && nextLocal == Long.MAX_VALUE && nextPeriod == Long.MAX_VALUE) {
             return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
         }
         // The wall deadlines are on this swarm's clock: convert them against it and the loop's base, read together
@@ -1124,6 +1134,13 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
                 : ai.badmonkey.agentspaces.common.time.TimeSources.monoDue(mono, clock.millis(), next);
         if (nextLocal != Long.MAX_VALUE) {
             long ahead = Math.min(nextLocal - Math.floorDiv(mono, 1_000_000L),
+                    ai.badmonkey.agentspaces.common.time.TimeSources.MAX_DUE_AHEAD_MILLIS);
+            due = Math.min(due, ahead <= 0 ? mono : mono + ahead * 1_000_000L);
+        }
+        if (nextPeriod != Long.MAX_VALUE) {
+            // on the clock's own monotonic base: converted against it, read now (the loop's base when the clock is
+            // the node's time source; a hand-moved clock's own wall otherwise)
+            long ahead = Math.min(nextPeriod - periods.monoMillis(),
                     ai.badmonkey.agentspaces.common.time.TimeSources.MAX_DUE_AHEAD_MILLIS);
             due = Math.min(due, ahead <= 0 ? mono : mono + ahead * 1_000_000L);
         }
@@ -1877,7 +1894,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
         message.violation().ifPresent(v -> {
             throw new IllegalArgumentException(v);
         });
-        long now = clock.millis();
+        long now = periods.monoMillis(); // a local period (EL-C-04, §10.35)
         PendingChallenge pending = new PendingChallenge(holder, root, message.picks(), now, now + deadline.toMillis());
         if (pdtLevel(holder) < PDT_LEVEL) {
             pending.settle(false, holder.display() + " is at pdt level 1 and reads no CHALLENGE", now);
@@ -1927,7 +1944,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
         if (pending == null || !pending.holder.equals(from)) {
             return false;
         }
-        long now = clock.millis();
+        long now = periods.monoMillis();
         if (now > pending.deadlineMillis) {
             // the tick settles a lapsed challenge only on its next run; an answer in between is still late
             finishChallenge(nodes.req(), pending, false, "no complete answer before the deadline", now);
@@ -1968,7 +1985,7 @@ public final class Content implements ai.badmonkey.agentspaces.api.spi.DueCapabi
         for (Map.Entry<Integer, PendingChallenge> e : challenges.entrySet()) {
             PendingChallenge pending = e.getValue();
             if (pending.holder.equals(from) && pending.root.equals(reject.root())) {
-                finishChallenge(e.getKey(), pending, false, "REJECT reason " + reject.reason(), clock.millis());
+                finishChallenge(e.getKey(), pending, false, "REJECT reason " + reject.reason(), periods.monoMillis());
                 return true;
             }
         }

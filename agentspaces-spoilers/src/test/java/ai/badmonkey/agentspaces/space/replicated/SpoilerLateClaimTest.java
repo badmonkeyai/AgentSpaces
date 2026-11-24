@@ -331,6 +331,212 @@ class SpoilerLateClaimTest {
         lateCompletionByAntiEntropy("LateCompletionReoffered", 4714, false);
     }
 
+    /**
+     * Seam st01 (srad/agentspaces-event-loop.md §10.33, §10.37; SPEC §7.4 rule two): the displaced holder's completion
+     * reaches the winner first, under a claim that does not authenticate it, and is kept; the displaced claim comes
+     * later, alone, in the loser's re-offer, a rumor. The rumor's own handler pairs the two at once
+     * ({@code judgeDisplaced}). Once the completion is in, no anti-entropy answer reaches the winner (periodic rounds
+     * 60 s out, every PULL_RESP into it dropped), so nothing else can pair them: before §10.37 the store race
+     * scenarios passed without the rumor path, because the winner's targeted round toward the displaced holder (owner
+     * decision 4), or any anti-entropy answer carrying a claim of the entry, paired them a moment later. The rumor path
+     * is the one that needs no answer from the displaced holder (a dial-only holder may give none).
+     */
+    @Test
+    @Timeout(120)
+    void aDisplacedClaimArrivingAloneInARumorIsPairedWithTheKeptCompletionAtOnce() throws Exception {
+        try (SpaceFleet fleet = fleet("LateClaimByRumor")) {
+            SpaceFleet.Member a = fleet.get("a");
+            SpaceFleet.Member b = fleet.get("b");
+            ScriptRunner runner = arm(fleet, Script.of("b").seed(4715)
+                    .rule("hold-claim")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR, Envelope.Kind.PULL_RESP, Envelope.Kind.BATCH).to("a")
+                            .item(ItemKind.CLAIM).attr("holderPeer", b.id().toString()))
+                    .act(Action.hold()).always()
+                    .until(Trigger.frame().from("a").item(ItemKind.COMPLETION))
+                    .ceiling(Ceiling.periods(40))
+                    .rule("drop-completion-rumors")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR).to("b").item(ItemKind.COMPLETION))
+                    .act(Action.drop()).always()
+                    .rule("completion-into-b")
+                    .when(Trigger.frame(Envelope.Kind.PULL_RESP).to("b").item(ItemKind.COMPLETION)
+                            .attr("issuerPeer", fleet.get("w").id().toString()))
+                    .act(Action.count())
+                    .rule("drop-loser-claims")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR, Envelope.Kind.PULL_RESP, Envelope.Kind.BATCH).to("b")
+                            .item(ItemKind.CLAIM).attr("holderPeer", a.id().toString()))
+                    .act(Action.drop()).always()
+                    .until(Trigger.afterPeriods(8))
+                    .build());
+            CompletableFuture<VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>>> atB = fleet.clock.start(
+                    () -> b.space().take(task(), MINUTES_10, Duration.ZERO));
+            fleet.clock.runDue();
+            awaitFired(runner, "hold-claim", "spoiler.late-claim-rumor.held");
+            fleet.clock.advance(Duration.ofMillis(10));
+            Optional<TakenEntry<TaskEntry>> displaced = fleet.call(
+                    () -> a.space().take(task(), MINUTES_10, Duration.ZERO)).value();
+            assertThat(displaced).as("a judged itself the winner").isPresent();
+            Optional<TakenEntry<TaskEntry>> winning = atB.join().value();
+            assertThat(winning).as("b holds the lattice's winning claim").isPresent();
+            EntryId entryId = winning.get().entryId();
+            a.space().complete(displaced.get(), new FindingEntry("contested", "done by a"), MINUTES_30);
+            SimWait.ticks("spoiler.late-claim-rumor.pulled", HOLDER_PULL_TICKS, fleet::tickSlowly,
+                    () -> runner.report().fired("completion-into-b") > 0,
+                    Wait.with().diagnostics(() -> "firings " + runner.report().signatures()));
+            // From here no anti-entropy answer reaches b, so none can pair them: not a periodic round (60 s out),
+            // not the winner's targeted round toward a (owner decision 4), not a pull a probe's digests start.
+            for (SpaceFleet.Member m : fleet.members.values()) {
+                m.runtime().gossip().antiEntropyPeriod(Duration.ofSeconds(60));
+            }
+            fleet.own(fleet.network.filter(null, "b", frame -> "PULL_RESP".equals(frame.kind())
+                    ? ai.badmonkey.agentspaces.test.LinkFilter.Verdict.drop()
+                    : ai.badmonkey.agentspaces.test.LinkFilter.Verdict.pass()));
+            SimWait.ticks("spoiler.late-claim-rumor.loser-claims-pass", 40, fleet::tickSlowly,
+                    () -> runner.report().signatures().stream().anyMatch(sig -> sig.startsWith("drop-loser-claims release")),
+                    Wait.with().diagnostics(() -> "firings " + runner.report().signatures()));
+            // the loser's next offer, a claim-only rumor, is due once its back-off has passed
+            Measurement learned = SimWait.ticks("spoiler.late-claim-rumor.paired", 20, () -> {
+                a.space().staleOfferForTest(entryId);
+                fleet.tickSlowly();
+            }, () -> b.space().knowsDisplacedCompletion(entryId),
+                    Wait.with().diagnostics(() -> "a offered its claim " + a.space().displacedReoffers() + " times"));
+            System.out.printf("st01: b paired the rumored claim with the kept completion %.0f ticks after the drop"
+                    + " rule ended; a offered %d times%n", learned.value(), a.space().displacedReoffers());
+            assertThatThrownBy(() -> b.space().complete(winning.get(), new FindingEntry("contested", "done by b"),
+                    MINUTES_30)).isInstanceOf(LeaseExpiredException.class).hasMessageContaining("completed first");
+            runner.finish();
+        }
+    }
+
+    /**
+     * Seam st02s (srad/agentspaces-event-loop.md §10.33, §10.37; SPEC §7.4): a displaced holder offers its claim
+     * again when a replica offers the entry present, the evidence that it has not heard of the completion. A rumor is
+     * such an offer: the writer's renewal of the entry reaches the holder as a rumor of the entry, present, and the
+     * next offer goes at once. With every anti-entropy round 60 s out, nothing else can bring it.
+     */
+    @Test
+    @Timeout(120)
+    void aRumorOfferingTheEntryPresentBringsTheDisplacedHoldersNextOffer() throws Exception {
+        try (SpaceFleet fleet = new SpaceFleet("StaleOfferedRumor", ConflictStrategyType.LEASE_RACE, "work")) {
+            fleet.member("w", 1, b -> b.settleWindow(SETTLE));
+            fleet.member("a", 2, b -> b.settleWindow(SETTLE), "w");
+            fleet.tickAll(4);
+            ai.badmonkey.agentspaces.api.space.EntryHandle handle = fleet.get("w").space()
+                    .write(new TaskEntry("renewed", 1), MINUTES_30);
+            fleet.tickAll(2);
+            SpaceFleet.Member a = fleet.get("a");
+            Optional<TakenEntry<TaskEntry>> taken = fleet.call(
+                    () -> a.space().take(task(), MINUTES_10, Duration.ZERO)).value();
+            assertThat(taken).isPresent();
+            EntryId entryId = taken.get().entryId();
+            for (SpaceFleet.Member m : fleet.members.values()) {
+                m.runtime().gossip().antiEntropyPeriod(Duration.ofSeconds(60));
+            }
+            a.space().noteDisplacedOwnForTest(entryId);
+            assertThat(a.space().displacedReoffers()).as("the first offer at once").isEqualTo(1);
+            fleet.tickAll(5); // past the 1 s back-off
+            assertThat(a.space().displacedReoffers()).as("no replica offered the entry present: no offer")
+                    .isEqualTo(1);
+            handle.renew(Duration.ofHours(1)); // the writer's renewal: a rumor of the entry, present
+            Measurement offered = SimWait.ticks("spoiler.stale-offered.reoffer", 2, fleet::tickAll,
+                    () -> a.space().displacedReoffers() == 2,
+                    Wait.with().diagnostics(() -> "offers " + a.space().displacedReoffers()));
+            System.out.printf("st02s: the rumored present state brought the next offer in %.0f ticks%n",
+                    offered.value());
+        }
+    }
+
+    /**
+     * C04 of EL-A-03 (srad/agentspaces-event-loop.md §10.37): the store race of 2026-11-22 while the member TTL falls.
+     * Twelve members idle ten minutes, so the cycle-bound member TTL rises above its 45 s floor; then nine fall silent
+     * at once, and the TTL falls back while the late-claim race between {@code a} and {@code b} runs (the claim heard
+     * first, so the winner's targeted rounds toward the displaced holder pull its completion). PREVENTED: none of the
+     * three survivors drops another at any tick, the winner acknowledges the displaced holder's completion and stands
+     * down, nothing is done twice, and the nine leave every survivor's view.
+     */
+    @Test
+    @Timeout(600)
+    void c04AStoreRaceWhileTheMemberTtlFallsIsResolvedAndDropsNoSurvivor() throws Exception {
+        try (SpaceFleet fleet = new SpaceFleet("C04", ConflictStrategyType.LEASE_RACE, "work")) {
+            fleet.member("w", 1, b -> b.settleWindow(SETTLE));
+            fleet.member("a", 2, b -> b.settleWindow(SETTLE), "w");
+            fleet.member("b", 3, b -> b.settleWindow(SETTLE), "w");
+            for (int i = 0; i < 9; i++) {
+                fleet.member("x" + i, 10 + i, b -> b.settleWindow(SETTLE), "w");
+            }
+            SimWait.ticks("spoiler.c04.formed", 400, fleet::tickAll, () -> fleet.members.values().stream()
+                    .allMatch(m -> m.runtime().membership().size() == 11), Wait.with());
+            fleet.tickAll(2_000); // ten quiet minutes
+            SpaceFleet.Member a = fleet.get("a");
+            SpaceFleet.Member b = fleet.get("b");
+            List<SpaceFleet.Member> survivors = List.of(fleet.get("w"), a, b);
+            long ttlHigh = b.runtime().membership().memberTtlMillis();
+            assertThat(ttlHigh).as("the quiet twelve raised the member TTL above its floor").isGreaterThan(45_000L);
+            fleet.get("w").space().write(new TaskEntry("contested", 1), MINUTES_30);
+            fleet.tickAll(1);
+            int[] lost = {0};
+            Runnable tick = () -> {
+                fleet.tickSlowly();
+                for (SpaceFleet.Member m : survivors) {
+                    for (SpaceFleet.Member other : survivors) {
+                        if (other != m && m.runtime().membership().member(other.id()).isEmpty()) {
+                            lost[0]++;
+                        }
+                    }
+                }
+            };
+            for (int i = 0; i < 9; i++) { // nine fall silent at once
+                fleet.members.remove("x" + i).node().close();
+            }
+            ScriptRunner runner = arm(fleet, Script.of("b").seed(4716)
+                    .rule("hold-claim")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR, Envelope.Kind.PULL_RESP, Envelope.Kind.BATCH).to("a")
+                            .item(ItemKind.CLAIM).attr("holderPeer", b.id().toString()))
+                    .act(Action.hold()).always()
+                    .until(Trigger.frame().from("a").item(ItemKind.COMPLETION))
+                    .ceiling(Ceiling.periods(40))
+                    .rule("drop-completion-rumors")
+                    .when(Trigger.frame(Envelope.Kind.RUMOR).to("b").item(ItemKind.COMPLETION))
+                    .act(Action.drop()).always()
+                    .build());
+            CompletableFuture<VirtualTime.Outcome<Optional<TakenEntry<TaskEntry>>>> atB = fleet.clock.start(
+                    () -> b.space().take(task(), MINUTES_10, Duration.ZERO));
+            fleet.clock.runDue();
+            awaitFired(runner, "hold-claim", "spoiler.c04.held");
+            fleet.clock.advance(Duration.ofMillis(10));
+            Optional<TakenEntry<TaskEntry>> displaced = fleet.call(
+                    () -> a.space().take(task(), MINUTES_10, Duration.ZERO)).value();
+            assertThat(displaced).as("a judged itself the winner").isPresent();
+            Optional<TakenEntry<TaskEntry>> winning = atB.join().value();
+            assertThat(winning).as("b holds the lattice's winning claim").isPresent();
+            EntryId entryId = winning.get().entryId();
+            a.space().complete(displaced.get(), new FindingEntry("contested", "done by a"), MINUTES_30);
+            Measurement learned = SimWait.ticks("spoiler.c04.winner-learns", HOLDER_PULL_TICKS, tick,
+                    () -> b.space().knowsDisplacedCompletion(entryId),
+                    Wait.with().diagnostics(() -> "firings " + runner.report().signatures()));
+            assertThatThrownBy(() -> b.space().complete(winning.get(), new FindingEntry("contested", "done by b"),
+                    MINUTES_30)).isInstanceOf(LeaseExpiredException.class).hasMessageContaining("completed first");
+            Measurement fell = SimWait.ticks("spoiler.c04.ttl-fell", 1_200, tick,
+                    () -> survivors.stream().allMatch(m -> m.runtime().membership().size() == 2
+                            && m.runtime().membership().memberTtlMillis() < ttlHigh),
+                    Wait.with().diagnostics(() -> survivors.stream().map(m -> m.name() + ": view "
+                            + m.runtime().membership().size() + ", TTL " + m.runtime().membership().memberTtlMillis())
+                            .toList().toString()));
+            for (int i = 0; i < 200; i++) { // a minute more at the fallen TTL
+                tick.run();
+            }
+            runner.finish();
+            System.out.printf("C04: TTL %d ms before the fall, %s after; b learned in %.0f ticks; the nine left and"
+                    + " the TTL fell within %.0f ticks; survivors lost one another %d times%n", ttlHigh,
+                    survivors.stream().map(m -> m.runtime().membership().memberTtlMillis()).toList(), learned.value(),
+                    fell.value(), lost[0]);
+            assertThat(lost[0]).as("PREVENTED: no survivor dropped another during the fall").isZero();
+            for (SpaceFleet.Member m : survivors) {
+                assertThat(m.space().duplicateCompletions()).as("nothing done twice at " + m.name()).isZero();
+            }
+            assertThat(b.space().outbidAcknowledged()).isEqualTo(1);
+        }
+    }
+
     @Test
     @Timeout(120)
     void twoWorkersOnAnIdempotentTakeBothCompleteAndTheDuplicateIsCountedOnce() throws Exception {

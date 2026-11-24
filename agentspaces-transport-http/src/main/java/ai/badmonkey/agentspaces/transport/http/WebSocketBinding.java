@@ -224,6 +224,15 @@ abstract class WebSocketBinding extends HttpBinding {
                                     WsConnection connection = new WsConnection(ctx.channel(), target.toString(),
                                             attested, chain, counters);
                                     ctx.pipeline().replace(this, "frames", connection.handler(false));
+                                    // Bytes off the socket, before TLS and the frame aggregator: a large frame
+                                    // trickling over a slow link answers the dialer's dead-link PING (§9.4).
+                                    ctx.pipeline().addFirst("progress", new ChannelInboundHandlerAdapter() {
+                                        @Override
+                                        public void channelRead(ChannelHandlerContext raw, Object msg) {
+                                            connection.progressed();
+                                            raw.fireChannelRead(msg);
+                                        }
+                                    });
                                     opened.complete(connection);
                                     return;
                                 }

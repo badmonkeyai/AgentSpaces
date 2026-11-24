@@ -219,7 +219,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
     /** Pins refused for their signature or its deadline, remembered so each is counted once. */
     static final int UNSIGNED_SEEN = 4096;
 
-    /** The pause between scans that find nothing to take, or that fail. */
+    /** The pause after a scan that fails; a scan that finds nothing waits for a change instead (EL-W-04). */
     static final Duration SCAN_PAUSE = Duration.ofMillis(200);
 
     /** What a requester signed, read from a signed pin: one consent, one take per store. */
@@ -328,6 +328,15 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
     private volatile boolean withdrawn;
     private ConnectorRuntime runtime;
     private Thread loop;
+    /**
+     * Moves with every change the take loop judges by (EL-W-04): the pin and manifest space's change signal, a take
+     * that ends, a holding released, an authorizer given, the close. The loop waits on it under the 30 s backstop.
+     */
+    private final ai.badmonkey.agentspaces.common.time.ChangeSignal scanSignal;
+    /** The space's listener feeding {@link #scanSignal} while the store runs. */
+    private volatile AutoCloseable scanSignals;
+    /** The earliest wall instant a refused pin may be taken with no change (a holding's renewal window), or MAX. */
+    private volatile long rejudgeAtMillis = Long.MAX_VALUE;
     private long refreshedMillis = Long.MIN_VALUE / 4;
 
     private ContentStore(Builder b) {
@@ -340,6 +349,8 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         this.name = b.name == null ? self.value() : b.name;
         this.policy = Objects.requireNonNull(b.policy, "policy");
         this.clock = b.clock;
+        this.scanSignal = new ai.badmonkey.agentspaces.common.time.ChangeSignal(
+                ai.badmonkey.agentspaces.common.time.Waits.base(b.clock));
         this.authorizer = b.authorizer;
         this.requesters = b.requesters;
         this.holdingInterval = b.holdingInterval;
@@ -495,6 +506,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         // The race check shares the card's deadline, so an idle store on a loop wakes once a holding interval, not
         // twice (EL-T-09); no take has completed at start, so the first check has nothing to look at before then.
         racesCheckedMillis = refreshedMillis;
+        scanSignals = space.onChangeSignal(scanSignal); // EL-W-04: the take loop waits for a change
         loop = Thread.ofVirtual().name("content-store-" + name).start(this::takeLoop);
         // A store that joined its loop before it started read NEVER there (not running yet): its deadlines begin now.
         wakeLoop();
@@ -510,6 +522,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         Objects.requireNonNull(value, "authorizer");
         boolean waited = waiting();
         this.authorizer = value;
+        scanSignal.run(); // the grant rule may admit pins now (EL-W-04)
         if (runtime != null) {
             runtime.authorizer(value);
         }
@@ -751,6 +764,16 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         }
         running = false;
         withdrawn = true;
+        AutoCloseable signals = scanSignals;
+        scanSignals = null;
+        if (signals != null) {
+            try {
+                signals.close();
+            } catch (Exception e) {
+                // a listener list never refuses a removal
+            }
+        }
+        scanSignal.run();
         if (loop != null) {
             loop.interrupt();
         }
@@ -1111,9 +1134,36 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         ai.badmonkey.agentspaces.common.time.Waits.base(clock).sleep(SCAN_PAUSE);
     }
 
+    /** Scans of the pin space the take loop made; for tests (EL-W-04). */
+    private final AtomicLong scans = new AtomicLong();
+
+    /** How many scans of the pin space the take loop made (EL-W-04); for tests. */
+    long scans() {
+        return scans.get();
+    }
+
+    /**
+     * Waits for a change of what the take loop judges (EL-W-04, was a 200 ms pause): the space's signal and the store's
+     * own, under the 30 s backstop, or until a refused pin's holding reaches its renewal window.
+     */
+    private void awaitScan(long seen) throws InterruptedException {
+        ai.badmonkey.agentspaces.common.time.TimeSource time = scanSignal.time();
+        long deadline = ai.badmonkey.agentspaces.common.time.Waits.deadline(time,
+                ai.badmonkey.agentspaces.common.time.Waits.BACKSTOP);
+        long rejudge = rejudgeAtMillis;
+        if (rejudge != Long.MAX_VALUE) {
+            long ahead = Math.max(0, rejudge - clock.millis());
+            deadline = Math.min(deadline, time.monoNanos() + ahead * 1_000_000L);
+        }
+        scanSignal.await(seen, deadline);
+    }
+
     private void takeLoop() {
         while (running) {
             try {
+                long seen = scanSignal.seen(); // before the look, so a change during it is not lost
+                rejudgeAtMillis = Long.MAX_VALUE;
+                scans.incrementAndGet();
                 Set<String> wanted = new HashSet<>();
                 if (!waiting()) {
                     for (Space.Issued<SignedPin> issued : space.readAllIssued(Template.of(SignedPin.class), SCAN)) {
@@ -1123,7 +1173,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
                     }
                 }
                 if (wanted.isEmpty()) {
-                    pauseScan();
+                    awaitScan(seen);
                     continue;
                 }
                 Optional<TakenEntry<SignedPin>> took = space.take(Template.of(SignedPin.class)
@@ -1241,6 +1291,11 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         long lease = leaseMillis(pin);
         Optional<StoreLedger.Held> held = ledger.holding(pin.root(), pin.requester());
         if (held.isPresent() && now + lease - held.get().until() <= lease / 4) {
+            // takeable again, with no change, once the holding is within a quarter lease of its end (EL-W-04)
+            long at = held.get().until() - lease + lease / 4 + 1;
+            if (at < rejudgeAtMillis) {
+                rejudgeAtMillis = at;
+            }
             return Optional.of("this store already holds the root for the lease");
         }
         if (StorePin.KIND_ARTIFACT.equals(pin.kind())) {
@@ -1353,6 +1408,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
 
     private void abandon(InFlight f, String why) {
         if (inFlight.remove(f.pin.root(), f)) {
+            scanSignal.run(); // the root is no longer being fetched (EL-W-04)
             f.cancel();
             abandoned.incrementAndGet();
             LOG.log(System.Logger.Level.INFO, "store " + name + " abandoned a pin of " + f.pin.root() + ": " + why);
@@ -1416,6 +1472,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
         taken.incrementAndGet();
         full = free() <= 0;
         inFlight.remove(root, f);
+        scanSignal.run(); // the root is no longer being fetched (EL-W-04)
     }
 
     private long treeBytes(String root) {
@@ -1432,6 +1489,7 @@ public final class ContentStore implements AssetProvider, AutoCloseable {
             return;
         }
         wakeLoop(); // the card's free bytes moved: its next run publishes it (owner answer 6)
+        scanSignal.run(); // and a pin that did not fit may now (EL-W-04)
         released.incrementAndGet();
         LOG.log(System.Logger.Level.INFO, "store " + name + " released " + held.root() + " for "
                 + held.requester().display() + ": " + why);

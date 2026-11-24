@@ -38,8 +38,14 @@ import java.util.function.Supplier;
  * {@link ChannelTrust} instance until a file actually changes, which is what
  * tells a node to re-judge its live connections. A file that fails to read or
  * parse keeps the last good trust and is retried at the next refresh.
+ *
+ * <p>While anyone listens ({@link #onChange}), the files are checked every
+ * {@code refresh} as a task on the clock's time source (the node's, when the
+ * clock is one), and a change tells the listeners at once
+ * (srad/agentspaces-event-loop.md EL-L-14): a node then re-judges on the change
+ * and never looks on a timer. A {@link #get()} past the refresh still checks too.
  */
-public final class ReloadingChannelTrust implements Supplier<ChannelTrust> {
+public final class ReloadingChannelTrust implements SignallingChannelTrust {
 
     private static final System.Logger LOG = System.getLogger(ReloadingChannelTrust.class.getName());
 
@@ -51,6 +57,9 @@ public final class ReloadingChannelTrust implements Supplier<ChannelTrust> {
     private volatile ChannelTrust current;
     private volatile List<String> lastModified;
     private volatile Instant nextCheck;
+    private final List<Runnable> listeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** The refresh task while anyone listens; guarded by this. */
+    private ai.badmonkey.agentspaces.common.time.Periodic refresher;
 
     /**
      * Loads the trust now, failing when a CRL file cannot be read.
@@ -83,23 +92,75 @@ public final class ReloadingChannelTrust implements Supplier<ChannelTrust> {
         if (crlFiles.isEmpty() || now.isBefore(nextCheck)) {
             return current;
         }
+        return check(false);
+    }
+
+    /**
+     * Checks the files now (or when due) and returns the trust; a change tells the listeners, outside the lock.
+     */
+    private ChannelTrust check(boolean force) {
+        ChannelTrust before;
+        ChannelTrust after;
         synchronized (this) {
-            if (now.isBefore(nextCheck)) {
-                return current;
-            }
-            nextCheck = now.plus(refresh);
-            List<String> modified = modifiedTimes();
-            if (!modified.equals(lastModified)) {
-                try {
-                    current = build(load());
-                    lastModified = modified;
-                } catch (GeneralSecurityException | RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, "cannot reload CRLs " + crlFiles
-                            + "; keeping the last good trust: " + e.getMessage());
+            before = current;
+            Instant now = clock.instant();
+            if (force || !now.isBefore(nextCheck)) {
+                nextCheck = now.plus(refresh);
+                List<String> modified = modifiedTimes();
+                if (!modified.equals(lastModified)) {
+                    try {
+                        current = build(load());
+                        lastModified = modified;
+                    } catch (GeneralSecurityException | RuntimeException e) {
+                        LOG.log(System.Logger.Level.WARNING, "cannot reload CRLs " + crlFiles
+                                + "; keeping the last good trust: " + e.getMessage());
+                    }
                 }
             }
-            return current;
+            after = current;
         }
+        if (after != before) {
+            for (Runnable listener : listeners) {
+                try {
+                    listener.run();
+                } catch (RuntimeException e) {
+                    LOG.log(System.Logger.Level.WARNING, "a trust-change listener failed: " + e);
+                }
+            }
+        }
+        return after;
+    }
+
+    /**
+     * Registers a listener told when a refresh replaces the trust (EL-L-14). The first listener starts the refresh
+     * task, every {@code refresh} on the clock's time source; closing the last one stops it.
+     */
+    @Override
+    public AutoCloseable onChange(Runnable listener) {
+        Runnable l = Objects.requireNonNull(listener, "listener");
+        synchronized (this) {
+            listeners.add(l);
+            if (refresher == null && !crlFiles.isEmpty()) {
+                refresher = ai.badmonkey.agentspaces.common.time.Periodic.every(
+                        ai.badmonkey.agentspaces.common.time.Waits.base(clock), refresh, "crl-refresh", () -> {
+                            check(true);
+                            return true;
+                        });
+            }
+        }
+        return () -> {
+            ai.badmonkey.agentspaces.common.time.Periodic stop = null;
+            synchronized (this) {
+                listeners.remove(l);
+                if (listeners.isEmpty() && refresher != null) {
+                    stop = refresher;
+                    refresher = null;
+                }
+            }
+            if (stop != null) {
+                stop.close();
+            }
+        };
     }
 
     private ChannelTrust build(List<X509CRL> crls) {

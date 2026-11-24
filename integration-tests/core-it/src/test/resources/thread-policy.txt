@@ -1,0 +1,38 @@
+# The thread policy's allowlist (srad/agentspaces-event-loop.md §3.8, decision 13, EL-X-05 to EL-X-08), read by
+# ThreadPolicyTest. One line per site:
+#
+#   rule | class or class#method | the calls it may make, comma-separated | why
+#
+# rule: thread (platform threads and pools, EL-X-06), fixed-rate (never allowed in core, EL-X-07), raw-clock
+# (EL-X-08) or sleep (a real Thread.sleep, group W, §10.35). A class covers its nested classes and lambdas; class#method names one method (a lambda counts as the
+# method that declares it). A thread line always names its method, so a second platform thread elsewhere in the same
+# class cannot pass under it (srad/agentspaces-event-loop.md §10.23, R4). Every call a line names must still be made there, or the test fails it as stale: this
+# list may only shrink.
+
+# --- Platform threads: five sites, all per process, none per node (§3.8) ---------------------------------------------
+
+thread | ai.badmonkey.agentspaces.common.time.SystemTime#startTimerLocked | Thread.ofPlatform | agentspaces-timer: the one timer thread per process (EL-X-01); it only dispatches deadlines to the loop pool or a virtual thread and runs no task body, and a JVM with no node never starts it
+thread | ai.badmonkey.agentspaces.common.time.Watchdog#startThreadLocked | Thread.ofPlatform | agentspaces-watchdog: the redundant liveness check must run when every virtual-thread carrier is saturated or pinned and when the timer thread or the loop pool is dead, so it cannot be a virtual thread or a task on either; one per process, parks between ticks, does no protocol work (§3.9, EL-H-01)
+thread | ai.badmonkey.agentspaces.common.time.LoopPool#startWorkerLocked | Thread.ofPlatform | agentspaces-loop: loop work must not wait behind application code on the carriers (R11), and its threads grow and shrink with overrun, which virtual threads cannot express; per process, 1 thread at idle, at most min(8, max(2, cores / 2)) (decision 2, EL-O-02)
+thread | ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace$VerifyPool#<clinit> | new ThreadPoolExecutor, new Thread | space-verify: CPU-bound signature checks of large batches (RE-Q-PRF-03); per process, sized to the cores less one and at most 16, idles to zero threads after 30 s
+thread | ai.badmonkey.agentspaces.pdt.blob.GroupHasher$Pool#create | new ThreadPoolExecutor, new Thread | agentspaces-blake3: CPU-bound hashing of large blobs; per process, at most one thread a core, idles to zero threads after 30 s
+
+# Reserved: JVM shutdown hooks (Runtime.addShutdownHook). Core main code registers none (2026-11-22); a hook added later
+# takes a thread line here with its reason.
+
+# --- Raw clock reads (EL-C-08, EL-X-08) -----------------------------------------------------------------------------
+# The time source itself, and pure elapsed-time metrics, which measure the work's real cost whatever clock the node runs
+# on. A deadline or a protocol period never reads the clock raw: it goes through the node's TimeSource, or through
+# TimeSource.system() where the wait is real time by design (a caller blocking on a future or a monitor).
+
+raw-clock | ai.badmonkey.agentspaces.common.time.SystemTime | Instant.now, System.currentTimeMillis | the system time source: the one place core reads the wall clock (§3.1)
+raw-clock | ai.badmonkey.agentspaces.peering.node.NodeLoop#<init> | System.nanoTime | the real-time run meter (busy share and slow runs over 100 ms, EL-X-10): a run's real cost, which a virtual or test clock would not show
+raw-clock | ai.badmonkey.agentspaces.peering.node.PeerNode#onFrame | System.nanoTime | the handle time of one inbound frame (EL-H-11, a slow frame named by kind and peer): a real-cost metric, never a deadline
+raw-clock | ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace#applySync | System.nanoTime | the time one sync batch held the space's lock (lastBatchLockedNanos): a real-cost metric, never a deadline
+raw-clock | ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain#await | System.nanoTime | the start of one locator's elapsed time in the bootstrap trace: a metric; the locator's timeout is Future.get's
+raw-clock | ai.badmonkey.agentspaces.peering.bootstrap.BootstrapChain#elapsed | System.nanoTime | the end of one locator's elapsed time in the bootstrap trace: a metric, never a deadline
+
+# --- Real sleeps (group W, §10.35) ------------------------------------------------------------------------------------
+# A wait goes through the time source or a ChangeSignal, so a virtual clock moves it and a change ends it.
+
+sleep | ai.badmonkey.agentspaces.common.time.SystemTime#sleep | Thread.sleep | the system time source's own sleep: the one real sleep every other wait in core reaches through TimeSource.sleep

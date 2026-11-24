@@ -2430,21 +2430,39 @@ public final class AgentBinder implements AutoCloseable {
                             time.watchdog().registerHeld(new ai.badmonkey.agentspaces.common.time.Watchdog.Held(
                                     handle.agentId.toString(), method.getName(),
                                     String.valueOf(taken.get().entryId()), heldSince));
-                    AutoCloseable renewer = renewTakeWhileRunning(taken.get(), takeLease.duration(), label, handle,
-                            time, heldSince);
                     Duration limit = holdLimit;
+                    HeldTake held = new HeldTake(taken.get(), takeLease.duration(), label, handle, time, heldSince,
+                            limit);
+                    AutoCloseable renewer = renewTakeWhileRunning(held);
+                    // C05 (§10.37, owner decision 5 of 2026-11-23): a wake from a sleep, or any wall step, re-checks
+                    // the held take at once against its wall-time lease; the hold limit stays on the monotonic clock
+                    AutoCloseable woke = time.onWallStep(step -> recheckHeld(held));
+                    // SPEC v0.1.37 §9.4: a timer wake more than 30 s late with no wall step (a frozen process) is a
+                    // wake too, and re-checks the take the same way
+                    AutoCloseable late = time.onLateWake(lateness -> recheckHeld(held));
                     // §10.33 (I-05): a renewal from inside the method (an LLM advisor or listener during a model
-                    // stream) obeys the same end as the binder's own renewer: the agent unbound, or the hold limit
-                    java.util.function.BooleanSupplier renewable = () -> handle.running
-                            && (limit == null || time.monoNanos() - heldSince < limit.toNanos());
+                    // stream) obeys the same end as the binder's own renewer: the agent unbound, the hold limit, or
+                    // a take that lapsed (C05)
+                    java.util.function.BooleanSupplier renewable = held::renewingFromInside;
                     Object result;
                     try {
                         result = invokeWithin(new TakeContext(taken.get(),
                                 takeLease.duration(), handle.agentId, spaceName, renewable),
                                 agent, method, taken.get().entry());
                     } finally {
+                        closeQuietly(woke);
+                        closeQuietly(late);
                         closeQuietly(renewer);
                         heldWatch.close();
+                    }
+                    if (held.lapsed()) {
+                        // C05: the take lapsed while the handler ran (its claim is no longer this taker's, or a sleep
+                        // outlasted its lease); another member may hold the entry now, so this result is late:
+                        // nothing completed, nothing written
+                        LOG.log(System.Logger.Level.WARNING, label + ": held entry " + taken.get().entryId()
+                                + " lapsed while its handler ran (" + held.lapseCause + "); the result is late and"
+                                + " is dropped: nothing completed, nothing written");
+                        continue;
                     }
                     dispatch(result, space, resultSpace, resultLease, taken.get(), handle, method, label);
                 } catch (RuntimeException | Error e) {
@@ -2544,26 +2562,116 @@ public final class AgentBinder implements AutoCloseable {
         return takeRenewals.get();
     }
 
+    /** How many held {@code @OrderedTake} takes were found lapsed (C05); their results were dropped. */
+    private final java.util.concurrent.atomic.AtomicLong lateTakes = new java.util.concurrent.atomic.AtomicLong();
+    /** How many held takes a wake or wall step renewed at once (C05). */
+    private final java.util.concurrent.atomic.AtomicLong wakeRenewals = new java.util.concurrent.atomic.AtomicLong();
+
     /**
-     * Renews a take at half its lease until interrupted (EL-E-08, owner answer 12): what keeps an {@code @OrderedTake}
-     * handler's entry while it runs, so the 30 s default exceeds the 15 s cycle that renews it. The renewal also ends
-     * with the binding (closed, or unbound by a revocation): the unbind interrupts the handler's thread, but a handler
-     * that ignores the interrupt would otherwise keep its entry for as long as it hung, and no other member could ever
-     * take it (srad/agentspaces-event-loop.md §10.14, the phase 2 wire adversary).
+     * How many held {@code @OrderedTake} takes lapsed while their handler ran (SPEC v0.1.37 §7.4 and §9.4, C05): the
+     * take's claim was no longer this taker's ({@link TakenEntry#held()}: another claim displaced it, or the ordered
+     * log decided another), or the wall time passed the take's own lease end (the wall instant of its take or last
+     * renewal plus the lease), most often across a sleep that the monotonic renewal did not count. Each one stopped
+     * renewing for good and its result was dropped: nothing completed, nothing written ({@code late_takes}).
+     *
+     * @return the count
      */
-    private AutoCloseable renewTakeWhileRunning(TakenEntry<?> taken, Duration lease, String label, Bound handle,
-                                                ai.badmonkey.agentspaces.common.time.TimeSource time, long heldSince) {
-        Duration every = lease.dividedBy(2).isZero() ? lease : lease.dividedBy(2);
-        Duration limit = holdLimit;
-        // A task on the binder's time source (EL-W-02): renewal and expiry judged on one source; closed when the
-        // handler returns.
-        return ai.badmonkey.agentspaces.common.time.Periodic.every(time, every, "space-ordered-renew-" + label, () -> {
-            if (!handle.running) {
-                return false; // its agent was unbound while the handler ran
+    public long lateTakes() {
+        return lateTakes.get();
+    }
+
+    /**
+     * How many held takes a wake or a wall step renewed at once because their lease still held (C05).
+     *
+     * @return the count
+     */
+    public long wakeRenewals() {
+        return wakeRenewals.get();
+    }
+
+    /** The binder's wall reading, in ms: what a take's lease end is judged against (the space judges on wall time). */
+    private long wallMillis() {
+        return clock.millis();
+    }
+
+    /**
+     * One held {@code @OrderedTake} take while its handler runs: its own lease end on the wall clock, renewed by the
+     * binder's renewer, by a renewal from inside the handler, and by a wake's re-check (C05). Once lapsed it stays
+     * lapsed: no path renews it again, and its result is late. Guarded by itself.
+     */
+    private final class HeldTake {
+        final TakenEntry<?> taken;
+        final Duration lease;
+        final String label;
+        final Bound handle;
+        final ai.badmonkey.agentspaces.common.time.TimeSource time;
+        final long heldSince;
+        final Duration limit;
+        volatile long expiresAtMillis;
+        private boolean lapsed;
+        /** Why the take lapsed, for the log; null while it has not. */
+        volatile String lapseCause;
+        /** Set when the renewal ended for good: the agent unbound, the hold limit, or a failed renewal. */
+        private boolean stopped;
+
+        HeldTake(TakenEntry<?> taken, Duration lease, String label, Bound handle,
+                 ai.badmonkey.agentspaces.common.time.TimeSource time, long heldSince, Duration limit) {
+            this.taken = taken;
+            this.lease = lease;
+            this.label = label;
+            this.handle = handle;
+            this.time = time;
+            this.heldSince = heldSince;
+            this.limit = limit;
+            this.expiresAtMillis = wallMillis() + lease.toMillis();
+        }
+
+        /** Whether the hold limit has passed, on the monotonic clock: a sleep does not use it up. */
+        boolean pastHoldLimit() {
+            return limit != null && time.monoNanos() - heldSince >= limit.toNanos();
+        }
+
+        /**
+         * Marks the take lapsed (SPEC v0.1.37 §7.4) once its claim is no longer this taker's or the wall clock has
+         * passed its lease end; counts it once. Callers hold this.
+         */
+        private boolean judgeLapse(long nowMillis) {
+            if (lapsed) {
+                return true;
             }
-            if (limit != null && time.monoNanos() - heldSince >= limit.toNanos()) {
-                // The hold limit (owner decision 2, 2026-11-22; off by default): the handler is taken as hung, the
-                // renewal stops, and the entry lapses to another member's clerk at the lease's end.
+            if (nowMillis >= expiresAtMillis) {
+                lapse("its lease ended at " + java.time.Instant.ofEpochMilli(expiresAtMillis) + "; a sleep outlasted it");
+            } else if (!taken.held()) {
+                lapse("its claim is no longer this taker's: another claim displaced it");
+            }
+            return lapsed;
+        }
+
+        private void lapse(String cause) {
+            lapsed = true;
+            lapseCause = cause;
+            lateTakes.incrementAndGet();
+            LOG.log(System.Logger.Level.WARNING, label + ": held entry " + taken.entryId() + " lapsed while its handler"
+                    + " ran (" + cause + "); it is no longer renewed and its result will be dropped (C05)");
+        }
+
+        /** Whether the take lapsed; judged now as well, so a result is never dispatched past the lease's end. */
+        synchronized boolean lapsed() {
+            return judgeLapse(wallMillis());
+        }
+
+        /** Renews the take for its lease, if it may still be renewed; returns whether the caller should go on. */
+        synchronized boolean renew(boolean fromWake) {
+            long now = wallMillis();
+            if (judgeLapse(now) || stopped) {
+                return false;
+            }
+            if (!handle.running) {
+                stopped = true; // its agent was unbound while the handler ran
+                return false;
+            }
+            if (pastHoldLimit()) {
+                stopped = true;
                 holdLimitStops.incrementAndGet();
                 LOG.log(System.Logger.Level.WARNING, label + ": held entry " + taken.entryId() + " for "
                         + Duration.ofNanos(time.monoNanos() - heldSince).toMillis() + " ms, past the hold limit of "
@@ -2572,13 +2680,62 @@ public final class AgentBinder implements AutoCloseable {
             }
             try {
                 taken.renew(lease);
+                expiresAtMillis = now + lease.toMillis();
                 takeRenewals.incrementAndGet();
+                if (fromWake) {
+                    wakeRenewals.incrementAndGet();
+                }
                 return true;
+            } catch (ai.badmonkey.agentspaces.api.error.LeaseExpiredException e) {
+                lapse("its renewal was refused: " + e.getMessage()); // the claim went between the check and here
+                return false;
             } catch (RuntimeException e) {
+                stopped = true;
                 LOG.log(System.Logger.Level.WARNING, label + ": renewing the take lease failed", e);
                 return false;
             }
-        });
+        }
+
+        /**
+         * The I-05 guard of a renewal from inside the handler ({@link TakeContext#renew()}): the agent bound, the hold
+         * limit not passed, the take not lapsed. A true answer is followed by the renewal, so the lease end moves.
+         */
+        synchronized boolean renewingFromInside() {
+            long now = wallMillis();
+            if (judgeLapse(now) || !handle.running || pastHoldLimit()) {
+                return false;
+            }
+            expiresAtMillis = now + lease.toMillis();
+            return true;
+        }
+    }
+
+    /**
+     * C05 (SPEC v0.1.37 §7.4 and §9.4): a wake from a sleep, any wall step, or a timer wake more than 30 s late with no
+     * wall step (a frozen process) re-checks a held take at once. Past its lease end on the wall clock, or with its
+     * claim no longer this taker's, it has lapsed: it is never renewed again and its result will be late. Otherwise it
+     * is renewed at once, unless the agent was unbound or the hold limit (monotonic) has passed. Without this the next
+     * renewal came on the monotonic period, which does not count a sleep, so it could come after the wall-time lease
+     * had ended and another member had taken the entry.
+     */
+    private void recheckHeld(HeldTake held) {
+        held.renew(true);
+    }
+
+    /**
+     * Renews a take at half its lease until interrupted (EL-E-08, owner answer 12): what keeps an {@code @OrderedTake}
+     * handler's entry while it runs, so the 30 s default exceeds the 15 s cycle that renews it. The renewal also ends
+     * with the binding (closed, or unbound by a revocation): the unbind interrupts the handler's thread, but a handler
+     * that ignores the interrupt would otherwise keep its entry for as long as it hung, and no other member could ever
+     * take it (srad/agentspaces-event-loop.md §10.14, the phase 2 wire adversary). It ends, too, at the hold limit
+     * (owner decision 2, 2026-11-22; off by default), and once the take has lapsed (C05).
+     */
+    private AutoCloseable renewTakeWhileRunning(HeldTake held) {
+        Duration every = held.lease.dividedBy(2).isZero() ? held.lease : held.lease.dividedBy(2);
+        // A task on the binder's time source (EL-W-02): renewal and expiry judged on one source; closed when the
+        // handler returns.
+        return ai.badmonkey.agentspaces.common.time.Periodic.every(held.time, every,
+                "space-ordered-renew-" + held.label, () -> held.renew(false));
     }
 
     /**

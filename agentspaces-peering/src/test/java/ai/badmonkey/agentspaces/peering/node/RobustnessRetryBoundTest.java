@@ -27,17 +27,22 @@ class RobustnessRetryBoundTest {
         fleet.close();
     }
 
-    /** How many retry rounds the backoff allows in a span: 5, 10, 20, 30, 30... seconds apart. */
+    /**
+     * How many retry rounds the redial table allows in a span at most (owner decision 1 of 2026-11-23): 5, 10, 20,
+     * 30 s, then 5 s again, each at its shortest (-10 %), after a round that waited one stagger step for an answer.
+     * The table wraps where the old back-off held at 30 s, so it allows about 1.8 times as many rounds.
+     */
     private static long retriesIn(long spanMillis) {
-        long interval = PeerNode.LOST_RETRY_INTERVAL_MILLIS;
         long at = 0;
         long count = 0;
-        while (at + interval <= spanMillis) {
-            at += interval;
+        for (int i = 0; ; i = (i + 1) % SeedRedial.TABLE_MILLIS.length) {
+            long wait = SeedRedial.STAGGER_MILLIS + Math.round(SeedRedial.TABLE_MILLIS[i] * (1 - SeedRedial.SPREAD));
+            if (at + wait > spanMillis) {
+                return count;
+            }
+            at += wait;
             count++;
-            interval = Math.min(interval * 2, PeerNode.LOST_RETRY_MAX_INTERVAL_MILLIS);
         }
-        return count;
     }
 
     private static long rumors(PeerNode node) {
@@ -112,7 +117,7 @@ class RobustnessRetryBoundTest {
                 PAST_THE_WINDOW, aRumorsDuring, bRumorsDuring, maxConnectionsA, maxConnectionsB,
                 fleet.runtimes.get("a").membership().allMembers().size(),
                 fleet.runtimes.get("b").membership().allMembers().size());
-        // B's view is empty, so B re-dials its seed at the backed-off cadence for the whole loss, and
+        // B's view is empty, so B re-dials its seed on the redial table for the whole loss, and
         // A answers each dial with at most three frames (the re-admission flood, the introduction
         // back, a direct refresh) before dropping B for silence again.
         long retries = retriesIn(PAST_THE_WINDOW * 1000L);

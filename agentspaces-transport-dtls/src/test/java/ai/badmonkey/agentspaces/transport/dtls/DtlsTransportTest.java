@@ -75,6 +75,29 @@ class DtlsTransportTest {
         return connect(new DtlsTransport(a), new DtlsTransport(b), a, b);
     }
 
+    /**
+     * EL-W-06 (srad/agentspaces-event-loop.md, §10.47): an idle association's delivery thread waits on a take, not a
+     * 250 ms poll, and ends at the close through a sentinel behind the frames already complete.
+     */
+    @Test
+    @Timeout(60)
+    void anIdleDeliveryWaitsOnATakeAndEndsAtTheClose() throws Exception {
+        Pair pair = connect();
+        pair.dialed().send("ping".getBytes());
+        assertThat(pair.atListener().poll(10, TimeUnit.SECONDS)).isEqualTo("ping".getBytes());
+        Thread deliver = ((DtlsAssociation) pair.accepted()).deliverThread();
+        assertThat(deliver).isNotNull();
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (deliver.getState() != Thread.State.WAITING && System.nanoTime() - until < 0) {
+            Thread.sleep(5); // a poll for a state the thread reaches; no timing is asserted
+        }
+        assertThat(deliver.getState()).as("idle: parked on a take, with no timeout to wake for").isEqualTo(
+                Thread.State.WAITING);
+        pair.dialed().send("last".getBytes());
+        pair.accepted().close();
+        assertThat(deliver.join(Duration.ofSeconds(5))).as("the close ends the delivery thread").isTrue();
+    }
+
     @Test
     @Timeout(60)
     void framesFlowBothWaysAndBothEndsAttest() throws Exception {

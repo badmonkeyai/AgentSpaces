@@ -44,4 +44,16 @@ public interface TakenEntry<T> {
      * @throws ai.badmonkey.agentspaces.api.error.LeaseExpiredException if the lease already lapsed
      */
     void renew(Duration extension);
+
+    /**
+     * Whether this taker still holds the take where it was made: its claim stands, is this taker's at the take's
+     * epoch, and has not expired (SPEC v0.1.37 §7.4, a take held across a wake). A take whose claim is no longer its
+     * own has lapsed, whatever its own lease end says: another holder's claim displaced it, or the ordered log decided
+     * another. Reading it changes nothing. The default cannot tell and answers true, so only the lease end judges.
+     *
+     * @return whether the take is still held
+     */
+    default boolean held() {
+        return true;
+    }
 }

@@ -268,8 +268,9 @@ public final class PeerNode implements AutoCloseable {
      * @param eventWakes        runs a wake started (a frame, a change signal, a registration)
      * @param directRuns        runs of {@link #tick()}
      * @param backstopRuns      runs that swept every participant because the backstop came due
-     * @param backstopFoundWork sweeps that found a participant reporting a deadline earlier than the one the loop held
-     *                          with no wake (a missed wake, EL-Q-REL-03), over every participant
+     * @param backstopFoundWork sweeps that found a participant reporting a deadline earlier than the one the loop held,
+     *                          or doing work it said fell due before it ({@code NodeLoop.foundOverdue}), with no wake (a
+     *                          missed wake, EL-Q-REL-03), over every participant
      * @param backstopFoundBy   the same, by participant name
      * @param participantThrows runs of a participant that threw, by participant name (NL-4)
      * @param flushRuns         runs of the flush timer, armed only by an enqueue into an idle node (EL-B-01)
@@ -315,6 +316,26 @@ public final class PeerNode implements AutoCloseable {
                             Map<String, Long> dueRuns, Map<String, Long> askedRuns, Map<String, Long> wakeCalls,
                             int stretch, long stretches, long restores, long refreshes, long stretchUnrefreshed,
                             int poolThreads, int poolMax, java.util.List<String> wireVisible) {
+    }
+
+    /**
+     * The node loop's last {@value NodeLoop#TRACE_RUNS} participant runs, oldest first (srad/agentspaces-event-loop.md
+     * EL-Q-MNT-01): participant, deadline, start, real time taken and cause.
+     *
+     * @return the trace
+     */
+    public List<NodeLoop.TraceEntry> loopTrace() {
+        return loop.trace();
+    }
+
+    /**
+     * Logs the node loop's trace on request, at INFO (EL-Q-MNT-01), and returns the text: for a host's debug endpoint
+     * or a REPL when a loop looks late or stuck.
+     *
+     * @return the text logged
+     */
+    public String logLoopTrace() {
+        return loop.logTrace();
     }
 
     /** A loop run longer than this is counted as slow (srad/agentspaces-event-loop.md EL-X-10). */
@@ -564,21 +585,25 @@ public final class PeerNode implements AutoCloseable {
 
     private record HeldAd(long issuedMillis, byte[] payload) {
     }
-    private final Map<GroupId, Long> lastLostRetryMillis = new ConcurrentHashMap<>();
+    /** Each group's seed redial: the table's position, the link's hold, the round of seed dials (2026-11-23). */
+    private final Map<GroupId, SeedRedial> seedRedials = new ConcurrentHashMap<>();
     /**
      * How long after a member's loss this node keeps introducing itself to its last endpoints when retirement is off;
      * it then forgets the member, as before retirement existed.
      */
     static final long LOST_RETRY_WINDOW_MILLIS = 10 * 60_000L;
     /**
-     * The longest delay between two introductions to one lost member: {@link #LOST_RETRY_EARLY_CAP_MILLIS} for its
-     * first {@link #LOST_RETRY_EARLY_PHASE_MILLIS} lost, so a fleet rejoins within about a minute of a partition, a
-     * sleep or a blip healing; this after, for a member that may be gone for good (2026-11-19: a five-minute cap from
-     * the start made a twelve-minute partition take minutes to heal).
+     * The lost-member retry's table (SPEC v0.1.37 §9.4; house rule: backoffs are fixed cycling tables): a lost member's
+     * last endpoints are introduced to again after 5, 10, 20 and 30 s, 1, 2 and 5 minutes, then 5 s again, each wait
+     * spread by {@link #LOST_RETRY_SPREAD} either way, until it answers or retires ({@link #RETIRE_AFTER_MILLIS}). The
+     * wrap finds a member back from a long partition within one cycle (about 9 minutes; 2026-11-19: a five-minute cap
+     * from the start made a twelve-minute partition take minutes to heal), and costs about 1,100 dials a day to a
+     * member gone for good, against about 340 under the doubling backoff it replaces; each dial runs on a virtual
+     * thread of its own, off the loop.
      */
-    static final long LOST_RETRY_CAP_MILLIS = 5 * 60_000L;
-    static final long LOST_RETRY_EARLY_CAP_MILLIS = 60_000L;
-    static final long LOST_RETRY_EARLY_PHASE_MILLIS = 60 * 60_000L;
+    static final long[] LOST_RETRY_TABLE_MILLIS = {5_000, 10_000, 20_000, 30_000, 60_000, 120_000, 300_000};
+    /** The spread on each wait of the lost-member table, so a fleet that lost the same member does not dial in step. */
+    static final double LOST_RETRY_SPREAD = 0.10;
     /** At most this many lost members are re-dialed per round, the oldest-due first: no dial storm after a split. */
     static final int LOST_RETRY_BUDGET = 8;
     /** With retirement on, a lost member that never answered retires this long after its loss (the default). */
@@ -587,13 +612,26 @@ public final class PeerNode implements AutoCloseable {
     static final long LAST_RESORT_AFTER_MILLIS = 2 * 60_000L;
     /** Retired members tried per last-resort round. */
     static final int LAST_RESORT_BUDGET = 4;
-    static final long LAST_RESORT_BASE_MILLIS = 2 * 60_000L;
-    static final long LAST_RESORT_MAX_MILLIS = 10 * 60_000L;
+    /**
+     * The last resort's table (house rule: backoffs are fixed cycling tables, in the lost-member table's style): the
+     * first round at once, then after 2, 4, 8 and 10 minutes, then 2 minutes again, each wait spread by
+     * {@link #LOST_RETRY_SPREAD} either way. It replaces a doubling back-off (2 minutes doubling to a 10 minute cap,
+     * a quarter either way) that stayed at its cap for as long as the view was empty; the table keeps the cap as its
+     * longest wait and wraps, so an isolated node finds a retired member that came back within one cycle (24 minutes).
+     */
+    static final long[] LAST_RESORT_TABLE_MILLIS = {120_000, 240_000, 480_000, 600_000};
     /** Each lost member's retry schedule, per group. */
     private final Map<GroupId, Map<PeerId, Backoff>> lostSchedule = new ConcurrentHashMap<>();
     /** When each group's view became empty, while it is. */
     private final Map<GroupId, Long> emptySince = new ConcurrentHashMap<>();
     private final Map<GroupId, Backoff> lastResortSchedule = new ConcurrentHashMap<>();
+    /**
+     * Backward wall steps not yet applied to the lost-member and last-resort schedules, in milliseconds (zero or less).
+     * Those schedules are kept on the wall clock beside the loss they date from, but their waits are local periods: a
+     * step back must not hold the next try for the step's length (the cross-client check of 2026-11-23). Applied on the
+     * loop, in the next run of the lost-member participant.
+     */
+    private final AtomicLong wallStepBackMillis = new AtomicLong();
     private final Map<GroupId, Integer> lastResortCursor = new ConcurrentHashMap<>();
     private final AtomicLong lostIntroductions = new AtomicLong();
     private final AtomicLong lastResortIntroductions = new AtomicLong();
@@ -602,16 +640,72 @@ public final class PeerNode implements AutoCloseable {
     private final boolean postRetirement;
     private final long retireAfterMillis;
     private final RetirementList retirementList;
-    /** How soon after a loss the lost members and (on an empty view) the seeds are first tried. */
+    /** How soon after a loss a lost member is first tried; also the redial table's first wait ({@link SeedRedial}). */
     static final long LOST_RETRY_INTERVAL_MILLIS = 5_000L;
     /**
-     * The retry interval doubles after each round that admitted nobody, up to this cap, and snaps
-     * back on an admission (ROBUSTNESS.md §5, the retry bound): a pair alone under a one-way loss
-     * otherwise re-introduces, re-admits and re-drops at full rate for as long as the loss lasts.
+     * The redial table's longest wait (5, 10, 20, 30 s, then 5 s again; {@link SeedRedial}): with nobody in view the
+     * seeds are dialled again no more than this (+10 %) apart, and a link that ends within 5 s climbs the table
+     * rather than redial at once (ROBUSTNESS.md §5, the retry bound): a pair alone under a one-way loss otherwise
+     * re-introduces, re-admits and re-drops at full rate for as long as the loss lasts.
      */
-    static final long LOST_RETRY_MAX_INTERVAL_MILLIS = 30_000L;
-    /** The current retry interval per group: the base after an admission, doubling while nobody answers. */
-    private final Map<GroupId, Long> lostRetryIntervalMillis = new ConcurrentHashMap<>();
+    static final long LOST_RETRY_MAX_INTERVAL_MILLIS = SeedRedial.TABLE_MILLIS[SeedRedial.TABLE_MILLIS.length - 1];
+    /**
+     * The dead-link rule (SPEC v0.1.37 §9.4, as every client) for every link a dial-only node dialed and every link
+     * dialed to a seed: a link nothing arrived on for this long is asked with a PING.
+     */
+    static final long LINK_QUIET_MILLIS = 45_000L;
+    /**
+     * The PING's answer window: a link still silent this long after it is closed. Any frame counts as the answer, and
+     * so do bytes of a frame still arriving.
+     */
+    static final long LINK_ANSWER_MILLIS = 2_000L;
+
+    /**
+     * A link this node dialed (an introduction, a seed round's dial, a member's endpoint), watched from the reader
+     * thread: when it last carried a frame, who answered on it, and the dead-link rule's PING.
+     */
+    static final class DialedLink {
+        final GroupId group;
+        /** The endpoint's key ({@link SeedRedial#key}). */
+        final String key;
+        final long dialedMillis;
+        /** Dialled by a seed round: its first answer wakes the round. */
+        final boolean seedRound;
+        /** When a frame last arrived on it, on the local base, or -1 for never. */
+        volatile long heardMillis = -1;
+        /** The peer whose verified frame first arrived on it, or the member it was dialled for; null until then. */
+        volatile PeerId peer;
+        /** When the dead-link rule's PING went, or -1 when none waits. */
+        volatile long askedMillis = -1;
+        /** When bytes of a frame not yet whole last arrived on it, on the local base, or -1 (SPEC v0.1.37 §9.4). */
+        volatile long progressMillis = -1;
+
+        /** When anything last arrived on it, a whole frame or bytes of one: what the dead-link rule judges. */
+        long lastArrivalMillis() {
+            return Math.max(heardMillis, progressMillis);
+        }
+
+        DialedLink(GroupId group, String key, long dialedMillis, boolean seedRound, PeerId peer) {
+            this.group = group;
+            this.key = key;
+            this.dialedMillis = dialedMillis;
+            this.seedRound = seedRound;
+            this.peer = peer;
+        }
+    }
+
+    /** Every open link this node dialed, until it closes. */
+    private final Map<TransportConnection, DialedLink> dialedLinks = new ConcurrentHashMap<>();
+    /** The last introduction link per endpoint key: a new introduction there replaces it, never adds to it. */
+    private final Map<String, TransportConnection> introLinks = new ConcurrentHashMap<>();
+    private final AtomicLong seedDials = new AtomicLong();
+    private final AtomicLong lateSeedChannels = new AtomicLong();
+    private final AtomicLong seedPings = new AtomicLong();
+    private final AtomicLong wakePings = new AtomicLong();
+    private final AtomicLong linksSilent = new AtomicLong();
+    private final AtomicLong introductionsUnanswered = new AtomicLong();
+    /** The node-wide participant of the dead-link rule and the unanswered introductions. */
+    private DueWork.Registration linkWatch;
     /** When a probe's digests last started a targeted pull from a peer, so a persistent mismatch pulls once per period. */
     private final Map<PeerId, Long> probePulls = new ConcurrentHashMap<>();
     /** Members whose advertisement carries {@link #SESSION_HINT}. */
@@ -1469,13 +1563,20 @@ public final class PeerNode implements AutoCloseable {
         retirementList.onDirty(this::persistDue);
         registerNodeParticipants();
         // EL-C-12, EL-C-14: the time source tells this node of a wall step (TS-6); the node asks every participant
-        // again, and after a forward step longer than a group's member TTL re-introduces itself there.
+        // again, and after a forward step longer than the 30 s keepalive bound (a wake) re-introduces itself there.
         this.wallStepRegistration = time.onWallStep(this::onWallStep);
+        // SPEC v0.1.37 §9.4: a timer wake more than 30 s late with no wall step (a frozen process: SIGSTOP, a long GC or
+        // VM pause) is a wake too.
+        this.lateWakeRegistration = time.onLateWake(this::onLateWake);
     }
 
     // ---- the wall-step signal and the resume probe (srad/agentspaces-event-loop.md §3.6, EL-C-12, EL-C-14)
 
     private final AutoCloseable wallStepRegistration;
+    private final AutoCloseable lateWakeRegistration;
+    private final AtomicLong lateWakes = new AtomicLong();
+    /** When the last wake ran its resume, on the local base; {@link Long#MIN_VALUE} before the first. */
+    private volatile long lastResumeMillis = Long.MIN_VALUE;
     private final AtomicLong wallStepsSeen = new AtomicLong();
     private final AtomicLong resumeRejoins = new AtomicLong();
     /** The monotonic instant of the last wall step not yet followed by a run of the wall-step marker, or -1. */
@@ -1506,10 +1607,13 @@ public final class PeerNode implements AutoCloseable {
     /**
      * A wall step (TS-6): every participant is asked again at once, so a wall-anchored deadline (a space's lapse, a
      * lease renewal, a card, credential or retirement expiry, the card refresh) is converted again on the stepped
-     * clock instead of waiting out the deadline converted before it (EL-C-12). A forward step longer than a group's
-     * member TTL may have been an absence (a suspend, a long freeze), and its peers may have dropped this node, so the
-     * node re-introduces itself to the group's seeds and members and probes each member once (EL-C-14). Local periods
-     * are on monotonic time and do not move (EL-C-05).
+     * clock instead of waiting out the deadline converted before it (EL-C-12). A forward step longer than the 30 s
+     * keepalive bound ({@link GroupMembership#KEEPALIVE_TTL}) is a wake (SPEC v0.1.37 §9.4, as in every client): it may
+     * have been an absence (a suspend, a long freeze), its peers may have dropped this node and its links may be
+     * dead, so the node re-introduces itself to the group's seeds and members, probes each member once (EL-C-14) and
+     * runs the wake rule on its seed link. Before 2026-11-23 (§10.38) the core waited for a step past the member TTL
+     * (45 s at the least), so a 30 to 45 s sleep was a wake in the clients and not here. Local periods are on
+     * monotonic time and do not move (EL-C-05).
      */
     private void onWallStep(Duration step) {
         if (loop.closed()) {
@@ -1517,10 +1621,13 @@ public final class PeerNode implements AutoCloseable {
         }
         wallStepsSeen.incrementAndGet();
         wallStepPendingNanos = time.monoNanos();
+        if (step.isNegative()) {
+            wallStepBackMillis.addAndGet(step.toMillis()); // the retry waits keep their length (runLost)
+        }
         if (!step.isNegative()) {
             long stepMillis = step.toMillis();
-            for (GroupRuntime runtime : groups.values()) {
-                if (stepMillis > runtime.membership().memberTtlMillis()) {
+            if (stepMillis > GroupMembership.KEEPALIVE_TTL.toMillis()) {
+                for (GroupRuntime runtime : groups.values()) {
                     resumeProbe(runtime);
                 }
             }
@@ -1528,10 +1635,48 @@ public final class PeerNode implements AutoCloseable {
         loop.wakeAll();
     }
 
-    /** EL-C-14: back from a possible absence, introduce this node again and probe every member once. */
+    /**
+     * A late wake (SPEC v0.1.37 §9.4): the time source's timer woke more than 30 s past its deadline with no wall step,
+     * so this process was frozen (SIGSTOP, a long GC or VM pause) or its monotonic clock counted a sleep. It is a wake
+     * as a forward wall step is: each group runs the resume (the self ads, one probe of each member, the seed PING and
+     * fail-over), unless a wall step's resume already ran during the stall. The membership judges a member found past
+     * its TTL by a late tick with a probe, not a drop ({@link GroupMembership#lateReprobes()}), whichever comes first.
+     */
+    private void onLateWake(Duration late) {
+        if (loop.closed()) {
+            return;
+        }
+        lateWakes.incrementAndGet();
+        long since = localMillis() - late.toMillis();
+        if (lastResumeMillis != Long.MIN_VALUE && lastResumeMillis >= since) {
+            return; // the wall step of the same absence ran the resume
+        }
+        for (GroupRuntime runtime : groups.values()) {
+            resumeProbe(runtime);
+        }
+        loop.wakeAll();
+    }
+
+    /**
+     * Late wakes this node was told of (SPEC v0.1.37 §9.4); each ran the resume unless a wall step's had.
+     *
+     * @return the count
+     */
+    public long lateWakes() {
+        return lateWakes.get();
+    }
+
+    /**
+     * EL-C-14 and owner decision 3 of 2026-11-23: back from a possible absence, introduce this node again and probe
+     * every member once; the redial table starts again from its first wait. With somebody in view, the seed link's
+     * member is PINGed, and silence for the ping timeout (2 s) drops it at once and fails over to the other seeds,
+     * however young its link: the monotonic clock did not count the sleep. With nobody in view, the seeds are dialled
+     * at once rather than after the rest of the table's wait.
+     */
     private void resumeProbe(GroupRuntime runtime) {
         GroupId groupId = runtime.id();
         resumeRejoins.incrementAndGet();
+        lastResumeMillis = localMillis();
         Set<PeerId> sentTo = selfAdSentTo.get(groupId);
         if (sentTo != null) {
             sentTo.clear(); // the self ad goes to every member directly in the next run
@@ -1540,11 +1685,23 @@ public final class PeerNode implements AutoCloseable {
         if (gp != null) {
             gp.introductionsOwed = true;
         }
-        List<PeerAdvertisement.Endpoint> seeds = groupSeeds.get(groupId);
-        if (seeds != null && !seeds.isEmpty()) {
-            introduceTo(groupId, seeds); // as a lost view's retry does, without waiting for its back-off
+        SeedRedial st = seedRedials.get(groupId);
+        PeerId wakeSeed = null;
+        if (st != null) {
+            // Without the redial's lock: a round's dial may hold it, and the wall-step thread never waits on a dial.
+            st.wakeReset = true; // the next run resets the table
+            PeerId seed = st.seedPeer;
+            if (runtime.membership().allMembers().isEmpty()) {
+                st.roundWanted = true; // no link: dial at once
+            } else if (seed != null && runtime.membership().member(seed).isPresent()) {
+                wakeSeed = seed; // PINGed before the resume probes, which then skip it
+            }
+            if (gp != null) {
+                gp.lost.wake();
+            }
         }
-        runtime.membership().probeEachOnce(); // after the self ads: the self-ad participant runs first
+        // after the self ads: the self-ad participant runs first; the wake's PING and the resume probes in one ask
+        runtime.membership().probeAtResume(wakeSeed);
     }
 
     private void persistDue(GroupId groupId) {
@@ -2484,6 +2641,16 @@ public final class PeerNode implements AutoCloseable {
 
     private void onConnectionClosed(TransportConnection connection) {
         attached.remove(connection);
+        DialedLink dialed = dialedLinks.remove(connection);
+        if (dialed != null) {
+            introLinks.remove(dialed.key, connection);
+            if (dialed.seedRound) {
+                GroupParticipants gp = participants.get(dialed.group);
+                if (gp != null) {
+                    gp.lost.wake(); // a seed link closed: a round waiting on it starts its next dial at once
+                }
+            }
+        }
         for (Map.Entry<PeerId, TransportConnection> entry : List.copyOf(connections.entrySet())) {
             if (entry.getValue() == connection) {
                 dropConnection(entry.getKey(), connection);
@@ -3548,10 +3715,325 @@ public final class PeerNode implements AutoCloseable {
             beaconParticipant.wake();
         }
 
-        // Introduce ourselves to the seeds directly; gossip takes it from there.
+        // Introduce ourselves to the seeds directly; gossip takes it from there. The join's dials are the first round
+        // of the seed redial: the lost participant's first run finds it under way and dials nothing more (2026-11-23,
+        // the double dial at join).
         groupSeeds.put(groupId, List.copyOf(seeds));
-        introduceTo(groupId, seeds);
+        SeedRedial redial = new SeedRedial();
+        seedRedials.put(groupId, redial);
+        synchronized (redial.lock) {
+            long mono = localMillis();
+            if (byPriority(seeds).stream().anyMatch(this::dialableEndpoint)) {
+                startRound(runtime, redial, mono);
+            } else {
+                redial.nextRoundMillis = mono; // nothing to dial: the locator is asked on the first run, as before
+            }
+        }
+        GroupParticipants joined = participants.get(groupId);
+        if (joined != null) {
+            joined.lost.wake(); // a loop already running learns of the round's next step
+        }
         return runtime;
+    }
+
+    /** Whether this node has a transport that can dial an endpoint (a signalled endpoint names no address). */
+    private boolean dialableEndpoint(PeerAdvertisement.Endpoint endpoint) {
+        Transport transport = transports.get(endpoint.transport());
+        return transport != null && !transport.signalled();
+    }
+
+    // ---- the seed redial (owner decisions of 2026-11-23: the table, the stagger, the wake; SeedRedial)
+
+    /**
+     * The seed redial's run, from the lost participant: the link's hold (the view going from empty to held and back),
+     * the round in progress, and a new round when one is due or wanted. Returns the next deadline on the local base,
+     * or {@link Long#MAX_VALUE}.
+     */
+    private long runSeeds(GroupRuntime runtime, long mono) {
+        SeedRedial st = seedRedials.get(runtime.id());
+        if (st == null) {
+            return Long.MAX_VALUE;
+        }
+        synchronized (st.lock) {
+            if (st.wakeReset) {
+                st.wakeReset = false;
+                st.reset(); // a wake: the table starts again from its first wait
+            }
+            boolean empty = runtime.membership().allMembers().isEmpty();
+            if (!empty && st.linkSinceMillis < 0) {
+                st.linkSinceMillis = mono; // linked: somebody is in view
+            } else if (empty && st.linkSinceMillis >= 0) {
+                // The link ended. One that held at least the table's first wait resets the table and redials at once;
+                // a shorter one waits the next step, so a seed that admits and drops this node at once climbs the
+                // table and gets no dial loop.
+                long held = mono - st.linkSinceMillis;
+                st.linkSinceMillis = -1;
+                if (held >= SeedRedial.HOLD_MILLIS) {
+                    st.reset();
+                    st.nextRoundMillis = mono;
+                } else {
+                    st.nextRoundMillis = mono + st.nextWait(random);
+                }
+            }
+            adoptLateSeed(st);
+            boolean seedsChanged = st.seedsChanged;
+            st.seedsChanged = false;
+            if (st.round != null) {
+                if (seedsChanged) {
+                    extendRound(runtime, st.round); // the locator's new seeds join the round under way
+                }
+                st.roundWanted = false; // the round under way serves it
+                stepRound(runtime, st, mono);
+            } else if (st.roundWanted || (empty && mono >= st.nextRoundMillis)) {
+                st.roundWanted = false;
+                startRound(runtime, st, mono);
+                if (empty) {
+                    relocateIfStale(runtime.id(), time.millis()); // the locator, on the same table
+                }
+            }
+            SeedRedial.Round round = st.round;
+            if (round != null) {
+                return lastStartWaits(round) ? round.lastStartMillis + SeedRedial.STAGGER_MILLIS : Long.MAX_VALUE;
+            }
+            return runtime.membership().allMembers().isEmpty() ? st.nextRoundMillis : Long.MAX_VALUE;
+        }
+    }
+
+    /** Starts a round of seed dials in list order, the seed lost last at the end. Under the redial's lock. */
+    private void startRound(GroupRuntime runtime, SeedRedial st, long mono) {
+        List<PeerAdvertisement.Endpoint> seeds = groupSeeds.getOrDefault(runtime.id(), List.of()).stream()
+                .filter(this::dialableEndpoint).toList();
+        st.lastRoundLinks.clear();
+        st.round = new SeedRedial.Round(SeedRedial.order(byPriority(seeds), st.lostSeed));
+        stepRound(runtime, st, mono);
+    }
+
+    /**
+     * Adds to a round under way the seeds it does not hold yet, in list order after the rest: the locator answered
+     * new seeds while the round of the old ones still ran (§10.38). Under the redial's lock.
+     */
+    private void extendRound(GroupRuntime runtime, SeedRedial.Round round) {
+        java.util.Set<String> held = new java.util.HashSet<>();
+        round.order.forEach(seed -> held.add(SeedRedial.key(seed)));
+        for (PeerAdvertisement.Endpoint seed : byPriority(groupSeeds.getOrDefault(runtime.id(), List.of()))) {
+            if (dialableEndpoint(seed) && held.add(SeedRedial.key(seed))) {
+                round.order.add(seed);
+            }
+        }
+    }
+
+    /**
+     * Whether the round's last dial still waits: its connect still runs, or its link waits for an answer (a refused or
+     * closed one does not).
+     */
+    private boolean lastStartWaits(SeedRedial.Round round) {
+        SeedRedial.Dial dial = round.lastDial;
+        return dial != null && (!dial.done || dial.connection != null && round.waiting.containsKey(dial.connection));
+    }
+
+    /**
+     * Whether a seed or lost-member dial made now runs off the calling thread (SPEC v0.1.37 §9.4): from the loop's own
+     * run it does, each dial on a virtual thread of its own (a task of the node's time source), so a blackholed
+     * connect never holds the loop. A join's first dial, and a run a host drives by hand ({@link NodeLoop#tick()}),
+     * dial on the caller's thread as before.
+     */
+    private boolean dialsOffLoop() {
+        return loop.insideRun() && !loop.directRun();
+    }
+
+    /** A round's dial ended: a refusal starts the next seed at once; a link joins the round's waiting links. */
+    private void dialed(SeedRedial st, SeedRedial.Dial dial, TransportConnection connection) {
+        dial.done = true;
+        SeedRedial.Round round = dial.round;
+        round.dialing--;
+        if (connection == null || !dialedLinks.containsKey(connection)) {
+            return; // refused, or cut for its chain
+        }
+        dial.connection = connection;
+        if (round.won) {
+            lateSeedChannels.incrementAndGet();
+            connection.close(); // another seed answered while this connect ran
+            return;
+        }
+        round.waiting.put(connection, dial.key);
+        if (st.round == round || st.round == null) {
+            st.lastRoundLinks.put(connection, dial.key); // a late answer still names the seed link
+        }
+    }
+
+    /**
+     * Moves a round on: its first answer wins; otherwise the next seed starts once the last one has waited the
+     * stagger, at once when it was refused, and no further while {@link SeedRedial#DIALS_IN_FLIGHT_MAX} wait. With
+     * every seed started and the last one's stagger out, the round failed and the table's next wait begins. Under the
+     * redial's lock.
+     */
+    private void stepRound(GroupRuntime runtime, SeedRedial st, long mono) {
+        SeedRedial.Round round = st.round;
+        if (roundAnswered(st, round)) {
+            return;
+        }
+        while (round.next < round.order.size()) {
+            if (lastStartWaits(round) && mono < round.lastStartMillis + SeedRedial.STAGGER_MILLIS) {
+                return;
+            }
+            if (round.waiting.size() + round.dialing >= SeedRedial.DIALS_IN_FLIGHT_MAX) {
+                return; // every slot is taken: a link that closes, or a dial refused, starts the next
+            }
+            PeerAdvertisement.Endpoint seed = round.order.get(round.next++);
+            String key = SeedRedial.key(seed);
+            PeerId member = memberAt(runtime, seed);
+            if (member != null) {
+                won(st, round, key, member, null); // already linked to the member at that address: no dial
+                return;
+            }
+            round.lastStartMillis = mono;
+            SeedRedial.Dial dial = new SeedRedial.Dial(key, round);
+            round.lastDial = dial;
+            round.dialing++;
+            if (dialsOffLoop()) {
+                // The connect runs on a virtual thread of its own; its outcome wakes this participant, so a refusal
+                // starts the next seed at once and a silent connect costs the loop nothing (SPEC v0.1.37 §9.4).
+                GroupId groupId = runtime.id();
+                time.schedule(Duration.ZERO, () -> {
+                    TransportConnection connection = introduceOn(groupId, seed, true);
+                    synchronized (st.lock) {
+                        dialed(st, dial, connection);
+                    }
+                    GroupParticipants gp = participants.get(groupId);
+                    if (gp != null) {
+                        gp.lost.wake();
+                    }
+                });
+                continue; // the stagger holds the next one
+            }
+            dialed(st, dial, introduceOn(runtime.id(), seed, true));
+            if (roundAnswered(st, round)) {
+                return;
+            }
+        }
+        if (lastStartWaits(round) && mono < round.lastStartMillis + SeedRedial.STAGGER_MILLIS) {
+            return;
+        }
+        // Every seed started and nobody answered in time: the round failed. Its links stay open for a late answer
+        // until the next round to the same seed replaces them, or the unanswered-introduction rule closes them.
+        st.round = null;
+        if (runtime.membership().allMembers().isEmpty()) {
+            // Nothing to dial and no locator to ask again: no round is scheduled until a seed or a member turns up
+            // (a lone founder ran an empty round on every step of the table).
+            st.nextRoundMillis = round.order.isEmpty() && !locates(runtime.id()) ? Long.MAX_VALUE
+                    : mono + st.nextWait(random);
+        }
+    }
+
+    /**
+     * A lost member's endpoints less those the seed redial dials: with nobody in view the redial's rounds dial every
+     * seed on the table, the lost seed last, so the lost-member retry, on its own table, does not dial a
+     * seed between the rounds too (§10.38: it did, twice the dials, each closing the round's waiting link). With
+     * somebody in view no round runs, and the retry dials every endpoint as before.
+     */
+    private List<PeerAdvertisement.Endpoint> offTable(GroupRuntime runtime, List<PeerAdvertisement.Endpoint> endpoints) {
+        if (endpoints == null || endpoints.isEmpty()) {
+            return List.of();
+        }
+        if (!seedRedials.containsKey(runtime.id()) || !runtime.membership().allMembers().isEmpty()) {
+            return endpoints;
+        }
+        java.util.Set<String> seeds = new java.util.HashSet<>();
+        groupSeeds.getOrDefault(runtime.id(), List.of()).forEach(seed -> seeds.add(SeedRedial.key(seed)));
+        return endpoints.stream().filter(e -> !seeds.contains(SeedRedial.key(e))).toList();
+    }
+
+    /** Whether a group's locator can be asked again for seeds (not a fixed list). */
+    private boolean locates(GroupId groupId) {
+        BeaconLocator locator = groupLocators.get(groupId);
+        return locator != null && !(locator instanceof SeedsLocator) && locator.canLocate();
+    }
+
+    /** Whether a link of the round has carried a verified frame; the first such link wins. Under the redial's lock. */
+    private boolean roundAnswered(SeedRedial st, SeedRedial.Round round) {
+        round.waiting.keySet().removeIf(c -> !dialedLinks.containsKey(c)); // closed: refused late, or cut
+        for (Map.Entry<TransportConnection, String> entry : round.waiting.entrySet()) {
+            DialedLink link = dialedLinks.get(entry.getKey());
+            if (link != null && link.heardMillis >= 0 && link.peer != null) {
+                won(st, round, entry.getValue(), link.peer, entry.getKey());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The round's winner is the seed link; the links still waiting are closed, and no other seed is dialled. */
+    private void won(SeedRedial st, SeedRedial.Round round, String key, PeerId peer, TransportConnection winner) {
+        st.seedKey = key;
+        st.seedPeer = peer;
+        st.round = null;
+        round.won = true; // a dial still running closes its link when it completes
+        for (TransportConnection late : List.copyOf(round.waiting.keySet())) {
+            if (late != winner) {
+                lateSeedChannels.incrementAndGet();
+                late.close(); // another seed answered first
+            }
+        }
+        st.lastRoundLinks.clear();
+    }
+
+    /** A seed that answered after its round ended still names the seed link. Under the redial's lock. */
+    private void adoptLateSeed(SeedRedial st) {
+        if (st.round != null || st.seedPeer != null || st.lastRoundLinks.isEmpty()) {
+            return;
+        }
+        st.lastRoundLinks.keySet().removeIf(c -> !dialedLinks.containsKey(c));
+        for (Map.Entry<TransportConnection, String> entry : st.lastRoundLinks.entrySet()) {
+            DialedLink link = dialedLinks.get(entry.getKey());
+            if (link != null && link.heardMillis >= 0 && link.peer != null) {
+                st.seedKey = entry.getValue();
+                st.seedPeer = link.peer;
+                st.lastRoundLinks.clear();
+                return;
+            }
+        }
+    }
+
+    /** A member of the group that advertises the endpoint and holds a live link here, or null. */
+    private PeerId memberAt(GroupRuntime runtime, PeerAdvertisement.Endpoint endpoint) {
+        for (GroupMembership.Member member : runtime.membership().allMembers()) {
+            if (member.id().equals(peerId()) || connections.get(member.id()) == null) {
+                continue;
+            }
+            for (PeerAdvertisement.Endpoint advertised : member.endpoints()) {
+                if (advertised.transport().equals(endpoint.transport())
+                        && advertised.address().equals(endpoint.address())) {
+                    return member.id();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The seed link's member left the view: its seed goes last in every round from now on, and a wake's unanswered
+     * PING (owner decision 3) or the dead-link rule fails over to the other seeds at once with the table reset.
+     */
+    private void seedLinkLost(GroupId groupId, PeerId peer, boolean failOver) {
+        SeedRedial st = seedRedials.get(groupId);
+        if (st == null) {
+            return;
+        }
+        synchronized (st.lock) {
+            if (peer.equals(st.seedPeer)) {
+                st.lostSeed = st.seedKey;
+                st.seedPeer = null;
+                st.seedKey = null;
+            }
+            if (failOver) {
+                st.reset();
+                st.roundWanted = true;
+            }
+        }
+        GroupParticipants gp = participants.get(groupId);
+        if (gp != null) {
+            gp.lost.wake();
+        }
     }
 
     /**
@@ -3562,19 +4044,71 @@ public final class PeerNode implements AutoCloseable {
      * verified multicast beacon, and after a join-by-GroupID fetch.
      */
     private void introduceTo(GroupId groupId, List<PeerAdvertisement.Endpoint> endpoints) {
+        boolean offLoop = dialsOffLoop(); // a lost member's or a retired member's dial never holds the loop (§9.4)
         for (PeerAdvertisement.Endpoint seed : byPriority(endpoints)) {
-            Transport transport = transports.get(seed.transport());
-            if (transport == null || transport.signalled()) {
-                continue; // a signalled endpoint names no address to introduce ourselves at
+            if (offLoop) {
+                time.schedule(Duration.ZERO, () -> introduceOn(groupId, seed, false));
+            } else {
+                introduceOn(groupId, seed, false);
             }
-            try {
-                TransportConnection connection = transport.dial(seed.address());
-                attach(connection);
-                maybeAnnounceChannel(groupId, connection, null); // the seed's identity is not known yet
-                sendOn(connection, groupId, null, Envelope.Kind.RUMOR, selfAdRumor(groupId));
-            } catch (IOException e) {
-                // Seed unreachable; others may work, and gossip is redundant.
+        }
+    }
+
+    /**
+     * Dials one endpoint and introduces this node on the new link (spec §5.1). An earlier introduction link to the
+     * same endpoint that no member holds is closed first, so a redial replaces a link and never adds one: before
+     * 2026-11-23 every pass left one more link open to a seed that never answered (nine after eight passes). The
+     * link is watched ({@link DialedLink}): one nobody answers on is closed by the unanswered-introduction rule.
+     *
+     * @return the link, or null when the endpoint has no transport here or the dial failed
+     */
+    private TransportConnection introduceOn(GroupId groupId, PeerAdvertisement.Endpoint seed, boolean seedRound) {
+        Transport transport = transports.get(seed.transport());
+        if (loop.closed() || !groups.containsKey(groupId)) {
+            return null; // a dial that ran off the loop after the node closed or left the group
+        }
+        if (transport == null || transport.signalled()) {
+            return null; // a signalled endpoint names no address to introduce ourselves at
+        }
+        String key = SeedRedial.key(seed);
+        TransportConnection previous = introLinks.get(key);
+        if (previous != null && !connections.containsValue(previous) && introLinks.remove(key, previous)) {
+            previous.close();
+        }
+        if (seedRound) {
+            seedDials.incrementAndGet();
+        }
+        try {
+            TransportConnection connection = transport.dial(seed.address());
+            if (loop.closed()) {
+                connection.close(); // a dial off the loop that connected after the node closed (§9.4)
+                return null;
             }
+            // Before the reader starts: an answer can arrive the moment the link is attached.
+            dialedLinks.put(connection, new DialedLink(groupId, key, localMillis(), seedRound, null));
+            introLinks.put(key, connection);
+            if (!attach(connection)) {
+                return null; // cut for its chain
+            }
+            if (loop.closed()) {
+                // close() ran between the check above and the attach, after it closed every attached link: the
+                // closed flag is set before that, so this second look cannot miss it (the cross-client check of
+                // 2026-11-23).
+                attached.remove(connection);
+                dialedLinks.remove(connection);
+                introLinks.remove(key, connection);
+                connection.close();
+                return null;
+            }
+            maybeAnnounceChannel(groupId, connection, null); // the seed's identity is not known yet
+            sendOn(connection, groupId, null, Envelope.Kind.RUMOR, selfAdRumor(groupId));
+            DueWork.Registration watch = linkWatch;
+            if (watch != null) {
+                watch.wake();
+            }
+            return connection;
+        } catch (IOException e) {
+            return null; // seed unreachable; others may work, and gossip is redundant
         }
     }
 
@@ -3613,7 +4147,7 @@ public final class PeerNode implements AutoCloseable {
                     }
                     continue;
                 }
-                Backoff backoff = schedule.computeIfAbsent(peer, p -> new Backoff(lostAt));
+                Backoff backoff = schedule.computeIfAbsent(peer, p -> new Backoff(lostAt, random));
                 if (nowMillis >= backoff.nextDueMillis) {
                     due.add(Map.entry(peer, backoff));
                 }
@@ -3626,31 +4160,21 @@ public final class PeerNode implements AutoCloseable {
                 if (budget-- <= 0) {
                     break;
                 }
-                List<PeerAdvertisement.Endpoint> endpoints = lastEndpoints.get(entry.getKey());
-                if (endpoints != null && !endpoints.isEmpty()) {
+                List<PeerAdvertisement.Endpoint> endpoints = offTable(runtime, lastEndpoints.get(entry.getKey()));
+                if (!endpoints.isEmpty()) {
                     introduceTo(groupId, endpoints);
                     lostIntroductions.incrementAndGet();
                 }
                 entry.getValue().scheduleNext(nowMillis, random);
             }
         }
+        // The seeds and the locator, on the redial table (SeedRedial): an empty view's rounds, a fail-over, a wake.
+        runSeeds(runtime, localMillis());
         if (!runtime.membership().allMembers().isEmpty()) {
             emptySince.remove(groupId);
             return;
         }
         long empty = emptySince.computeIfAbsent(groupId, g -> nowMillis);
-        // An empty view: the seeds and the locator, on the group's own back-off (5 s doubling to 30 s).
-        Long last = lastLostRetryMillis.get(groupId);
-        long interval = lostRetryIntervalMillis.getOrDefault(groupId, LOST_RETRY_INTERVAL_MILLIS);
-        if (last == null || nowMillis - last >= interval) {
-            List<PeerAdvertisement.Endpoint> seeds = groupSeeds.get(groupId);
-            if (seeds != null && !seeds.isEmpty()) {
-                introduceTo(groupId, seeds);
-            }
-            relocateIfStale(groupId, nowMillis);
-            lastLostRetryMillis.put(groupId, nowMillis);
-            lostRetryIntervalMillis.put(groupId, Math.min(interval * 2, LOST_RETRY_MAX_INTERVAL_MILLIS));
-        }
         if (nowMillis - empty < LAST_RESORT_AFTER_MILLIS) {
             return;
         }
@@ -3818,8 +4342,9 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * Introduces this node to a few retired members' last endpoints, the most recently seen first, on a slow back-off
-     * of its own (two minutes doubling to ten). Opt-in: a retired member's address may by now belong to another host,
+     * Introduces this node to a few retired members' last endpoints, the most recently seen first, on a slow cycling
+     * table of its own ({@link #LAST_RESORT_TABLE_MILLIS}: 2, 4, 8, 10 minutes, wrapping). Opt-in: a retired member's
+     * address may by now belong to another host,
      * which learns of this node from the card it is sent; admission still verifies whoever answers.
      *
      * @return whether the list held anyone to try (the node is not out of options yet)
@@ -3837,9 +4362,9 @@ public final class PeerNode implements AutoCloseable {
         if (retired.isEmpty()) {
             return false;
         }
-        // the first round at once, the next ones on the slow back-off
+        // the first round at once, the next ones on the last resort's own cycling table
         Backoff backoff = lastResortSchedule.computeIfAbsent(groupId,
-                g -> new Backoff(nowMillis - LAST_RESORT_BASE_MILLIS, LAST_RESORT_BASE_MILLIS, LAST_RESORT_MAX_MILLIS));
+                g -> new Backoff(nowMillis, LAST_RESORT_TABLE_MILLIS));
         if (nowMillis < backoff.nextDueMillis) {
             return true;
         }
@@ -3884,40 +4409,43 @@ public final class PeerNode implements AutoCloseable {
     }
 
     /**
-     * A per-target retry schedule: the first try at the base after the loss, then doubling to the cap (a lower cap
-     * in the first hour for lost members), each delay spread by a quarter either way so a fleet that lost the same
-     * members does not re-dial them in step.
+     * A per-target retry schedule on a fixed cycling table, each wait spread by {@link #LOST_RETRY_SPREAD} either way,
+     * the position wrapping after the last step. A lost member's is {@link #LOST_RETRY_TABLE_MILLIS}, its first try
+     * one table step after the loss; the last resort's is {@link #LAST_RESORT_TABLE_MILLIS}, its first round at once.
      */
     static final class Backoff {
         final long sinceMillis;
-        final long baseMillis;
-        final long earlyCapMillis;
-        final long capMillis;
+        /** The cycling table. */
+        final long[] table;
+        /** The index of the next wait in {@link #table}. */
+        int position;
         int attempts;
         long nextDueMillis;
 
-        Backoff(long sinceMillis) {
-            this(sinceMillis, LOST_RETRY_INTERVAL_MILLIS, LOST_RETRY_EARLY_CAP_MILLIS, LOST_RETRY_CAP_MILLIS);
-        }
-
-        Backoff(long sinceMillis, long baseMillis, long capMillis) {
-            this(sinceMillis, baseMillis, capMillis, capMillis);
-        }
-
-        Backoff(long sinceMillis, long baseMillis, long earlyCapMillis, long capMillis) {
+        /** The lost-member retry, on its table: the first try one spread step after the loss. */
+        Backoff(long sinceMillis, Random random) {
             this.sinceMillis = sinceMillis;
-            this.baseMillis = baseMillis;
-            this.earlyCapMillis = earlyCapMillis;
-            this.capMillis = capMillis;
-            this.nextDueMillis = sinceMillis + baseMillis;
+            this.table = LOST_RETRY_TABLE_MILLIS;
+            this.nextDueMillis = sinceMillis + nextWait(random);
+        }
+
+        /** A table whose first try is due at {@code firstDueMillis}; the table's waits follow it. */
+        Backoff(long firstDueMillis, long[] table) {
+            this.sinceMillis = firstDueMillis;
+            this.table = table;
+            this.nextDueMillis = firstDueMillis;
+        }
+
+        /** The table's next wait, spread, and the position moves on (wrapping after the last). */
+        private long nextWait(Random random) {
+            long wait = table[position];
+            position = (position + 1) % table.length;
+            return Math.round(wait * (1 + LOST_RETRY_SPREAD * (2 * random.nextDouble() - 1)));
         }
 
         void scheduleNext(long nowMillis, Random random) {
             attempts++;
-            long cap = nowMillis - sinceMillis < LOST_RETRY_EARLY_PHASE_MILLIS ? earlyCapMillis : capMillis;
-            long delay = Math.min(cap, baseMillis << Math.min(attempts, 20));
-            long spread = delay / 4;
-            nextDueMillis = nowMillis + delay - spread + (spread == 0 ? 0 : (long) (random.nextDouble() * 2 * spread));
+            nextDueMillis = nowMillis + nextWait(random);
         }
     }
 
@@ -3948,7 +4476,15 @@ public final class PeerNode implements AutoCloseable {
                 BeaconHint hint = locate(groupId, name, locator, false);
                 if (!hint.endpoints().isEmpty() && groups.containsKey(groupId)) {
                     groupSeeds.put(groupId, hint.endpoints());
-                    introduceTo(groupId, hint.endpoints());
+                    // A round of the new seeds at once, on the loop, staggered as any round (no dial from here); a
+                    // round already under way takes them on (§10.38: it used to swallow the request).
+                    SeedRedial st = seedRedials.get(groupId);
+                    GroupParticipants gp = participants.get(groupId);
+                    if (st != null && gp != null) {
+                        st.seedsChanged = true;
+                        st.roundWanted = true;
+                        gp.lost.wake();
+                    }
                 }
             } finally {
                 locating.remove(groupId);
@@ -4031,8 +4567,15 @@ public final class PeerNode implements AutoCloseable {
         lastResortCursor.remove(groupId);
         retirementList.flushAll(time.millis());
         retirementList.forget(groupId);
-        lastLostRetryMillis.remove(groupId);
-        lostRetryIntervalMillis.remove(groupId);
+        SeedRedial redial = seedRedials.remove(groupId);
+        if (redial != null) {
+            synchronized (redial.lock) {
+                if (redial.round != null) {
+                    redial.round.waiting.keySet().forEach(TransportConnection::close); // nobody answered yet
+                    redial.round = null;
+                }
+            }
+        }
         heldAds.remove(groupId);
         newlyAdmitted.remove(groupId);
         admittedAtMillis.keySet().removeIf(key -> key.group().equals(groupId));
@@ -4157,6 +4700,8 @@ public final class PeerNode implements AutoCloseable {
     private final Map<GroupId, GroupParticipants> participants = new ConcurrentHashMap<>();
     /** The node-wide participants: the trust rejudge (EL-L-14) and the bootstrap beacon. */
     private DueWork.Registration trustParticipant;
+    /** The signalling trust supplier's registration (EL-L-14), or null. */
+    private AutoCloseable trustSignals;
     private DueWork.Registration beaconParticipant;
     /** Moves whenever an input of this node's card moves (an endpoint, a hint), for the self ad's change test (EL-L-09). */
     private final AtomicLong selfAdVersion = new AtomicLong();
@@ -4216,14 +4761,175 @@ public final class PeerNode implements AutoCloseable {
             }
             return DueWork.NEVER;
         });
+        // EL-L-14: a supplier that signals its changes (ReloadingChannelTrust) wakes the participant itself, so it is
+        // never due on its own; any other supplier is compared once a second (EL-Q-SEC-06)
+        boolean signalled = channelTrust instanceof ai.badmonkey.agentspaces.identity.SignallingChannelTrust;
         trustParticipant = loop.register("trust", NodeLoop.Kind.PROTOCOL, "", now -> {
             rejudgeIfTrustChanged();
-            // one reference compare a second until every supplier signals (EL-L-14, EL-Q-SEC-06)
-            return channelTrust == null ? DueWork.NEVER : now + TRUST_RECHECK_MILLIS * 1_000_000L;
+            return channelTrust == null || signalled ? DueWork.NEVER : now + TRUST_RECHECK_MILLIS * 1_000_000L;
         }, LOCAL_PERIOD); // a local recheck; a trust change also signals (EL-L-14)
+        if (signalled) {
+            trustSignals = ((ai.badmonkey.agentspaces.identity.SignallingChannelTrust) channelTrust).onChange(this::trustChanged);
+        }
         // The beacon takes no part in the stretch (EL-O-11): its retries follow their own table, so FIXED.
         beaconParticipant = loop.register("beacon", NodeLoop.Kind.PROTOCOL, "", now -> runBeacon(),
                 NodeLoop.Timing.FIXED);
+        // The dead-link rule and the unanswered introductions (2026-11-23): judged by the far end, so FIXED.
+        linkWatch = loop.register("links", NodeLoop.Kind.PROTOCOL, "", now -> runLinkWatch(),
+                NodeLoop.Timing.FIXED);
+    }
+
+    /**
+     * The links this node dialed (owner decisions of 2026-11-23):
+     * <ul>
+     *   <li>an introduction nobody answered on (no frame at all, and no member holds it) for the dead-link rule's
+     *       whole span, {@link #LINK_QUIET_MILLIS} plus {@link #LINK_ANSWER_MILLIS}, is closed: a seed of another
+     *       group, a hung process or a filtering middlebox no longer holds a socket here for good;</li>
+     *   <li>on every link a dial-only node dialed (no endpoint advertised, so nobody can dial it back), and on every
+     *       link any node dialed to a seed (SPEC v0.1.37 §9.4: a listening member keeps no half-open seed link that
+     *       indirect probes vouch for), a link nothing arrived on for {@link #LINK_QUIET_MILLIS} is asked with a PING;
+     *       any frame within {@link #LINK_ANSWER_MILLIS}, or bytes of one still arriving ({@link #onProgress}),
+     *       answers it, and silence closes the link. The next send to its member dials afresh; the seed link's member
+     *       goes last in the rounds, which fail over to the other seeds at once. A run late past the answer window
+     *       asks again rather than judge the link by this node's own stall.</li>
+     * </ul>
+     * Returns the earliest deadline among the links.
+     */
+    private long runLinkWatch() {
+        if (dialedLinks.isEmpty()) {
+            return DueWork.NEVER;
+        }
+        long mono = localMillis();
+        boolean dialOnly = advertisedEndpoints.isEmpty();
+        long next = Long.MAX_VALUE;
+        for (Map.Entry<TransportConnection, DialedLink> entry : dialedLinks.entrySet()) {
+            TransportConnection connection = entry.getKey();
+            DialedLink link = entry.getValue();
+            PeerId holder = holderOf(connection);
+            if (link.heardMillis < 0 && holder == null) {
+                long due = link.dialedMillis + LINK_QUIET_MILLIS + LINK_ANSWER_MILLIS;
+                if (mono >= due) {
+                    introductionsUnanswered.incrementAndGet();
+                    dialedLinks.remove(connection);
+                    introLinks.remove(link.key, connection);
+                    connection.close();
+                } else {
+                    next = Math.min(next, due);
+                }
+                continue;
+            }
+            PeerId peer = holder != null ? holder : link.peer;
+            if (peer == null || !groups.containsKey(link.group) || !(dialOnly || seedKeyOf(link.group, link.key))) {
+                continue; // the rule watches every link a dial-only node dialed, and every link dialed to a seed
+            }
+            long asked = link.askedMillis;
+            if (asked < 0) {
+                long due = Math.max(link.lastArrivalMillis(), link.dialedMillis) + LINK_QUIET_MILLIS;
+                if (mono < due) {
+                    next = Math.min(next, due);
+                } else {
+                    askLink(connection, link, peer, mono);
+                    next = Math.min(next, mono + LINK_ANSWER_MILLIS);
+                }
+                continue;
+            }
+            long due = asked + LINK_ANSWER_MILLIS;
+            if (mono < due) {
+                next = Math.min(next, due);
+            } else if (mono - due > LINK_ANSWER_MILLIS) {
+                askLink(connection, link, peer, mono); // this node did not run for the window: ask again
+                next = Math.min(next, mono + LINK_ANSWER_MILLIS);
+            } else {
+                linksSilent.incrementAndGet();
+                dialedLinks.remove(connection);
+                introLinks.remove(link.key, connection);
+                connection.close(); // the close drops the link here; the next send dials afresh
+                SeedRedial st = seedRedials.get(link.group);
+                if (st != null && peer.equals(st.seedPeer)) {
+                    seedLinkLost(link.group, peer, true); // the seed link failed: the other seeds at once
+                }
+            }
+        }
+        return next == Long.MAX_VALUE ? DueWork.NEVER : dueFromLocal(next);
+    }
+
+    /** The member a link is held for, or null. */
+    private PeerId holderOf(TransportConnection connection) {
+        for (Map.Entry<PeerId, TransportConnection> entry : connections.entrySet()) {
+            if (entry.getValue() == connection) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /** The dead-link rule's PING, on the link itself; marked before it goes, since its answer may come inline. */
+    private void askLink(TransportConnection connection, DialedLink link, PeerId peer, long mono) {
+        link.askedMillis = mono;
+        seedPings.incrementAndGet();
+        try {
+            sendOn(connection, link.group, peer, Envelope.Kind.PING, new Bodies.Ping(relayNonce.nextLong()));
+        } catch (IOException e) {
+            connection.close(); // dead already: the close drops it
+        }
+    }
+
+    /**
+     * The seed links' counters, named as the clients name theirs (owner decision 4 of 2026-11-23).
+     *
+     * @param seedDials        seed dials a round started
+     * @param lateSeedChannels links of a round closed because another seed answered first
+     * @param seedPings        PINGs sent under the dead-link rule and at a wake
+     * @param wakePings        wakes that PINGed the seed link's member: a PING sent, or one already waiting (a probe's, as
+     *                         a late tick's re-probe of a frozen process) that became the wake's, not sent again
+     * @param linksSilent      links closed, or seed members dropped, because a PING went unanswered
+     * @param resumes          wakes, per group: forward wall steps longer than the 30 s keepalive bound, and late wakes
+     *                         (a timer wake more than 30 s late with no wall step) whose absence no wall step covered
+     * @param introductionsUnanswered introduction links closed because nobody answered on them
+     */
+    public record SeedLinkStats(long seedDials, long lateSeedChannels, long seedPings, long wakePings, long linksSilent,
+                                long resumes, long introductionsUnanswered) {
+    }
+
+    /**
+     * The seed links' counters (owner decision 4 of 2026-11-23).
+     *
+     * @return the counters as of now
+     */
+    public SeedLinkStats seedLinkStats() {
+        long adopted = 0;
+        for (GroupRuntime runtime : groups.values()) {
+            adopted += runtime.membership().wakePingsAdopted();
+        }
+        return new SeedLinkStats(seedDials.get(), lateSeedChannels.get(), seedPings.get(), wakePings.get() + adopted,
+                linksSilent.get(), resumeRejoins.get(), introductionsUnanswered.get());
+    }
+
+    /** The links this node dialed and holds open now; package-private, for tests. */
+    int dialedLinkCount() {
+        return dialedLinks.size();
+    }
+
+    /** A group's position in the redial table; package-private, for tests. */
+    int seedTablePosition(GroupId groupId) {
+        SeedRedial st = seedRedials.get(groupId);
+        if (st == null) {
+            return -1;
+        }
+        synchronized (st.lock) {
+            return st.position;
+        }
+    }
+
+    /** A group's seeds as its rounds dial them now; package-private, for tests. */
+    List<PeerAdvertisement.Endpoint> groupSeedsOf(GroupId groupId) {
+        return groupSeeds.getOrDefault(groupId, List.of());
+    }
+
+    /** The member a group's seed link answered from, or null; package-private, for tests. */
+    PeerId seedLinkPeer(GroupId groupId) {
+        SeedRedial st = seedRedials.get(groupId);
+        return st == null ? null : st.seedPeer;
     }
 
     /**
@@ -4410,6 +5116,13 @@ public final class PeerNode implements AutoCloseable {
             }
 
             @Override
+            public void wakePing(PeerId target, long nonce) {
+                wakePings.incrementAndGet();
+                seedPings.incrementAndGet();
+                ping(target, nonce);
+            }
+
+            @Override
             public java.util.Collection<PeerId> linkHolders(PeerId target) {
                 // TR-1: the members the target names in relay.via, when this node holds no link to it, cannot dial
                 // it and has no relay path; a PING would go nowhere (srad/agentspaces-event-loop.md §3.12).
@@ -4423,6 +5136,13 @@ public final class PeerNode implements AutoCloseable {
             @Override
             public java.util.Collection<PeerId> declaredHolders(PeerId target) {
                 return viaOf(runtime.id(), target); // TR-2: an escalated round asks these first
+            }
+
+            @Override
+            public boolean progressSince(PeerId target, long sinceMillis) {
+                TransportConnection link = connections.get(target);
+                DialedLink dialed = link == null ? null : dialedLinks.get(link);
+                return dialed != null && dialed.progressMillis >= sinceMillis; // §9.4: bytes still arriving answer
             }
 
             @Override
@@ -4531,11 +5251,33 @@ public final class PeerNode implements AutoCloseable {
         return DueWork.NEVER;
     }
 
+    /**
+     * Moves every lost-member and last-resort try, and every empty view's start, back by a backward wall step, so each
+     * wait keeps its length on the stepped clock: before the cross-client check of 2026-11-23 a step back of an hour
+     * held the lost-member table's next try an hour. A forward step is not applied: it may be an absence, and a try
+     * then due at once is the lenient side. The 24 h retirement still counts from the loss as the wall dates it.
+     */
+    private void shiftRetriesBack(long backMillis) {
+        if (backMillis >= 0) {
+            return;
+        }
+        for (Map<PeerId, Backoff> schedule : lostSchedule.values()) {
+            for (Backoff backoff : schedule.values()) {
+                backoff.nextDueMillis += backMillis;
+            }
+        }
+        for (Backoff backoff : lastResortSchedule.values()) {
+            backoff.nextDueMillis += backMillis;
+        }
+        emptySince.replaceAll((group, since) -> since + backMillis);
+    }
+
     /** Lost members and the empty view: their retries' next due times (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md). */
     private long runLost(GroupParticipants gp, long now) {
         GroupRuntime runtime = gp.runtime;
         GroupId groupId = runtime.id();
         long nowMillis = time.millis();
+        shiftRetriesBack(wallStepBackMillis.getAndSet(0));
         retryLost(runtime, nowMillis);
         long next = Long.MAX_VALUE;
         Map<PeerId, Long> lost = lostMembers.get(groupId);
@@ -4550,9 +5292,6 @@ public final class PeerNode implements AutoCloseable {
             }
         }
         if (runtime.membership().size() == 0) {
-            Long last = lastLostRetryMillis.get(groupId);
-            long interval = lostRetryIntervalMillis.getOrDefault(groupId, LOST_RETRY_INTERVAL_MILLIS);
-            next = Math.min(next, last == null ? nowMillis : last + interval);
             Long empty = emptySince.get(groupId);
             if (empty != null && nowMillis - empty < LAST_RESORT_AFTER_MILLIS) {
                 next = Math.min(next, empty + LAST_RESORT_AFTER_MILLIS);
@@ -4564,7 +5303,27 @@ public final class PeerNode implements AutoCloseable {
             }
         }
         // A retry already overdue (the round's budget ran out) goes on the next run a moment later.
-        return next <= nowMillis ? dueFromWall(nowMillis + 100) : dueFromWall(next);
+        long wall = next <= nowMillis ? dueFromWall(nowMillis + 100) : dueFromWall(next);
+        long seeds = seedsDue(groupId);
+        return seeds == Long.MAX_VALUE ? wall : earlier(wall, dueFromLocal(Math.max(seeds, localMillis())));
+    }
+
+    /** The seed redial's next deadline on the local base, as its last run left it, or {@link Long#MAX_VALUE}. */
+    private long seedsDue(GroupId groupId) {
+        SeedRedial st = seedRedials.get(groupId);
+        if (st == null) {
+            return Long.MAX_VALUE;
+        }
+        synchronized (st.lock) {
+            if (st.roundWanted || st.wakeReset) {
+                return localMillis();
+            }
+            SeedRedial.Round round = st.round;
+            if (round != null) {
+                return lastStartWaits(round) ? round.lastStartMillis + SeedRedial.STAGGER_MILLIS : Long.MAX_VALUE;
+            }
+            return st.linkSinceMillis < 0 ? st.nextRoundMillis : Long.MAX_VALUE;
+        }
     }
 
     /** The relay mesh (relays only): each unlinked relay again a minute after its last dial (LB-R-02). */
@@ -4725,6 +5484,22 @@ public final class PeerNode implements AutoCloseable {
     }
 
 
+    /**
+     * The flood a run's direct self ad falls back to when a frame it handed to a dial off the loop was finally not
+     * delivered (its dial and every relay failed): as when a send fails at once, the group carries the ad instead,
+     * once for the run however many of its frames fail.
+     */
+    private Runnable selfAdFloodOnce(GossipBus gossip, GroupId groupId) {
+        java.util.concurrent.atomic.AtomicBoolean flooded = new java.util.concurrent.atomic.AtomicBoolean();
+        return () -> {
+            if (!loop.closed() && groups.containsKey(groupId) && flooded.compareAndSet(false, true)) {
+                Bodies.Rumor selfAd = selfAdRumor(groupId);
+                gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload());
+                selfAdFloods.incrementAndGet();
+            }
+        };
+    }
+
     private void publishSelfAd(GroupParticipants gp, GroupRuntime runtime, GossipBus gossip, long nowMillis) {
         GroupId groupId = runtime.id();
         // The change test (srad/agentspaces-event-loop.md EL-L-09): with no input of the card moved, the view as it
@@ -4778,11 +5553,12 @@ public final class PeerNode implements AutoCloseable {
             lastSelfAdMillis.put(groupId, nowMillis);
             Bodies.Rumor selfAd = selfAdRumor(groupId);
             Bodies.Rumor refresh = new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload());
+            Runnable floodOnce = selfAdFloodOnce(gossip, groupId);
             for (PeerId member : current) {
                 if (member.equals(peerId())) {
                     continue;
                 }
-                if (!send(groupId, member, Envelope.Kind.RUMOR, refresh)) {
+                if (!send(groupId, member, Envelope.Kind.RUMOR, refresh, floodOnce)) {
                     gossip.publish(selfAd.streamId(), selfAd.itemId(), selfAd.payload()); // unreachable: flood
                     selfAdFloods.incrementAndGet();
                     return;
@@ -4792,6 +5568,7 @@ public final class PeerNode implements AutoCloseable {
             return;
         }
         Bodies.Rumor direct = null;
+        Runnable floodOnce = null;
         for (PeerId member : current) {
             if (member.equals(peerId()) || sentTo.contains(member)) {
                 continue;
@@ -4799,8 +5576,9 @@ public final class PeerNode implements AutoCloseable {
             if (direct == null) {
                 Bodies.Rumor selfAd = selfAdRumor(groupId);
                 direct = new Bodies.Rumor(selfAd.streamId(), selfAd.itemId(), 1, selfAd.payload());
+                floodOnce = selfAdFloodOnce(gossip, groupId);
             }
-            if (send(groupId, member, Envelope.Kind.RUMOR, direct)) {
+            if (send(groupId, member, Envelope.Kind.RUMOR, direct, floodOnce)) {
                 sentTo.add(member);
                 selfAdIntroductions.incrementAndGet();
                 continue;
@@ -4945,6 +5723,15 @@ public final class PeerNode implements AutoCloseable {
      * @param body    the body object
      */
     boolean send(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+        return send(groupId, to, kind, body, null);
+    }
+
+    /**
+     * {@link #send(GroupId, PeerId, Envelope.Kind, Object)} with a fallback for a frame that waited behind a dial off
+     * the sender's thread and was finally not delivered (its dial and every relay failed): the result can no longer
+     * say so, so the fallback runs instead, on the dial's thread.
+     */
+    private boolean send(GroupId groupId, PeerId to, Envelope.Kind kind, Object body, Runnable undelivered) {
         if (!groups.containsKey(groupId)) {
             return false; // a group this node left sends nothing more, even over a link it still holds (R2-2.2)
         }
@@ -4959,7 +5746,7 @@ public final class PeerNode implements AutoCloseable {
             enqueue(groupId, to, kind, body);
             return true;
         }
-        return sendNow(groupId, to, kind, body);
+        return sendNow(groupId, to, kind, body, undelivered);
     }
 
     private static boolean batchable(Envelope.Kind kind) {
@@ -5010,9 +5797,55 @@ public final class PeerNode implements AutoCloseable {
     }
 
     boolean sendNow(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+        return sendNow(groupId, to, kind, body, null);
+    }
+
+    /**
+     * Sends at once over a live link, or, when the send needs a dial on a node whose loop runs on its own, hands it to
+     * a dial off the sender's thread (SPEC v0.1.37 §9.4, as the seed and lost-member dials): the frame waits in the
+     * member's queue behind that one dial, which runs on a virtual thread of its own (a task of the node's time
+     * source), and goes out in order on the link it brings, or by a relay when it brings none. A blackholed connect
+     * then holds no sender: not the loop, not a reader thread handling a frame (which may hold a lock the loop wants),
+     * not an application's write, and no other member's frames. A run a host drives by hand ({@link NodeLoop#tick()})
+     * and a node whose loop never started dial on the caller's thread, as before.
+     *
+     * @param undelivered run when a frame handed to a dial is finally not delivered (its dial and every relay failed),
+     *                    on the dial's thread; null for none. A frame sent at once reports it by the result instead.
+     * @return whether the frame went out, or waits behind a dial
+     */
+    private boolean sendNow(GroupId groupId, PeerId to, Envelope.Kind kind, Object body, Runnable undelivered) {
+        if (!sendsDialOffThread()) {
+            return sendLinked(groupId, to, kind, body, true);
+        }
+        if (!behindDialFor(to)) {
+            Boolean sent = sendLinked(groupId, to, kind, body, false);
+            if (sent != null) {
+                return sent;
+            }
+        }
+        return sendBehindDial(groupId, to, kind, body, undelivered);
+    }
+
+    /**
+     * Whether a send that needs a dial hands it off the calling thread: on a node whose loop runs on its own, from any
+     * thread but a run driven by hand. A loop run, the coalescer's flush, a reader thread and an application thread
+     * alike: each may hold a lock another of them waits on (the gossip bus's, a space's), so none may sit in a connect.
+     */
+    private boolean sendsDialOffThread() {
+        return tickPeriod != null && !loop.directRun();
+    }
+
+    /**
+     * One send over the links held, dialing when {@code mayDial}; without it, null when the send would need a dial
+     * (the frame to the member, the pinned path's first hop, or a relay), before anything went out.
+     */
+    private Boolean sendLinked(GroupId groupId, PeerId to, Envelope.Kind kind, Object body, boolean mayDial) {
+        if (!mayDial && needsDial(groupId, to)) {
+            return null;
+        }
         TransportConnection connection = connectionTo(groupId, to);
         if (connection == null) {
-            return sendViaRelay(groupId, to, kind, body);
+            return sendViaRelay(groupId, to, kind, body, mayDial);
         }
         try {
             sendOn(connection, groupId, to, kind, body);
@@ -5022,9 +5855,12 @@ public final class PeerNode implements AutoCloseable {
             // restart). Drop it and try once more over a fresh dial, which also carries this
             // node's introduction, so a request is not lost to a stale channel.
             dropConnection(to, connection);
+            if (!mayDial && needsDial(groupId, to)) {
+                return null; // the fresh dial goes off this thread too
+            }
             TransportConnection fresh = connectionTo(groupId, to);
             if (fresh == null || fresh == connection) {
-                return sendViaRelay(groupId, to, kind, body);
+                return sendViaRelay(groupId, to, kind, body, mayDial);
             }
             try {
                 sendOn(fresh, groupId, to, kind, body);
@@ -5034,6 +5870,128 @@ public final class PeerNode implements AutoCloseable {
                 return false;
             }
         }
+    }
+
+    /** Whether reaching a member needs a dial: no live link, and an endpoint this node can dial unsignalled. */
+    private boolean needsDial(GroupId groupId, PeerId to) {
+        if (connections.containsKey(to)) {
+            return false;
+        }
+        GroupRuntime runtime = groups.get(groupId);
+        if (runtime == null) {
+            return false;
+        }
+        return runtime.membership().member(to).map(member -> member.endpoints().stream().anyMatch(endpoint -> {
+            Transport transport = transports.get(endpoint.transport());
+            return transport != null && !transport.signalled();
+        })).orElse(false);
+    }
+
+    /** At most this many frames wait behind one member's dial; a frame past it is dropped and counted. */
+    static final int BEHIND_DIAL_MAX = 256;
+
+    /** One frame waiting behind its member's dial. */
+    private record BehindDial(GroupId groupId, Envelope.Kind kind, Object body, Runnable undelivered) {
+    }
+
+    /** The frames waiting behind each member's dial off the sender's thread, in order; guarded by itself. */
+    private final Map<PeerId, java.util.ArrayDeque<BehindDial>> behindDial = new java.util.HashMap<>();
+    private final AtomicLong sendDials = new AtomicLong();
+    private final AtomicLong sendsBehindDial = new AtomicLong();
+    private final AtomicLong sendsDroppedBehindDial = new AtomicLong();
+
+    private boolean behindDialFor(PeerId to) {
+        synchronized (behindDial) {
+            return behindDial.containsKey(to);
+        }
+    }
+
+    /**
+     * Queues a frame behind the member's dial, starting that dial when none runs: one dial per member at a time, on a
+     * task of the node's time source (a virtual thread of its own on {@code SystemTime}).
+     */
+    private boolean sendBehindDial(GroupId groupId, PeerId to, Envelope.Kind kind, Object body,
+                                   Runnable undelivered) {
+        boolean start;
+        synchronized (behindDial) {
+            java.util.ArrayDeque<BehindDial> queue = behindDial.get(to);
+            start = queue == null;
+            if (start) {
+                queue = new java.util.ArrayDeque<>();
+                behindDial.put(to, queue);
+            }
+            if (queue.size() >= BEHIND_DIAL_MAX) {
+                sendsDroppedBehindDial.incrementAndGet();
+                return false; // gossip's redundancy and the probes absorb it, as any lost frame
+            }
+            queue.add(new BehindDial(groupId, kind, body, undelivered));
+        }
+        sendsBehindDial.incrementAndGet();
+        if (start) {
+            sendDials.incrementAndGet();
+            time.schedule(Duration.ZERO, () -> drainBehindDial(to));
+        }
+        return true;
+    }
+
+    /**
+     * The dial's task: the first frame dials (and falls back to a relay when the dial brings no link); the frames
+     * behind it go out on the link it brought, or, when it brought none, by a relay without dialing the member again.
+     */
+    private void drainBehindDial(PeerId to) {
+        boolean dialFailed = false;
+        while (true) {
+            BehindDial next;
+            synchronized (behindDial) {
+                java.util.ArrayDeque<BehindDial> queue = behindDial.get(to);
+                next = queue == null ? null : queue.poll();
+                if (next == null) {
+                    behindDial.remove(to);
+                    return;
+                }
+            }
+            if (loop.closed() || !groups.containsKey(next.groupId()) || quarantined(to)) {
+                continue; // the node closed, left the group, or sentenced the member meanwhile: nothing goes out
+            }
+            boolean sent;
+            try {
+                sent = dialFailed
+                        ? sendViaRelay(next.groupId(), to, next.kind(), next.body(), true)
+                        : sendLinked(next.groupId(), to, next.kind(), next.body(), true);
+                if (!dialFailed && !connections.containsKey(to)) {
+                    dialFailed = true; // no link came of it: the rest take the relays, not another connect
+                }
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "a send behind the dial to " + to.display() + " failed", e);
+                sent = false;
+            }
+            if (!sent && next.undelivered() != null) {
+                try {
+                    next.undelivered().run();
+                } catch (RuntimeException e) {
+                    LOG.log(System.Logger.Level.WARNING, "an undelivered frame's fallback failed", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Sends that needed a dial and handed it off the sender's thread (SPEC v0.1.37 §9.4).
+     *
+     * @param dials   dials started for sends, one per member at a time
+     * @param queued  frames that waited behind such a dial
+     * @param dropped frames dropped because {@link #BEHIND_DIAL_MAX} already waited
+     */
+    public record SendDialStats(long dials, long queued, long dropped) {
+    }
+
+    /**
+     * What sends that needed a dial did off the sender's thread.
+     *
+     * @return the counters
+     */
+    public SendDialStats sendDialStats() {
+        return new SendDialStats(sendDials.get(), sendsBehindDial.get(), sendsDroppedBehindDial.get());
     }
 
     /**
@@ -5046,6 +6004,15 @@ public final class PeerNode implements AutoCloseable {
      * as before.
      */
     private boolean sendViaRelay(GroupId groupId, PeerId to, Envelope.Kind kind, Object body) {
+        return sendViaRelay(groupId, to, kind, body, true);
+    }
+
+    /**
+     * {@link #sendViaRelay(GroupId, PeerId, Envelope.Kind, Object)}, dialing a relay only when {@code mayDial}:
+     * without it, null when the pinned path's first hop needs a dial, or when no relay with a live link carried the
+     * frame and one without a link remains, before anything went out (the caller then hands the send to a dial).
+     */
+    private Boolean sendViaRelay(GroupId groupId, PeerId to, Envelope.Kind kind, Object body, boolean mayDial) {
         if (kind == Envelope.Kind.RELAY_FRAME) {
             return false;
         }
@@ -5059,6 +6026,9 @@ public final class PeerNode implements AutoCloseable {
         List<PeerId> path = pathTo(groupId, runtime, to);
         if (path != null) {
             PeerId first = path.get(0);
+            if (!mayDial && needsDial(groupId, first)) {
+                return null;
+            }
             TransportConnection connection = connectionTo(groupId, first);
             if (connection == null) {
                 firstHopFailedAt.put(first, localMillis()); // not a start for a while (LB-R-04)
@@ -5076,9 +6046,14 @@ public final class PeerNode implements AutoCloseable {
             }
             unpin(groupId, to);
         }
+        boolean relayNeedsDial = false;
         for (PeerId relay : runtime.membership()
                 .withRole(PeerAdvertisement.PeerRole.RELAY)) {
             if (relay.equals(to) || relay.equals(peerId())) {
+                continue;
+            }
+            if (!mayDial && needsDial(groupId, relay)) {
+                relayNeedsDial = true; // tried behind a dial if no relay with a link carries the frame
                 continue;
             }
             TransportConnection connection = connectionTo(groupId, relay);
@@ -5094,7 +6069,7 @@ public final class PeerNode implements AutoCloseable {
                 dropConnection(relay, connection);
             }
         }
-        return false;
+        return relayNeedsDial ? null : false;
     }
 
     // ------------------------------------------------------------ relay paths (group R)
@@ -5467,8 +6442,16 @@ public final class PeerNode implements AutoCloseable {
         loop.close(); // and leaves the watchdog
         try {
             wallStepRegistration.close();
+            lateWakeRegistration.close();
         } catch (Exception e) {
             // a registration's close does not fail
+        }
+        if (trustSignals != null) {
+            try {
+                trustSignals.close(); // the supplier's refresh stops with its last listener
+            } catch (Exception e) {
+                // a registration's close does not fail
+            }
         }
         ai.badmonkey.agentspaces.common.time.Watchdog.Registration fw = flushWatch;
         if (fw != null) {
@@ -5542,8 +6525,24 @@ public final class PeerNode implements AutoCloseable {
             }
         }
         connection.onReceive(frame -> onFrame(connection, frame));
+        connection.onProgress(() -> onProgress(connection));
         return true;
     }
+
+    /**
+     * Bytes of a frame not yet whole arrived on a link (SPEC v0.1.37 §9.4): on a link this node dialed they answer the
+     * dead-link rule's PING, and a wake's PING to the seed, as a whole frame does. Local only. The reader's thread.
+     */
+    private void onProgress(TransportConnection connection) {
+        DialedLink dialed = dialedLinks.isEmpty() ? null : dialedLinks.get(connection);
+        if (dialed != null) {
+            dialed.progressMillis = localMillis();
+            dialed.askedMillis = -1;
+            linkProgress.incrementAndGet();
+        }
+    }
+
+    private final AtomicLong linkProgress = new AtomicLong();
 
     /** A member left a group's view: its per-member state goes, its loss is recorded for retries, its link closes. */
     private void memberLeft(GroupRuntime runtime, GossipBus gossip, PeerId dropped, long nowMillis) {
@@ -5554,11 +6553,23 @@ public final class PeerNode implements AutoCloseable {
         gossip.memberLeft(dropped);
         probePulls.remove(dropped);
         boolean ejected = runtime.membership().consumeEjected(dropped);
+        boolean wakeVerdict = runtime.membership().consumeWakeDropped(dropped);
+        if (wakeVerdict) {
+            linksSilent.incrementAndGet(); // the wake's PING went unanswered (owner decision 3)
+        }
+        seedLinkLost(runtime.id(), dropped, wakeVerdict);
         if (!ejected && !runtime.revocations().revoked(dropped)) {
             lostMembers.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, nowMillis);
             Long issued = lastAdIssued.get(dropped);
             if (issued != null) {
-                lostAdIssued.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped, issued);
+                // At least the issuer's clock at the drop: the newest card's issue time plus how long this node has
+                // held it, since the card was issued before it arrived. A copy issued no later is no evidence of life
+                // after the drop, even when it is newer than the card held here (a card minted for one peer, such as
+                // a newcomer's direct introduction, that the rest of the group never got: §10.51).
+                Long seen = lastAdSeenLocal.get(dropped);
+                long held = seen == null ? 0 : Math.max(0, localMillis() - seen - DROP_BOUND_SLACK_MILLIS);
+                lostAdIssued.computeIfAbsent(runtime.id(), g -> new ConcurrentHashMap<>()).put(dropped,
+                        issued + held);
             }
         }
         heldAds.getOrDefault(runtime.id(), Map.of()).remove(dropped);
@@ -5571,8 +6582,15 @@ public final class PeerNode implements AutoCloseable {
 
     /** The issue time of each peer's newest admitted advertisement, on the issuer's own clock. */
     private final Map<PeerId, Long> lastAdIssued = new ConcurrentHashMap<>();
-    /** Per group, the issue time of a lost member's newest advertisement when it was dropped, on its own clock. */
+    /** When each peer's newest admitted advertisement ({@link #lastAdIssued}) first reached this node, local base. */
+    private final Map<PeerId, Long> lastAdSeenLocal = new ConcurrentHashMap<>();
+    /**
+     * Per group, a lower bound of a lost member's clock when it was dropped, on its own clock: its newest
+     * advertisement's issue time plus how long this node had held that advertisement (less a slack for clock rates).
+     */
     private final Map<GroupId, Map<PeerId, Long>> lostAdIssued = new ConcurrentHashMap<>();
+    /** What the drop bound leaves for the issuer's clock running slower than this node's over the hold. */
+    static final long DROP_BOUND_SLACK_MILLIS = 1_000L;
 
     /** Cuts a link for the chain it presented; anything it read before the cut is dropped in onFrame. */
     private void cutForChain(TransportConnection connection) {
@@ -5676,6 +6694,11 @@ public final class PeerNode implements AutoCloseable {
 
     private void onFrame(TransportConnection connection, byte[] frame) {
         bytesReceived.addAndGet(frame.length);
+        DialedLink dialed = dialedLinks.isEmpty() ? null : dialedLinks.get(connection);
+        if (dialed != null) {
+            dialed.heardMillis = localMillis(); // bytes arriving answer the dead-link rule's PING
+            dialed.askedMillis = -1;
+        }
         if (anyChainCut && chainCut.contains(connection)) {
             // Read before the link was cut for its chain, delivered after: the revocation wins.
             framesDropped.incrementAndGet();
@@ -5695,6 +6718,15 @@ public final class PeerNode implements AutoCloseable {
             session.confirmed = true; // the other end holds the key: key confirmation (spec §5.6)
         }
         Envelope envelope = decoded.get().envelope();
+        if (dialed != null && dialed.peer == null && !envelope.from().equals(peerId())) {
+            dialed.peer = envelope.from(); // the first verified frame names who answered on the link
+            if (dialed.seedRound) {
+                GroupParticipants gp = participants.get(dialed.group);
+                if (gp != null) {
+                    gp.lost.wake(); // a seed answered: its round ends now, not at the next stagger step
+                }
+            }
+        }
         long handleStart = System.nanoTime();
         dispatch(envelope, connection);
         long took = System.nanoTime() - handleStart;
@@ -5860,7 +6892,8 @@ public final class PeerNode implements AutoCloseable {
             case DIGEST -> {
                 Bodies.Digest digest = decodeAntiEntropy(runtime, envelope, Bodies.Digest.class);
                 if (digest != null) {
-                    runtime.gossip().onDigest(envelope.from(), digest);
+                    runtime.gossip().onDigest(envelope.from(), digest,
+                            displacedOnly(runtime, envelope.from(), connection));
                 }
             }
             case PULL_RESP -> {
@@ -5892,6 +6925,38 @@ public final class PeerNode implements AutoCloseable {
                     send(runtime.id(), envelope.from(), Envelope.Kind.GROUP_AD, founding));
             case GROUP_AD -> onGroupAdAnswer(envelope); // only a pending fetch cares
         }
+    }
+
+    /**
+     * Whether a {@code DIGEST} is answered for displaced entries alone (SPEC v0.1.37 §9.4): on a dial-only node (no
+     * endpoint advertised), one that reached it relayed or from a member other than its seed. Its own seed's
+     * {@code DIGEST} on the link it dialed is answered as before, and a node that listens answers any member. The seed
+     * is the member the seed round found, or, before one did, whoever answers on a link dialed to a seed's address.
+     */
+    private boolean displacedOnly(GroupRuntime runtime, PeerId from, TransportConnection connection) {
+        if (!advertisedEndpoints.isEmpty()) {
+            return false;
+        }
+        DialedLink link = connection == null ? null : dialedLinks.get(connection);
+        if (link == null) {
+            return true; // relayed, or not a link this node dialed
+        }
+        SeedRedial st = seedRedials.get(runtime.id());
+        PeerId seed = st == null ? null : st.seedPeer;
+        if (seed != null) {
+            return !from.equals(seed);
+        }
+        return !seedKeyOf(runtime.id(), link.key);
+    }
+
+    /** Whether an endpoint key is one of a group's seeds. */
+    private boolean seedKeyOf(GroupId groupId, String key) {
+        for (PeerAdvertisement.Endpoint seed : groupSeeds.getOrDefault(groupId, List.of())) {
+            if (SeedRedial.key(seed).equals(key)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -6855,15 +7920,34 @@ public final class PeerNode implements AutoCloseable {
     private TransportConnection dialEndpoint(GroupId groupId, PeerId to, Transport transport,
                                              PeerAdvertisement.Endpoint endpoint) throws IOException {
         TransportConnection dialed = transport.dial(endpoint.address(), to);
+        if (loop.closed()) {
+            dialed.close(); // a send's dial off the sender's thread that connected after the node closed (§9.4)
+            throw new IOException("the node closed while the dial to " + to.display() + " ran");
+        }
+        // Watched from before the reader starts (a close removes it, a cut or a lost race included).
+        dialedLinks.put(dialed, new DialedLink(groupId, SeedRedial.key(endpoint), localMillis(), false, to));
         connectionSchemes.put(dialed, transport.scheme());
         if (!attach(dialed)) {
             // The far end presented a revoked chain: never cache the cut link as this peer's channel.
             throw new IOException("the channel certificate " + to.display() + " presented is revoked");
         }
+        if (loop.closed()) {
+            // close() ran between the check above and the attach, after it closed every attached link (as
+            // introduceOn): the closed flag is set before that, so this second look cannot miss it
+            attached.remove(dialed);
+            dialedLinks.remove(dialed);
+            connectionSchemes.remove(dialed);
+            dialed.close();
+            throw new IOException("the node closed while the dial to " + to.display() + " ran");
+        }
         TransportConnection raced = connections.putIfAbsent(to, dialed);
         if (raced != null) {
             dialed.close();
             return raced;
+        }
+        DueWork.Registration watch = linkWatch;
+        if (watch != null) {
+            watch.wake();
         }
         linksChanged(); // a link opened (EL-L-03)
         maybeAnnounceChannel(groupId, dialed, null); // a session opens once the peer answers
@@ -7006,8 +8090,8 @@ public final class PeerNode implements AutoCloseable {
                 if (retiredCard.isPresent() && ad.issued().toEpochMilli() <= retiredCard.get().cardIssuedMillis()) {
                     continue; // a retired member's old card is no evidence it is back
                 }
-                // Issued no later than the newest card this node held when it dropped the member, both on the
-                // issuer's own clock: no evidence it lives. Comparing the issue time with this node's drop time mixed
+                // Issued no later than the issuer's clock when this node dropped it (the newest card held then, plus
+                // how long it was held; both on the issuer's own clock): no evidence it lives. Comparing the issue time with this node's drop time mixed
                 // two clocks, so a node whose clock trails the issuer's re-admitted the member from an old copy, again
                 // and again (HorizonLaggingCopyTest, 2026-11-18). Without the card's time, the drop time stands in.
                 if (!member && droppedAt != null && ad.issued().toEpochMilli()
@@ -7040,7 +8124,12 @@ public final class PeerNode implements AutoCloseable {
         boolean admission = runtime.membership().member(ad.issuer()).isEmpty();
         runtime.membership().onPeerAdvertisement(ad);
         lastEndpoints.put(ad.issuer(), List.copyOf(ad.endpoints()));
-        lastAdIssued.merge(ad.issuer(), ad.issued().toEpochMilli(), Math::max);
+        long issuedMillis = ad.issued().toEpochMilli();
+        Long previousIssue = lastAdIssued.get(ad.issuer());
+        if (previousIssue == null || issuedMillis > previousIssue) {
+            lastAdSeenLocal.put(ad.issuer(), localMillis()); // the drop bound counts from the newest card's arrival
+        }
+        lastAdIssued.merge(ad.issuer(), issuedMillis, Math::max);
         Map<PeerId, Long> lost = lostMembers.get(runtime.id());
         if (lost != null) {
             lost.remove(ad.issuer());
@@ -7059,7 +8148,7 @@ public final class PeerNode implements AutoCloseable {
         }
         lastResortSchedule.remove(runtime.id()); // somebody is here: the last resort starts afresh next time
         if (admission && runtime.membership().member(ad.issuer()).isPresent()) {
-            lostRetryIntervalMillis.remove(runtime.id()); // somebody answered: retries start fresh
+            // The redial table is not reset by an admission: only the end of a link that held 5 s resets it (SeedRedial).
             newlyAdmitted.computeIfAbsent(runtime.id(), g -> ConcurrentHashMap.newKeySet()).add(ad.issuer());
             admittedAtMillis.putIfAbsent(new GroupPeer(runtime.id(), ad.issuer()), localMillis());
             runtime.gossip().topologyChanged();
@@ -7229,10 +8318,35 @@ public final class PeerNode implements AutoCloseable {
         return verifiedPeerAd(payload).filter(ad -> !revocations.revoked(ad.issuer())).isPresent();
     }
 
-    private Optional<PeerAdvertisement> verifiedPeerAd(byte[] payload) {
-        return decodeSignedPeerAd(codec, payload)
-                .filter(ad -> !ad.expired(time.instant())
-                        && !ad.issued().isAfter(time.instant().plus(MAX_AD_ISSUED_SKEW)));
+    Optional<PeerAdvertisement> verifiedPeerAd(byte[] payload) {
+        Object[] last = lastPeerAd.get();
+        Optional<PeerAdvertisement> decoded;
+        if (last != null && last[0] == payload) {
+            @SuppressWarnings("unchecked")
+            Optional<PeerAdvertisement> same = (Optional<PeerAdvertisement>) last[1];
+            decoded = same; // the same item's handler and forward filter: verified once (idle profile, §10.47)
+        } else {
+            decoded = decodeSignedPeerAd(codec, payload);
+            peerAdVerifications.incrementAndGet();
+            lastPeerAd.set(new Object[] {payload, decoded});
+        }
+        return decoded.filter(ad -> !ad.expired(time.instant())
+                && !ad.issued().isAfter(time.instant().plus(MAX_AD_ISSUED_SKEW)));
+    }
+
+    /**
+     * The last peers-stream payload this thread decoded and verified, by identity, with the result: the gossip bus hands
+     * one item's bytes to its handler and then to its forward filter on the same thread, and each verified the ad's
+     * Ed25519 signature again (a sixth of an idle member's signature checks at ten members, srad/agentspaces-event-loop.md
+     * §10.47). The expiry is judged on each read.
+     */
+    private final ThreadLocal<Object[]> lastPeerAd = new ThreadLocal<>();
+    /** Signed peer advertisements decoded and verified; for tests. */
+    private final AtomicLong peerAdVerifications = new AtomicLong();
+
+    /** How many signed peer advertisements this node decoded and verified (§10.47); for tests. */
+    long peerAdVerifications() {
+        return peerAdVerifications.get();
     }
 
     /**

@@ -165,8 +165,19 @@ final class WebRtcConnection implements TransportConnection {
         }
         if (frame != null) {
             inbound.add(frame);
+        } else {
+            progressListener.run(); // a chunk of a frame not yet whole (SPEC v0.1.37 §9.4)
         }
         return null;
+    }
+
+    /** Bytes of a frame not yet whole: told for each chunk that does not complete one. */
+    private volatile Runnable progressListener = () -> {
+    };
+
+    @Override
+    public void onProgress(Runnable listener) {
+        this.progressListener = Objects.requireNonNull(listener, "listener");
     }
 
     @Override

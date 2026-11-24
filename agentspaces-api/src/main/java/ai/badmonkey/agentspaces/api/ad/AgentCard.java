@@ -45,6 +45,8 @@ import java.util.Objects;
  * @param costHints   free-form cost hints (tokens, latency, price, …)
  * @param spill       the reference to the card's parts document when the card is a stub (SPEC §6.1a.5, v0.1.32),
  *                    omitted when absent
+ * @param threads     the conversations the agent answers (SPEC §6.1, v0.1.38), at most {@link #MAX_THREADS}, distinct;
+ *                    omitted when absent or empty
  */
 public record AgentCard(
         String id,
@@ -92,7 +94,17 @@ public record AgentCard(
         // names. A card without it is byte-identical to v0.1.31.
         @com.fasterxml.jackson.annotation.JsonInclude(
                 com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
-        CardSpill spill) implements Advertisement {
+        CardSpill spill,
+        // Appended in v0.1.38 (srad/cards.md §3.9, decision D12 of revision 3), omitted when absent or empty: the
+        // conversations the agent answers, each a space, a thread key, and a scope, so a console, a planner or another
+        // agent reads from the card which channel the agent chats on. A card without it is byte-identical to v0.1.37.
+        // A new advertisement field: a reader before v0.1.38 refuses it and drops the card (0.7.0, every implementation).
+        @com.fasterxml.jackson.annotation.JsonInclude(
+                com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        List<ChatThread> threads) implements Advertisement {
+
+    /** The most threads a card names (SPEC §6.1, v0.1.38). */
+    public static final int MAX_THREADS = 16;
 
     /** The fields a stub moves into its parts document, in field order (SPEC §6.1a.5). */
     public static final List<String> SPILL_SET = List.of("actions", "ui");
@@ -127,6 +139,16 @@ public record AgentCard(
             }
             return List.copyOf(out);
         }
+    }
+
+    /** The v0.1.32 to v0.1.37 shape: everything but the threads. */
+    public AgentCard(String id, PeerId issuer, GroupId group, Instant issued, Duration ttl,
+                     AgentId agent, String description, List<String> goals,
+                     List<String> consumes, List<String> produces, Map<String, String> costHints,
+                     Map<String, String> spaceBindings, byte[] agentPublicKey, List<CardAction> actions,
+                     ai.badmonkey.agentspaces.api.security.AgentCertificate agentCertificate, UiDeclaration ui, CardSpill spill) {
+        this(id, issuer, group, issued, ttl, agent, description, goals, consumes, produces,
+                costHints, spaceBindings, agentPublicKey, actions, agentCertificate, ui, spill, null);
     }
 
     /** The v0.1.26 to v0.1.31 shape: everything but the spill reference. */
@@ -225,6 +247,19 @@ public record AgentCard(
                 throw new IllegalArgumentException("action names must be unique within a card");
             }
         }
+        if (threads != null) {
+            // an empty list is written as the absent field (withThreads), so one on the wire is not canonical and refused
+            if (threads.isEmpty()) {
+                throw new IllegalArgumentException("a card omits threads when it names none; an empty threads list is refused");
+            }
+            if (threads.size() > MAX_THREADS) {
+                throw new IllegalArgumentException("a card names at most " + MAX_THREADS + " threads: " + threads.size());
+            }
+            threads = List.copyOf(threads);
+            if (new java.util.HashSet<>(threads).size() != threads.size()) {
+                throw new IllegalArgumentException("a card's threads are distinct");
+            }
+        }
         if (spill != null) {
             // FR-14 (AppCard origin and formats, 2026-11-09): a stub's actions and ui are absent, in its document
             spill.requireWithin(SPILL_SET);
@@ -252,13 +287,20 @@ public record AgentCard(
     /** The card with its ui declaration (v0.1.26), every other field unchanged; null clears it. */
     public AgentCard withUi(UiDeclaration declaration) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, declaration, spill);
+                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, declaration, spill, threads);
+    }
+
+    /** The card with the conversations its agent answers (v0.1.38); null or empty clears them. */
+    public AgentCard withThreads(List<ChatThread> conversations) {
+        return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
+                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, ui, spill,
+                conversations == null || conversations.isEmpty() ? null : conversations);
     }
 
     /** The card with its spill reference (v0.1.32); null clears it. */
     public AgentCard withSpill(CardSpill reference) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, ui, reference);
+                produces, costHints, spaceBindings, agentPublicKey, actions, agentCertificate, ui, reference, threads);
     }
 
     /**
@@ -286,7 +328,7 @@ public record AgentCard(
             throw new IllegalArgumentException("a stub moves every non-empty part " + parts().nonEmpty() + ": " + reference.parts());
         }
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, null, agentCertificate, null, reference);
+                produces, costHints, spaceBindings, agentPublicKey, null, agentCertificate, null, reference, threads);
     }
 
     /**
@@ -304,7 +346,7 @@ public record AgentCard(
             throw new IllegalArgumentException("the parts document holds " + document.nonEmpty() + " where the stub names " + spill.parts());
         }
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, document.actions(), agentCertificate, document.ui(), null);
+                produces, costHints, spaceBindings, agentPublicKey, document.actions(), agentCertificate, document.ui(), null, threads);
     }
 
     /** Whether the card declares what its agent can show. */
@@ -329,14 +371,15 @@ public record AgentCard(
                 && Objects.equals(actions, that.actions)
                 && Objects.equals(agentCertificate, that.agentCertificate)
                 && Objects.equals(ui, that.ui)
-                && Objects.equals(spill, that.spill);
+                && Objects.equals(spill, that.spill)
+                && Objects.equals(threads, that.threads);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(id, issuer, group, issued, ttl, agent, description, goals, consumes,
                 produces, costHints, spaceBindings, java.util.Arrays.hashCode(agentPublicKey),
-                actions, agentCertificate, ui, spill);
+                actions, agentCertificate, ui, spill, threads);
     }
 
     /**
@@ -360,7 +403,7 @@ public record AgentCard(
      */
     public AgentCard withActions(List<CardAction> declared) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, declared, agentCertificate, ui, spill);
+                produces, costHints, spaceBindings, agentPublicKey, declared, agentCertificate, ui, spill, threads);
     }
 
     /**
@@ -372,7 +415,7 @@ public record AgentCard(
      */
     public AgentCard withAgentCertificate(ai.badmonkey.agentspaces.api.security.AgentCertificate certificate) {
         return new AgentCard(id, issuer, group, issued, ttl, agent, description, goals, consumes,
-                produces, costHints, spaceBindings, agentPublicKey, actions, certificate, ui, spill);
+                produces, costHints, spaceBindings, agentPublicKey, actions, certificate, ui, spill, threads);
     }
 
 }

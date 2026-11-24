@@ -40,6 +40,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ParallelOutboardTest {
 
     private static final int GROUP = BoNode.GROUP_BYTES;
+    /** EL-X-09: the shared blake3 pool is one thread per core, at most 16, as {@code space-verify} is. */
+    @Test
+    void theHashingPoolIsOneThreadPerCoreUpToSixteen() {
+        assertThat(GroupHasher.hashers(1)).isEqualTo(1);
+        assertThat(GroupHasher.hashers(8)).isEqualTo(8);
+        assertThat(GroupHasher.hashers(16)).isEqualTo(16);
+        assertThat(GroupHasher.hashers(64)).as("a JVM that sees many CPUs bounds its burst").isEqualTo(16);
+        assertThat(GroupHasher.hashers(0)).as("at least one").isEqualTo(1);
+    }
+
     private static final int LEAF = BoNode.LEAF_GROUPS * GROUP;
     private static final int MOST = 3 * LEAF + 5 * GROUP + 17;
     /** One seeded stream; each size hashes a prefix of it. */

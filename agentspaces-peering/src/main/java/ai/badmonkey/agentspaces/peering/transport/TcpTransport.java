@@ -74,6 +74,33 @@ public final class TcpTransport implements Transport {
         };
     }
 
+    /**
+     * Reads one frame's body off a stream, telling {@code progress} after the length prefix and after each read that
+     * leaves the frame short (SPEC v0.1.37 §9.4: bytes of a frame still arriving count as the far end's answer). A
+     * read returns what the socket holds, so a frame trickling over a slow link tells it as each piece lands.
+     *
+     * @param in       the stream, its length prefix already read
+     * @param frame    the body to fill, sized by the prefix
+     * @param progress run on the reader's thread; must only note the time
+     * @throws IOException when the stream ends or fails before the frame is whole
+     */
+    static void readFrame(DataInputStream in, byte[] frame, Runnable progress) throws IOException {
+        if (frame.length > 0 && in.available() < frame.length) {
+            progress.run(); // the prefix is here and the body is not, whole
+        }
+        int off = 0;
+        while (off < frame.length) {
+            int n = in.read(frame, off, frame.length - off);
+            if (n < 0) {
+                throw new EOFException("the stream ended " + (frame.length - off) + " bytes short of a frame");
+            }
+            off += n;
+            if (off < frame.length) {
+                progress.run();
+            }
+        }
+    }
+
     /** Returns the local port a listener handle is bound to; helper for tests and demos. */
     public static InetSocketAddress parse(String address) {
         int colon = address.lastIndexOf(':');
@@ -131,7 +158,7 @@ public final class TcpTransport implements Transport {
                         return;
                     }
                     byte[] frame = new byte[length];
-                    in.readFully(frame);
+                    readFrame(in, frame, progressListener);
                     if (!pump.offer(frame)) {
                         return; // the receiver failed and the connection is closing
                     }
@@ -155,6 +182,15 @@ public final class TcpTransport implements Transport {
         @Override
         public void onClose(Runnable listener) {
             this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        /** Bytes of a frame not yet whole (SPEC v0.1.37 §9.4): told as each piece of one lands. */
+        private volatile Runnable progressListener = () -> {
+        };
+
+        @Override
+        public void onProgress(Runnable listener) {
+            this.progressListener = Objects.requireNonNull(listener, "listener");
         }
 
         private void notifyClosed() {

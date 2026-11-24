@@ -96,7 +96,15 @@ class PdtBindingsTest {
             assertThat(behindRelay).as("the curator and analyst-1 reach analyst-2 through the relay: " + topology).isTrue();
 
             Composition.Fleet fleet = new Composition.Fleet(curator, List.of(a1, a2), null, null);
-            Composition.Report report = Composition.run(fleet, Composition.Sizes.bindings(), dir.resolve("work"), null, System.out);
+            Composition.Report report;
+            try {
+                report = Composition.run(fleet, Composition.Sizes.bindings(), dir.resolve("work"), null, System.out);
+            } catch (RuntimeException e) {
+                System.out.println("relay at the failure: links=" + relay.node().connectionSchemes() + " members="
+                        + relay.runtime().membership().allMembers().size() + " relayed="
+                        + relay.node().relayStats(relay.runtime().id()) + " dtls=" + relay.dtlsCounters());
+                throw e;
+            }
             System.out.print(report.summary());
 
             assertThat(curator.runtime().hopsTo(a2.id())).as("the path stayed pinned: one relay between").isEqualTo(1);

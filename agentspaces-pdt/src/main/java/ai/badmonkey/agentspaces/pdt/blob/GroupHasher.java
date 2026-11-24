@@ -191,14 +191,28 @@ final class GroupHasher {
         }
     }
 
-    /** The hashing threads every outboard shares: at most one per core, made on demand and gone after 30 s idle. */
+    /** The most hashing threads the shared pool keeps, as {@code space-verify} caps its own (EL-X-09). */
+    static final int MAX_HASHERS = 16;
+
+    /**
+     * The shared pool's size on a host with this many cores: one per core, at most {@link #MAX_HASHERS}, so a JVM that
+     * sees many CPUs bounds its burst (srad/agentspaces-event-loop.md EL-X-09).
+     *
+     * @param cores the cores the JVM sees
+     * @return the threads
+     */
+    static int hashers(int cores) {
+        return Math.max(1, Math.min(MAX_HASHERS, cores));
+    }
+
+    /** The hashing threads every outboard shares: one per core up to 16, made on demand and gone after 30 s idle. */
     private static final class Pool {
         static final ExecutorService HASHERS = create();
 
         private static ExecutorService create() {
-            int cores = Runtime.getRuntime().availableProcessors();
+            int threads = hashers(Runtime.getRuntime().availableProcessors());
             AtomicInteger made = new AtomicInteger();
-            ThreadPoolExecutor pool = new ThreadPoolExecutor(cores, cores, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>(),
+            ThreadPoolExecutor pool = new ThreadPoolExecutor(threads, threads, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>(),
                     task -> {
                         Thread thread = new Thread(task, "agentspaces-blake3-" + made.incrementAndGet());
                         thread.setDaemon(true);

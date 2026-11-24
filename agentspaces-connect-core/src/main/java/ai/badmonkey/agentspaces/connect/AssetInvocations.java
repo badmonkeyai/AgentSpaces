@@ -28,7 +28,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 import static ai.badmonkey.agentspaces.api.space.Matchers.eq;
 
@@ -216,7 +215,14 @@ public final class AssetInvocations {
             answer.completeExceptionally(e);
             return answer;
         }
-        return answer.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS)
-                .whenComplete((result, failure) -> subscription.close());
+        // The caller's timeout as a one-shot on the system's time source (srad/agentspaces-event-loop.md §10.35):
+        // orTimeout ran it on the JDK's own delay-scheduler thread, a real-time platform thread beside the time source.
+        ai.badmonkey.agentspaces.common.time.TimeSource.Scheduled timer = ai.badmonkey.agentspaces.common.time.TimeSource
+                .system().schedule(timeout, () -> answer.completeExceptionally(new java.util.concurrent.TimeoutException(
+                        "no result for invocation " + invocation.invocationId() + " within " + timeout)));
+        return answer.whenComplete((result, failure) -> {
+            timer.cancel();
+            subscription.close();
+        });
     }
 }

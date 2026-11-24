@@ -206,18 +206,26 @@ class LargePayloadTest {
         }
         byte[] data = new byte[120_000];
         new Random(31).nextBytes(data);
+        // B starts a fetch as soon as the record merges (the deferred WRITTEN), not only on a read. Before this filter
+        // the block's frame could cross ahead of the partition below and land after the read: no attempt failed, no
+        // retry was queued, and the wait timed out (core reactor, 2026-11-23). Every frame from A to B large enough to
+        // carry the 120,000-byte block is dropped until the heal, so attempt 0 fails whatever the timing.
+        AutoCloseable noBlock = network.filter("a", "b", frame -> frame.bytes().length >= 100_000
+                ? ai.badmonkey.agentspaces.test.LinkFilter.Verdict.drop()
+                : ai.badmonkey.agentspaces.test.LinkFilter.Verdict.pass());
         ai.badmonkey.agentspaces.api.space.EntryHandle written =
                 a.space().write(new BigEntry("retried", data), Lease.of(Duration.ofMinutes(30)));
         for (int i = 0; i < 4; i++) {
-            nodes.forEach(PeerNode::tick); // the record replicates; the block waits for a read
+            nodes.forEach(PeerNode::tick); // the record replicates; the block's frame is dropped
         }
         assertThat(b.space().recordOf(written.entryId(), true)).as("the record replicated").isPresent();
 
         network.partition("a", "b");
-        assertThat(b.space().read(Template.of(BigEntry.class))).isEmpty(); // starts attempt 0
+        assertThat(b.space().read(Template.of(BigEntry.class))).isEmpty(); // attempt 0, or the merge's, in flight
         Measure.await("space.large-payload.wait-2", Duration.ofSeconds(30), () -> b.space().pendingBlockRetries() != 0);
         assertThat(b.space().pendingBlockRetries()).as("attempt 0 failed and queued a retry").isEqualTo(1);
 
+        noBlock.close();
         network.heal();
         nodes.forEach(PeerNode::tick);
         assertThat(b.space().pendingBlockRetries()).as("not due yet: 2 s of back-off").isEqualTo(1);

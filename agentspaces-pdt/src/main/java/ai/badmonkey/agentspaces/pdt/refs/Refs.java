@@ -228,7 +228,10 @@ public final class Refs implements AutoCloseable {
         }
     }
 
-    /** A root whose fetch failed: its failures so far and the clock time its next fetch is due (swarm retries). */
+    /**
+     * A root whose fetch failed: its failures so far and when its next fetch is due (swarm retries), on the engine's
+     * local base ({@link #periods}, EL-C-04), so a wall step neither holds nor hurries a retry.
+     */
     private static final class Retry {
         int failures;
         long dueMillis;
@@ -318,7 +321,9 @@ public final class Refs implements AutoCloseable {
     private static final class Own {
         final EntryHandle handle;
         final String root;
+        /** On the local base ({@link #periods}, EL-C-04): the renewal falls at half-life of real time, never later. */
         long lastRenewMillis;
+        /** On the local base, as the renewal. */
         Long supersededAtMillis;
         /** The bases the entry names, so a displaced entry goes once the versions it supersedes are gone. */
         final List<String> base;
@@ -452,7 +457,11 @@ public final class Refs implements AutoCloseable {
         // ---- the quiet tick (idle-loop O4, reviews/IDLE-LOOP-2026-11-18.md): what the last full tick read
         /** The space's change signals when the last full tick began, or -1 when no full tick has been judged quiet. */
         long quietSignals = -1;
-        /** The earliest time a full tick has time-based work: a head lapses, a renewal, a cancel grace, a retry. */
+        /**
+         * The earliest time a full tick has time-based work: a head lapses, a renewal, a cancel grace, a retry. On the
+         * local base ({@link #periods}, EL-C-04), so a wall step back does not keep the engine quiet until the wall
+         * catches up; a wall deadline (a head's lapse) is converted to it when it is computed.
+         */
         long quietUntil = Long.MIN_VALUE;
         /** The heads a read last computed, as the last full tick saw them. */
         Heads quietLastHeads;
@@ -515,6 +524,14 @@ public final class Refs implements AutoCloseable {
     private final NodeLoader loader;
     private final Retention retention;
     private final InstantSource clock;
+    /**
+     * The base of the engine's local periods (srad/agentspaces-event-loop.md EL-C-04, §10.35): own heads' renewals at
+     * half-life, the cancel grace, fetch retries, and the quiet tick's deadline, on the clock's monotonic time, so a wall
+     * step moves none of them (a renewal comes at half-life of real time, sooner than the wall would say after a
+     * forward step, never later after a back one). A head's lapse and the subscription stay on wall time. On a plain
+     * clock a test moves by hand it follows that clock.
+     */
+    private final ai.badmonkey.agentspaces.common.time.TimeSource periods;
     private final Config config;
     /** The writer's side of eager push, or null with push off (P2-P-01). */
     private final PushPublisher pusher;
@@ -566,6 +583,7 @@ public final class Refs implements AutoCloseable {
         this.loader = swarm.loader();
         this.retention = Objects.requireNonNull(retention, "retention");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.periods = ai.badmonkey.agentspaces.common.time.TimeSources.of(clock);
         this.config = Objects.requireNonNull(config, "config");
         boolean pushing = Objects.requireNonNull(push, "push").enabled();
         this.pusher = pushing ? new PushPublisher(swarm.content(), clock, push) : null;
@@ -604,12 +622,54 @@ public final class Refs implements AutoCloseable {
             completeRoots.clear();
         }
         heldEpoch.incrementAndGet();
+        localChanged();
+    }
+
+    /** Told when an input of the quiet check changed outside the ref space (srad/agentspaces-event-loop.md DW-2). */
+    private final List<Runnable> localChangeListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /**
+     * Registers a listener told when something the engine's quiet check reads changed without a change of the ref
+     * space: this peer's own heads after a swap, the heads a deref read, the remembered completeness. A swap's write
+     * signals the ref space before the engine records its own entry and its heads, so a loop that ran in between
+     * kept the older quiet state and only the backstop's sweep found the rest (close-out gate,
+     * srad/agentspaces-event-loop.md §10.39, EL-Q-REL-03). The listener only wakes: it never blocks or re-enters.
+     *
+     * @param listener the wake
+     * @return closing it removes the listener
+     */
+    public AutoCloseable onLocalChange(Runnable listener) {
+        Objects.requireNonNull(listener, "listener");
+        localChangeListeners.add(listener);
+        return () -> localChangeListeners.remove(listener);
+    }
+
+    private void localChanged() {
+        for (Runnable listener : localChangeListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                System.getLogger(Refs.class.getName()).log(System.Logger.Level.WARNING,
+                        "refs: a local change listener threw", e);
+            }
+        }
     }
 
     /** Advances whenever the remembered completeness is dropped, so a quiet ref looks at its heads again. */
     private final AtomicLong heldEpoch = new AtomicLong();
     /** Ref ticks skipped because nothing they read had changed and no time-based work was due (idle-loop O4). */
     private final AtomicLong quietTicks = new AtomicLong();
+
+    private final java.util.concurrent.atomic.AtomicLong ownRenewals = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How many times this engine renewed one of its own head entries at half-life (EL-C-04: on the local base).
+     *
+     * @return the count
+     */
+    public long ownRenewals() {
+        return ownRenewals.get();
+    }
 
     /** Ref ticks skipped because nothing they read had changed and no time-based work was due (idle-loop O4). */
     public long quietTicks() {
@@ -1046,7 +1106,12 @@ public final class Refs implements AutoCloseable {
         if (heads.isEmpty()) {
             return new Result<>(state.kind.empty(store, loader), heads);
         }
-        state.lastHeads = heads;
+        if (!heads.equals(state.lastHeads)) {
+            // the quiet check reads lastHeads: a deref on the caller's thread that read other heads wakes the loop;
+            // the same heads again change nothing and keep the recorded value, so a reader in a loop costs no tick
+            state.lastHeads = heads;
+            localChanged();
+        }
         return new Result<>(materialize(state, heads, store), heads);
     }
 
@@ -1742,7 +1807,7 @@ public final class Refs implements AutoCloseable {
     private boolean backingOff(Map<String, Retry> retries, String key) {
         synchronized (retries) {
             Retry retry = retries.get(key);
-            return retry != null && clock.millis() < retry.dueMillis;
+            return retry != null && periods.monoMillis() < retry.dueMillis;
         }
     }
 
@@ -1750,7 +1815,7 @@ public final class Refs implements AutoCloseable {
     private boolean retryDue(State<?> state, String root, long now) {
         synchronized (state.unloadable) {
             Retry retry = state.unloadable.get(root);
-            return retry != null && now >= retry.dueMillis;
+            return retry != null && periods.monoMillis() >= retry.dueMillis;
         }
     }
 
@@ -1770,7 +1835,7 @@ public final class Refs implements AutoCloseable {
             Retry retry = retries.computeIfAbsent(key, k -> new Retry());
             retry.failures++;
             long wait = Math.min(cap, RETRY_BASE_MILLIS << Math.min(retry.failures - 1, 20));
-            retry.dueMillis = clock.millis() + wait + java.util.concurrent.ThreadLocalRandom.current().nextLong(wait / 2 + 1);
+            retry.dueMillis = periods.monoMillis() + wait + java.util.concurrent.ThreadLocalRandom.current().nextLong(wait / 2 + 1);
         }
     }
 
@@ -2064,6 +2129,9 @@ public final class Refs implements AutoCloseable {
                 }
             }
             state.recheck.put(record.root(), head);
+            // the space signalled before this event, and the loop may have run the engine in between, which saw the
+            // change but not this head: the recheck is work in flight nothing else signals (EL-Q-REL-03, §10.49)
+            localChanged();
             return;
         }
         swarm.fetcher().follow(record.root()).prefer(head.issuer().peer());
@@ -2087,7 +2155,11 @@ public final class Refs implements AutoCloseable {
         if (closed) {
             throw new IllegalStateException("the refs engine is closed");
         }
-        return state.linear() ? swapLinear(state, f) : swapMulti(state, f);
+        try {
+            return state.linear() ? swapLinear(state, f) : swapMulti(state, f);
+        } finally {
+            localChanged(); // its own entry and heads are recorded after the space's signal (EL-Q-REL-03)
+        }
     }
 
     private <T> T swapMulti(State<T> state, UnaryOperator<T> f) {
@@ -2212,7 +2284,7 @@ public final class Refs implements AutoCloseable {
                         existing.displaced = true;
                     }
                 }
-                state.own.put(handle.entryId(), new Own(handle, newRoot, now, head.base()));
+                state.own.put(handle.entryId(), new Own(handle, newRoot, periods.monoMillis(), head.base()));
             }
             releaseSuperseded(state, newRoot, heads);
             retention.recordVersion(state.name, newRoot, now);
@@ -2420,11 +2492,11 @@ public final class Refs implements AutoCloseable {
                     existing.displaced = true;
                 }
             }
-            state.own.put(handle.entryId(), new Own(handle, head.root(), now, head.base()));
+            state.own.put(handle.entryId(), new Own(handle, head.root(), periods.monoMillis(), head.base()));
             Set<String> oldRoots = new HashSet<>(superseded.roots());
             for (Own own : state.own.values()) {
                 if (oldRoots.contains(own.root) && own.supersededAtMillis == null) {
-                    own.supersededAtMillis = now;
+                    own.supersededAtMillis = periods.monoMillis();
                 }
             }
         }
@@ -2475,6 +2547,7 @@ public final class Refs implements AutoCloseable {
         if (closed) {
             return;
         }
+        lastTickLocal = periods.monoMillis(); // the in-flight step counts from here (EL-X-07, §10.47)
         long now = clock.millis();
         if (receiver != null) {
             receiver.expire(now);
@@ -2486,6 +2559,14 @@ public final class Refs implements AutoCloseable {
 
     /** How often the engine is stepped while a fetch, a recheck or a chain batch is in flight: today's cadence. */
     public static final long IN_FLIGHT_STEP_MILLIS = 250;
+
+    /**
+     * When the engine last ticked, on the local base, or {@link Long#MIN_VALUE} before its first tick. The in-flight
+     * step is a fixed deadline after it: read as "now + 250 ms" on every call, it moved with the clock, a loop that
+     * asked found the engine never due, and work in flight waited for the next change of the ref space (example 33's
+     * flake on the loop, srad/agentspaces-event-loop.md §10.47).
+     */
+    private volatile long lastTickLocal = Long.MIN_VALUE;
 
     /**
      * When {@link #tick()} next has work no change signal covers (srad/agentspaces-event-loop.md EL-T-08): the
@@ -2503,10 +2584,12 @@ public final class Refs implements AutoCloseable {
         long due = receiver == null ? Long.MAX_VALUE : receiver.nextExpiryMillis();
         long signals = changeSignals();
         long epoch = heldEpoch.get();
+        long ticked = lastTickLocal;
+        long step = ticked == Long.MIN_VALUE ? now : wallOf(ticked + IN_FLIGHT_STEP_MILLIS, now);
         for (State<?> state : states.values()) {
             if (!state.recheck.isEmpty() || !state.pending.isEmpty() || !state.chainWanted.isEmpty()
                     || state.chainBatch != null) {
-                due = Math.min(due, now + IN_FLIGHT_STEP_MILLIS);
+                due = Math.min(due, step); // a fixed step after the last tick: it comes due (§10.47)
                 continue;
             }
             int ownCount;
@@ -2517,7 +2600,8 @@ public final class Refs implements AutoCloseable {
                     || ownCount != state.quietOwn || epoch != state.quietHeldEpoch) {
                 return now;
             }
-            due = Math.min(due, state.quietUntil);
+            // the quiet deadline is on the local base: stated on this engine's clock, read now (EL-C-04)
+            due = Math.min(due, state.quietUntil == Long.MIN_VALUE ? now : wallOf(state.quietUntil, now));
         }
         return due;
     }
@@ -2532,7 +2616,8 @@ public final class Refs implements AutoCloseable {
         synchronized (state.own) {
             ownCount = state.own.size();
         }
-        if (signals >= 0 && signals == state.quietSignals && now < state.quietUntil && heads == state.quietLastHeads
+        if (signals >= 0 && signals == state.quietSignals && periods.monoMillis() < state.quietUntil
+                && heads == state.quietLastHeads
                 && ownCount == state.quietOwn && epoch == state.quietHeldEpoch && state.recheck.isEmpty()
                 && state.pending.isEmpty() && state.chainWanted.isEmpty() && state.chainBatch == null) {
             quietTicks.incrementAndGet();
@@ -2554,10 +2639,25 @@ public final class Refs implements AutoCloseable {
      * peer knows of expires, or the notify subscription is renewed. At or after it the next tick is a full one.
      */
     private <T> long nextDue(State<T> state, List<Heads.Head> live, long now) {
-        long due = state.subscriptionRenewedMillis + SUBSCRIPTION_LEASE.toMillis() / 2;
+        // wall deadlines (the subscription's renewal, a head's lapse), then the local ones; the result is on the local
+        // base (EL-C-04)
+        long wall = state.subscriptionRenewedMillis + SUBSCRIPTION_LEASE.toMillis() / 2;
         for (Heads.Head head : live) {
-            due = Math.min(due, head.expiresAtMillis());
+            wall = Math.min(wall, head.expiresAtMillis());
         }
+        Heads last = state.lastHeads;
+        if (last != null) {
+            synchronized (state.known) {
+                for (String root : last.roots()) {
+                    Heads.Head known = state.known.get(root);
+                    if (known != null && known.expiresAtMillis() > now) {
+                        wall = Math.min(wall, known.expiresAtMillis());
+                    }
+                }
+            }
+        }
+        long local = periods.monoMillis();
+        long due = localOf(wall, now, local);
         long halfLife = config.headLease().toMillis() / 2;
         synchronized (state.own) {
             for (Own own : state.own.values()) {
@@ -2571,18 +2671,25 @@ public final class Refs implements AutoCloseable {
                 due = Math.min(due, retry.dueMillis);
             }
         }
-        Heads last = state.lastHeads;
-        if (last != null) {
-            synchronized (state.known) {
-                for (String root : last.roots()) {
-                    Heads.Head known = state.known.get(root);
-                    if (known != null && known.expiresAtMillis() > now) {
-                        due = Math.min(due, known.expiresAtMillis());
-                    }
-                }
-            }
-        }
         return due;
+    }
+
+    /** A wall deadline on the local base, against the wall and local clocks read together. */
+    private static long localOf(long wallDeadline, long wallNow, long localNow) {
+        if (wallDeadline == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        long ahead = wallDeadline - wallNow;
+        return ahead >= Long.MAX_VALUE - localNow ? Long.MAX_VALUE : localNow + ahead;
+    }
+
+    /** A local deadline on this engine's wall clock, against the local clock read now. */
+    private long wallOf(long localDeadline, long wallNow) {
+        if (localDeadline == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        long ahead = localDeadline - periods.monoMillis();
+        return ahead >= Long.MAX_VALUE - wallNow ? Long.MAX_VALUE : wallNow + ahead;
     }
 
     private <T> List<Heads.Head> fullTick(State<T> state, long now) {
@@ -2663,6 +2770,7 @@ public final class Refs implements AutoCloseable {
             }
         }
         long halfLife = config.headLease().toMillis() / 2;
+        long local = periods.monoMillis(); // EL-C-04: the renewals' and the cancel grace's base
         List<Own> owned;
         synchronized (state.own) {
             owned = new ArrayList<>(state.own.values());
@@ -2675,12 +2783,12 @@ public final class Refs implements AutoCloseable {
             boolean superseded = cancellable.contains(own.root)
                     || (own.displaced && java.util.Collections.disjoint(own.base, liveRoots));
             if (own.supersededAtMillis == null && superseded) {
-                own.supersededAtMillis = now;
+                own.supersededAtMillis = local;
             } else if (own.supersededAtMillis != null && !superseded) {
                 own.supersededAtMillis = null;
             }
             if (own.supersededAtMillis != null) {
-                if (now - own.supersededAtMillis >= config.cancelGrace().toMillis()) {
+                if (local - own.supersededAtMillis >= config.cancelGrace().toMillis()) {
                     try {
                         own.handle.cancel();
                     } catch (RuntimeException gone) {
@@ -2698,10 +2806,11 @@ public final class Refs implements AutoCloseable {
                 }
                 continue;
             }
-            if (now - own.lastRenewMillis >= halfLife) {
+            if (local - own.lastRenewMillis >= halfLife) {
                 try {
                     own.handle.renew(config.headLease());
-                    own.lastRenewMillis = now;
+                    own.lastRenewMillis = local;
+                    ownRenewals.incrementAndGet();
                 } catch (LeaseExpiredException lapsed) {
                     synchronized (state.own) {
                         state.own.remove(own.handle.entryId(), own);
@@ -2909,7 +3018,7 @@ public final class Refs implements AutoCloseable {
         }
         state.ownEntries.add(handle.entryId());
         synchronized (state.own) {
-            state.own.put(handle.entryId(), new Own(handle, head.root(), clock.millis(), head.base()));
+            state.own.put(handle.entryId(), new Own(handle, head.root(), periods.monoMillis(), head.base()));
         }
         headsRewritten.incrementAndGet();
         liveEntries(state);

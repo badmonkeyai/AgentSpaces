@@ -64,7 +64,7 @@ final class TransportBlocks {
     /** Whether an enabled block will register a binding that can attest. */
     static boolean anyAttesting(AgentSpacesProperties properties) {
         AgentSpacesProperties.Transport transport = properties.getTransport();
-        return transport.getQuic().isEnabled()
+        return transport.quicBlock().isEnabled()
                 || (transport.getDtls().isEnabled() && !unattested(transport.getDtls()))
                 || transport.getWss().isEnabled()
                 || transport.getWebrtc().isEnabled(); // attests by signed fingerprint (JS-W-04, decision 5)
@@ -81,7 +81,7 @@ final class TransportBlocks {
     /** Startup refusals that name the property (SRAD DT-H-02, DT-Q-MNT-02). */
     static void validate(AgentSpacesProperties properties, boolean requireAttestation) {
         AgentSpacesProperties.Transport transport = properties.getTransport();
-        requireModule("quic", transport.getQuic(), QUIC_CLASS, "agentspaces-transport-quic");
+        requireModule("quic", transport.quicBlock(), QUIC_CLASS, "agentspaces-transport-quic");
         requireModule("dtls", transport.getDtls(), DTLS_CLASS, "agentspaces-transport-dtls");
         requireModule("udp", transport.getUdp(), UDP_CLASS, "agentspaces-transport-dtls");
         requireModule("ws", transport.getWs(), HTTP_CLASS, HTTP_ARTIFACT);
@@ -185,10 +185,10 @@ final class TransportBlocks {
                              Supplier<ChannelTrust> trust, Map<String, Transport> provided) {
         List<Block> blocks = new ArrayList<>();
         AgentSpacesProperties.Transport transport = properties.getTransport();
-        if (transport.getQuic().isEnabled()) {
+        if (transport.quicBlock().isEnabled()) {
             Transport bean = provided.remove("quic");
-            blocks.add(new Block("quic", bean != null ? bean : QuicBlocks.build(identity, transport.getQuic(), serving, trust),
-                    transport.getQuic(), bean == null));
+            blocks.add(new Block("quic", bean != null ? bean : QuicBlocks.build(identity, transport.quicBlock(), serving, trust),
+                    transport.quicBlock(), bean == null));
         }
         if (transport.getDtls().isEnabled()) {
             Transport bean = provided.remove("dtls");

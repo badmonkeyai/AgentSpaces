@@ -543,10 +543,15 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     /** At most this many displaced claims, or unproven completions, are kept per entry; past it the oldest goes. */
     private static final int DISPLACED_PER_ENTRY = 4;
 
-    /** One of this peer's completions whose claim a better claim displaced, and its offers so far. */
+    /**
+     * One of this peer's completions whose claim a better claim displaced, and its offers so far. Its schedule is on
+     * the space's local (monotonic) base, so a sleep or a wall step neither spends the offers at once nor stalls them
+     * (srad/agentspaces-event-loop.md §10.36); the claim's own expiry and drift stay on the wall clock.
+     */
     private static final class Reoffer {
         final SpaceWire.SignedClaim claim;
         int offers;
+        /** When the next offer may go, on {@link #localMillis()}. */
         long nextMillis;
 
         Reoffer(SpaceWire.SignedClaim claim, long nextMillis) {
@@ -567,6 +572,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * on). Bounded like {@link #outbidCompletions}. Under {@link #lock}.
      */
     private final Map<EntryId, Reoffer> displacedOwn = boundedLines();
+    /**
+     * The claims made here that a better claim displaced, per entry, whether or not an agent here completed under
+     * them: what a dial-only member answers a relayed or another member's {@code DIGEST} for (SPEC v0.1.37 §9.4), so a
+     * winner's targeted round reaches it. Bounded like {@link #outbidCompletions}. Under {@link #lock}.
+     */
+    private final Map<EntryId, SpaceWire.SignedClaim> displacedHere = boundedLines();
     /** Set under {@link #lock} when a {@link #displacedOwn} offer is due; {@link #offerDisplaced} sends it after the lock. */
     private volatile boolean reofferDue;
     /** Whether {@link #displacedOwn} may hold a line: read without the lock on every state received, so almost always false. */
@@ -586,7 +597,10 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * a round is the usual digest. Bounded like {@link #displacedClaims}. Under {@link #lock}.
      */
     private final Map<EntryId, DisplacedPull> displacedPulls = boundedLines();
-    /** The earliest {@link #displacedPulls} round due, on the space's clock; {@link Long#MAX_VALUE} for none. */
+    /**
+     * The earliest {@link #displacedPulls} round due, on the space's local (monotonic) base ({@link #localMillis()});
+     * {@link Long#MAX_VALUE} for none. The participant converts it to the space's clock as it returns.
+     */
     private final java.util.concurrent.atomic.AtomicLong pullDue = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
     /**
      * When this replica re-publishes its advertisement, on the space's clock: two thirds of the advertisement TTL
@@ -605,6 +619,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
     private static final class DisplacedPull {
         final java.util.Set<PeerId> holders = new java.util.LinkedHashSet<>();
         int rounds;
+        /** When the next round is due, on {@link #localMillis()}. */
         long nextMillis;
 
         DisplacedPull(long nextMillis) {
@@ -799,6 +814,17 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                 @Override
                 public void matched(PeerId from) {
                     ReplicatedSpace.this.digestMatched(from);
+                }
+
+                // A dial-only member answers a relayed or another member's DIGEST for these entries alone (§9.4).
+                @Override
+                public boolean holdsDisplaced() {
+                    return ReplicatedSpace.this.holdsDisplaced();
+                }
+
+                @Override
+                public ReconcilableState.Bounded displacedFor(byte[] remoteDigest, long budget, boolean first) {
+                    return ReplicatedSpace.this.displacedFor(remoteDigest, budget, first);
                 }
 
                 // The trie audit of SPEC annex I.6 (srad/replication-by-entry.md phase 4): the bus asks these only
@@ -1915,9 +1941,12 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             dueEpoch = epoch;
             dueLooks.incrementAndGet();
             horizonDue.set(Long.MAX_VALUE); // horizon(now), inside the sweep, files the next round afresh
+            sweepDue.set(Long.MAX_VALUE);
+            // Not under the space lock: the sweep fires its events after its own lock, and a listener that takes a
+            // lock of its own which another thread holds while it reads this space (a reduce binding's drain) would
+            // otherwise deadlock with this run (2026-11-23). A deadline lowered meanwhile is kept by the minimum.
+            sweepIfDue();
             synchronized (lock) {
-                sweepDue.set(Long.MAX_VALUE);
-                sweepIfDue();
                 sweepDue.accumulateAndGet(nextDueLocked(), Math::min);
             }
             synchronized (horizonLock) {
@@ -1941,16 +1970,19 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             retryDue.accumulateAndGet(next, Math::min);
         }
-        if (direct || nowMillis >= pullDue.get()) {
+        long localNow = localMillis();
+        if (direct || localNow >= pullDue.get()) {
             pullDue.set(Long.MAX_VALUE); // a holder displaced after this lowers it again and wakes the participant
-            pullDue.accumulateAndGet(pullDisplacedHolders(nowMillis), Math::min);
+            pullDue.accumulateAndGet(pullDisplacedHolders(nowMillis, localNow), Math::min);
         }
         if (nowMillis >= adDue.get()) {
             adDue.set(Long.MAX_VALUE); // a no-op refresh (read-only, closed to advertising) lets it lapse, as designed
             adRenewals.incrementAndGet();
             refreshAdvertisement();
         }
-        return Math.min(Math.min(Math.min(sweepDue.get(), retryDue.get()), Math.min(horizonDue.get(), pullDue.get())),
+        long pull = pullDue.get();
+        long pullOnClock = pull == Long.MAX_VALUE ? Long.MAX_VALUE : nowMillis + Math.max(0, pull - localNow);
+        return Math.min(Math.min(Math.min(sweepDue.get(), retryDue.get()), Math.min(horizonDue.get(), pullOnClock)),
                 adDue.get());
     }
 
@@ -1959,9 +1991,11 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
      * take is no longer open here: this peer's agent no longer holds the claim, the entry is no longer present, the
      * displaced completion is already noted, or the rounds are spent. The rounds are opened after the lock.
      *
-     * @return the next round's deadline on the space's clock, or {@link Long#MAX_VALUE}
+     * @param nowMillis the space's clock, for the claim's expiry
+     * @param localNow  the local base, for the rounds' schedule
+     * @return the next round's deadline on the local base, or {@link Long#MAX_VALUE}
      */
-    private long pullDisplacedHolders(long nowMillis) {
+    private long pullDisplacedHolders(long nowMillis, long localNow) {
         java.util.Set<PeerId> partners = new java.util.LinkedHashSet<>();
         long next = Long.MAX_VALUE;
         synchronized (lock) {
@@ -1983,9 +2017,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                     lines.remove();
                     continue;
                 }
-                if (nowMillis >= pull.nextMillis) {
+                if (localNow >= pull.nextMillis) {
                     partners.addAll(pull.holders);
-                    pull.nextMillis = nowMillis + (REOFFER_BACKOFF_MILLIS << pull.rounds);
+                    pull.nextMillis = localNow + (REOFFER_BACKOFF_MILLIS << pull.rounds);
                     pull.rounds++;
                 }
                 next = Math.min(next, pull.nextMillis);
@@ -3317,7 +3351,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         }
         synchronized (lock) {
             Reoffer reoffer = displacedOwn.get(entryId);
-            if (reoffer != null && nowMillis() >= reoffer.nextMillis) {
+            if (reoffer != null && localMillis() >= reoffer.nextMillis) {
                 reofferDue = true;
             }
         }
@@ -3337,6 +3371,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         synchronized (lock) {
             reofferDue = false;
             long now = nowMillis();
+            long localNow = localMillis();
             Iterator<Map.Entry<EntryId, Reoffer>> lines = displacedOwn.entrySet().iterator();
             while (lines.hasNext()) {
                 Map.Entry<EntryId, Reoffer> line = lines.next();
@@ -3348,8 +3383,8 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
                         || crdt.state(line.getKey()).isEmpty()
                         || (decided != null && claim.epoch() <= decided)) { // the ordered log alone names the holder
                     lines.remove();
-                } else if (now >= reoffer.nextMillis) {
-                    reoffer.nextMillis = now + (REOFFER_BACKOFF_MILLIS << reoffer.offers);
+                } else if (localNow >= reoffer.nextMillis) {
+                    reoffer.nextMillis = localNow + (REOFFER_BACKOFF_MILLIS << reoffer.offers);
                     reoffer.offers++;
                     due.add(Map.entry(line.getKey(), reoffer.claim));
                 }
@@ -3375,6 +3410,40 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         synchronized (lock) {
             TakeClaim held = claimOf(entryId);
             return held != null && Long.valueOf(held.epoch()).equals(outbidCompletions.get(entryId));
+        }
+    }
+
+    /**
+     * For tests: this peer's held claim of an entry is displaced, as a better claim merged here would make it
+     * ({@link #noteDisplaced}), and the first offer goes at once.
+     */
+    void noteDisplacedOwnForTest(EntryId entryId) {
+        synchronized (lock) {
+            displacedOwn.put(entryId, new Reoffer(heldClaim(entryId), localMillis()));
+            anyDisplacedOwn = true;
+            reofferDue = true;
+        }
+        offerDisplaced();
+    }
+
+    /** For tests: a replica offered the entry present again ({@link #staleOffered}); a due offer goes. */
+    void staleOfferForTest(EntryId entryId) {
+        synchronized (lock) {
+            Reoffer reoffer = displacedOwn.get(entryId);
+            if (reoffer != null && localMillis() >= reoffer.nextMillis) {
+                reofferDue = true;
+            }
+        }
+        offerDisplaced();
+    }
+
+    /** For tests: a holder this peer's claim displaced, as {@link #noteDisplaced} records one; its round is due now. */
+    void noteDisplacedHolderForTest(EntryId entryId, PeerId holder) {
+        synchronized (lock) {
+            long now = localMillis();
+            DisplacedPull pull = displacedPulls.computeIfAbsent(entryId, k -> new DisplacedPull(now));
+            pull.holders.add(holder);
+            lowerDue(pullDue, pull.nextMillis);
         }
     }
 
@@ -4688,6 +4757,9 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return; // the same holder's renewal or attestation upgrade displaces nobody
         }
         PeerId self = identity.peerId();
+        if (lost.claim().holder().peer().equals(self) && !kept.claim().holder().peer().equals(self)) {
+            displacedHere.putIfAbsent(entryId, lost); // the claim this peer first lost on the entry
+        }
         if (kept.claim().holder().peer().equals(self)) {
             List<SpaceWire.SignedClaim> lines = displacedClaims.computeIfAbsent(entryId, k -> new ArrayList<>(2));
             if (lines.stream().noneMatch(c -> c.claim().equals(lost.claim()))) {
@@ -4698,7 +4770,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             PeerId displacedPeer = lost.claim().holder().peer();
             if (!displacedPeer.equals(self)) {
-                long now = nowMillis();
+                long now = localMillis();
                 DisplacedPull pull = displacedPulls.computeIfAbsent(entryId, k -> new DisplacedPull(now));
                 if (pull.holders.add(displacedPeer) && pull.rounds > 0) {
                     pull.nextMillis = Math.min(pull.nextMillis, now); // a newly displaced holder is asked at once
@@ -4708,7 +4780,7 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
         } else if (lost.claim().holder().peer().equals(self)
                 && Long.valueOf(lost.claim().epoch()).equals(completedHere.get(entryId))
                 && !displacedOwn.containsKey(entryId)) {
-            displacedOwn.put(entryId, new Reoffer(lost, nowMillis()));
+            displacedOwn.put(entryId, new Reoffer(lost, localMillis()));
             anyDisplacedOwn = true;
             reofferDue = true;
         }
@@ -5239,6 +5311,73 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
         }
         return bounded(offers, budget, first);
+    }
+
+    /**
+     * Whether a displaced claim made here is still worth sending (SPEC v0.1.37 §9.4): the entry is known, the claim is
+     * live, and well inside the drift ceiling, as a re-offer judges. Lines past that are forgotten. Callers hold
+     * {@link #lock}.
+     */
+    private boolean pruneDisplacedHere(long now) {
+        displacedHere.entrySet().removeIf(line -> {
+            TakeClaim claim = line.getValue().claim();
+            return claim.expired(now) || now - claim.stamp().physical() > HybridLogicalClock.MAX_DRIFT_MILLIS / 2
+                    || crdt.state(line.getKey()).isEmpty();
+        });
+        return !displacedHere.isEmpty() || !displacedOwn.isEmpty();
+    }
+
+    /** Whether a dial-only member holds anything to answer a member other than its seed with (§9.4). */
+    boolean holdsDisplaced() {
+        synchronized (lock) {
+            return pruneDisplacedHere(nowMillis());
+        }
+    }
+
+    /**
+     * A dial-only member's answer to a relayed or another member's {@code DIGEST} (SPEC v0.1.37 §9.4): the entries
+     * whose claim made here a better claim displaced, each with that claim (the one the winner pairs with the
+     * completion) and, when the asker's digest lacks it, the entry's state, which carries this peer's completion.
+     * Nothing else this replica holds goes, so no member draws its whole state through the seed.
+     *
+     * @return the delta and the count of items left out for the budget
+     */
+    ReconcilableState.Bounded displacedFor(byte[] remoteDigest, long budget, boolean first) {
+        Set<String> remote = Set.of(new String(remoteDigest, StandardCharsets.UTF_8).split("\n"));
+        List<Offer> offers = new ArrayList<>();
+        synchronized (lock) {
+            pruneDisplacedHere(nowMillis());
+            Map<EntryId, SpaceWire.SignedClaim> lines = new java.util.LinkedHashMap<>(displacedHere);
+            displacedOwn.forEach((entryId, reoffer) -> lines.putIfAbsent(entryId, reoffer.claim));
+            lines.forEach((entryId, claim) -> {
+                SpaceWire.EntryStateDto signed = null;
+                var state = crdt.state(entryId);
+                if (state.isPresent()) {
+                    String key = "e:" + entryId.value() + "=" + SpaceStateCrdt.stateHash(state.get());
+                    if (!remote.contains(key) && !remote.contains("a:" + key)) {
+                        signed = signedStates.get(entryId);
+                    }
+                }
+                offers.add(new Offer(entryId, signed, state.map(st -> st.present()).orElse(false), claim));
+            });
+        }
+        if (offers.isEmpty()) {
+            return new ReconcilableState.Bounded(new byte[0], 0);
+        }
+        displacedAnswers.incrementAndGet();
+        return bounded(offers, budget, first);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong displacedAnswers = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Answers this replica gave a relayed or another member's {@code DIGEST} as a dial-only member, each carrying only
+     * its displaced claims (SPEC v0.1.37 §9.4).
+     *
+     * @return the count
+     */
+    public long displacedAnswers() {
+        return displacedAnswers.get();
     }
 
     /**
@@ -7512,6 +7651,15 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             }
             publishDelta(new SpaceWire.Delta(null, entryId, sign(renewed, actor)),
                     "c:" + entryId + ":renew:" + nowMillis());
+        }
+
+        @Override
+        public boolean held() {
+            synchronized (lock) {
+                TakeClaim current = claimOf(entryId);
+                return current != null && current.holder().equals(actor.id()) && current.epoch() == epoch
+                        && !current.expired(nowMillis());
+            }
         }
     }
 

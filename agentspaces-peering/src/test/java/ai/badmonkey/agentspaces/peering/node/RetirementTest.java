@@ -145,7 +145,9 @@ class RetirementTest {
             a.noteLostForTest(groupId, PeerIdentity.generate().peerId(),
                     List.of(new PeerAdvertisement.Endpoint("mem", "gone-" + i, 0)), now);
         }
-        clock.advance(Duration.ofSeconds(5));
+        // The table's first step, 5 s spread by a tenth either way (SPEC v0.1.37 §9.4): every lost member is due.
+        clock.advance(Duration.ofMillis(Math.round(PeerNode.LOST_RETRY_TABLE_MILLIS[0]
+                * (1 + PeerNode.LOST_RETRY_SPREAD))));
         a.tick();
         assertThat(a.lostIntroductions()).as("one round's budget").isEqualTo(PeerNode.LOST_RETRY_BUDGET);
         for (int i = 0; i < 4; i++) {

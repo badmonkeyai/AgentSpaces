@@ -140,12 +140,14 @@ class GrantWithoutAuthorizerTest {
         assertThat(store.contentStore().ledger().holds(root)).as("the authorizer refuses the writer").isFalse();
 
         // its backing service goes away and every question throws: the store admits nothing and backs off
+        // (EL-W-04, §10.47: a scan that took nothing waits for a change or the 30 s backstop, so the first failing
+        // question comes at the latest at the backstop; from then on each failing scan costs a 200 ms pause)
         gone.set(true);
         asked.set(0);
-        fleet.runFor(Duration.ofSeconds(2));
+        fleet.runFor(Duration.ofSeconds(32));
         assertThat(store.contentStore().ledger().holds(root)).isFalse();
         assertThat(writer.contentSpace().readAll(Template.of(SignedPin.class), 4)).as("the pin stays").hasSize(1);
-        assertThat(asked.get()).as("one question a scan, a scan a pause").isBetween(1, 20);
+        assertThat(asked.get()).as("the backstop, then one question a scan, a scan a pause").isBetween(1, 30);
     }
 
     @Test

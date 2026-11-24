@@ -671,6 +671,16 @@ public final class Composition {
         return total;
     }
 
+    private List<Peer> allPeers() {
+        List<Peer> all = new ArrayList<>();
+        all.add(fleet.curator());
+        all.addAll(fleet.analysts());
+        if (fleet.meter() != null) {
+            all.add(fleet.meter());
+        }
+        return all;
+    }
+
     private String diagnose(List<Peer> readers, Function<Peer, Ref<?>> refOf, String root) {
         StringBuilder out = new StringBuilder();
         out.append("curator ").append(fleet.curator().pdt().stats()).append(' ').append(fleet.curator().content().stats())
@@ -687,6 +697,17 @@ public final class Composition {
             for (TreeFetch fetch : reader.swarm().fetcher().inFlight().values()) {
                 out.append(" trace=").append(fetch.trace());
             }
+            // the swarm's own sessions (a reader's per-attempt fetches), and the links each peer holds
+            for (TreeFetch fetch : reader.content().activeTreeFetches()) {
+                out.append(" session=").append(fetch.trace());
+            }
+        }
+        for (Peer peer : allPeers()) {
+            out.append("; ").append(peer.name()).append(" links=").append(peer.node().connectionSchemes())
+                    .append(" members=").append(peer.runtime().membership().allMembers().size())
+                    .append(" seedLinks=").append(peer.node().seedLinkStats())
+                    .append(" dtls=").append(peer.dtlsCounters())
+                    .append(" loop=").append(peer.node().loopStats());
         }
         return out.toString();
     }

@@ -208,20 +208,25 @@ public final class RemoteAction {
         // write so no result can slip between the write and the watch; delivery
         // is at-least-once, which the correlation check tolerates.
         ConcurrentLinkedQueue<Object> observed = new ConcurrentLinkedQueue<>();
+        // A result observed signals the waiter at once (srad/agentspaces-event-loop.md §10.35); the caller's timeout is
+        // real time, on the system's time source (EL-C-08). It slept between looks.
+        ai.badmonkey.agentspaces.common.time.ChangeSignal arrived = new ai.badmonkey.agentspaces.common.time.ChangeSignal(
+                ai.badmonkey.agentspaces.common.time.TimeSource.system());
         Template<?> resultTemplate = Template.of(outputType);
         // Entries equal to one already present are not answers to this request;
         // remember how many of each existed before the write (a multiset), so
         // the readAll backstop cannot resurrect a stale result.
         List<Object> baseline = new ArrayList<>(resultSpace.readAll(resultTemplate, 1_000));
-        Subscription subscription = subscribeResults(observed);
+        Subscription subscription = subscribeResults(observed, arrived);
         ai.badmonkey.agentspaces.api.space.EntryHandle written = null;
         try {
             written = tags.isEmpty() ? taskSpace.write(input, writeLease) : taskSpace.write(input, writeLease, tags);
-            // The caller's timeout, waited out with real sleeps: on the system's time source (EL-C-08).
+            // The caller's timeout, on the system's time source (EL-C-08).
             long deadline = ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos() + timeout.toNanos();
             // The poll backstop backs off from 100 ms to 2 s (review §7.5, A5); a subscription event resets it.
             long backoffMillis = 100;
             while (ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos() < deadline) {
+                long seen = arrived.seen(); // before the look: a result observed meanwhile ends the wait at once
                 Object event;
                 while ((event = observed.poll()) != null) {
                     if (correlation.matches(input, event)) {
@@ -239,7 +244,13 @@ public final class RemoteAction {
                     }
                 }
                 long remaining = Math.max(1, (deadline - ai.badmonkey.agentspaces.common.time.TimeSource.system().monoNanos()) / 1_000_000);
-                sleep(Duration.ofMillis(Math.min(backoffMillis, remaining)));
+                try {
+                    arrived.await(seen, ai.badmonkey.agentspaces.common.time.Waits.deadline(arrived.time(),
+                            Duration.ofMillis(Math.min(backoffMillis, remaining))));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
                 backoffMillis = observed.isEmpty() ? Math.min(backoffMillis * 2, 2_000) : 100;
             }
             if (onTimeout == OnTimeout.WITHDRAW && stillOffered(written.entryId())) {
@@ -275,11 +286,13 @@ public final class RemoteAction {
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private Subscription subscribeResults(ConcurrentLinkedQueue<Object> observed) {
+    private Subscription subscribeResults(ConcurrentLinkedQueue<Object> observed,
+                                          ai.badmonkey.agentspaces.common.time.ChangeSignal arrived) {
         return resultSpace.notify((Template) Template.of(outputType), event -> {
             SpaceEvent<?> spaceEvent = (SpaceEvent<?>) event;
             if (spaceEvent.kind() == SpaceEvent.Kind.WRITTEN) {
                 observed.add(spaceEvent.entry());
+                arrived.run();
             }
         }, Lease.of(Duration.ofMinutes(10)));
     }
@@ -313,14 +326,6 @@ public final class RemoteAction {
             }
         }
         return fresh;
-    }
-
-    private static void sleep(Duration duration) {
-        try {
-            Thread.sleep(duration.toMillis());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
     }
 
     @Override

@@ -1260,6 +1260,8 @@ public final class GoldenVectors {
         AgentCard uiCard = actionCard.withUi(exampleUi());
         require(codec.toBytes(uiCard.withUi(null)).length == codec.toBytes(actionCard).length, "a card without ui keeps its bytes");
         json.append(field("agent_card_ui_cbor", hex.formatHex(codec.toBytes(uiCard))));
+        // v0.1.38 (srad/cards.md §3.9, CA-C-05): the same card with threads appended last, and what a reader refuses.
+        json.append(threadVectors(codec, hex, uiCard));
         // v0.1.28 (ISSUE-AppHost, SPEC §6.1a.4): an AppCard with a host group appended last; the same bytes the api
         // module pins in src/test/resources/vectors/app_card_host_cbor.hex (AppCardHostTest).
         //   app_card_host_cbor  the card with host {url, port, hostAgent, path, signOn, publishedBy, publishedAt, status}
@@ -1760,7 +1762,67 @@ public final class GoldenVectors {
                         @JsonInclude(JsonInclude.Include.NON_NULL) List<ai.badmonkey.agentspaces.api.ad.CardAction> actions,
                         @JsonInclude(JsonInclude.Include.NON_NULL) Object agentCertificate,
                         @JsonInclude(JsonInclude.Include.NON_NULL) ai.badmonkey.agentspaces.api.ad.UiDeclaration ui,
-                        @JsonInclude(JsonInclude.Include.NON_NULL) RawSpill spill) {
+                        @JsonInclude(JsonInclude.Include.NON_NULL) RawSpill spill,
+                        @JsonInclude(JsonInclude.Include.NON_NULL) List<RawThread> threads) {
+    }
+
+    /** An unchecked mirror of ChatThread (v0.1.38). */
+    record RawThread(String space, String key, String scope) {
+    }
+
+    /**
+     * v0.1.38 (SPEC §6.1; srad/cards.md §3.9, decision D12 of revision 3): an AgentCard's threads.
+     *   agent_card_threads_cbor              agent_card_ui_cbor's card with threads [main tree, agent-research exact,
+     *                                        findings all] appended last
+     *   adv_agent_card_threads_scope_cbor    a scope outside exact, tree, all
+     *   adv_agent_card_threads_all_key_cbor  scope all with a key
+     *   adv_agent_card_threads_key_cbor      scope exact with an empty key
+     *   adv_agent_card_threads_count_cbor    seventeen threads
+     *   adv_agent_card_threads_twice_cbor    one thread twice
+     *   adv_agent_card_threads_empty_cbor    an empty threads list, which a writer omits
+     * A card without threads keeps its v0.1.37 bytes; each refusal is undecodable by the strict reader.
+     */
+    private static String threadVectors(CborCodec codec, HexFormat hex, AgentCard base) {
+        assertSameNames(ai.badmonkey.agentspaces.api.ad.ChatThread.class, RawThread.class);
+        StringBuilder json = new StringBuilder();
+        AgentCard card = base.withThreads(List.of(
+                new ai.badmonkey.agentspaces.api.ad.ChatThread("conversations", "main", ai.badmonkey.agentspaces.api.ad.ChatThread.TREE),
+                new ai.badmonkey.agentspaces.api.ad.ChatThread("conversations", "agent-research", ai.badmonkey.agentspaces.api.ad.ChatThread.EXACT),
+                new ai.badmonkey.agentspaces.api.ad.ChatThread("findings", "", ai.badmonkey.agentspaces.api.ad.ChatThread.ALL)));
+        require(Arrays.equals(codec.toBytes(card.withThreads(List.of())), codec.toBytes(base)), "a card without threads keeps its bytes");
+        require(codec.fromWire(codec.toBytes(card), AgentCard.class).equals(card), "the card with threads decodes to itself");
+        json.append(field("agent_card_threads_cbor", hex.formatHex(codec.toBytes(card))));
+        RawThread main = new RawThread("conversations", "main", "tree");
+        List<RawThread> seventeen = new java.util.ArrayList<>();
+        for (int i = 0; i < 17; i++) {
+            seventeen.add(new RawThread("conversations", "t-" + i, "exact"));
+        }
+        Map<String, Object> refusals = new java.util.LinkedHashMap<>();
+        refusals.put("adv_agent_card_threads_scope_cbor", rawCard(base, List.of(new RawThread("conversations", "main", "some"))));
+        refusals.put("adv_agent_card_threads_all_key_cbor", rawCard(base, List.of(new RawThread("conversations", "main", "all"))));
+        refusals.put("adv_agent_card_threads_key_cbor", rawCard(base, List.of(new RawThread("conversations", "", "exact"))));
+        refusals.put("adv_agent_card_threads_count_cbor", rawCard(base, seventeen));
+        refusals.put("adv_agent_card_threads_twice_cbor", rawCard(base, List.of(main, main)));
+        refusals.put("adv_agent_card_threads_empty_cbor", rawCard(base, List.of()));
+        for (Map.Entry<String, Object> refusal : refusals.entrySet()) {
+            byte[] bytes = codec.toBytes(refusal.getValue());
+            boolean refused;
+            try {
+                codec.fromWire(bytes, AgentCard.class);
+                refused = false;
+            } catch (RuntimeException expected) {
+                refused = true;
+            }
+            require(refused, refusal.getKey() + " is undecodable");
+            json.append(field(refusal.getKey(), hex.formatHex(bytes)));
+        }
+        return json.toString();
+    }
+
+    /** The card as an unchecked mirror with the given threads. */
+    private static RawAgentCard rawCard(AgentCard c, List<RawThread> threads) {
+        return new RawAgentCard(c.id(), c.issuer(), c.group(), c.issued(), c.ttl(), c.agent(), c.description(), c.goals(), c.consumes(),
+                c.produces(), c.costHints(), c.spaceBindings(), c.agentPublicKey(), c.actions(), c.agentCertificate(), c.ui(), null, threads);
     }
 
     /** The content root of a parts document over 65,536-byte pieces, as the content swarm computes it. */
@@ -1899,7 +1961,7 @@ public final class GoldenVectors {
                 researcherStub.group(), researcherStub.issued(), researcherStub.ttl(), researcherStub.agent(),
                 researcherStub.description(), researcherStub.goals(), researcherStub.consumes(), researcherStub.produces(),
                 researcherStub.costHints(), researcherStub.spaceBindings(), null, List.of(), null, null,
-                new RawSpill(researcherStub.spill().root(), researcherStub.spill().size(), researcherStub.spill().parts())));
+                new RawSpill(researcherStub.spill().root(), researcherStub.spill().size(), researcherStub.spill().parts()), null));
         for (Map.Entry<String, Object> refusal : refusals.entrySet()) {
             byte[] bytes = codec.toBytes(refusal.getValue());
             Class<?> type = refusal.getValue() instanceof RawAgentCard ? AgentCard.class : ai.badmonkey.agentspaces.api.ad.AppCard.class;

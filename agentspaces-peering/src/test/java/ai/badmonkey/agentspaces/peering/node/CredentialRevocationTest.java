@@ -170,4 +170,32 @@ class CredentialRevocationTest {
                 .as("the revoked peer's ad stops here").isFalse();
         assertThat(node.forwardsPeerAd(founder.revocations(), selfAd.apply(bystander))).isTrue();
     }
+
+    /**
+     * The idle profile of §10.47: the gossip bus hands one peers-stream item to its handler and then to its forward
+     * filter, and each verified the advertisement's signature. The same bytes are verified once.
+     */
+    @Test
+    void aPeerAdItemIsVerifiedOnceForItsHandlerAndItsForwardFilter() throws Exception {
+        GroupAdvertisement open = group("zVerifyOnce", GroupAdvertisement.MembershipPolicy.OPEN);
+        GroupRuntime founder = join(founderId, "f", 1, open, Map.of());
+        PeerIdentity peer = PeerIdentity.generate();
+        ai.badmonkey.agentspaces.common.codec.CborCodec codec =
+                ai.badmonkey.agentspaces.common.codec.CborCodec.defaultCodec();
+        byte[] adBytes = codec.toBytes(new ai.badmonkey.agentspaces.api.ad.PeerAdvertisement(
+                "aspace://" + open.group().value() + "/peer/" + peer.peerId().value(),
+                peer.peerId(), open.group(), clock.instant(), Duration.ofMinutes(10),
+                List.of(new ai.badmonkey.agentspaces.api.ad.PeerAdvertisement.Endpoint("mem", "x", 0)),
+                java.util.Set.of(), Map.of()));
+        byte[] payload = codec.toBytes(new PeerNode.SignedPeerAd(adBytes, peer.rawPublicKey(), peer.sign(adBytes)));
+        PeerNode node = nodes.get(0);
+        long before = node.peerAdVerifications();
+        assertThat(node.verifiedPeerAd(payload)).isPresent(); // the handler
+        assertThat(node.forwardsPeerAd(founder.revocations(), payload)).isTrue(); // the forward filter
+        assertThat(node.peerAdVerifications() - before).as("one signature check for one item").isEqualTo(1);
+        byte[] forged = payload.clone();
+        forged[forged.length - 1] ^= 1;
+        assertThat(node.verifiedPeerAd(forged)).as("other bytes are verified on their own").isEmpty();
+        assertThat(node.peerAdVerifications() - before).isEqualTo(2);
+    }
 }

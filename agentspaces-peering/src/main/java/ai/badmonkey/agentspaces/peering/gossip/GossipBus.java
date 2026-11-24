@@ -1911,6 +1911,27 @@ public final class GossipBus {
      * @param digest the asker's digests
      */
     public void onDigest(PeerId from, Bodies.Digest digest) {
+        onDigest(from, digest, false);
+    }
+
+    /**
+     * Handles an inbound DIGEST, as {@link #onDigest(PeerId, Bodies.Digest)}; with {@code displacedOnly} as a dial-only
+     * member handles one that reached it relayed or from a member other than its seed (SPEC v0.1.37 §9.4): it answers
+     * only for the streams whose state holds a displaced claim made here ({@link ReconcilableState#holdsDisplaced()}),
+     * by the text form, with only those entries ({@link ReconcilableState#displacedFor}); every other part of the body
+     * is ignored and counted ({@link #digestsIgnored()}). No member can so draw this member's whole state through its
+     * seed, and a winner's targeted round toward it still brings the displaced completion. The per-sender rate limit
+     * the node applies to every frame bounds these answers as it bounds any.
+     *
+     * @param from          the asking peer
+     * @param digest        the asker's digests
+     * @param displacedOnly whether to answer for displaced entries alone
+     */
+    public void onDigest(PeerId from, Bodies.Digest digest, boolean displacedOnly) {
+        if (displacedOnly) {
+            onDigestDisplacedOnly(from, digest);
+            return;
+        }
         if (digest.carriesAudit() && !audit.enabled()) {
             audit.refuse(from, null, "lacks-hint");
             return;
@@ -1951,6 +1972,107 @@ public final class GossipBus {
             return;
         }
         answerPull(from, digest);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong digestsIgnored = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong displacedDigestAnswers =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * {@code DIGEST}s a dial-only member ignored because they reached it relayed or from a member other than its seed
+     * and named nothing it holds displaced (SPEC v0.1.37 §9.4).
+     *
+     * @return the count
+     */
+    public long digestsIgnored() {
+        return digestsIgnored.get();
+    }
+
+    /**
+     * Answers ({@code DIGEST} asking for text digests, or {@code PULL_RESP}) a dial-only member gave a relayed or
+     * another member's {@code DIGEST}, each carrying its displaced entries alone (SPEC v0.1.37 §9.4).
+     *
+     * @return the count
+     */
+    public long displacedDigestAnswers() {
+        return displacedDigestAnswers.get();
+    }
+
+    /**
+     * A dial-only member's handling of a relayed or another member's {@code DIGEST} (SPEC v0.1.37 §9.4). An opening of
+     * hashes is answered with {@code want} for the streams that hold a displaced claim and differ, by the text form
+     * even toward an auditing member, so the winner sends its text digests; text digests draw a {@code PULL_RESP} with
+     * those entries alone. A {@code want} for a round this member opened is answered as ever. Anything else
+     * ({@code tree}, {@code ids}, a stream with nothing displaced) is ignored and counted.
+     */
+    private void onDigestDisplacedOnly(PeerId from, Bodies.Digest digest) {
+        boolean answered = false;
+        if (digest.want() != null && !digest.want().isEmpty() && expectedPullPartners.contains(from)) {
+            // A round this member opened (its own anti-entropy, which goes to its seed): answered as ever.
+            wantsReceived.incrementAndGet();
+            wantedStreamsReceived.addAndGet(digest.want().size());
+            Map<String, byte[]> digests = fullDigests(digest.want());
+            if (!digests.isEmpty()) {
+                digestTextBytesSent.addAndGet(byteCount(digests));
+                sender.sendDigest(from, new Bodies.Digest(digests));
+                answered = true;
+            }
+        }
+        if (digest.hashes() != null) {
+            List<String> want = new ArrayList<>();
+            for (Map.Entry<String, byte[]> e : new java.util.TreeMap<>(digest.hashes()).entrySet()) {
+                ReconcilableState state = states.get(e.getKey());
+                if (state != null && e.getValue() != null && state.holdsDisplaced()
+                        && !java.util.Arrays.equals(state.digestHash(), e.getValue())) {
+                    want.add(e.getKey());
+                }
+            }
+            if (!want.isEmpty()) {
+                wantsSent.incrementAndGet();
+                sender.sendDigest(from, new Bodies.Digest(null, null, want, null, null, null, null));
+                displacedDigestAnswers.incrementAndGet();
+                answered = true;
+            }
+        }
+        Map<String, byte[]> texts = digest.digests() == null ? Map.of() : digest.digests();
+        if (!texts.isEmpty()) {
+            digestTextBytesReceived.addAndGet(byteCount(texts));
+            Long asked = digest.budget();
+            long cap = asked == null ? Long.MAX_VALUE : Math.min(asked, TrieAudit.BUDGET_CEILING);
+            Map<String, byte[]> deltas = new HashMap<>();
+            Map<String, Long> remainder = asked == null ? null : new java.util.TreeMap<>();
+            long used = PULL_RESP_BASE;
+            for (String streamId : answerOrder(texts.keySet(), java.util.Set.of())) {
+                ReconcilableState state = states.get(streamId);
+                if (state == null || !state.holdsDisplaced()) {
+                    if (remainder != null) {
+                        remainder.put(streamId, 0L);
+                    }
+                    continue;
+                }
+                long room = cap == Long.MAX_VALUE ? Long.MAX_VALUE : cap - used - streamOverhead(streamId);
+                ReconcilableState.Bounded answer = state.displacedFor(texts.get(streamId), room, deltas.isEmpty());
+                if (remainder != null) {
+                    remainder.put(streamId, Math.max(0, answer.left()));
+                }
+                if (answer.delta().length > 0) {
+                    deltas.put(streamId, answer.delta());
+                    used += answer.delta().length + streamOverhead(streamId);
+                }
+            }
+            if (!deltas.isEmpty()) {
+                markTraffic();
+                pullRespSent.incrementAndGet();
+                pullRespDeltasSent.addAndGet(deltas.size());
+                pullRespBytesSent.addAndGet(byteCount(deltas));
+                displacedDigestAnswers.incrementAndGet();
+                sender.sendPullResp(from, new Bodies.PullResp(deltas, remainder));
+                answered = true;
+            }
+        }
+        if (!answered) {
+            digestsIgnored.incrementAndGet();
+        }
     }
 
     /** Bytes of a {@code PULL_RESP} body beside its deltas: the record's field names and its map and list heads. */
@@ -2848,24 +2970,34 @@ public final class GossipBus {
      * A forwarder along the tree pushes only to dial-only members it is linked to, which nobody
      * else can reach: every other hint-less member had its chance at the origin and gets the rest
      * by anti-entropy, where every tree member pushing to every one of them cost each of them
-     * four copies of every item. A push that could not leave frees its slot for the next pick.
+     * four copies of every item. The origin pushes to those linked dial-only members too, all of
+     * them and outside the slots, for the same reason: when they took the slots by chance, a seed
+     * with more dial-only clients than slots reached some of them with its own writes only by
+     * anti-entropy (the live mixed-language run, srad/agentspaces-event-loop.md §10.49). A push
+     * that could not leave frees its slot for the next pick.
      */
     private void pushToPlain(List<PeerId> plain, Bodies.Rumor rumor, boolean origin) {
         if (plain.isEmpty()) {
             return;
         }
         long now = clock.getAsLong();
-        if (!origin) {
-            for (PeerId peer : plain) {
-                if (dialOnly.test(peer) && linked.test(peer)) {
-                    push(peer, rumor, now);
-                }
+        java.util.Set<PeerId> chosen = new java.util.HashSet<>();
+        for (PeerId peer : plain) {
+            if (dialOnly.test(peer) && linked.test(peer)) {
+                push(peer, rumor, now);
+                chosen.add(peer);
             }
+        }
+        if (!origin) {
             return;
         }
         List<PeerId> strong = new ArrayList<>();
-        List<PeerId> weak = new ArrayList<>(plain);
+        List<PeerId> weak = new ArrayList<>();
         for (PeerId peer : plain) {
+            if (chosen.contains(peer)) {
+                continue;
+            }
+            weak.add(peer);
             Long failed = plainFailed.get(peer);
             if (linked.test(peer) && (failed == null || now - failed > PLAIN_FAILURE.toMillis())) {
                 strong.add(peer);
@@ -2873,7 +3005,6 @@ public final class GossipBus {
         }
         weak.sort(java.util.Comparator.comparingLong(peer -> plainServed.getOrDefault(peer, -1L)));
         int sent = 0;
-        java.util.Set<PeerId> chosen = new java.util.HashSet<>();
         int strongSlots = Math.max(0, fanout - 1);
         for (PeerId peer : strong) {
             if (sent >= strongSlots) {

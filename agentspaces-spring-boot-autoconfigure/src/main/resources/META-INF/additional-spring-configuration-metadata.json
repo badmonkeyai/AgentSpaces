@@ -799,6 +799,91 @@
       "type": "java.util.Map<java.lang.String,java.lang.String>",
       "description": "Expert overrides of the TTL floor, key to reason (EL-E-04): a key named here passes whatever its value, and the node logs the reason once at start. Keys are the property names (agentspaces.relay.path-ttl) or the binder's (binder.<AgentClass>.<method>.<member>); write a dotted key in brackets, agentspaces.ttl.expert-overrides[agentspaces.relay.path-ttl]=<reason>.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Ttl"
+    },
+    {
+      "name": "agentspaces.coalesce-millis",
+      "type": "java.lang.Long",
+      "description": "The frame coalescing window (ms): rumors and pipe frames to one peer batch into one signed frame, flushed by one timer when the window closes (EL-B-01); 0 turns it off.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
+      "defaultValue": 20
+    },
+    {
+      "name": "agentspaces.watchdog.period-millis",
+      "type": "java.lang.Long",
+      "description": "The watchdog's tick (ms), per process (srad/agentspaces-event-loop.md §3.9, decision 4, EL-Q-MNT-02). Unset: 2,000, or the same system property.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.grace-millis",
+      "type": "java.lang.Long",
+      "description": "The missed-fire and missed-wake grace (ms), per process. Unset: 250.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.slow-millis",
+      "type": "java.lang.Long",
+      "description": "A loop run longer than this (ms) is counted and logged as slow (EL-X-10), per process. Unset: 100.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.wedge-millis",
+      "type": "java.lang.Long",
+      "description": "A loop run longer than this (ms) is wedged: the watchdog fences its participant and re-initialises the loop (EL-H-03), per process. Unset: 5,000.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.escalate-after",
+      "type": "java.lang.Integer",
+      "description": "Re-initialisations within escalate-window-millis that escalate (EL-H-08), per process. Unset: 3.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.escalate-window-millis",
+      "type": "java.lang.Long",
+      "description": "The escalation window (ms), per process. Unset: 600,000.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.fence-limit-millis",
+      "type": "java.lang.Long",
+      "description": "How long a participant may stay fenced (ms) before the loop escalates, per process. Unset: 120,000.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.watchdog.connector-hold-limit",
+      "type": "java.time.Duration",
+      "description": "The hold limit of a connector's held operation (§10.16, §10.35): an AssetInvocation held this long is taken as hung, its claim is no longer renewed and it lapses to another replica. Unset: no limit. Hosts that build a ConnectorRuntime apply it.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog"
+    },
+    {
+      "name": "agentspaces.loop.pool-max",
+      "type": "java.lang.Integer",
+      "description": "The elastic loop pool's most threads, per process (decision 2, EL-O-02). Unset or 0: min(8, max(2, cores / 2)).",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Loop"
+    },
+    {
+      "name": "agentspaces.loop.pool-idle-millis",
+      "type": "java.lang.Long",
+      "description": "A loop-pool thread idle this long (ms) ends, down to the min (EL-O-03), per process. Unset: 60,000.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Loop"
+    },
+    {
+      "name": "agentspaces.loop.grow-lateness-millis",
+      "type": "java.lang.Long",
+      "description": "Runs waiting over this (ms) at p99 for two watchdog ticks grow the pool by one thread (EL-O-03), per process. Unset: 20.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Loop"
+    },
+    {
+      "name": "agentspaces.loop.stretch-lateness-millis",
+      "type": "java.lang.Long",
+      "description": "At the pool's max, lateness over this (ms) for three ticks stretches local periods after every wire-visible timer is refreshed (EL-O-04 to EL-O-06), per process. Unset: 100.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Loop"
+    },
+    {
+      "name": "agentspaces.loop.stretch-cap",
+      "type": "java.lang.Integer",
+      "description": "The stretch's cap, a factor of 1 to 4 that never passes a SPEC floor (EL-O-04), per process. Unset: 4.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Loop"
     }
   ],
   "hints": [

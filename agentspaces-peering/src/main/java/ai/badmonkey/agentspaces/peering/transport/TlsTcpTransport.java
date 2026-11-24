@@ -296,7 +296,7 @@ public final class TlsTcpTransport implements Transport {
                         return;
                     }
                     byte[] frame = new byte[length];
-                    in.readFully(frame);
+                    TcpTransport.readFrame(in, frame, progressListener);
                     if (!pump.offer(frame)) {
                         return; // the receiver failed and the connection is closing
                     }
@@ -320,6 +320,15 @@ public final class TlsTcpTransport implements Transport {
         @Override
         public void onClose(Runnable listener) {
             this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        /** Bytes of a frame not yet whole (SPEC v0.1.37 §9.4): told as each piece of one lands. */
+        private volatile Runnable progressListener = () -> {
+        };
+
+        @Override
+        public void onProgress(Runnable listener) {
+            this.progressListener = Objects.requireNonNull(listener, "listener");
         }
 
         private void notifyClosed() {

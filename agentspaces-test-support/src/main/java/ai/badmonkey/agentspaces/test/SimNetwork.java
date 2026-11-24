@@ -401,6 +401,30 @@ public final class SimNetwork {
         return false;
     }
 
+    /**
+     * Tells the receiving end of every live connection from {@code from} to {@code to} that bytes of a frame arrived
+     * that is not yet whole ({@code TransportConnection#onProgress}), as a large frame trickling over a slow link does.
+     * Nothing is delivered. False when no connection is live in that direction.
+     *
+     * @param from the sending node
+     * @param to   the receiving node
+     * @return whether a connection was told
+     */
+    public boolean progress(String from, String to) {
+        Set<SimConnection> connections = live.get(directed(from, to));
+        boolean told = false;
+        if (connections != null) {
+            for (SimConnection c : connections) {
+                SimConnection target = c.peer;
+                if (!c.closed && target != null && !target.closed) {
+                    target.progressListener.run();
+                    told = true;
+                }
+            }
+        }
+        return told;
+    }
+
     /** Delivers a frame that passed the filters, unless the older {@link #hold} queues its direction. */
     private void forward(String key, SimConnection target, byte[] wire) {
         if (holding.contains(key)) {
@@ -529,6 +553,8 @@ public final class SimNetwork {
         };
         private volatile Runnable closeListener = () -> {
         };
+        private volatile Runnable progressListener = () -> {
+        };
         private volatile boolean closed;
 
         private SimConnection(String localNode, String remoteNode) {
@@ -585,6 +611,11 @@ public final class SimNetwork {
         @Override
         public void onClose(Runnable listener) {
             this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        @Override
+        public void onProgress(Runnable listener) {
+            this.progressListener = Objects.requireNonNull(listener, "listener");
         }
 
         @Override

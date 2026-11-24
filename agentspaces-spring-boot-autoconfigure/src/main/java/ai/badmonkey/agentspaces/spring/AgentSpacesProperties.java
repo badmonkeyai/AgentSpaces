@@ -1205,9 +1205,8 @@ public class AgentSpacesProperties {
 
     /**
      * The node loop's watchdog ({@code agentspaces.watchdog.*}, srad/agentspaces-event-loop.md §3.9, decision 4). Its
-     * period and bounds are per process and read from the {@code agentspaces.watchdog.*-millis} system properties, as
-     * are the elastic loop pool's and the stretch's ({@code agentspaces.loop.pool-max}, {@code .pool-idle-millis},
-     * {@code .grow-lateness-millis}, {@code .stretch-lateness-millis}, {@code .stretch-cap}; decision 2, EL-O-10).
+     * period and bounds are per process: set here (or as the same system properties), they apply to the process's
+     * watchdog when the node is built (§10.35, EL-O-10), as {@link Loop}'s do to the loop pool.
      */
     public static class Watchdog {
         /**
@@ -1225,6 +1224,93 @@ public class AgentSpacesProperties {
          * while it runs. The watchdog names a handler held past a minute either way.
          */
         private java.time.Duration holdLimit;
+
+        /**
+         * The hold limit of a connector's held operation ({@code ConnectorRuntime.holdLimit}, §10.16, §10.35): an
+         * {@code AssetInvocation} held this long is taken as hung, its claim is no longer renewed and it lapses to
+         * another replica. Unset (the default): no limit. Hosts that build a {@code ConnectorRuntime} apply it
+         * with {@code runtime.holdLimit(properties.getWatchdog().getConnectorHoldLimit())}.
+         */
+        private java.time.Duration connectorHoldLimit;
+
+        /** The watchdog's tick (ms); unset, 2,000 (decision 4). Per process (§7.2, EL-O-10). */
+        private Long periodMillis;
+        /** The missed-fire and missed-wake grace (ms); unset, 250. Per process. */
+        private Long graceMillis;
+        /** A run over this (ms) is slow (EL-X-10); unset, 100. Per process. */
+        private Long slowMillis;
+        /** A run over this (ms) is wedged; unset, 5,000. Per process. */
+        private Long wedgeMillis;
+        /** Re-initialisations within {@code escalate-window-millis} that escalate; unset, 3. Per process. */
+        private Integer escalateAfter;
+        /** The escalation window (ms); unset, 600,000. Per process. */
+        private Long escalateWindowMillis;
+        /** How long a participant may stay fenced (ms) before the loop escalates; unset, 120,000. Per process. */
+        private Long fenceLimitMillis;
+
+        public java.time.Duration getConnectorHoldLimit() {
+            return connectorHoldLimit;
+        }
+
+        public void setConnectorHoldLimit(java.time.Duration connectorHoldLimit) {
+            this.connectorHoldLimit = connectorHoldLimit;
+        }
+
+        public Long getPeriodMillis() {
+            return periodMillis;
+        }
+
+        public void setPeriodMillis(Long periodMillis) {
+            this.periodMillis = periodMillis;
+        }
+
+        public Long getGraceMillis() {
+            return graceMillis;
+        }
+
+        public void setGraceMillis(Long graceMillis) {
+            this.graceMillis = graceMillis;
+        }
+
+        public Long getSlowMillis() {
+            return slowMillis;
+        }
+
+        public void setSlowMillis(Long slowMillis) {
+            this.slowMillis = slowMillis;
+        }
+
+        public Long getWedgeMillis() {
+            return wedgeMillis;
+        }
+
+        public void setWedgeMillis(Long wedgeMillis) {
+            this.wedgeMillis = wedgeMillis;
+        }
+
+        public Integer getEscalateAfter() {
+            return escalateAfter;
+        }
+
+        public void setEscalateAfter(Integer escalateAfter) {
+            this.escalateAfter = escalateAfter;
+        }
+
+        public Long getEscalateWindowMillis() {
+            return escalateWindowMillis;
+        }
+
+        public void setEscalateWindowMillis(Long escalateWindowMillis) {
+            this.escalateWindowMillis = escalateWindowMillis;
+        }
+
+        public Long getFenceLimitMillis() {
+            return fenceLimitMillis;
+        }
+
+        public void setFenceLimitMillis(Long fenceLimitMillis) {
+            this.fenceLimitMillis = fenceLimitMillis;
+        }
 
         public String getEscalation() {
             return escalation;
@@ -1245,6 +1331,75 @@ public class AgentSpacesProperties {
 
     public void setHealth(Health health) {
         this.health = health;
+    }
+
+    /** The elastic loop pool and the stretch ({@code agentspaces.loop.*}, decision 2, EL-O-10). */
+    private Loop loop = new Loop();
+
+    public Loop getLoop() {
+        return loop;
+    }
+
+    public void setLoop(Loop loop) {
+        this.loop = loop;
+    }
+
+    /**
+     * The elastic loop pool and the stretch ({@code agentspaces.loop.*}, srad/agentspaces-event-loop.md §3.10,
+     * decision 2, EL-O-10): per process, applied to the process's pool when the node is built (§10.35). Unset keys
+     * keep the defaults (or the same system properties).
+     */
+    public static class Loop {
+        /** The pool's most threads; unset or 0, min(8, max(2, cores / 2)). */
+        private Integer poolMax;
+        /** A thread idle this long (ms) ends; unset, 60,000. */
+        private Long poolIdleMillis;
+        /** Runs waiting over this (ms) at p99 for two ticks grow the pool; unset, 20. */
+        private Long growLatenessMillis;
+        /** At the pool's max, lateness over this (ms) for three ticks stretches local periods; unset, 100. */
+        private Long stretchLatenessMillis;
+        /** The stretch's cap, a factor of 1 to 4; unset, 4. */
+        private Integer stretchCap;
+
+        public Integer getPoolMax() {
+            return poolMax;
+        }
+
+        public void setPoolMax(Integer poolMax) {
+            this.poolMax = poolMax;
+        }
+
+        public Long getPoolIdleMillis() {
+            return poolIdleMillis;
+        }
+
+        public void setPoolIdleMillis(Long poolIdleMillis) {
+            this.poolIdleMillis = poolIdleMillis;
+        }
+
+        public Long getGrowLatenessMillis() {
+            return growLatenessMillis;
+        }
+
+        public void setGrowLatenessMillis(Long growLatenessMillis) {
+            this.growLatenessMillis = growLatenessMillis;
+        }
+
+        public Long getStretchLatenessMillis() {
+            return stretchLatenessMillis;
+        }
+
+        public void setStretchLatenessMillis(Long stretchLatenessMillis) {
+            this.stretchLatenessMillis = stretchLatenessMillis;
+        }
+
+        public Integer getStretchCap() {
+            return stretchCap;
+        }
+
+        public void setStretchCap(Integer stretchCap) {
+            this.stretchCap = stretchCap;
+        }
     }
 
     /**
@@ -2542,8 +2697,27 @@ public class AgentSpacesProperties {
             }
         }
 
-        /** The QUIC listener block ({@code agentspaces.transport.quic.*}); needs agentspaces-transport-quic. */
-        public Quic getQuic() {
+        /**
+         * The QUIC listener block ({@code agentspaces.transport.quic.*}), as its 0.6.0 type: kept for binary
+         * compatibility, since code compiled against 0.6.0 links to {@code Listener getQuic()}. The object is the
+         * {@link Quic} block, dial timeout and all.
+         *
+         * @return the block
+         * @deprecated since 0.7.0: read {@link #quicBlock()}, which returns the block as a {@link Quic}
+         */
+        @Deprecated(since = "0.7.0")
+        public Listener getQuic() {
+            return quic;
+        }
+
+        /**
+         * The QUIC listener block ({@code agentspaces.transport.quic.*}) with its dial timeout; needs
+         * agentspaces-transport-quic. Not a bean getter, so binders still see one property, {@code quic}, typed by
+         * its setter.
+         *
+         * @return the block
+         */
+        public Quic quicBlock() {
             return quic;
         }
 

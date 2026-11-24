@@ -189,6 +189,16 @@ class DtlsHardeningTest {
                 .isBetween(1, (int) counters.helloVerifyRequestsSent());
     }
 
+    /**
+     * A client socket bound on the loopback address before it connects there. A socket bound on the wildcard address
+     * takes its loopback address only at connect, and on macOS that late bind failed once with "Address already in
+     * use" while other test JVMs of a parallel build held UDP ports on 127.0.0.1 (close-out gate,
+     * srad/agentspaces-event-loop.md §10.39); bound on 127.0.0.1 first, the kernel picks a port free on that address.
+     */
+    private static DatagramSocket loopbackSocket() throws java.net.SocketException {
+        return new DatagramSocket(new InetSocketAddress("127.0.0.1", 0));
+    }
+
     /** ClientHellos the listener has read: each is either answered or dropped by the rate. */
     private static long seen(DtlsCounters counters) {
         return counters.helloVerifyRequestsSent() + counters.clientHellosDropped();
@@ -201,7 +211,7 @@ class DtlsHardeningTest {
         List<Thread> stallers = new ArrayList<>();
         List<DatagramSocket> sockets = new ArrayList<>();
         for (int i = 0; i < 20; i++) {
-            DatagramSocket socket = new DatagramSocket();
+            DatagramSocket socket = loopbackSocket();
             socket.connect(new InetSocketAddress("127.0.0.1", bound.port()));
             sockets.add(socket);
             // Answers the cookie exchange, then never reads the listener's flight: a stalled handshake.
@@ -265,7 +275,7 @@ class DtlsHardeningTest {
     @Timeout(30)
     void aConformingClientCompletes() throws Exception {
         DtlsTransport.Bound bound = listen(DtlsOptions.defaults());
-        try (DatagramSocket socket = new DatagramSocket()) {
+        try (DatagramSocket socket = loopbackSocket()) {
             socket.connect(new InetSocketAddress("127.0.0.1", bound.port()));
             new DTLSClientProtocol().connect(new PolicyClient(ProtocolVersion.DTLSv12, BcSupport.ALL_SUITES, true),
                     new UDPTransport(socket, 1_200)).close();
@@ -292,7 +302,7 @@ class DtlsHardeningTest {
 
     private void assertHandshakeFails(PolicyClient client) throws Exception {
         DtlsTransport.Bound bound = listen(DtlsOptions.defaults());
-        try (DatagramSocket socket = new DatagramSocket()) {
+        try (DatagramSocket socket = loopbackSocket()) {
             socket.connect(new InetSocketAddress("127.0.0.1", bound.port()));
             assertThatThrownBy(() -> new DTLSClientProtocol().connect(client, new UDPTransport(socket, 1_200)))
                     .isInstanceOf(IOException.class);

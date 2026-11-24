@@ -108,6 +108,20 @@ abstract class FrameConnection implements TransportConnection {
         return closed.get();
     }
 
+    /** Bytes arriving (SPEC v0.1.37 §9.4); a binding that reads raw bytes tells it, the others never do. */
+    private volatile Runnable progressListener = () -> {
+    };
+
+    @Override
+    public final void onProgress(Runnable listener) {
+        this.progressListener = Objects.requireNonNull(listener, "listener");
+    }
+
+    /** Tells the node that bytes arrived on this connection, a frame not yet whole among them. */
+    final void progressed() {
+        progressListener.run();
+    }
+
     /** Hands an inbound frame to the delivery thread. */
     final void deliver(byte[] frame) {
         if (closed.get()) {

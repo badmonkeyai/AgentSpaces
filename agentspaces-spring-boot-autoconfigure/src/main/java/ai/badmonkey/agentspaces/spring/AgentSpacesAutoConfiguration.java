@@ -309,6 +309,81 @@ public class AgentSpacesAutoConfiguration {
         });
     }
 
+    /** Whether the one log of a non-default {@code tick-millis} was written in this process (EL-Q-MNT-02). */
+    private static final java.util.concurrent.atomic.AtomicBoolean TICK_MILLIS_NOTED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Logs once per process what a non-default {@code agentspaces.tick-millis} means since 0.7.0 (EL-Q-MNT-02): a
+     * fleet tuned to a short tick for speed gets nothing for it now, and should be told so rather than guess.
+     *
+     * @param properties the properties
+     * @return whether this call logged
+     */
+    static void resetTickMillisNote() { // for tests
+        TICK_MILLIS_NOTED.set(false);
+    }
+
+    static boolean noteTickMillis(AgentSpacesProperties properties) {
+        if (properties.getTickMillis() == 250 || !TICK_MILLIS_NOTED.compareAndSet(false, true)) {
+            return false;
+        }
+        LOG.log(System.Logger.Level.INFO, "agentspaces.tick-millis=" + properties.getTickMillis() + " is set. Since"
+                + " 0.7.0 it no longer paces the node: the node loop runs each piece of due work at its own deadline,"
+                + " and Raft's election timeout is a fixed 1.25 to 2.25 s. It still sets the step of the deprecated"
+                + " GroupRuntime.onTick adapters and the period startTicking is given; nothing else gets faster or"
+                + " slower (srad/agentspaces-event-loop.md EL-T-02, EL-T-05, EL-Q-MNT-02)");
+        return true;
+    }
+
+    /**
+     * Applies {@code agentspaces.watchdog.*-millis}, {@code .escalate-after} and {@code agentspaces.loop.*} to the
+     * process's watchdog and loop pool (srad/agentspaces-event-loop.md EL-O-10, EL-Q-MNT-02, §10.35): per process, so
+     * set keys replace those bounds on the time source the node runs on; unset keys keep what the source holds (its
+     * defaults, or the same system properties). A bound the watchdog or pool refuses stops the start, naming the key.
+     *
+     * @param properties the properties
+     * @param time       the node's time source
+     */
+    public static void applyProcessBounds(AgentSpacesProperties properties, ai.badmonkey.agentspaces.common.time.TimeSource time) {
+        AgentSpacesProperties.Watchdog w = properties.getWatchdog();
+        if (w.getPeriodMillis() != null || w.getGraceMillis() != null || w.getSlowMillis() != null
+                || w.getWedgeMillis() != null || w.getEscalateAfter() != null || w.getEscalateWindowMillis() != null
+                || w.getFenceLimitMillis() != null) {
+            ai.badmonkey.agentspaces.common.time.Watchdog dog = time.watchdog();
+            ai.badmonkey.agentspaces.common.time.Watchdog.Options o = dog.options();
+            try {
+                dog.options(new ai.badmonkey.agentspaces.common.time.Watchdog.Options(
+                        millis(w.getPeriodMillis(), o.period()), millis(w.getGraceMillis(), o.grace()),
+                        millis(w.getSlowMillis(), o.slow()), millis(w.getWedgeMillis(), o.wedge()),
+                        w.getEscalateAfter() == null ? o.escalateAfter() : w.getEscalateAfter(),
+                        millis(w.getEscalateWindowMillis(), o.escalateWindow()),
+                        millis(w.getFenceLimitMillis(), o.fenceLimit())));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("agentspaces.watchdog: " + e.getMessage(), e);
+            }
+        }
+        AgentSpacesProperties.Loop l = properties.getLoop();
+        ai.badmonkey.agentspaces.common.time.LoopPool pool = time.loopPool();
+        if (pool != null && (l.getPoolMax() != null || l.getPoolIdleMillis() != null || l.getGrowLatenessMillis() != null
+                || l.getStretchLatenessMillis() != null || l.getStretchCap() != null)) {
+            ai.badmonkey.agentspaces.common.time.LoopPool.Options o = pool.options();
+            try {
+                pool.options(new ai.badmonkey.agentspaces.common.time.LoopPool.Options(o.min(),
+                        l.getPoolMax() == null || l.getPoolMax() <= 0 ? o.max() : l.getPoolMax(),
+                        millis(l.getPoolIdleMillis(), o.idle()), millis(l.getGrowLatenessMillis(), o.growLateness()),
+                        o.growTicks(), o.stuck(), millis(l.getStretchLatenessMillis(), o.stretchLateness()),
+                        o.stretchTicks(), o.stretchClear(), l.getStretchCap() == null ? o.stretchCap() : l.getStretchCap()));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("agentspaces.loop: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    private static Duration millis(Long value, Duration fallback) {
+        return value == null ? fallback : Duration.ofMillis(value);
+    }
+
     /**
      * Checks the configured TTLs, leases and expiries against the floor (EL-E-03): each against its own default, which
      * the TTL register lists with its reason, so a default passes silently and a configured value under 60 s warns, or
@@ -319,36 +394,61 @@ public class AgentSpacesAutoConfiguration {
      */
     public static void checkTtls(AgentSpacesProperties properties) {
         ai.badmonkey.agentspaces.common.time.TtlFloor floor = ttlFloor(properties);
+        for (TtlCheck c : ttlChecks(properties)) {
+            floor.check(c.key(), c.value(), c.registeredDefault());
+        }
+    }
+
+    /**
+     * One configured TTL, lease or expiry the floor judges at start: its key, the value configured, and its default.
+     *
+     * @param key               the property
+     * @param value             the configured value, or null when unset
+     * @param registeredDefault the default the TTL register lists
+     */
+    public record TtlCheck(String key, java.time.Duration value, java.time.Duration registeredDefault) {
+    }
+
+    /**
+     * What {@link #checkTtls} judges: every TTL, lease or expiry that is a property of this starter, read from the
+     * properties. Only properties: the member TTL and the peer-advertisement TTL are not properties here (the core's
+     * defaults and floors hold them, {@code TtlRegisterTest}), and the checks of them that compared two constants could
+     * never fire (§10.33, removed in §10.35 under EL-A-04).
+     *
+     * @param properties the properties
+     * @return the checks, in order
+     */
+    public static List<TtlCheck> ttlChecks(AgentSpacesProperties properties) {
         AgentSpacesProperties defaults = new AgentSpacesProperties();
-        floor.check("agentspaces.membership.member-ttl", GroupMembership.Config.defaults().memberTtl(),
-                GroupMembership.MEMBER_TTL_FLOOR);
-        floor.check("agentspaces.peer-ad-ttl", PeerNode.DEFAULT_PEER_AD_TTL, PeerNode.DEFAULT_PEER_AD_TTL);
-        floor.check("agentspaces.content.holding-lease", properties.getContent().getHoldingLease(),
-                defaults.getContent().getHoldingLease());
-        floor.check("agentspaces.relay.path-ttl", properties.getRelay().getPathTtl(), defaults.getRelay().getPathTtl());
-        floor.check("agentspaces.store.lease-default", properties.getStore().getLeaseDefault(),
-                defaults.getStore().getLeaseDefault());
-        floor.check("agentspaces.store.lease-max", properties.getStore().getLeaseMax(),
-                defaults.getStore().getLeaseMax());
-        floor.check("agentspaces.identity.agent-certificate-ttl", properties.getIdentity().getAgentCertificateTtl(),
-                defaults.getIdentity().getAgentCertificateTtl());
+        List<TtlCheck> checks = new ArrayList<>();
+        checks.add(new TtlCheck("agentspaces.content.holding-lease", properties.getContent().getHoldingLease(),
+                defaults.getContent().getHoldingLease()));
+        checks.add(new TtlCheck("agentspaces.relay.path-ttl", properties.getRelay().getPathTtl(),
+                defaults.getRelay().getPathTtl()));
+        checks.add(new TtlCheck("agentspaces.store.lease-default", properties.getStore().getLeaseDefault(),
+                defaults.getStore().getLeaseDefault()));
+        checks.add(new TtlCheck("agentspaces.store.lease-max", properties.getStore().getLeaseMax(),
+                defaults.getStore().getLeaseMax()));
+        checks.add(new TtlCheck("agentspaces.identity.agent-certificate-ttl",
+                properties.getIdentity().getAgentCertificateTtl(), defaults.getIdentity().getAgentCertificateTtl()));
         String actionLease = properties.getEmbabel().getActionLease();
+        java.time.Duration parsed = null;
         if (actionLease != null && !actionLease.isBlank()) {
-            java.time.Duration parsed;
             try {
                 parsed = ai.badmonkey.agentspaces.common.time.Durations.parse(actionLease, false);
             } catch (IllegalArgumentException e) {
                 parsed = null; // the Embabel wiring refuses it, naming the key
             }
-            floor.check("agentspaces.embabel.action-lease", parsed,
-                    ai.badmonkey.agentspaces.common.time.Durations.parse(defaults.getEmbabel().getActionLease(), false));
         }
-        floor.check("agentspaces.a2a.task-lease-millis",
+        checks.add(new TtlCheck("agentspaces.embabel.action-lease", parsed,
+                ai.badmonkey.agentspaces.common.time.Durations.parse(defaults.getEmbabel().getActionLease(), false)));
+        checks.add(new TtlCheck("agentspaces.a2a.task-lease-millis",
                 java.time.Duration.ofMillis(properties.getA2a().getTaskLeaseMillis()),
-                java.time.Duration.ofMillis(defaults.getA2a().getTaskLeaseMillis()));
-        floor.check("agentspaces.a2a.result-lease-millis",
+                java.time.Duration.ofMillis(defaults.getA2a().getTaskLeaseMillis())));
+        checks.add(new TtlCheck("agentspaces.a2a.result-lease-millis",
                 java.time.Duration.ofMillis(properties.getA2a().getResultLeaseMillis()),
-                java.time.Duration.ofMillis(defaults.getA2a().getResultLeaseMillis()));
+                java.time.Duration.ofMillis(defaults.getA2a().getResultLeaseMillis())));
+        return checks;
     }
 
     /**
@@ -459,6 +559,8 @@ public class AgentSpacesAutoConfiguration {
             throw new IllegalStateException(e.getMessage(), e);
         }
         checkTtls(properties); // EL-E-03: a TTL under 60 s warns, or refuses to start under agentspaces.ttl.strict
+        applyProcessBounds(properties, nodeTime(clock)); // EL-O-10: agentspaces.watchdog.*-millis and agentspaces.loop.*
+        noteTickMillis(properties); // EL-Q-MNT-02
         if (properties.getRetirement().getAfter() != null) {
             try {
                 builder.retireAfter(properties.getRetirement().getAfter());
@@ -502,7 +604,7 @@ public class AgentSpacesAutoConfiguration {
         // transport attests with, and may accept CA-rooted revocations.
         AgentSpacesProperties.Transport.Tls tls = properties.getTransport().getTls();
         java.util.function.Supplier<ai.badmonkey.agentspaces.identity.ChannelTrust> caTrust =
-                tlsEnabled || attestingBlock ? caTrust(tls) : null;
+                tlsEnabled || attestingBlock ? caTrust(tls, nodeTime(clock)) : null;
         String validator = tls.getRevocationValidator() == null ? "founder"
                 : tls.getRevocationValidator().trim().toLowerCase();
         if (!validator.equals("founder") && !validator.equals("founder-or-ca")) {
@@ -615,8 +717,8 @@ public class AgentSpacesAutoConfiguration {
      * plan §3), its CRL files re-read every {@code crl-refresh} (SPEC §5.6,
      * v0.1.13); null in the self-signed identity-endorsed mode.
      */
-    private static java.util.function.Supplier<ai.badmonkey.agentspaces.identity.ChannelTrust> caTrust(
-            AgentSpacesProperties.Transport.Tls tls) {
+    static java.util.function.Supplier<ai.badmonkey.agentspaces.identity.ChannelTrust> caTrust(
+            AgentSpacesProperties.Transport.Tls tls, ai.badmonkey.agentspaces.common.time.TimeSource time) {
         if (tls.getTrustStore() == null || tls.getTrustStore().isBlank()) {
             return null;
         }
@@ -630,7 +732,7 @@ public class AgentSpacesAutoConfiguration {
             }
             return new ai.badmonkey.agentspaces.identity.ReloadingChannelTrust(authorities, crlFiles,
                     tls.getCrlRefresh() == null ? Duration.ofMinutes(5) : tls.getCrlRefresh(),
-                    tls.isRevocationStrict(), ai.badmonkey.agentspaces.common.time.TimeSource.system());
+                    tls.isRevocationStrict(), time); // the node's one time source (EL-C-06, §10.35)
         } catch (java.security.GeneralSecurityException e) {
             throw new IllegalStateException("cannot load the TLS trust store or CRLs", e);
         }

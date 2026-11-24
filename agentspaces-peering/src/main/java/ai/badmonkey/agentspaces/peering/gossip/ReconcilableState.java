@@ -86,6 +86,33 @@ public interface ReconcilableState {
     default void matched(ai.badmonkey.agentspaces.common.id.PeerId from) {
     }
 
+    // ---- a dial-only member's answer to a relayed or another member's DIGEST (SPEC v0.1.37 §9.4)
+
+    /**
+     * Whether this replica holds an entry whose claim, made here, a better claim displaced, with or without this
+     * peer's completion under it: the one thing a dial-only member answers a relayed {@code DIGEST} for, so that a
+     * winner's targeted round reaches it. The default holds none.
+     *
+     * @return whether such an entry is held
+     */
+    default boolean holdsDisplaced() {
+        return false;
+    }
+
+    /**
+     * The delta a dial-only member sends a member other than its seed: only the entries {@link #holdsDisplaced()}
+     * names, each with the displaced claim made here and, where the asker's digest lacks it, the entry's state. Cut to
+     * the budget as {@link #deltaFor(byte[], long, boolean)} cuts. The default sends nothing.
+     *
+     * @param remoteDigest the asker's digest
+     * @param budget       the most bytes, or {@link Long#MAX_VALUE} for no budget
+     * @param first        whether the first item goes in whatever its size
+     * @return the delta and the count left out for the budget
+     */
+    default Bounded displacedFor(byte[] remoteDigest, long budget, boolean first) {
+        return new Bounded(new byte[0], 0);
+    }
+
     // ---- the trie audit (SPEC annex I.6, v0.1.35; srad/replication-by-entry.md §3.2). Each default says the
     // state keeps the text digest alone, so a state that does not override them takes no part in an audit and the
     // bus treats its stream as it treats peers, ads and the revocation streams.

@@ -408,7 +408,16 @@ public final class QuicTransport implements Transport, AutoCloseable {
 
     private static ChannelHandler[] frameHandlers(QuicConnection connection) {
         return new ChannelHandler[]{
-                new LengthFieldBasedFrameDecoder(MAX_FRAME, 0, 4, 0, 4),
+                new LengthFieldBasedFrameDecoder(MAX_FRAME, 0, 4, 0, 4) {
+                    @Override
+                    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+                        Object frame = super.decode(ctx, in);
+                        if (frame == null && in.isReadable()) {
+                            connection.progressed(); // bytes of a frame not yet whole (SPEC v0.1.37 §9.4)
+                        }
+                        return frame;
+                    }
+                },
                 new LengthFieldPrepender(4),
                 new ChannelInboundHandlerAdapter() {
                     @Override
@@ -542,6 +551,19 @@ public final class QuicTransport implements Transport, AutoCloseable {
         @Override
         public void onClose(Runnable listener) {
             this.closeListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        /** Bytes of a frame not yet whole (SPEC v0.1.37 §9.4), told from the stream's decoder. */
+        private volatile Runnable progressListener = () -> {
+        };
+
+        @Override
+        public void onProgress(Runnable listener) {
+            this.progressListener = Objects.requireNonNull(listener, "listener");
+        }
+
+        void progressed() {
+            progressListener.run();
         }
 
         void notifyClosed() {

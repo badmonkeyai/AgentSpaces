@@ -177,7 +177,7 @@ class AgentSpacesPropertiesTest {
         t.setTls(tls);
         t.setWebrtc(t.getWebrtc());
         t.setUdp(t.getUdp());
-        t.setQuic(t.getQuic());
+        t.setQuic(t.quicBlock());
         t.setDtls(t.getDtls());
         assertThat(t.getWs().getPath()).isEqualTo("/aspace");
         assertThat(t.getWss().getAllowedOrigins()).containsExactly("https://app.example");

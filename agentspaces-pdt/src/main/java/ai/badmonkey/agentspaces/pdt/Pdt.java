@@ -465,6 +465,12 @@ public final class Pdt implements AutoCloseable {
         }
         PdtSwarm attached = PdtSwarm.attach(content, store, loadTimeout);
         Refs engine = new Refs(refSpace, attached, retention, clock, refsConfig, push);
+        engine.onLocalChange(() -> { // the engine's own changes wake its participant, as the ref space's do
+            ai.badmonkey.agentspaces.api.spi.DueWork.Registration joined = loopRegistration;
+            if (joined != null) {
+                joined.wake();
+            }
+        });
         this.collector = new NodeCollector(store, engine::liveRoots, retention, collectorVisits);
         this.refs = engine;
         this.swarm = attached;
@@ -567,7 +573,11 @@ public final class Pdt implements AutoCloseable {
             return ai.badmonkey.agentspaces.api.spi.DueWork.NEVER;
         }
         long next = Long.MAX_VALUE;
-        if (refs.nextDueMillis() <= now) {
+        long refsDueBefore = refs.nextDueMillis();
+        if (refsDueBefore <= now) {
+            // the engine judges "due now" for itself from inputs no wake covers: a backstop sweep that runs this tick
+            // found late work even when the deadline returned below is the one the loop held (EL-Q-REL-03, §10.47)
+            ai.badmonkey.agentspaces.peering.node.NodeLoop.foundOverdue(runtime.dueAt(clock, refsDueBefore));
             refs.tick();
             dueTicks.incrementAndGet();
         }

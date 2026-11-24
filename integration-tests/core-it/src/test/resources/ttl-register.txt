@@ -1,0 +1,99 @@
+# The TTL register (srad/agentspaces-event-loop.md §3.11, EL-E-01, EL-E-02, EL-E-09).
+#
+# Every default TTL, lease and expiry of the core, one per line:
+#
+#   <class>#<member> <value> [reason]
+#
+# <member> is a static field (FIELD), an annotation member's default (member()), or a getter chain on a new instance
+# (getA().getB()). <value> is a duration (250ms, 30s, 15m, 1h, 7d, or ISO-8601) or, for a count, a plain integer.
+# A long field or getter whose name ends in MILLIS is read as milliseconds. A duration under 60 s carries its reason:
+# principle 8, "a TTL under 60 s is probably too fast, unless someone really knows what they are doing"; the reason is
+# that someone. TtlRegisterTest (core-it) reads every line by reflection and fails on a value that differs from the
+# code, on a duration under 60 s with no reason, on a line that matches no code, and on a lease or TTL member of the
+# binder's annotations that is missing here.
+
+# ---- membership (decision 17 as re-decided, EL-E-05 to EL-E-07)
+ai.badmonkey.agentspaces.peering.membership.GroupMembership#MEMBER_TTL_FLOOR 45s 1.5 x the 30 s self-ad refresh, and never less than 1.5 x the quiet probe cycle (memberTtlMillis), the cycles that renew it; a member heard only through probes gets the larger
+ai.badmonkey.agentspaces.peering.membership.GroupMembership#KEEPALIVE_TTL 30s the bound this node keeps its own keepalive inside (probe stretch, self-ad refresh), so a 0.6.0 member or another implementation that judges 30 s sees today's cadence (EL-E-06); not a TTL this node judges by
+ai.badmonkey.agentspaces.peering.node.PeerNode#DEFAULT_PEER_AD_TTL 10m
+ai.badmonkey.agentspaces.peering.node.PeerNode#DEFAULT_PATH_TTL 10m
+ai.badmonkey.agentspaces.peering.node.PeerNode#MAX_FRAME_AGE_MILLIS 300s
+ai.badmonkey.agentspaces.peering.node.PeerNode#MAX_AD_ISSUED_SKEW 10m
+ai.badmonkey.agentspaces.peering.node.PeerNode#REVOCATION_GOSSIP_TTL 30d
+ai.badmonkey.agentspaces.peering.node.PeerNode#SESSION_HELLO_MAX_AGE_MILLIS 30s the SESSION_HELLO replay window, whose shortness is the defence (ROBUSTNESS.md §5); a wire check, never renewed
+ai.badmonkey.agentspaces.peering.node.JoinCredentials#EXPIRY_SKEW 10m
+ai.badmonkey.agentspaces.peering.bootstrap.MulticastLocator#DEFAULT_LEARNED_TTL 30m 1.5 x the beacon's longest retry interval, 20 min (EL-O-11): a backed-off beacon renews it inside it
+
+# ---- discovery and beacons
+ai.badmonkey.agentspaces.api.spi.BeaconHint#DEFAULT_TTL 5m
+ai.badmonkey.agentspaces.discovery.AdCache#MAX_ISSUED_SKEW 10m
+ai.badmonkey.agentspaces.discovery.AdCache#MAX_TTL 30d
+
+# ---- capabilities (card TTLs; the Raft lease)
+ai.badmonkey.agentspaces.capabilities.orderedlog.RaftLog#ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.capabilities.orderedlog.RaftLog#ELECTION_TIMEOUT_MIN_PERIODS 5 the leader lease spans 5 to 9 base periods (1.25 to 2.25 s at 250 ms): it must end before the followers' election timeout or two leaders overlap; the lease guard and the watchdog backstop it (EL-H-09)
+ai.badmonkey.agentspaces.capabilities.orderedlog.RaftLog#ELECTION_TIMEOUT_MAX_PERIODS 9 as above
+ai.badmonkey.agentspaces.capabilities.vote.VoteCapability#ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.capabilities.learn.GossipLearner#ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.capabilities.aggregate.PushSumAggregate#ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.capabilities.semantic.SemanticDiscovery#ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.capabilities.keywrap.GroupKeyDistributor#ADVERTISEMENT_TTL 15m
+
+# ---- spaces
+ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace#DEFAULT_ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace#COLLECTED_ACK_HOLD_MILLIS 5m
+ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace#MAX_TRACKED_LEASE_MILLIS 24h
+ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace#PENDING_STATE_TTL_MILLIS 10m
+ai.badmonkey.agentspaces.space.replicated.ReplicatedSpace#MAX_CLAIM_HOLD_MILLIS 24h
+ai.badmonkey.agentspaces.space.crdt.SpaceStateCrdt#LAPSED_GRACE_MILLIS 5m
+
+# ---- content, PDT and the store
+ai.badmonkey.agentspaces.content.Content#ADVERTISEMENT_TTL 15m
+ai.badmonkey.agentspaces.content.Content#DEFAULT_HOLDING_LEASE 5m
+ai.badmonkey.agentspaces.content.Content#MANIFEST_KEEPALIVE_LEASE 7d
+ai.badmonkey.agentspaces.content.PublishOptions#DEFAULT_LEASE 7d
+ai.badmonkey.agentspaces.pdt.refs.Refs#DEFAULT_HEAD_LEASE 10m
+ai.badmonkey.agentspaces.pdt.refs.Refs#DEFAULT_TAKE_LEASE 30s a linear swap holds its take only from the take to its complete, bounded by its own 5 s take and 10 s load timeouts; 30 s exceeds that hold (EL-E-08)
+ai.badmonkey.agentspaces.pdt.stores.Stores#PIN_ENTRY_LEASE 1h
+ai.badmonkey.agentspaces.store.ContentStore#CARD_TTL 15m
+ai.badmonkey.agentspaces.store.ContentStore#DEFAULT_TAKE_LEASE 1m
+
+# ---- connectors
+ai.badmonkey.agentspaces.connect.ConnectorRuntime#DEFAULT_INVOKE_LEASE 30s renewed at half the lease while the operation runs (runHeld), 15 s, twice inside it (EL-E-08)
+ai.badmonkey.agentspaces.connect.ConnectorRuntime#FAILURE_RESULT_LEASE 30s a failed result's freshness, never renewed and costing no frames: a short life so a retry reaches the source again soon; not a liveness TTL
+ai.badmonkey.agentspaces.connect.ConnectorRuntime#QUERY_TAKE_LEASE 1m
+ai.badmonkey.agentspaces.connect.AssetInvocations#DEFAULT_INVOCATION_LEASE 5m
+
+# ---- the binder
+ai.badmonkey.agentspaces.agent.AgentBinder#CARD_TTL 15m
+ai.badmonkey.agentspaces.agent.join.KeyTickets#PENDING_CLAIM_MAX_AGE 30s bounds the wait for a claim record in flight; local, never renewed, costs no frames
+ai.badmonkey.agentspaces.agent.remote.RemoteActions#RESOLVE_FAILURE_TTL_MILLIS 30s a local negative cache: a longer one hides a schema that just arrived; costs no frames
+ai.badmonkey.agentspaces.agent.annotation.OrderedTake#lease() 30s the binder renews it at half the lease while the handler runs, 15 s, twice inside it (EL-E-08, owner answer 12)
+ai.badmonkey.agentspaces.agent.annotation.OrderedTake#resultLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.SpaceReduce#lease() 30s the reducer renews its take before each step (ReduceBinding), well inside 30 s (EL-E-08)
+ai.badmonkey.agentspaces.agent.annotation.SpaceReduce#accumulatorLease() 24h
+ai.badmonkey.agentspaces.agent.annotation.SpaceReduce#subscriptionLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.SpaceJoin#lease() 1h
+ai.badmonkey.agentspaces.agent.annotation.SpaceJoin#ticketLease() 10m
+ai.badmonkey.agentspaces.agent.annotation.SpaceJoin#takeLease() 30s the join holds a take at most min(lease/2, 5 s) before it completes or releases it (JoinBinding), inside 30 s (EL-E-08)
+ai.badmonkey.agentspaces.agent.annotation.SpaceJoin#resultLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.SpaceTake#lease() 10m
+ai.badmonkey.agentspaces.agent.annotation.SpaceTake#resultLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.SpaceNotify#lease() 1h
+ai.badmonkey.agentspaces.agent.annotation.SpaceNotify#resultLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.OnDecision#lease() 1h
+ai.badmonkey.agentspaces.agent.annotation.OnDecision#resultLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.OnEstimate#resultLease() 1h
+ai.badmonkey.agentspaces.agent.annotation.Ballot#lease() 1h
+ai.badmonkey.agentspaces.agent.annotation.Propose#lease() 1h
+ai.badmonkey.agentspaces.agent.annotation.Propose#subscriptionLease() 1h
+
+# ---- the starter's properties (agentspaces.*)
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getContent().getHoldingLease() 5m
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getRelay().getPathTtl() 10m
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getStore().getLeaseDefault() 30d
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getStore().getLeaseMax() 365d
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getIdentity().getAgentCertificateTtl() 24h
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getEmbabel().getActionLease() PT1M
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getA2a().getTaskLeaseMillis() 10m
+ai.badmonkey.agentspaces.spring.AgentSpacesProperties#getA2a().getResultLeaseMillis() 1h

@@ -66,9 +66,6 @@ import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -123,7 +120,6 @@ public final class PersistentValuesFleet {
         private final NodeStore store;
         private final PdtSwarm swarm;
         private final Pdt pdt;
-        private final ScheduledExecutorService ticker;
         private final List<AutoCloseable> transports;
         private final List<AutoCloseable> extras = new ArrayList<>();
         private volatile Ref<PMap<String, String>> facts;
@@ -132,7 +128,7 @@ public final class PersistentValuesFleet {
 
         private Peer(String name, PeerIdentity identity, PeerNode node, GroupRuntime runtime, ReplicatedSpace contentSpace,
                      ReplicatedSpace refSpace, ReplicatedSpace plans, CapabilityRuntime capabilities, Content content,
-                     PackNodeStore pack, NodeStore store, PdtSwarm swarm, Pdt pdt, ScheduledExecutorService ticker,
+                     PackNodeStore pack, NodeStore store, PdtSwarm swarm, Pdt pdt,
                      List<AutoCloseable> transports) {
             this.name = name;
             this.identity = identity;
@@ -147,7 +143,6 @@ public final class PersistentValuesFleet {
             this.store = store;
             this.swarm = swarm;
             this.pdt = pdt;
-            this.ticker = ticker;
             this.transports = transports;
         }
 
@@ -225,6 +220,17 @@ public final class PersistentValuesFleet {
             return ref;
         }
 
+        /** The dtls binding's counters, for a failure's diagnostic; empty without a dtls binding. */
+        public String dtlsCounters() {
+            StringBuilder out = new StringBuilder();
+            for (AutoCloseable transport : transports) {
+                if (transport instanceof ai.badmonkey.agentspaces.transport.dtls.DtlsTransport dtls) {
+                    out.append(dtls.counters());
+                }
+            }
+            return out.toString();
+        }
+
         /** Something to close before the peer: an agent binder, a worker. */
         public void closeWith(AutoCloseable extra) {
             extras.add(extra);
@@ -240,7 +246,6 @@ public final class PersistentValuesFleet {
                 return;
             }
             closed = true;
-            ticker.shutdownNow();
             for (AutoCloseable extra : extras) {
                 quietly(extra);
             }
@@ -378,24 +383,11 @@ public final class PersistentValuesFleet {
         } else {
             swarm = PdtSwarm.attach(content, store, LOAD_TIMEOUT);
         }
-        // Open (srad/agentspaces-event-loop.md §10.29): this example keeps its fixed-rate ticker. On the node's own loop
-        // its DTLS bindings test failed in 1 of about 6 runs (12 of 12 green on this ticker): a reader's tree fetches got
-        // no node from any holder for 120 s. Until that is root-caused the example drives its node by hand.
-        ScheduledExecutorService ticker = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "tick-" + name);
-            t.setDaemon(true);
-            return t;
-        });
-        ticker.scheduleAtFixedRate(() -> {
-            try {
-                node.tick();
-            } catch (RuntimeException e) {
-                System.err.println(name + " tick failed: " + e.getMessage());
-            }
-        }, 0, 100, TimeUnit.MILLISECONDS);
-        capabilities.autoRefresh(Duration.ofSeconds(30), ticker);
+        // the node's own loop runs each participant at its own deadline (srad/agentspaces-event-loop.md EL-X-07)
+        node.startTicking(Duration.ofMillis(250));
+        capabilities.autoRefresh(Duration.ofSeconds(30)); // on the node's time source (EL-T-12)
         Peer peer = new Peer(name, identity, node, runtime, contentSpace, refSpace, plans, capabilities, content, pack, store,
-                swarm, pdt, ticker, transports);
+                swarm, pdt, transports);
         if (refs) {
             // the handles exist before any head arrives, as an agent's would
             peer.facts();

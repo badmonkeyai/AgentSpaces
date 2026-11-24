@@ -92,8 +92,10 @@ public record AppCard(
     /**
      * How an app connects, a closed set (AppCard origin and formats, 2026-11-09): {@code peer}, the app is itself a
      * member; {@code fed}, an agent of the group feeds it its entries and views; {@code gateway}, it sits behind the
-     * A2A gateway; {@code assembled}, a static app its publisher assembled from extracted data and serves as is, which
-     * reads nothing live, as a published static HTML site does. A reader refuses any other value.
+     * A2A gateway; {@code assembled}, a composition its publisher selected and reviewed before publishing and serves as
+     * is (SPEC §6.1a.2, revised in v0.1.38): a static site that reads nothing live, or a page whose components were chosen
+     * once and that binds the live reads its {@code reads} name, such as a chat page over a group's conversations. A reader
+     * refuses any other value.
      */
     public static final List<String> KINDS = List.of("peer", "fed", "gateway", "assembled");
     public static final List<String> SHAPES = List.of("web", "desktop", "static", "a2ui");

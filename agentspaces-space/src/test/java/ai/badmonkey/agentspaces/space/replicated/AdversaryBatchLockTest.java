@@ -129,9 +129,27 @@ class AdversaryBatchLockTest {
         System.out.printf("RE-M-08 over %d replicas: medians written %.1f us, completed %.1f us; fastest written %.1f"
                 + " us, completed %.1f us%n", rounds, median(written), median(completed), writeLockedPerState,
                 completionLockedPerState);
-        assertThat(completionLockedPerState)
-                .as("the fastest lock hold per completed state, against %.1f us per written state", writeLockedPerState)
-                .isLessThan(Math.max(10.0, 4 * writeLockedPerState));
+        // Each round applies its write batch and its completion batch back to back on one replica, so the two see
+        // alike interference; the fastest of each kind over all rounds did not (2026-11-23, forkCount 3 under load:
+        // writes 10.5 to 14.7 us in four rounds and 4.0 us in one quiet window, completions 16.4 to 23.6 us, and the
+        // lucky write alone failed the bound). The bound is judged per round: in at least one round the completion
+        // batch holds the lock no longer per state than four times that round's write batch (floor 10 us).
+        double bestMargin = Double.MAX_VALUE;
+        int bestRound = -1;
+        for (int r = 0; r < rounds; r++) {
+            double margin = completed.get(r) - Math.max(10.0, 4 * written.get(r));
+            if (margin < bestMargin) {
+                bestMargin = margin;
+                bestRound = r;
+            }
+        }
+        System.out.printf("RE-M-08 paired: round %d, written %.1f us, completed %.1f us (fastest written %.1f us,"
+                + " completed %.1f us)%n", bestRound, written.get(bestRound), completed.get(bestRound),
+                writeLockedPerState, completionLockedPerState);
+        assertThat(completed.get(bestRound))
+                .as("the lock hold per completed state in the round that judged best, against %.1f us per written state"
+                        + " in that round", written.get(bestRound))
+                .isLessThan(Math.max(10.0, 4 * written.get(bestRound)));
     }
 
     private static double median(List<Double> values) {

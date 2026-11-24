@@ -94,6 +94,13 @@ public final class ConnectorRuntime implements AutoCloseable {
     private final AssetProvider provider;
     private final GroupId group;
     private final InstantSource clock;
+    /**
+     * Move when this connector's advertised assets change (srad/agentspaces-event-loop.md §10.35): the serve loop and
+     * the invoke loop, with no asset to take for, each wait on its own, on the clock's time source, instead of
+     * sleeping a second at a time. One each, so one loop's deadline never wakes the other.
+     */
+    private final ai.badmonkey.agentspaces.common.time.ChangeSignal serveAssets;
+    private final ai.badmonkey.agentspaces.common.time.ChangeSignal invokeAssets;
     private final Duration defaultFreshness;
     private final AdvertisementSigner signer = new AdvertisementSigner();
     private final Map<String, Duration> freshnessByAsset = new java.util.concurrent.ConcurrentHashMap<>();
@@ -203,6 +210,10 @@ public final class ConnectorRuntime implements AutoCloseable {
         this.provider = Objects.requireNonNull(provider, "provider");
         this.group = Objects.requireNonNull(group, "group");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.serveAssets = new ai.badmonkey.agentspaces.common.time.ChangeSignal(
+                ai.badmonkey.agentspaces.common.time.Waits.base(clock));
+        this.invokeAssets = new ai.badmonkey.agentspaces.common.time.ChangeSignal(
+                ai.badmonkey.agentspaces.common.time.Waits.base(clock));
         this.defaultFreshness = Objects.requireNonNull(defaultFreshness, "defaultFreshness");
         this.invocationSpace = dataSpace;
     }
@@ -348,10 +359,34 @@ public final class ConnectorRuntime implements AutoCloseable {
                         + "'; not advertising it");
                 continue;
             }
-            freshnessByAsset.put(card.asset(), parseFreshness(card.freshness()));
+            boolean added = freshnessByAsset.put(card.asset(), parseFreshness(card.freshness())) == null;
             invokeOpsByAsset.put(card.asset(), Set.copyOf(AssetInvocations.invokeOps(card)));
             discovery.publish(signer.sign(card, identity));
+            if (added) {
+                serveAssets.run(); // a loop with nothing to take for looks again now
+                invokeAssets.run();
+            }
         }
+    }
+
+    /**
+     * How a serve or invoke loop waits while this connector advertises no asset: for an asset to be added, under the
+     * one backstop ({@link ai.badmonkey.agentspaces.common.time.Waits#BACKSTOP}), on the clock's time source. It slept
+     * a real second at a time.
+     */
+    private static void awaitAssets(ai.badmonkey.agentspaces.common.time.ChangeSignal assets, long seen)
+            throws InterruptedException {
+        assets.await(seen, ai.badmonkey.agentspaces.common.time.Waits.deadline(assets.time(),
+                ai.badmonkey.agentspaces.common.time.Waits.BACKSTOP));
+    }
+
+    /**
+     * How many times the advertised assets changed (an asset added): what a waiting loop wakes on.
+     *
+     * @return the count
+     */
+    public long assetChanges() {
+        return serveAssets.seen();
     }
 
     /**
@@ -450,9 +485,10 @@ public final class ConnectorRuntime implements AutoCloseable {
                 // Only the queries for assets this connector advertises: several connectors may
                 // share one data space (a vector store and a knowledge graph, say), and a take
                 // of every DataQuery would let one of them claim, and fail, the other's queries.
+                long seen = serveAssets.seen(); // before the look: an asset added meanwhile is not missed
                 Template<DataQuery> mine = ownQueries();
                 if (mine == null) {
-                    Thread.sleep(Duration.ofSeconds(1));
+                    awaitAssets(serveAssets, seen);
                     continue;
                 }
                 taken = dataSpace.take(mine, Lease.of(QUERY_TAKE_LEASE), Duration.ofSeconds(1));
@@ -577,9 +613,10 @@ public final class ConnectorRuntime implements AutoCloseable {
             Optional<TakenEntry<AssetInvocation>> taken;
             Map<String, PeerId> requesters;
             try {
+                long seen = invokeAssets.seen(); // before the look: an asset added meanwhile is not missed
                 Object[] assets = freshnessByAsset.keySet().toArray();
                 if (assets.length == 0) {
-                    Thread.sleep(Duration.ofSeconds(1));
+                    awaitAssets(invokeAssets, seen);
                     continue;
                 }
                 Template<AssetInvocation> mine = Template.of(AssetInvocation.class)
@@ -667,7 +704,20 @@ public final class ConnectorRuntime implements AutoCloseable {
                 repeated.incrementAndGet();
                 result = fromReplica;
             } else {
-                result = runHeld(taken, invocation, requester);
+                HeldInvocation held = runHeld(taken, invocation, requester);
+                result = held.result;
+                if (held.lapsed()) {
+                    // C05 (SPEC v0.1.37 §7.4 and §9.4): the claim lapsed while the operation ran (it is no longer this
+                    // connector's, or a sleep outlasted its lease); another replica may hold the invocation now, so
+                    // this result is late: nothing completed, nothing written. The target ran here, so a retry routed
+                    // here is answered from memory, and a replica's result is still mirrored for this card's callers.
+                    LOG.log(System.Logger.Level.WARNING, "invocation " + id + " lapsed while its operation ran ("
+                            + held.lapseCause + "); the result is late and is dropped: nothing completed, nothing"
+                            + " written");
+                    remember(id, result);
+                    oweMirror(space, id);
+                    return;
+                }
             }
         }
         remember(id, result);
@@ -735,8 +785,8 @@ public final class ConnectorRuntime implements AutoCloseable {
      * that outlasts the lease (a large upload) keeps the invocation claimed and a retry under the
      * same id waits for this run instead of starting another (CC-L-03).
      */
-    private AssetInvocationResult runHeld(TakenEntry<AssetInvocation> taken, AssetInvocation invocation,
-                                          PeerId requester) {
+    private HeldInvocation runHeld(TakenEntry<AssetInvocation> taken, AssetInvocation invocation,
+                                   PeerId requester) {
         Duration lease = invokeLease;
         Duration every = lease.dividedBy(2).isZero() ? lease : lease.dividedBy(2);
         Duration limit = holdLimit;
@@ -751,9 +801,11 @@ public final class ConnectorRuntime implements AutoCloseable {
                 new ai.badmonkey.agentspaces.common.time.Watchdog.Held(connectorName,
                         invocation.asset() + "/" + invocation.operation(), String.valueOf(taken.entryId()),
                         heldSince));
+        HeldInvocation held = new HeldInvocation(taken, lease, invocation, time, heldSince, limit);
         // The renewal ends with the operation or with this connector, whichever comes first: close() interrupts the
         // invoke loop, but an operation that ignores the interrupt would otherwise hold its claim for as long as it
-        // hung, and no replica could take it (srad/agentspaces-event-loop.md §10.14).
+        // hung, and no replica could take it (srad/agentspaces-event-loop.md §10.14). It ends, too, once the claim
+        // has lapsed (C05).
         Thread renewer = Thread.ofVirtual().name("connector-renew-" + invocation.invocationId()).start(() -> {
             while (!Thread.currentThread().isInterrupted() && running) {
                 try {
@@ -764,28 +816,148 @@ public final class ConnectorRuntime implements AutoCloseable {
                 if (!running) {
                     return; // closed while this slept
                 }
-                if (limit != null && time.monoNanos() - heldSince >= limit.toNanos()) {
-                    holdLimitStops.incrementAndGet();
-                    LOG.log(System.Logger.Level.WARNING, "operation " + invocation.operation() + " on asset "
-                            + invocation.asset() + " held invocation " + invocation.invocationId() + " past the hold"
-                            + " limit of " + limit.toMillis() + " ms; its claim is no longer renewed and lapses");
-                    return;
-                }
-                try {
-                    taken.renew(lease);
-                    renewals.incrementAndGet();
-                } catch (RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, "renewing the claim on invocation "
-                            + invocation.invocationId() + " failed", e);
+                if (!held.renew(false)) {
                     return;
                 }
             }
         });
+        // C05 (SPEC v0.1.37 §7.4 and §9.4, as AgentBinder's held take): a wake from a sleep, any wall step, or a timer
+        // wake more than 30 s late with no wall step (a frozen process) re-checks the claim at once
+        AutoCloseable woke = time.onWallStep(step -> held.renew(true));
+        AutoCloseable late = time.onLateWake(lateness -> held.renew(true));
         try {
-            return run(invocation, requester);
+            held.result = run(invocation, requester);
+            return held;
         } finally {
             renewer.interrupt();
+            closeQuietly(woke);
+            closeQuietly(late);
             heldWatch.close();
+        }
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        try {
+            closeable.close();
+        } catch (Exception ignored) {
+            // a listener registration; nothing to undo
+        }
+    }
+
+    /** Held invocations whose claim lapsed while the operation ran (C05); their results completed nothing. */
+    private final java.util.concurrent.atomic.AtomicLong lateTakes = new java.util.concurrent.atomic.AtomicLong();
+    /** Held invocations a wake or a wall step renewed at once (C05). */
+    private final java.util.concurrent.atomic.AtomicLong wakeRenewals = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How many held invocations lapsed while their operation ran (SPEC v0.1.37 §7.4 and §9.4, C05, as
+     * {@code AgentBinder.lateTakes()}): the claim was no longer this connector's ({@link TakenEntry#held()}: another
+     * claim displaced it), its renewal was refused, or the wall time passed its own lease end, most often across a
+     * sleep the monotonic renewal did not count. Each stopped renewing for good and its result completed nothing.
+     *
+     * @return the count
+     */
+    public long lateTakes() {
+        return lateTakes.get();
+    }
+
+    /**
+     * How many held invocations a wake or a wall step renewed at once because their claim still held (C05).
+     *
+     * @return the count
+     */
+    public long wakeRenewals() {
+        return wakeRenewals.get();
+    }
+
+    /**
+     * One held invocation while its operation runs: its own lease end on the wall clock, renewed by the renewer and by
+     * a wake's re-check (C05). Once lapsed it stays lapsed: nothing renews it again, and its result is late. Guarded
+     * by itself.
+     */
+    private final class HeldInvocation {
+        final TakenEntry<AssetInvocation> taken;
+        final Duration lease;
+        final AssetInvocation invocation;
+        final ai.badmonkey.agentspaces.common.time.TimeSource time;
+        final long heldSince;
+        final Duration limit;
+        long expiresAtMillis;
+        private boolean lapsed;
+        /** Set when the renewal ended for good: the hold limit, or a failed renewal. */
+        private boolean stopped;
+        volatile String lapseCause;
+        volatile AssetInvocationResult result;
+
+        HeldInvocation(TakenEntry<AssetInvocation> taken, Duration lease, AssetInvocation invocation,
+                       ai.badmonkey.agentspaces.common.time.TimeSource time, long heldSince, Duration limit) {
+            this.taken = taken;
+            this.lease = lease;
+            this.invocation = invocation;
+            this.time = time;
+            this.heldSince = heldSince;
+            this.limit = limit;
+            this.expiresAtMillis = clock.millis() + lease.toMillis();
+        }
+
+        /** Marks the claim lapsed once it is no longer this connector's or the wall clock passed its lease end. */
+        private boolean judgeLapse(long nowMillis) {
+            if (lapsed) {
+                return true;
+            }
+            if (nowMillis >= expiresAtMillis) {
+                lapse("its lease ended at " + Instant.ofEpochMilli(expiresAtMillis) + "; a sleep outlasted it");
+            } else if (!taken.held()) {
+                lapse("its claim is no longer this connector's: another claim displaced it");
+            }
+            return lapsed;
+        }
+
+        private void lapse(String cause) {
+            lapsed = true;
+            lapseCause = cause;
+            lateTakes.incrementAndGet();
+            LOG.log(System.Logger.Level.WARNING, "invocation " + invocation.invocationId() + " (" + invocation.asset()
+                    + "/" + invocation.operation() + ") lapsed while its operation ran (" + cause + "); it is no"
+                    + " longer renewed and its result will complete nothing (C05)");
+        }
+
+        /** Whether the claim lapsed; judged now as well, so a result never completes past the lease's end. */
+        synchronized boolean lapsed() {
+            return judgeLapse(clock.millis());
+        }
+
+        /** Renews the claim for its lease if it may still be renewed; returns whether the renewer should go on. */
+        synchronized boolean renew(boolean fromWake) {
+            long now = clock.millis();
+            if (judgeLapse(now) || stopped || !running) {
+                return false;
+            }
+            if (limit != null && time.monoNanos() - heldSince >= limit.toNanos()) {
+                stopped = true;
+                holdLimitStops.incrementAndGet();
+                LOG.log(System.Logger.Level.WARNING, "operation " + invocation.operation() + " on asset "
+                        + invocation.asset() + " held invocation " + invocation.invocationId() + " past the hold"
+                        + " limit of " + limit.toMillis() + " ms; its claim is no longer renewed and lapses");
+                return false;
+            }
+            try {
+                taken.renew(lease);
+                expiresAtMillis = now + lease.toMillis();
+                renewals.incrementAndGet();
+                if (fromWake) {
+                    wakeRenewals.incrementAndGet();
+                }
+                return true;
+            } catch (ai.badmonkey.agentspaces.api.error.LeaseExpiredException e) {
+                lapse("its renewal was refused: " + e.getMessage()); // the claim went between the check and here
+                return false;
+            } catch (RuntimeException e) {
+                stopped = true;
+                LOG.log(System.Logger.Level.WARNING, "renewing the claim on invocation "
+                        + invocation.invocationId() + " failed", e);
+                return false;
+            }
         }
     }
 
@@ -808,6 +980,16 @@ public final class ConnectorRuntime implements AutoCloseable {
         }
         this.holdLimit = limit == null || limit.isZero() ? null : limit;
         return this;
+    }
+
+    /**
+     * The hold limit in force, or null when off (the default); a host that sets it from
+     * {@code agentspaces.watchdog.connector-hold-limit} reads it back (§10.35).
+     *
+     * @return the limit, or null
+     */
+    public Duration holdLimit() {
+        return holdLimit;
     }
 
     /**
@@ -853,17 +1035,25 @@ public final class ConnectorRuntime implements AutoCloseable {
             return true;
         } catch (RuntimeException refused) {
             LOG.log(System.Logger.Level.WARNING, "completing invocation " + result.invocationId() + " failed", refused);
-            if (replicas != null) {
-                synchronized (mirrorLock) {
-                    AssetInvocationResult fromReplica = replicaResult(space, result.invocationId());
-                    if (fromReplica != null) {
-                        writeMirror(fromReplica);
-                    } else {
-                        owedMirror.add(result.invocationId());
-                    }
+            oweMirror(space, result.invocationId());
+            return false;
+        }
+    }
+
+    /**
+     * An answered invocation for which this connector wrote no result (its completion refused, or its claim lapsed):
+     * a replica's result is mirrored now when one is there, else when it arrives.
+     */
+    private void oweMirror(Space space, String id) {
+        if (replicas != null) {
+            synchronized (mirrorLock) {
+                AssetInvocationResult fromReplica = replicaResult(space, id);
+                if (fromReplica != null) {
+                    writeMirror(fromReplica);
+                } else {
+                    owedMirror.add(id);
                 }
             }
-            return false;
         }
     }
 

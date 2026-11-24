@@ -82,6 +82,18 @@ public interface TransportConnection extends AutoCloseable {
     default void onClose(Runnable listener) {
     }
 
+    /**
+     * Registers a listener run when bytes of an inbound frame arrive before the frame is whole (SPEC v0.1.37 §9.4, the
+     * dead-seed rule): a large frame on a slow link shows the far end is writing, and counts as its answer as much as
+     * a whole frame does. One listener per connection; registering replaces the previous one. It runs on the
+     * transport's reader thread and must only note the time. A transport that delivers only whole frames, or cannot
+     * tell, never calls it (the default). Local only: nothing on the wire changes.
+     *
+     * @param listener the listener
+     */
+    default void onProgress(Runnable listener) {
+    }
+
     /** Closes the connection. Idempotent. */
     @Override
     void close();

@@ -136,6 +136,11 @@ public final class GroupMembership implements PeerSampler {
          * that started before the fall. Cleared when the member is heard.
          */
         private volatile long ttlHoldMillis;
+        /**
+         * Until when this member, found past its TTL by a late wake of this node (a frozen process), is judged by the
+         * probe that wake sent rather than by its TTL; {@link Long#MIN_VALUE} for none. Cleared when it is heard.
+         */
+        private volatile long reprobeUntilMillis = Long.MIN_VALUE;
 
         private Member(PeerId id, List<PeerAdvertisement.Endpoint> endpoints, long lastHeardMillis) {
             this.id = id;
@@ -164,6 +169,7 @@ public final class GroupMembership implements PeerSampler {
             lastHeardMillis = now;
             suspect = false;
             ttlHoldMillis = 0;
+            reprobeUntilMillis = Long.MIN_VALUE;
         }
 
         /** Returns the topology roles the member advertises (spec §5.4). */
@@ -244,10 +250,37 @@ public final class GroupMembership implements PeerSampler {
         default java.util.Collection<PeerId> declaredHolders(PeerId target) {
             return List.of();
         }
+
+        /**
+         * Sends the PING a wake asks of the seed this node is linked through ({@link #probeAtWake}); the node counts
+         * it apart from the probe's own PINGs. The default sends it as any PING.
+         *
+         * @param target the seed
+         * @param nonce  the correlation nonce
+         */
+        default void wakePing(PeerId target, long nonce) {
+            ping(target, nonce);
+        }
+
+        /**
+         * Whether bytes of a frame from the target arrived on its link since an instant, the frame not yet whole
+         * (SPEC v0.1.37 §9.4): a seed writing a large frame over a slow link is answering, and a wake's PING it has
+         * not yet answered with a whole frame is not judged unanswered. The default sees no bytes.
+         *
+         * @param target      the member
+         * @param sinceMillis the instant, on this view's clock
+         * @return whether bytes arrived since
+         */
+        default boolean progressSince(PeerId target, long sinceMillis) {
+            return false;
+        }
     }
 
-    /** Where a probe stands (TR-2): a direct PING, a routine round through the target's holders, or an indirect round. */
-    private enum Stage { DIRECT, HOLDER, INDIRECT }
+    /**
+     * Where a probe stands (TR-2): a direct PING, a routine round through the target's holders, an indirect round, or
+     * the PING a wake sent the seed (owner decision 3 of 2026-11-23), whose silence drops the seed at once.
+     */
+    private enum Stage { DIRECT, HOLDER, INDIRECT, WAKE }
 
     /**
      * An outstanding probe.
@@ -809,6 +842,15 @@ public final class GroupMembership implements PeerSampler {
             activeSinceProbe = true;
             quietCycles = 0;
         }
+        // A late wake (SPEC v0.1.37 §9.4): this tick runs more than the 30 s bound after the deadline it was due at,
+        // with no wall step (that would be the node's own wake): the process was frozen, or its monotonic clock counted
+        // a sleep. Every member went on meanwhile; one past its TTL only because this node did not run is probed, not
+        // dropped.
+        long armed = armedDueMillis;
+        boolean late = armed != Long.MAX_VALUE && now - armed > LATE_WAKE_MILLIS;
+        if (late) {
+            lateTicks.incrementAndGet();
+        }
 
         // Expire members whose lease of our attention ran out. The maps are walked in place, without a copy
         // (srad/agentspaces-event-loop.md EL-L-06): a concurrent map's iterator tolerates the removals below. A member
@@ -817,6 +859,13 @@ public final class GroupMembership implements PeerSampler {
         long cycleTtl = settleTtl();
         for (Member m : members.values()) {
             if (now - m.lastHeardMillis > ttlFor(m, cycleTtl)) {
+                if (now < m.reprobeUntilMillis) {
+                    continue; // the late wake's probe judges it
+                }
+                if (late && m.reprobeUntilMillis == Long.MIN_VALUE) {
+                    reprobe(prober, m, now);
+                    continue;
+                }
                 dropMember(m.id);
             }
         }
@@ -831,6 +880,22 @@ public final class GroupMembership implements PeerSampler {
             pendingProbes.remove(e.getKey());
             Member target = members.get(pending.target());
             if (target == null) {
+                continue;
+            }
+            if (pending.stage() == Stage.WAKE
+                    && prober.progressSince(pending.target(), pending.deadlineMillis() - config.pingTimeout().toMillis())) {
+                // Bytes of a frame from the seed are still arriving: it is answering (SPEC v0.1.37 §9.4).
+                wakeBytesAnswers.incrementAndGet();
+                target.heard(now);
+                continue;
+            }
+            if (pending.stage() == Stage.WAKE) {
+                // The seed did not answer the wake's PING within the ping timeout: it is dropped at once, with no
+                // indirect round, however young its link (the monotonic clock did not count the sleep), and the node
+                // fails over to its other seeds (owner decision 3 of 2026-11-23).
+                wakeDrops.incrementAndGet();
+                wakeDropped.add(pending.target());
+                dropMember(pending.target());
                 continue;
             }
             if (pending.stage() != Stage.INDIRECT) {
@@ -855,9 +920,15 @@ public final class GroupMembership implements PeerSampler {
             }
         }
 
+        PeerId wokeSeed = null;
+        if (wakeTarget != null) {
+            wokeSeed = wakeTarget;
+            wakeTarget = null;
+            wakeProbe(prober, wokeSeed, now); // before the resume probes, which then skip the seed
+        }
         if (probeEachRequested) {
             probeEachRequested = false;
-            probeEach(prober, now); // EL-C-14: back from a possible absence, every member at once
+            probeEach(prober, now, wokeSeed); // EL-C-14: back from a possible absence, every member at once
         }
 
         // Probe one random member once per protocol period (SWIM): probing on every 250 ms tick
@@ -989,15 +1060,26 @@ public final class GroupMembership implements PeerSampler {
      * @return the next due time in the clock's milliseconds, or {@link Long#MAX_VALUE}
      */
     public synchronized long nextDueMillis() {
+        long next = nextDue();
+        armedDueMillis = next;
+        return next;
+    }
+
+    /** {@link #nextDueMillis()} without noting it as the deadline the next tick is judged late against. */
+    private long nextDue() {
         long next = Long.MAX_VALUE;
         long cycleTtl = settleTtl();
         boolean anyone = false;
         for (Member m : members.values()) {
             anyone = true;
-            next = Math.min(next, m.lastHeardMillis + ttlFor(m, cycleTtl) + 1);
+            // a member a late wake re-probes is judged by its probe until the probe's span ends
+            next = Math.min(next, Math.max(m.lastHeardMillis + ttlFor(m, cycleTtl) + 1, m.reprobeUntilMillis));
         }
         for (Pending pending : pendingProbes.values()) {
             next = Math.min(next, pending.deadlineMillis());
+        }
+        if (wakeTarget != null || probeEachRequested) {
+            next = Math.min(next, nowMillis()); // a wake's probes go on the next run
         }
         if (anyone) {
             next = Math.min(next, lastProbeMillis == Long.MIN_VALUE ? nowMillis()
@@ -1141,9 +1223,163 @@ public final class GroupMembership implements PeerSampler {
         return resumeProbes.get();
     }
 
+    /** The seed a wake asked to PING at the next {@link #tick} ({@link #probeAtWake}), or null. Guarded by this. */
+    private PeerId wakeTarget;
+    /** Seeds dropped because they left the wake's PING unanswered, until the node consumes the mark. */
+    private final java.util.Set<PeerId> wakeDropped = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicLong wakeDrops = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong wakeAdopted = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Asks the next {@link #tick} to PING the seed this node is linked through, after a wake (owner decision 3 of
+     * 2026-11-23): an answer within the ping timeout keeps it; silence drops it at once, with no indirect round. A
+     * direct PING already waiting for the seed is not sent again: it becomes the wake's, with its own deadline.
+     *
+     * @param seed the member this node's seed link answered from
+     */
+    public synchronized void probeAtWake(PeerId seed) {
+        wakeTarget = Objects.requireNonNull(seed, "seed");
+    }
+
+    /**
+     * A resume's two asks at once (srad/agentspaces-event-loop.md §10.51): the seed's wake PING ({@link #probeAtWake},
+     * when {@code seed} is not null) and one probe of every other member ({@link #probeEachOnce}). Set under one lock,
+     * so the same {@link #tick} sends the wake's PING first and the resume probes then skip the seed; set apart, a tick
+     * between them could take the PING's answer before the resume probes ran, and the seed was probed twice.
+     *
+     * @param seed the seed link's member, or null for none
+     */
+    public synchronized void probeAtResume(PeerId seed) {
+        if (seed != null) {
+            wakeTarget = seed;
+        }
+        probeEachRequested = true;
+    }
+
+    /**
+     * Whether a peer left this view because it left a wake's PING unanswered ({@link #probeAtWake}), consuming the
+     * mark: the node then fails over to its other seeds at once.
+     *
+     * @param peer the peer that left the view
+     * @return true once, if a wake's PING dropped it
+     */
+    public boolean consumeWakeDropped(PeerId peer) {
+        return wakeDropped.remove(peer);
+    }
+
+    /**
+     * Seeds dropped by a wake's unanswered PING ({@link #probeAtWake}).
+     *
+     * @return the count
+     */
+    public long wakeDrops() {
+        return wakeDrops.get();
+    }
+
+    /**
+     * Wakes that found a direct PING already waiting for the seed and made it theirs rather than send another.
+     *
+     * @return the count
+     */
+    public long wakePingsAdopted() {
+        return wakeAdopted.get();
+    }
+
+    /** The wake's PING to the seed, or the adoption of one already waiting. Called from {@link #tick}, under this. */
+    private void wakeProbe(Prober prober, PeerId seed, long now) {
+        if (!members.containsKey(seed) || seed.equals(self)) {
+            return;
+        }
+        for (Map.Entry<Long, Pending> e : pendingProbes.entrySet()) {
+            Pending p = e.getValue();
+            if (!p.target().equals(seed)) {
+                continue;
+            }
+            if (p.stage() == Stage.DIRECT) {
+                wakeAdopted.incrementAndGet(); // the PING already out becomes the wake's; its deadline stands
+                pendingProbes.put(e.getKey(), new Pending(seed, p.deadlineMillis(), Stage.WAKE, p.relays(),
+                        p.fromHolder()));
+            }
+            return; // a holder or indirect round already judges it
+        }
+        long nonce = nextNonce();
+        pendingProbes.put(nonce, new Pending(seed, now + config.pingTimeout().toMillis(), Stage.WAKE,
+                java.util.Set.of(), false));
+        prober.wakePing(seed, nonce); // after the record: an answer may come back inline
+    }
+
+    /** A tick more than this late past its deadline is a late wake (SPEC v0.1.37 §9.4, the 30 s keepalive bound). */
+    public static final long LATE_WAKE_MILLIS = KEEPALIVE_TTL.toMillis();
+    /** The deadline {@link #nextDueMillis()} last gave, which the node's loop armed; {@link Long#MAX_VALUE} for none. */
+    private long armedDueMillis = Long.MAX_VALUE;
+    private final java.util.concurrent.atomic.AtomicLong lateTicks = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong lateReprobes = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong wakeBytesAnswers = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Ticks that ran more than {@link #LATE_WAKE_MILLIS} past their deadline (a frozen process, SPEC v0.1.37 §9.4).
+     *
+     * @return the count
+     */
+    public long lateTicks() {
+        return lateTicks.get();
+    }
+
+    /**
+     * Members a late tick found past their TTL and probed rather than dropped (SPEC v0.1.37 §9.4).
+     *
+     * @return the count
+     */
+    public long lateReprobes() {
+        return lateReprobes.get();
+    }
+
+    /**
+     * Wake PINGs to the seed answered by bytes of a frame still arriving rather than a whole frame (§9.4).
+     *
+     * @return the count
+     */
+    public long wakeBytesAnswers() {
+        return wakeBytesAnswers.get();
+    }
+
+    /**
+     * Probes a member a late tick found past its TTL (SPEC v0.1.37 §9.4): a probe already out for it judges it; else a
+     * direct PING or a holder round, with the ordinary timeout and escalation. Until that probe's whole span (the
+     * direct or holder stage, then the indirect one) has passed, the TTL does not drop it. Under this.
+     */
+    private void reprobe(Prober prober, Member m, long now) {
+        lateReprobes.incrementAndGet();
+        m.reprobeUntilMillis = now + 2 * config.pingTimeout().toMillis() + 1;
+        for (Pending p : pendingProbes.values()) {
+            if (p.target().equals(m.id)) {
+                return;
+            }
+        }
+        long nonce = nextNonce();
+        List<PeerId> holders = usableHolders(prober.linkHolders(m.id), m.id);
+        if (!holders.isEmpty()) {
+            holderRounds.incrementAndGet();
+            pendingProbes.put(nonce, new Pending(m.id, now + config.pingTimeout().toMillis(), Stage.HOLDER,
+                    java.util.Set.copyOf(holders), true));
+            askHolders(prober, holders, m.id, nonce);
+            return;
+        }
+        directPings.incrementAndGet();
+        pendingProbes.put(nonce, new Pending(m.id, now + config.pingTimeout().toMillis(), Stage.DIRECT,
+                java.util.Set.of(), false));
+        prober.ping(m.id, nonce); // after the record: an answer may come back inline
+    }
+
     /** Probes every member not already under a probe, once (EL-C-14). Called from {@link #tick}, under this. */
-    private void probeEach(Prober prober, long now) {
+    private void probeEach(Prober prober, long now, PeerId wokeSeed) {
         java.util.Set<PeerId> pending = new java.util.HashSet<>();
+        // The seed this tick's wake already PINGed is skipped by name, not only while its probe is pending: onAck takes
+        // no lock, so the seed's answer may remove that probe on another thread between the wake's PING and this
+        // loop, and the seed was then probed twice (EL-SP-16, the core reactor of 2026-11-23).
+        if (wokeSeed != null) {
+            pending.add(wokeSeed);
+        }
         for (Pending p : pendingProbes.values()) {
             pending.add(p.target());
         }

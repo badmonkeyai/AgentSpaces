@@ -960,6 +960,15 @@ public final class LocalSpace implements Space, AutoCloseable {
             }
             deliver(events);
         }
+
+        @Override
+        public boolean held() {
+            synchronized (lock) {
+                Stored stored = entries.get(entryId);
+                return stored != null && stored.state == State.TAKEN && stored.takeToken == token
+                        && stored.takeExpiryMillis > nowMillis();
+            }
+        }
     }
 
     private final class Sub implements Subscription {

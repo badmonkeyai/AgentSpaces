@@ -120,6 +120,11 @@ public final class ConnectorRuntime implements AutoCloseable {
     private Subscription mirror;
     /** The operations each advertised asset's card allows (appendix F {@code invoke-ops}). */
     private final Map<String, Set<String>> invokeOpsByAsset = new ConcurrentHashMap<>();
+    /** The cards this connector advertises, by asset, for the source gate's {@code hitl.<operation>} (SPEC §6.1a conventions). */
+    private final Map<String, AssetCard> cardsByAsset = new ConcurrentHashMap<>();
+    private volatile ai.badmonkey.agentspaces.connect.hitl.ApprovalGate approvalGate;
+    /** Operations the owner serves itself (a desk's {@code ask}, answered hours later); the invoke loop never takes them. */
+    private volatile Set<String> selfServed = Set.of();
     /** Answered invocations by id, kept for {@link #invocationRetention} so a retry never re-runs the target. */
     private final Map<String, Answered> answered = new ConcurrentHashMap<>();
     /**
@@ -284,6 +289,28 @@ public final class ConnectorRuntime implements AutoCloseable {
      * @param authorizer decides {@code CONNECTOR_SERVE} for this peer per asset
      * @return this runtime
      */
+    /**
+     * Gives the runtime the source gate (SPEC §6.1a conventions, v0.1.38): an operation whose card names a desk in
+     * {@code hitl.<operation>} runs only with an approval of that desk. Without a gate, such an operation runs as any
+     * other and the requester's own policy is the only check.
+     */
+    /**
+     * Leaves these operations to the runtime's owner (SPEC §6.1a conventions, v0.1.38: a desk's {@code ask} waits for
+     * people, often for hours). The invoke loop never takes an invocation of one of them; the owner takes it in its own
+     * loop and writes the result itself, under this peer's identity, when it has one. Every other operation of the same
+     * assets is served here as before.
+     */
+    public ConnectorRuntime selfServed(Set<String> operations) {
+        this.selfServed = Set.copyOf(Objects.requireNonNull(operations, "operations"));
+        invokeAssets.run();   // a loop waiting with nothing to take looks again
+        return this;
+    }
+
+    public ConnectorRuntime approvalGate(ai.badmonkey.agentspaces.connect.hitl.ApprovalGate gate) {
+        this.approvalGate = Objects.requireNonNull(gate, "gate");
+        return this;
+    }
+
     public ConnectorRuntime authorizer(Authorizer authorizer) {
         this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
         return this;
@@ -361,6 +388,7 @@ public final class ConnectorRuntime implements AutoCloseable {
             }
             boolean added = freshnessByAsset.put(card.asset(), parseFreshness(card.freshness())) == null;
             invokeOpsByAsset.put(card.asset(), Set.copyOf(AssetInvocations.invokeOps(card)));
+            cardsByAsset.put(card.asset(), card);
             discovery.publish(signer.sign(card, identity));
             if (added) {
                 serveAssets.run(); // a loop with nothing to take for looks again now
@@ -619,8 +647,12 @@ public final class ConnectorRuntime implements AutoCloseable {
                     awaitAssets(invokeAssets, seen);
                     continue;
                 }
+                Set<String> others = selfServed;
                 Template<AssetInvocation> mine = Template.of(AssetInvocation.class)
                         .where("asset", Matchers.in(assets));
+                if (!others.isEmpty()) {
+                    mine = mine.where("operation", Matchers.predicate(op -> !others.contains(String.valueOf(op))));
+                }
                 // A space other than a replicated one gives no record of a claimed entry, so there the
                 // requesting peer is read before the take: a template read cannot see an entry while
                 // it is claimed (issue #16 §9.3), and the scope is judged against the requesting
@@ -684,6 +716,7 @@ public final class ConnectorRuntime implements AutoCloseable {
         Set<String> allowed = invokeOpsByAsset.getOrDefault(invocation.asset(), Set.of());
         Authorizer gate = authorizer;
         AssetInvocationResult result;
+        String approvalWhy;
         if (!allowed.contains(invocation.operation())) {
             refused.incrementAndGet();
             result = AssetInvocationResult.refused(invocation, "unknown-operation", AssetInvocations.INVOKE_OPS,
@@ -698,6 +731,13 @@ public final class ConnectorRuntime implements AutoCloseable {
                     "requester " + (requester == null ? "unknown" : requester.value())
                             + " is not permitted to invoke '" + invocation.operation() + "' on '"
                             + invocation.asset() + "'");
+        } else if ((approvalWhy = approvalRefusal(invocation)) != null) {
+            // SPEC §6.1a conventions (v0.1.38): the source gate, once the requester may call the operation at all; an
+            // approval is used up only by a call that passes
+            refused.incrementAndGet();
+            int colon = approvalWhy.indexOf(':');
+            result = AssetInvocationResult.refused(invocation, colon > 0 ? approvalWhy.substring(0, colon) : "approval-required",
+                    ai.badmonkey.agentspaces.connect.hitl.ApprovalGate.KEY + invocation.operation(), approvalWhy);
         } else {
             AssetInvocationResult fromReplica = replicaResult(space, id);
             if (fromReplica != null) {
@@ -722,6 +762,13 @@ public final class ConnectorRuntime implements AutoCloseable {
         }
         remember(id, result);
         finish(space, taken, result);
+    }
+
+    /** Why the source gate refuses the call, or null when no gate is set, the asset is not this connector's, or it passes. */
+    private String approvalRefusal(AssetInvocation invocation) {
+        ai.badmonkey.agentspaces.connect.hitl.ApprovalGate g = approvalGate;
+        AssetCard card = cardsByAsset.get(invocation.asset());
+        return g == null || card == null ? null : g.refusal(card, invocation).orElse(null);
     }
 
     /** A result a replica already wrote for this invocation id, or null (CC-L-08). */

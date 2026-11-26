@@ -6095,16 +6095,23 @@ public final class ReplicatedSpace implements Space, AutoCloseable {
             return Optional.empty();
         }
         Object value = valueCache.get(record.entryId());
-        if (value == null) {
+        if (value == null || !template.type().isInstance(value)) {
+            // An Object read decodes as the registry can, often a map before this replica's code has used
+            // the type; a typed reader that finds that map decodes again as its own type. A typed value
+            // replaces the cached one, and an Object read never replaces a cached value (agentspaces-pws
+            // phase 1: a generic read hid entries from typed readers for as long as they waited).
             byte[] payload = clearPayload(record);
             if (payload == null) {
                 return Optional.empty();
             }
-            value = decodeDocument(payload, template.type());
-            if (value == null) {
+            Object decoded = decodeDocument(payload, template.type());
+            if (decoded == null) {
                 return Optional.empty();
             }
-            valueCache.put(record.entryId(), value);
+            if (value == null || template.type() != Object.class) {
+                valueCache.put(record.entryId(), decoded);
+            }
+            value = decoded;
         }
         if (!template.matches(value)) {
             return Optional.empty();

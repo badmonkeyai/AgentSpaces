@@ -177,6 +177,28 @@ class ObjectTemplateReadTest {
      * subset on every replica, whether the entries came by live writes or by one batched {@code PULL_RESP}.
      */
     @Test
+    void anObjectReadBeforeTheTypeIsRegisteredDoesNotHideTheEntryFromATypedRead() throws Exception {
+        // A browser reads every entry through an Object template before the reader's own code has used the
+        // type, so the record decodes as a map; a typed reader of that type must still see a Claim.
+        ReplicatedSpace writer = peer("w", null);
+        ReplicatedSpace reader = peer("r", null, "w");
+        tickAll(4);
+        writer.write(new Claim("c-1", 60000), Lease.of(Duration.ofMinutes(5)));
+        tickAll(8);
+
+        assertThat(reader.readAll(Template.of(Object.class), 10)).as("the generic read first").singleElement()
+                .isInstanceOf(Map.class);
+        assertThat(reader.readAll(Template.of(Claim.class), 10)).as("then the typed read").singleElement()
+                .isEqualTo(new Claim("c-1", 60000));
+        assertThat(reader.read(Template.of(Claim.class))).contains(new Claim("c-1", 60000));
+        assertThat(reader.readAll(Template.of(Object.class), 10)).as("a generic read after a typed one")
+                .singleElement().isEqualTo(new Claim("c-1", 60000));
+        var taken = reader.take(Template.of(Claim.class), Lease.of(Duration.ofMinutes(1)), Duration.ofMillis(10));
+        assertThat(taken).as("a typed take of an entry first read generically").isPresent();
+        assertThat(taken.get().entry()).isEqualTo(new Claim("c-1", 60000));
+    }
+
+    @Test
     void aCappedReadIsTheHeadOfTheFullReadAndOnlyASortedReadGivesTheNewest() throws Exception {
         ReplicatedSpace writer = peer("w", null);
         ReplicatedSpace batched = peer("b", null); // no seeds: learns everything from one PULL_RESP

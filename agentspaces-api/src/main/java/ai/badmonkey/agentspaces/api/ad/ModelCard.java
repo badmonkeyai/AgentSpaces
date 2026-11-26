@@ -27,7 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * A model advertised to a group (SPEC §6.1b, v0.1.24; ISSUE-ModelCard FR-1): what it does ({@code tasks},
+ * A model advertised to a group (SPEC §6.1a.1, v0.1.24; ISSUE-ModelCard FR-1): what it does ({@code tasks},
  * {@code modality}, {@code limits}), where it came from ({@code licence}, {@code provenance}: the upstream, the
  * weight root on the content swarm, the weight hash, the admitting identity), how it was judged ({@code evals}),
  * what it costs ({@code costHints}), where it may run and what it may see ({@code residency}: sites,

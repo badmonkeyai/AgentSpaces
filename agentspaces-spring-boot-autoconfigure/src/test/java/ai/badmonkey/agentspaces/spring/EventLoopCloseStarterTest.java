@@ -138,6 +138,9 @@ class EventLoopCloseStarterTest {
                 "agentspaces.loop.pool-max", "agentspaces.loop.pool-idle-millis",
                 "agentspaces.loop.grow-lateness-millis", "agentspaces.loop.stretch-lateness-millis",
                 "agentspaces.loop.stretch-cap");
+        // membership standing (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md): retirement, the last resort, readiness
+        assertThat(names).contains("agentspaces.retirement.enabled", "agentspaces.retirement.after",
+                "agentspaces.post-retirement.enabled", "agentspaces.health.refuse-traffic-when-isolated");
     }
 
     @Test

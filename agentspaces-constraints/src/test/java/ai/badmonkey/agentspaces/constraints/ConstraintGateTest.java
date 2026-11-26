@@ -424,6 +424,11 @@ class ConstraintGateTest {
                 assertThat(late.readAllEntries(Template.of(PaymentOrder.class), 10)).extracting(e -> e.value().claimId())
                         .containsExactlyInAnyOrder("c-1", "c-2", "c-3");
                 assertThat(constraints.readAll(Template.of(ConstraintViolated.class), 10)).as("no false violation").isEmpty();
+                // srad/cards.md §3.20 (2026-11-26): an A taken and completed before this member heard it written (c-3) is
+                // written here too, at its issue stamp, then claimed, the history of a gate that watched it live, so a
+                // reaction to the write fires on every member
+                assertThat(gate.events("c-3")).filteredOn(e -> e.type().equals("HumanApproval")).extracting(Event::kind)
+                        .containsExactly(Event.Kind.WRITTEN, Event.Kind.CLAIMED);
             }
         } finally {
             nodes.forEach(ai.badmonkey.agentspaces.peering.node.PeerNode::close);

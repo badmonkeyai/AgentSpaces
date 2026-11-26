@@ -50,7 +50,7 @@ import java.util.regex.Pattern;
  * @param issued    when it was issued
  * @param ttl       how long it lives
  * @param name      the app's name
- * @param kind      how the app connects: {@code peer}, {@code fed}, {@code gateway}, or {@code assembled}
+ * @param kind      how the app connects: {@code peer}, {@code fed}, {@code gateway}, {@code assembled}, or {@code dynamic} (v0.1.38)
  * @param shape     {@code web}, {@code desktop}, {@code static}, or {@code a2ui}
  * @param owner     who owns the app
  * @param reads     the {@code group/space} pairs it reads

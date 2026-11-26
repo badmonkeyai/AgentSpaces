@@ -51,7 +51,7 @@ public record CardAction(
         @JsonInclude(JsonInclude.Include.NON_NULL) Contract contract) {
 
     /**
-     * The planner's view of an action (SPEC §6.1b, v0.1.25): {@code pre}, the situation names or
+     * The planner's view of an action (SPEC §6.1c, v0.1.25): {@code pre}, the situation names or
      * conditions that must hold before the action runs (beside its consumed schemas); {@code post},
      * the schemas it produces and the situations it establishes (beside its produced schemas);
      * {@code cost}, a free hint a planner orders by ("1", "low", "PT2M"); {@code methods}, the HTN

@@ -208,6 +208,12 @@ public final class ConstraintGate implements AutoCloseable {
             String wire = ev.entry() == null ? "" : ev.entry().getClass().getName();
             e = Event.of(wire, ev.entryId().value(), now, ev.entry(), ev.tags(), kind);
         }
+        if (kind == Event.Kind.CLAIMED && ev.details() != null) {
+            // an entry taken before this member heard it written (a flow step that took a card's result at once, 2026-11-26,
+            // srad/cards.md §3.20): its WRITTEN first, at the entry's issue stamp, so this gate holds the history a gate that
+            // watched it live holds, and a reaction to the write fires here too; a WRITTEN heard already is not recorded twice
+            record(Event.of(ev.details(), Event.Kind.WRITTEN, now), ev.entryId().value());
+        }
         if (ev.kind() == SpaceEvent.Kind.TAKEN) {
             // a take is stamped when it is heard; a completion heard alone keeps its entry's issue stamp, the one place
             // in issue order a gate that watched the entry live would have its WRITTEN

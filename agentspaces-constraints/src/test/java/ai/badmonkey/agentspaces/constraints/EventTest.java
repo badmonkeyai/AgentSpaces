@@ -70,4 +70,14 @@ class EventTest {
         assertThat(otherWire.type()).as("the shape under another wire type is that type").isEqualTo("Envelope");
         assertThat(otherWire.fields()).containsEntry("type", "Assessment").containsKey("fields");
     }
+
+    @Test
+    void anIriNamesItsTypeByItsLastSegment() {
+        // srad/cards.md §3.20 (2026-11-26): a rule naming a card's ChatMessage or PromptedResult never matched its IRI
+        assertThat(Event.simpleName("https://badmonkey.ai/ns/apps/v1/ChatMessage")).isEqualTo("ChatMessage");
+        assertThat(Event.simpleName("https://badmonkey.ai/agentspaces/a2ui/v1/ChatMessage#v3")).isEqualTo("ChatMessage");
+        assertThat(Event.simpleName("ai.badmonkey.bma.Claim")).isEqualTo("Claim");
+        assertThat(Event.simpleName("a.b.Outer$Claim#v1")).isEqualTo("Claim");
+        assertThat(Event.simpleName("Claim")).isEqualTo("Claim");
+    }
 }

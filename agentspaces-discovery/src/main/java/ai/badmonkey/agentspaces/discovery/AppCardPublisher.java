@@ -37,7 +37,6 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class AppCardPublisher implements AutoCloseable {
 
     private final PeerIdentity identity;
-    private final GroupRuntime runtime;
     private final DiscoveryService discovery;
     private final AdvertisementSigner signer = new AdvertisementSigner();
     private final Map<String, AppCard> full = new ConcurrentHashMap<>();
@@ -53,8 +52,17 @@ public final class AppCardPublisher implements AutoCloseable {
      * @param discovery the group's discovery service, which publishes the cards and holds the spiller
      */
     public AppCardPublisher(PeerIdentity identity, GroupRuntime runtime, DiscoveryService discovery) {
+        this(identity, inGroup(runtime, discovery));
+    }
+
+    private static DiscoveryService inGroup(GroupRuntime runtime, DiscoveryService discovery) {
+        Objects.requireNonNull(runtime, "runtime");
+        return discovery;
+    }
+
+    /** Publishes through a discovery service that already owns its group and compatibility gate. */
+    public AppCardPublisher(PeerIdentity identity, DiscoveryService discovery) {
         this.identity = Objects.requireNonNull(identity, "identity");
-        this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.discovery = Objects.requireNonNull(discovery, "discovery");
         this.gateRegistration = discovery.onAppCardGateChange(open -> full.values().stream()
                 .filter(card -> !AppCards.forView(card, false).equals(card) || discovery.spiller().oversized(card))
@@ -101,7 +109,7 @@ public final class AppCardPublisher implements AutoCloseable {
         if (last != null && issued.toEpochMilli() <= last.issued().toEpochMilli()) {
             issued = Instant.ofEpochMilli(last.issued().toEpochMilli() + 1);
         }
-        boolean open = AppCards.gateOpen(runtime);
+        boolean open = discovery.appCardGateOpen();
         AppCard current = AppCards.issuedAt(card, issued);
         AppCard gated = AppCards.forView(current, open);
         if (!gated.equals(current)) {

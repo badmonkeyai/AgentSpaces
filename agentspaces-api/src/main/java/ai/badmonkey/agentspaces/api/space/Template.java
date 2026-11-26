@@ -115,9 +115,15 @@ public final class Template<T> {
                 || simpleName(recordType).equals(simpleName(typeName));
     }
 
+    /**
+     * The simple name of a wire type: the last segment of a Java name ({@code a.b.Claim}, {@code A$B}) or of an IRI
+     * ({@code https://example.org/ns/v1/PromptedResult}), without a {@code #v1} suffix. Before 2026-11-26 an IRI's
+     * name was cut at the last dot, inside its host, so a type condition by simple name never matched an IRI-named
+     * record (srad/cards.md §3.20: a flow could not take a card's result by its name).
+     */
     private static String simpleName(String wire) {
         String s = wire.contains("#") ? wire.substring(0, wire.indexOf('#')) : wire;
-        int i = Math.max(s.lastIndexOf('.'), s.lastIndexOf('$'));
+        int i = Math.max(Math.max(s.lastIndexOf('.'), s.lastIndexOf('$')), s.lastIndexOf('/'));
         return i < 0 ? s : s.substring(i + 1);
     }
 

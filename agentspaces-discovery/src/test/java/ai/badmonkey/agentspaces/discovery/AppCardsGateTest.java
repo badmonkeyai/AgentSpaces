@@ -115,7 +115,7 @@ class AppCardsGateTest {
         Wired b = peer("g1", 2);
         assertThat(until(() -> a.discovery().appCardGateOpen() && a.runtime().membership().allMembers().size() == 1
                 && b.runtime().membership().allMembers().size() == 1)).isTrue();
-        AppCardPublisher publisher = new AppCardPublisher(a.identity(), a.runtime(), a.discovery());
+        AppCardPublisher publisher = new AppCardPublisher(a.identity(), a.discovery());
         AppCard first = imported(a);
         AppCard published = publisher.publish(first).join();
         assertThat(until(() -> cardAt(b, first.id()).isPresent())).isTrue();

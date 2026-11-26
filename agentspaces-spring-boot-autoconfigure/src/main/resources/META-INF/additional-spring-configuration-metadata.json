@@ -45,7 +45,7 @@
     {
       "name": "agentspaces.space.horizon",
       "type": "java.lang.String",
-      "description": "per-entry advertises the hint wire.horizon=1, so a space whose whole view carries it collects a withdrawn entry five minutes at most after the entry's own lease expiry (SPEC 7.3); legacy keeps 2 x maxLease. Use legacy on a node that renews for an identity another node renews for at the same time.",
+      "description": "per-entry advertises the hint wire.horizon=1, so a space whose whole view carries it collects a withdrawn entry ten minutes after the entry's own lease expiry, the clock drift ceiling (SPEC 7.3); legacy keeps 2 x maxLease. Use legacy on a node that renews for an identity another node renews for at the same time.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties",
       "defaultValue": "per-entry"
     },
@@ -777,7 +777,7 @@
     {
       "name": "agentspaces.watchdog.escalation",
       "type": "java.lang.String",
-      "description": "What the node does when the watchdog escalates its loop (three re-initialisations within 10 minutes, or a participant fenced for 2 minutes; srad/agentspaces-event-loop.md decision 4): report (an ERROR log, the loop's health DOWN, liveness BROKEN) or exit (as report, then the node closes within 2 s and the process exits with status 70, for hosts with no liveness probe). The watchdog's period and bounds are per process: the system properties agentspaces.watchdog.period-millis, grace-millis, slow-millis, wedge-millis, escalate-after, escalate-window-millis and fence-limit-millis. So are the elastic loop pool's and the stretch's (decision 2, EL-O-10): agentspaces.loop.pool-max (0, the default, means min(8, max(2, cores / 2))), pool-idle-millis (60000), grow-lateness-millis (20), stretch-lateness-millis (100) and stretch-cap (4).",
+      "description": "What the node does when the watchdog escalates its loop (three re-initialisations within 10 minutes, or a participant fenced for 2 minutes; srad/agentspaces-event-loop.md decision 4): report (an ERROR log, the loop's health DOWN, liveness BROKEN) or exit (as report, then the node closes within 2 s and the process exits with status 70, for hosts with no liveness probe). The watchdog's period and bounds are per process: agentspaces.watchdog.period-millis, grace-millis, slow-millis, wedge-millis, escalate-after, escalate-window-millis and fence-limit-millis. So are the elastic loop pool's and the stretch's (decision 2, EL-O-10): agentspaces.loop.pool-max (0, the default, means min(8, max(2, cores / 2))), pool-idle-millis (60000), grow-lateness-millis (20), stretch-lateness-millis (100) and stretch-cap (4). Each may be set as a property here or as the same JVM system property; a property set here wins.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Watchdog",
       "defaultValue": "report"
     },
@@ -884,6 +884,34 @@
       "type": "java.lang.Integer",
       "description": "The stretch's cap, a factor of 1 to 4 that never passes a SPEC floor (EL-O-04), per process. Unset: 4.",
       "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Loop"
+    },
+    {
+      "name": "agentspaces.retirement.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Whether lost members retire (reviews/LOST-MEMBER-RETIREMENT-2026-11-18.md). On: a lost member is retried on a fixed cycling table (after 5, 10, 20 and 30 s, then 1, 2 and 5 minutes, then 5 s again, each wait spread 10 % either way; at most eight lost members re-dialed per round; SPEC §9.4) and, unanswered after agentspaces.retirement.after, retires to the retirement list kept in the state directory beside the admission memory. Off: a lost member is retried for ten minutes and forgotten.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Retirement",
+      "defaultValue": true
+    },
+    {
+      "name": "agentspaces.retirement.after",
+      "type": "java.time.Duration",
+      "description": "How long a lost member is retried before it retires to the retirement list.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Retirement",
+      "defaultValue": "24h"
+    },
+    {
+      "name": "agentspaces.post-retirement.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Whether the retirement list is the last resort: when a group's view has been empty for two minutes and its lost members, seeds and locator brought nobody back, this node introduces itself to retired members' last endpoints before it is out of service in the group. Off by default (opt in): a retired member's address may by now belong to another host, which learns of this node from the card it is sent.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$PostRetirement",
+      "defaultValue": false
+    },
+    {
+      "name": "agentspaces.health.refuse-traffic-when-isolated",
+      "type": "java.lang.Boolean",
+      "description": "Whether readiness turns REFUSING_TRAFFIC while this node is isolated in a group, and back once none is. Liveness is never touched.",
+      "sourceType": "ai.badmonkey.agentspaces.spring.AgentSpacesProperties$Health",
+      "defaultValue": true
     }
   ],
   "hints": [

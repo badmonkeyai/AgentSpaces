@@ -39,4 +39,16 @@ class TemplateTypeTest {
         assertThat(claims.whereTag("key", Matchers.eq("c-1")).typeName()).isEqualTo("Claim");
         assertThat(claims.toString()).contains("type=Claim");
     }
+
+    @Test
+    void anIriNamedRecordMatchesItsSimpleName() {
+        // srad/cards.md §3.20 (2026-11-26): an IRI was cut at the last dot, inside its host, so a flow's cue by simple name
+        // never took a card's PromptedResult or ChatMessage
+        String iri = "https://badmonkey.ai/ns/apps/v1/PromptedResult";
+        assertThat(Template.of(Object.class).whereType("PromptedResult").matchesType(iri)).isTrue();
+        assertThat(Template.of(Object.class).whereType(iri).matchesType(iri)).isTrue();
+        assertThat(Template.of(Object.class).whereType("PromptedResult").matchesType("https://badmonkey.ai/ns/apps/v1/PromptedResult#v1")).isTrue();
+        assertThat(Template.of(Object.class).whereType("ChatMessage").matchesType(iri)).isFalse();
+        assertThat(Template.of(Object.class).whereType("v1").matchesType(iri)).as("a path segment is no name").isFalse();
+    }
 }

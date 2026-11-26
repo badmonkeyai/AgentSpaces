@@ -49,13 +49,15 @@ public record Event(String type, String wireType, String entryId, Instant issued
         tags = tags == null ? Map.of() : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(tags));
     }
 
-    /** The simple name of a wire type: {@code a.b.Outer$Claim#v1} is {@code Claim}. */
+    /** The simple name of a wire type: {@code a.b.Outer$Claim#v1} is {@code Claim}, and so is {@code https://example.org/ns/v1/Claim}. */
     public static String simpleName(String wire) {
         if (wire == null) {
             return "";
         }
         String t = wire.contains("#") ? wire.substring(0, wire.indexOf('#')) : wire;
-        int i = Math.max(t.lastIndexOf('.'), t.lastIndexOf('$'));
+        // the last segment of a Java name or of an IRI: before 2026-11-26 an IRI was cut at the last dot, inside its host,
+        // so a rule naming an IRI-named record by its simple name (a card's ChatMessage, PromptedResult) never matched it
+        int i = Math.max(Math.max(t.lastIndexOf('.'), t.lastIndexOf('$')), t.lastIndexOf('/'));
         return i < 0 ? t : t.substring(i + 1);
     }
 

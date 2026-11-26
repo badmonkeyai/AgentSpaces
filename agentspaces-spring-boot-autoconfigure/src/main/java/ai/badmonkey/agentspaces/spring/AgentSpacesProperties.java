@@ -1426,9 +1426,10 @@ public class AgentSpacesProperties {
     }
 
     /**
-     * Retirement ({@code agentspaces.retirement.*}): a lost member is retried on a back-off of its own (5 s doubling
-     * to 5 min, at most eight per round) and, unanswered after {@code after}, retires to the retirement list kept in
-     * the state directory beside the admission memory. Off: a lost member is retried for ten minutes and forgotten.
+     * Retirement ({@code agentspaces.retirement.*}): a lost member is retried on a fixed cycling table (after 5, 10,
+     * 20 and 30 s, then 1, 2 and 5 minutes, then 5 s again, each wait spread 10 % either way; at most eight lost
+     * members re-dialed per round; SPEC §9.4) and, unanswered after {@code after}, retires to the retirement list kept
+     * in the state directory beside the admission memory. Off: a lost member is retried for ten minutes and forgotten.
      */
     public static class Retirement {
         /** Whether lost members retire; default on. */

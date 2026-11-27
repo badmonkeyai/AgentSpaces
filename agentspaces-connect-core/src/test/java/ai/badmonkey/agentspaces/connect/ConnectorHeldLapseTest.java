@@ -62,6 +62,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * A lapsed invocation is never renewed again and its result completes nothing. Before, {@code runHeld} renewed until
  * a renewal threw and completed whatever came back.
  *
+ * <p>Once the lapsed claim's own lease ends in the space, the invocation reappears, and this connector's loop takes it
+ * again: it answers from the result it remembers, so the target never runs twice (CC-L-08). That retake is the one
+ * completion and the one result, and it comes only after the lapsed run returned (the invoke loop is one thread). The
+ * tests wait for it and count it ({@link ConnectorRuntime#repeated()}); before, they read the completions at a moment
+ * that raced the loop (slice 6.7 of srad/cards.md §8.7: the sleep test failed with one completion, the claim test
+ * passed only because it read first).
+ *
  * <p>The invocation space is a {@link LocalSpace} behind a fake that can say a take's claim is gone (another
  * replica's claim displaced it), on virtual time: no sockets, no sleeps.
  */
@@ -80,6 +87,11 @@ class ConnectorHeldLapseTest {
     private final AtomicInteger completions = new AtomicInteger();
     private final AtomicBoolean entered = new AtomicBoolean();
     private final AtomicBoolean released = new AtomicBoolean();
+    /** The connector's renewer thread, once it first waits on the virtual clock. */
+    private final java.util.concurrent.atomic.AtomicReference<Thread> renewer = new java.util.concurrent.atomic.AtomicReference<>();
+    private AutoCloseable waits;
+    /** How many times the target ran. */
+    private final AtomicInteger invokes = new AtomicInteger();
     private PeerNode node;
     private LocalSpace data;
     private ConnectorRuntime connector;
@@ -104,6 +116,7 @@ class ConnectorHeldLapseTest {
         @Override
         public InvokeResult invoke(String asset, String operation, Map<String, String> params, String invocationId) {
             entered.set(true);
+            invokes.incrementAndGet();
             while (!released.get()) {
                 try {
                     time.sleep(Duration.ofMillis(500));
@@ -180,6 +193,13 @@ class ConnectorHeldLapseTest {
         GroupRuntime runtime = node.joinGroup(groupAd, GroupMembership.Config.defaults(), List.of());
         DiscoveryService discovery = new DiscoveryService(runtime, new AdCache(codec, time), codec, identity.peerId());
         data = LocalSpace.builder("data", identity.agent("connector")).clock(time).build();
+        // the renewer is the connector's own thread, which virtual time does not start or settle: it is seen when it
+        // first waits on the clock, so the tests step time only once its first renewal is due at a known instant
+        waits = time.onOutsideWait(() -> {
+            if (Thread.currentThread().getName().startsWith("connector-renew-")) {
+                renewer.compareAndSet(null, Thread.currentThread());
+            }
+        });
         connector = new ConnectorRuntime(claimable(data), discovery, identity, "inventory-connector", new Held(),
                 groupId, time, Duration.ofMinutes(1));
         connector.start();
@@ -189,11 +209,23 @@ class ConnectorHeldLapseTest {
         // spent the 10 s bound in a few milliseconds of real time under a parallel build (core reactor, 2026-11-23),
         // so the start is awaited on real time and virtual time stays where it is.
         ai.badmonkey.agentspaces.measure.Measure.await("connect.held-lapse.entered", Duration.ofSeconds(30), entered::get);
+        // and the renewer parked on its first sleep, due 15 s on: before, a parallel build's load could leave it unstarted
+        // while the test stepped all 20 s of its bound (the phase 6 gate, 2026-11-26: "the claim found gone ... within
+        // PT20S" failed with the renewer never run)
+        ai.badmonkey.agentspaces.measure.Measure.await("connect.held-lapse.renewer-parked", Duration.ofSeconds(30),
+                () -> renewer.get() != null && time.waitingOutside(renewer.get()));
     }
 
     @AfterEach
     void tearDown() {
         released.set(true);
+        if (waits != null) {
+            try {
+                waits.close();
+            } catch (Exception ignored) {
+                // a listener registration
+            }
+        }
         if (connector != null) {
             connector.close();
         }
@@ -202,13 +234,53 @@ class ConnectorHeldLapseTest {
         }
     }
 
-    /** Advances virtual time in 50 ms steps until the condition holds, within a bound of virtual time. */
-    private void await(BooleanSupplier condition, Duration bound, String what) {
+    /**
+     * Waits until the condition holds, stepping virtual time 50 ms per poll and never past the bound. The connector's
+     * threads run on real time once a step releases them, so time moves only as fast as the polls and stops at the
+     * bound: the condition holds within the bound of virtual time, however slowly the threads run (before, the test
+     * stepped the whole bound in a few milliseconds of real time and raced them). The real-time ceiling is 30 s.
+     */
+    private void await(BooleanSupplier condition, Duration bound, String metric) {
         long until = time.monoNanos() + bound.toNanos();
-        while (!condition.getAsBoolean()) {
-            assertThat(time.monoNanos()).as("%s within %s", what, bound).isLessThan(until);
-            time.advance(Duration.ofMillis(50));
-        }
+        ai.badmonkey.agentspaces.measure.Measure.await(metric, Duration.ofSeconds(30), () -> {
+            if (condition.getAsBoolean()) {
+                return true;
+            }
+            if (time.monoNanos() + STEP.toNanos() <= until) {
+                time.advance(STEP);
+            }
+            return false;
+        }, ai.badmonkey.agentspaces.measure.Wait.with().poll(POLL).diagnostics(() -> "virtual "
+                + Duration.ofNanos(time.monoNanos()) + " of a bound ending at " + Duration.ofNanos(until) + "; lateTakes "
+                + connector.lateTakes() + ", renewals " + connector.renewals() + ", retakes " + connector.repeated()
+                + ", completions " + completions.get() + ", renewer waiting " + (renewer.get() != null
+                && time.waitingOutside(renewer.get()))));
+    }
+
+    /** A step of virtual time per poll of real time: 50 ms each 2 ms, so a 20 s bound is reached in under a second. */
+    private static final Duration POLL = Duration.ofMillis(2);
+
+    private static final Duration STEP = Duration.ofMillis(50);
+
+    /**
+     * Waits for the connector's loop to take the reappeared invocation again and answer it from memory, within 5 s
+     * more of virtual time. The loop is a thread of its own that virtual time does not settle.
+     */
+    private void awaitTheRetake(String metric) {
+        await(() -> connector.repeated() >= 1 && completions.get() >= 1, Duration.ofSeconds(5), metric);
+    }
+
+    /**
+     * The late result completed nothing: the one completion and the one result are the retake's, answered from
+     * memory, and the target ran once. Had the late result completed, the invocation would never have reappeared:
+     * one completion, no retake.
+     */
+    private void assertTheLateResultCompletedNothing() {
+        assertThat(connector.repeated()).as("the reappeared invocation was taken again and answered from memory").isEqualTo(1);
+        assertThat(completions.get()).as("the late result completed nothing: the one completion is the retake's").isEqualTo(1);
+        assertThat(invokes.get()).as("the target never ran twice").isEqualTo(1);
+        assertThat(results()).as("one result, the remembered one").hasSize(1)
+                .allSatisfy(r -> assertThat(r.ok()).isTrue());
     }
 
     private List<AssetInvocationResult> results() {
@@ -219,18 +291,18 @@ class ConnectorHeldLapseTest {
     void c05AnInvocationWhoseClaimIsNoLongerOursLapsesAndItsResultCompletesNothing() {
         long took = time.monoNanos();
         claimOurs.set(false); // another replica's claim displaced this one
-        await(() -> connector.lateTakes() == 1, Duration.ofSeconds(20), "the claim found gone at the next renewal");
+        await(() -> connector.lateTakes() == 1, Duration.ofSeconds(20), "connect.held-lapse-claim-gone.lapse"); // at the next renewal
         long lapsedAfter = Duration.ofNanos(time.monoNanos() - took).toMillis();
         int renewals = connector.renewals();
         released.set(true);
-        time.advance(Duration.ofSeconds(40));
+        time.advance(Duration.ofSeconds(40)); // past the take's own 30 s lease: the invocation reappears
+        awaitTheRetake("connect.held-lapse-claim-gone.retake");
         System.out.printf("[close-out] connector, claim gone: lapsed %d ms after, lateTakes %d, renewals %d,"
-                + " completions %d, results %s%n", lapsedAfter, connector.lateTakes(), connector.renewals(),
-                completions.get(), results());
+                + " completions %d, retakes %d, invokes %d, results %s%n", lapsedAfter, connector.lateTakes(),
+                connector.renewals(), completions.get(), connector.repeated(), invokes.get(), results());
         assertThat(lapsedAfter).as("inside the invocation's own 30 s lease").isLessThan(30_000L);
         assertThat(connector.renewals()).as("a lapsed claim is never renewed again").isEqualTo(renewals);
-        assertThat(completions.get()).as("the late result completed nothing").isZero();
-        assertThat(results()).as("and wrote nothing").isEmpty();
+        assertTheLateResultCompletedNothing();
         assertThat(connector.lateTakes()).as("counted once").isEqualTo(1);
     }
 
@@ -242,11 +314,12 @@ class ConnectorHeldLapseTest {
         long lateAtWake = connector.lateTakes();
         released.set(true);
         time.advance(Duration.ofSeconds(5));
-        System.out.printf("[close-out] connector, 40 s sleep: lateTakes at the wake %d, completions %d, results %s%n",
-                lateAtWake, completions.get(), results());
+        awaitTheRetake("connect.held-lapse-sleep.retake");
+        System.out.printf("[close-out] connector, 40 s sleep: lateTakes at the wake %d, completions %d, retakes %d,"
+                + " invokes %d, results %s%n", lateAtWake, completions.get(), connector.repeated(), invokes.get(),
+                results());
         assertThat(lateAtWake).as("the wake re-checked the claim at once, past its wall-time lease").isEqualTo(1);
-        assertThat(completions.get()).as("the late result completed nothing").isZero();
-        assertThat(results()).isEmpty();
+        assertTheLateResultCompletedNothing();
     }
 
     @Test
@@ -256,7 +329,7 @@ class ConnectorHeldLapseTest {
         time.advance(Duration.ofMillis(10));
         long wakeRenewals = connector.wakeRenewals();
         released.set(true);
-        await(() -> !results().isEmpty(), Duration.ofSeconds(5), "the result written");
+        await(() -> !results().isEmpty(), Duration.ofSeconds(5), "connect.held-lapse-inside.result");
         System.out.printf("[close-out] connector, 20 s sleep: wake renewals %d, lateTakes %d, results %s%n",
                 wakeRenewals, connector.lateTakes(), results());
         assertThat(wakeRenewals).as("the wake renewed the claim at once").isEqualTo(1);

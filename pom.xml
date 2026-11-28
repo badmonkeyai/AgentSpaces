@@ -142,7 +142,7 @@
     <netty.version>4.1.138.Final</netty.version>
 
     <!-- Plugin versions -->
-    <maven-compiler-plugin.version>3.14.0</maven-compiler-plugin.version>
+    <maven-compiler-plugin.version>3.16.0</maven-compiler-plugin.version>
     <maven-surefire-plugin.version>3.5.4</maven-surefire-plugin.version>
     <!-- Test JVMs per module (docs/build.md, "Build time"): three forks, each reused for its share of the
          module's test classes. With -T 2 that is at most six test JVMs beside Maven's own. Override with

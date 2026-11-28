@@ -22,7 +22,7 @@
 
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces</artifactId>
-  <version>0.7.0-SNAPSHOT</version>
+  <version>0.7.0</version>
   <packaging>pom</packaging>
 
   <name>AgentSpaces</name>
@@ -178,7 +178,7 @@
 
     <!-- Measured waits for tests (srad/feature-measurements.md FM-L-01): a standalone open project, JDK only,
          used at test scope only and installed before the core reactor. -->
-    <agentspaces-test-measure.version>0.7.0-SNAPSHOT</agentspaces-test-measure.version>
+    <agentspaces-test-measure.version>0.7.0</agentspaces-test-measure.version>
   </properties>
 
   <dependencyManagement>

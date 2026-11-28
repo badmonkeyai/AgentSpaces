@@ -74,7 +74,8 @@ public final class EmbabelIntrospector {
     /**
      * Introspects one bean.
      *
-     * @param type the bean's class
+     * @param proxied the bean's class, possibly a proxy or subclass; the
+     *                user class behind it is the one introspected
      * @return the Embabel metadata, or empty when the class carries no
      *         {@code @Agent} annotation
      */

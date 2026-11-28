@@ -20,7 +20,12 @@ package ai.badmonkey.agentspaces.constraints;
 import java.util.List;
 import java.util.Map;
 
-/** Reserved for the planner (a later spiral): one step of a plan toward a goal. Nothing writes it today. */
+/**
+ * One step of a plan toward a goal, written into the group's plans space when the plan is made: by a planner that
+ * searches the cards' actions for a goal, and by an agent that runs a plan of its own (authored, or drafted from a
+ * prompt), one entry per step. {@code goal} names the goal or the plan, {@code version} the plan's version,
+ * {@code action} the step, {@code card} what serves it, {@code dependsOn} the step numbers it waits for.
+ */
 public record PlanStep(int v, String goal, String key, long version, int step, String action, String card,
                        Map<String, Object> inputs, List<Integer> dependsOn) {
 

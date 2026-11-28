@@ -33,6 +33,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -114,11 +115,15 @@ class VersionGraphTest {
             String v1 = onA.swap(m -> m.assoc("k", "v1")).root();
             assertThat(fleet.runUntil(Duration.ofSeconds(10), () -> onB.heads().roots().equals(List.of(v1))
                     && onR.heads().roots().equals(List.of(v1)))).isTrue();
+            // B's swap reads its heads before it calls the function, so once the function runs B's base is v1;
+            // A writes v2 only after that, else a late-starting fork thread reads v2 or v3 and forks from neither
+            CountDownLatch entered = new CountDownLatch(1);
             CountDownLatch release = new CountDownLatch(1);
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Thread fork = Thread.ofVirtual().start(() -> {
                 try {
                     onB.swap(m -> {
+                        entered.countDown();
                         try {
                             release.await();
                         } catch (InterruptedException e) {
@@ -130,6 +135,7 @@ class VersionGraphTest {
                     failure.set(t);
                 }
             });
+            assertThat(entered.await(10, TimeUnit.SECONDS)).as("B read v1 and entered its swap").isTrue();
             onA.swap(m -> m.assoc("k", "v2"));
             fleet.settle(2);
             String v3 = onA.swap(m -> m.assoc("k", "v3").assoc("c", "3")).root();
